@@ -41,7 +41,6 @@ struct Preferences {
 enum LatestSource {
     AntigravityAcp,
     Claude,
-    Npm(&'static str),
     Opencode,
     Github {
         repository: &'static str,
@@ -691,7 +690,6 @@ impl HarnessUpdateCoordinator {
                     None => Ok(UpdateCheck::Manual),
                 }
             }
-            LatestSource::Npm(package) => self.npm_latest(package).await.map(UpdateCheck::Version),
             LatestSource::Opencode => self
                 .npm_latest(opencode_release_package(&installed))
                 .await
@@ -930,7 +928,6 @@ impl HarnessUpdateCoordinator {
                 repository,
                 tag_prefix,
             } => self.github_latest(repository, tag_prefix).await,
-            LatestSource::Npm(package) => self.npm_latest(package).await,
             LatestSource::Opencode => self.npm_latest(opencode_release_package(installed)).await,
             LatestSource::AntigravityAcp => self.antigravity_acp_latest().await,
             LatestSource::Claude

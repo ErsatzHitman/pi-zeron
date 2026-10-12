@@ -9,6 +9,9 @@ pub(super) type Input =
 pub(super) struct Dialogs {
     pub input: Option<Arc<Input>>,
     tasks: JoinSet<()>,
+    /// Dialogs Pi is still waiting on, so a cancel can answer them: Pi's
+    /// `editor` has no timeout and an unanswered one stalls `abort`.
+    open: Arc<std::sync::Mutex<Vec<(Value, Client)>>>,
 }
 impl Dialogs {
     pub fn request(&mut self, client: Client, frame: &Value) {
@@ -50,6 +53,8 @@ impl Dialogs {
         let question_id = question.id.clone();
         let answer = (input)(vec![question]);
         let timeout = frame["timeout"].as_u64();
+        lock(&self.open).push((id.clone(), client.clone()));
+        let open = self.open.clone();
         self.tasks.spawn(async move {
             let deadline = async {
                 match timeout {
@@ -74,12 +79,19 @@ impl Dialogs {
                 ("input" | "editor", Some(value)) => response["value"] = json!(value),
                 _ => response["cancelled"] = json!(true),
             }
+            lock(&open).retain(|(open_id, _)| *open_id != id);
             let _ = client.send(response);
         });
     }
     pub fn cancel(&mut self) {
         self.tasks.abort_all();
+        for (id, client) in lock(&self.open).drain(..) {
+            let _ = client.send(json!({"type":"extension_ui_response","id":id,"cancelled":true}));
+        }
     }
+}
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -128,5 +140,16 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), sender.closed())
             .await
             .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply).unwrap(),
+            json!({
+                "type":"extension_ui_response", "id":"stopped", "cancelled":true
+            })
+        );
     }
 }

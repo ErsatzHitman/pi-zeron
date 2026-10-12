@@ -7,6 +7,35 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Pi's `trust.json` decision for `cwd`: the nearest ancestor (or the
+/// directory itself) with an explicit `true`/`false`, keyed by canonical path.
+fn project_trusted(trust: &Value, cwd: &Path) -> bool {
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let text = canonical.display().to_string();
+    // Node's realpath has no verbatim `\?\` prefix.
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned();
+    let mut dir = Some(PathBuf::from(text));
+    while let Some(current) = dir {
+        let key = current.display().to_string();
+        let decision = trust.as_object().and_then(|map| {
+            map.iter()
+                .find(|(path, _)| {
+                    if cfg!(windows) {
+                        path.eq_ignore_ascii_case(&key)
+                    } else {
+                        **path == key
+                    }
+                })
+                .and_then(|(_, value)| value.as_bool())
+        });
+        if let Some(decision) = decision {
+            return decision;
+        }
+        dir = current.parent().map(Path::to_path_buf);
+    }
+    false
+}
+
 #[derive(Clone)]
 pub(super) struct Store {
     root: PathBuf,
@@ -36,12 +65,19 @@ impl Store {
     /// Whether a steering mode is already set in the settings Pi loads for
     /// `cwd` (global, then project).
     pub fn steering_mode_configured(&self, cwd: &Path) -> bool {
-        [
-            self.agent.join("settings.json"),
-            cwd.join(".pi/settings.json"),
-        ]
-        .iter()
-        .any(|settings| json_file(settings).get("steeringMode").is_some())
+        self.settings_files(cwd)
+            .iter()
+            .any(|settings| json_file(settings).get("steeringMode").is_some())
+    }
+    /// The settings files Pi actually loads for `cwd`: the global one, plus
+    /// the project's only when the project is trusted (RPC mode never asks,
+    /// so an undecided project stays untrusted).
+    fn settings_files(&self, cwd: &Path) -> Vec<PathBuf> {
+        let mut files = vec![self.agent.join("settings.json")];
+        if project_trusted(&json_file(&self.agent.join("trust.json")), cwd) {
+            files.push(cwd.join(".pi/settings.json"));
+        }
+        files
     }
     fn key(&self, id: &str) -> PathBuf {
         self.root
@@ -138,10 +174,7 @@ impl Store {
             candidates.push(PathBuf::from(file));
         }
         let mut roots = vec![self.agent.join("sessions")];
-        for settings in [
-            self.agent.join("settings.json"),
-            cwd.join(".pi/settings.json"),
-        ] {
+        for settings in self.settings_files(cwd) {
             if let Some(root) = json_file(&settings)["sessionDir"].as_str() {
                 let path = if let Some(rest) = root.strip_prefix("~/") {
                     crate::executable::home_or_current_dir().join(rest)
@@ -276,7 +309,26 @@ mod tests {
             r#"{"steeringMode":"one-at-a-time"}"#,
         )
         .unwrap();
+        // Pi ignores an untrusted project's settings, so Zeron must too.
+        assert!(!store.steering_mode_configured(&cwd));
+        let key = |path: &Path| {
+            let text = path.canonicalize().unwrap().display().to_string();
+            text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+        };
+        let trust = |entries: &[(&Path, bool)]| {
+            let map: serde_json::Map<String, Value> = entries
+                .iter()
+                .map(|(path, decision)| (key(path), json!(decision)))
+                .collect();
+            std::fs::write(agent.join("trust.json"), Value::Object(map).to_string()).unwrap();
+        };
+        // The nearest explicit decision wins: a trusted parent folder...
+        trust(&[(dir.path(), true)]);
         assert!(store.steering_mode_configured(&cwd));
+        // ...unless the project itself is explicitly distrusted.
+        trust(&[(dir.path(), true), (&cwd, false)]);
+        assert!(!store.steering_mode_configured(&cwd));
+        trust(&[(dir.path(), true)]);
         std::fs::remove_file(cwd.join(".pi/settings.json")).unwrap();
         std::fs::write(agent.join("settings.json"), r#"{"steeringMode":"all"}"#).unwrap();
         assert!(store.steering_mode_configured(&cwd));

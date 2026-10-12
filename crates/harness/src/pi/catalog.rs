@@ -73,6 +73,11 @@ pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
         .flatten()
         .filter_map(|v| {
             let name = v["name"].as_str()?;
+            // Transport commands for GUI clients (PIUI's `pi_ui_event`), not
+            // something a person types.
+            if name.starts_with("pi_ui_") {
+                return None;
+            }
             Some(SlashCommand {
                 name: name.into(),
                 description: string(v, "description").into(),
@@ -117,9 +122,46 @@ pub(super) fn builtin(text: &str, auto: bool) -> Option<Value> {
         "/autocompact" => {
             json!({"type":"set_auto_compaction","enabled":match args {"on"=>true,"off"=>false,_=>!auto}})
         }
-        "/steering" if !args.is_empty() => json!({"type":"set_steering_mode","mode":args}),
-        "/follow-up" if !args.is_empty() => json!({"type":"set_follow_up_mode","mode":args}),
+        // Pi persists the mode to its global settings without validating it,
+        // so only its two real modes are ever sent; anything else shows the
+        // current state instead.
+        "/steering" if is_queue_mode(args) => json!({"type":"set_steering_mode","mode":args}),
+        "/follow-up" if is_queue_mode(args) => json!({"type":"set_follow_up_mode","mode":args}),
         "/steering" | "/follow-up" => json!({"type":"get_state"}),
         _ => return None,
     })
+}
+fn is_queue_mode(mode: &str) -> bool {
+    matches!(mode, "all" | "one-at-a-time")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn piui_transport_commands_are_hidden_from_the_palette() {
+        let listed = commands(&json!({"commands":[
+            {"name":"pi_ui_event","description":"Internal","source":"extension"},
+            {"name":"todo","description":"Todos","source":"extension"},
+        ]}));
+        assert!(listed.iter().all(|c| !c.name.starts_with("pi_ui_")));
+        assert!(listed.iter().any(|c| c.name == "todo"));
+    }
+
+    #[test]
+    fn only_real_queue_modes_are_persisted() {
+        assert_eq!(
+            builtin("/steering all", true).unwrap(),
+            json!({"type":"set_steering_mode","mode":"all"})
+        );
+        assert_eq!(
+            builtin("/steering bogus", true).unwrap(),
+            json!({"type":"get_state"})
+        );
+        assert_eq!(
+            builtin("/follow-up one-at-a-time", true).unwrap(),
+            json!({"type":"set_follow_up_mode","mode":"one-at-a-time"})
+        );
+    }
 }

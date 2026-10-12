@@ -25,8 +25,21 @@ use tokio::{
 };
 use zeron_proto::{AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode};
 
+/// Where the device's configured Pi executable comes from (Settings → Pi),
+/// read on every resolve so a changed setting applies to the next spawn.
+pub type ExecutableSetting = std::sync::Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
+
+/// Oldest Pi this client speaks to. Older Pi lacks the RPC shapes and the
+/// extension UI the client is built around; there is no compatibility path.
+pub const MIN_PI_VERSION: semver::Version = semver::Version::new(1, 1, 0);
+
+/// Pi run from source starts Node and a TypeScript resolver before printing
+/// its version; give it far longer than a native binary's probe.
+const VERSION_PROBE: Duration = Duration::from_secs(20);
+
 pub struct PiHarness {
     models_cache: crate::catalog::Catalog,
+    executable_setting: Option<ExecutableSetting>,
     workspace_commands: crate::skills::CommandDiscovery,
     session_store: Option<PathBuf>,
     agent_dir: Option<PathBuf>,
@@ -38,6 +51,7 @@ impl Default for PiHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            executable_setting: None,
             session_store: None,
             agent_dir: None,
             models_cache: Default::default(),
@@ -55,6 +69,12 @@ impl PiHarness {
         self.executable = Some(path.into());
         self
     }
+    /// The configured executable (Settings → Pi); `PI_EXECUTABLE` is the
+    /// fallback when the setting is empty.
+    pub fn with_executable_setting(mut self, setting: ExecutableSetting) -> Self {
+        self.executable_setting = Some(setting);
+        self
+    }
     pub fn with_session_store(mut self, path: impl Into<PathBuf>) -> Self {
         self.session_store = Some(path.into());
         self
@@ -70,29 +90,43 @@ impl PiHarness {
         self.kill_grace = kill;
         self
     }
+    /// The Pi to run: an explicit path, else Settings → Pi, else
+    /// `PI_EXECUTABLE`. Never a `pi` found on PATH: a stray global install is
+    /// usually an old release this client cannot drive.
     pub fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
-        if let Some(path) = self
-            .executable
-            .clone()
-            .or_else(|| std::env::var_os("PI_EXECUTABLE").map(PathBuf::from))
-        {
-            return crate::executable::validate_native_override(&path);
-        }
-        let home = crate::executable::home_or_current_dir();
-        crate::executable::find_on_paths(
-            "pi",
-            vec![
-                home.join(".local/bin/pi"),
-                home.join(".npm-global/bin/pi"),
-                PathBuf::from("/opt/homebrew/bin/pi"),
-                PathBuf::from("/usr/local/bin/pi"),
-            ],
-        )
-        .ok_or_else(|| {
-            HarnessError::NotInstalled(
-                "Pi CLI: install Pi or set PI_EXECUTABLE (the pi-acp adapter is not used)".into(),
-            )
-        })
+        let configured = self.executable.clone().or_else(|| {
+            self.executable_setting
+                .as_ref()
+                .and_then(|setting| setting())
+                .filter(|path| !path.as_os_str().is_empty())
+        });
+        let path = configured
+            .or_else(|| {
+                std::env::var_os("PI_EXECUTABLE")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            })
+            .ok_or_else(|| {
+                HarnessError::NotInstalled(
+                    "Pi is not configured: choose its executable in Settings → General → Pi                      (or set PI_EXECUTABLE)"
+                        .into(),
+                )
+            })?;
+        crate::executable::validate_native_override(&path)
+    }
+    /// The resolved executable and its version, refusing Pi older than
+    /// [`MIN_PI_VERSION`] or one whose version cannot be read.
+    pub fn verified_executable(&self) -> Result<(PathBuf, semver::Version), HarnessError> {
+        let exe = self.resolve_executable()?;
+        let version = crate::executable::binary_version_within(&exe, VERSION_PROBE)
+            .ok_or_else(|| {
+                HarnessError::NotInstalled(format!(
+                    "Could not read the Pi version from {} (`--version` failed)",
+                    exe.display()
+                ))
+            })?;
+        check_version(&exe, &version)?;
+        Ok((exe, version))
     }
     async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
         let mut process = self.spawn(cwd, &["--no-session".into()], None)?;
@@ -118,16 +152,7 @@ impl PiHarness {
         args: &[String],
         mcp: Option<&zeron_proto::McpServer>,
     ) -> Result<Process, HarnessError> {
-        let exe = self.resolve_executable()?;
-        if self.executable.is_none() {
-            if let Some(version) = crate::executable::binary_version(&exe) {
-                if version < semver::Version::new(0, 85, 1) {
-                    return Err(HarnessError::Protocol(format!(
-                        "Pi {version} is unsupported; update Pi to 0.85.1 or newer"
-                    )));
-                }
-            }
-        }
+        let (exe, _) = self.verified_executable()?;
         let mut cmd = Command::new(&exe);
         // Process group plus the same env scrubbing the ACP launch applied.
         crate::process::owned::configure(&mut cmd);
@@ -169,6 +194,15 @@ impl PiHarness {
             exit_deadline: None,
         })
     }
+}
+fn check_version(exe: &Path, version: &semver::Version) -> Result<(), HarnessError> {
+    if *version < MIN_PI_VERSION {
+        return Err(HarnessError::NotInstalled(format!(
+            "Pi {version} at {} is too old: Zeron needs Pi {MIN_PI_VERSION} or newer",
+            exe.display()
+        )));
+    }
+    Ok(())
 }
 struct Process {
     child: Child,
@@ -372,6 +406,7 @@ impl Harness for PiHarness {
                 store,
                 interrupted: false,
                 extension_commands: HashSet::new(),
+                pi_commands: HashSet::new(),
                 auto_compaction: true,
                 initial_pending: true,
                 deliveries: VecDeque::new(),
@@ -436,6 +471,9 @@ struct Delivery {
 }
 struct Runner {
     extension_commands: HashSet<String>,
+    /// Every command Pi advertised (extensions, prompt templates, skills).
+    /// Each shadows Zeron's built-in mapping of the same name.
+    pi_commands: HashSet<String>,
     auto_compaction: bool,
     interrupted: bool,
     initial_pending: bool,
@@ -497,7 +535,7 @@ impl Runner {
             .next()
             .unwrap_or("")
             .trim_start_matches('/');
-        if self.extension_commands.contains(name) {
+        if self.pi_commands.contains(name) {
             None
         } else {
             catalog::builtin(text, self.auto_compaction)
@@ -543,6 +581,12 @@ impl Runner {
             .process
             .query(json!({"type":"get_commands"}), backlog)
             .await?;
+        self.pi_commands = commands["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| string(c, "name").to_owned())
+            .collect();
         self.extension_commands = commands["commands"]
             .as_array()
             .into_iter()

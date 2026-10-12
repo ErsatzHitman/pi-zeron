@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {createInterface} from 'node:readline';
+import {pathToFileURL} from 'node:url';
 
 if (process.argv[2] === 'server') {
   createInterface({input: process.stdin}).on('line', line => {
@@ -15,7 +16,8 @@ if (process.argv[2] === 'server') {
     process.stdout.write(JSON.stringify({jsonrpc:'2.0', id:msg.id, result})+'\n');
   });
 } else {
-  const {default: extension} = await import(process.argv[2]);
+  // A Windows path (D:\...) is not an ESM specifier; a file URL is.
+  const {default: extension} = await import(pathToFileURL(process.argv[2]).href);
   for (const chat of ['first', 'second']) {
     process.env.ZERON_PI_MCP = JSON.stringify({name:'zeron',command:process.execPath,args:[process.argv[1],'server'],env:{ZERON_CHAT_ID:chat}});
     const handlers = {}, tools = {};

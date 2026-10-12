@@ -12,7 +12,12 @@ use tokio::{
     task::JoinHandle,
 };
 
-const MAX_FRAME: usize = 32 * 1024 * 1024;
+// Small under test so the skip path is cheap to exercise.
+const MAX_FRAME: usize = if cfg!(test) {
+    64 * 1024
+} else {
+    32 * 1024 * 1024
+};
 
 #[derive(Clone)]
 pub(super) struct Client {
@@ -72,6 +77,10 @@ impl Transport {
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(output);
             let mut bytes = Vec::new();
+            // Pi has no frame limit: a run with inline images can produce an
+            // `agent_end` beyond any sane buffer. Drop such a frame (its
+            // content already streamed as deltas) rather than the session.
+            let mut oversized = false;
             loop {
                 // fill_buf bounds allocation before a hostile/noisy peer sends LF.
                 let chunk = match reader.fill_buf().await {
@@ -91,17 +100,19 @@ impl Transport {
                     .iter()
                     .position(|b| *b == b'\n')
                     .map_or(chunk.len(), |i| i + 1);
-                if bytes.len() + count > MAX_FRAME {
-                    let _ = tx
-                        .send(Err(HarnessError::Protocol(
-                            "Pi RPC frame exceeds 32 MiB".into(),
-                        )))
-                        .await;
-                    break;
+                let ends_frame = chunk[..count].last() == Some(&b'\n');
+                if oversized || bytes.len() + count > MAX_FRAME {
+                    if !oversized {
+                        tracing::warn!("Pi RPC frame exceeds 32 MiB; skipping it");
+                    }
+                    bytes.clear();
+                    reader.consume(count);
+                    oversized = !ends_frame;
+                    continue;
                 }
                 bytes.extend_from_slice(&chunk[..count]);
                 reader.consume(count);
-                if bytes.last() != Some(&b'\n') {
+                if !ends_frame {
                     continue;
                 }
                 if !bytes.iter().all(u8::is_ascii_whitespace) {
@@ -178,6 +189,26 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Invalid Pi")
+        );
+    }
+    #[tokio::test]
+    async fn an_oversized_frame_is_skipped_without_ending_the_session() {
+        let (host, peer) = tokio::io::duplex(1 << 20);
+        let (read, write) = tokio::io::split(host);
+        let (_peer_read, mut peer_write) = tokio::io::split(peer);
+        let mut transport = Transport::new(write, read);
+        let huge = json!({"type":"agent_end","messages":["x".repeat(MAX_FRAME * 2)]});
+        peer_write
+            .write_all(format!("{huge}\n").as_bytes())
+            .await
+            .unwrap();
+        peer_write
+            .write_all(b"{\"type\":\"agent_settled\"}\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.incoming.recv().await.unwrap().unwrap(),
+            json!({"type":"agent_settled"})
         );
     }
 }

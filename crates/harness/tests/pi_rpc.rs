@@ -404,7 +404,11 @@ async fn extension_dialogs_roundtrip_without_autoaccepting_and_preserve_editor_t
         c.request_input = Box::new(move |questions| {
             assert_eq!(questions.len(), 1);
             assert_eq!(questions[0].multiline, method == "editor");
-            assert_eq!(questions[0].prefill.as_deref(), Some("initial\nvalue"));
+            // Pi 1.1 sends `prefill` only with `editor`.
+            assert_eq!(
+                questions[0].prefill.as_deref(),
+                (method == "editor").then_some("initial\nvalue")
+            );
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(
                 label
@@ -806,3 +810,90 @@ async fn a_model_switch_applies_to_the_live_process() {
     assert!(text.contains("reply:mock/medium|"), "{text}");
     assert!(text.contains("reply:mock-2/high|"), "{text}");
 }
+
+#[tokio::test]
+async fn pi_older_than_1_1_is_refused_with_a_clear_error() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let exe = {
+        let path = dir.path().join("old-pi.cmd");
+        std::fs::write(&path, "@echo 0.87.1\r\n").unwrap();
+        path
+    };
+    #[cfg(unix)]
+    let exe = {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("old-pi");
+        std::fs::write(&path, "#!/bin/sh\necho 0.87.1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let old = PiHarness::new().with_executable(&exe);
+    let error = old.verified_executable().unwrap_err().to_string();
+    assert!(
+        error.contains("0.87.1") && error.contains("1.1.0"),
+        "{error}"
+    );
+    let (c, _tx, _) = controls();
+    let Err(error) = old.run(request(dir.path(), "hello"), c).await else {
+        panic!("an old Pi must not start a session");
+    };
+    assert!(error.to_string().contains("too old"), "{error}");
+    let (exe, version) = harness().verified_executable().unwrap();
+    assert!(exe.exists());
+    assert_eq!(version, semver::Version::new(1, 1, 0));
+}
+
+/// No setting and no `PI_EXECUTABLE`: Pi is "not configured", and the `pi`
+/// on PATH (often an old global install) is never used instead.
+#[test]
+fn an_unconfigured_pi_never_falls_back_to_path() {
+    if std::env::var_os("ZERON_PI_UNCONFIGURED_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "an_unconfigured_pi_never_falls_back_to_path"])
+            .env("ZERON_PI_UNCONFIGURED_CHILD", "1")
+            .env_remove("PI_EXECUTABLE")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
+    let setting: zeron_harness::pi::ExecutableSetting = std::sync::Arc::new(|| None);
+    let pi = PiHarness::new().with_executable_setting(setting);
+    let error = pi.resolve_executable().unwrap_err().to_string();
+    assert!(error.contains("Settings"), "{error}");
+    assert!(!pi.installed());
+    let configured = std::path::PathBuf::from(env!("CARGO_BIN_EXE_harness-pi-fixture"));
+    let setting: zeron_harness::pi::ExecutableSetting =
+        std::sync::Arc::new(move || Some(configured.clone()));
+    assert!(PiHarness::new().with_executable_setting(setting).installed());
+}
+
+#[tokio::test]
+async fn edit_diffs_come_from_pi_edits_array_and_transport_commands_stay_hidden() {
+    let events = collect("edit").await;
+    let diff = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult { diff: Some(diff), .. } => Some(diff.clone()),
+            _ => None,
+        })
+        .expect("edit diff");
+    assert_eq!(diff.path, "a.txt");
+    assert_eq!(diff.old_text.as_deref(), Some("one\ntwo"));
+    assert_eq!(diff.new_text, "uno\ndos");
+    let commands = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::AvailableCommands { commands } => Some(commands.clone()),
+            _ => None,
+        })
+        .expect("advertised commands");
+    assert!(commands.iter().any(|c| c.name == "noop"));
+    assert!(commands.iter().all(|c| !c.name.starts_with("pi_ui_")));
+}
+

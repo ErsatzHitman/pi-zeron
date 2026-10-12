@@ -49,6 +49,10 @@ pub mod methods {
     /// replies with the device's fresh `ListHarnesses` catalog.
     pub const GET_TITLE_SETTINGS: &str = "GetTitleSettings";
     pub const SET_TITLE_SETTINGS: &str = "SetTitleSettings";
+    /// This device's Pi executable setting and its live status.
+    pub const GET_PI_SETTINGS: &str = "GetPiSettings";
+    /// Save the Pi executable (`{executable: string|null}`); replies like `GetPiSettings`.
+    pub const SET_PI_SETTINGS: &str = "SetPiSettings";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";

@@ -103,6 +103,14 @@ struct ListModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetPiSettingsParams {
+    /// `None` or blank clears the setting (falls back to `PI_EXECUTABLE`).
+    #[serde(default)]
+    executable: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetHarnessEnabledParams {
     harness: HarnessId,
     enabled: bool,
@@ -1431,6 +1439,8 @@ fn forwardable(method: &str) -> bool {
             | methods::CANCEL_INSTALL
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
+            | methods::GET_PI_SETTINGS
+            | methods::SET_PI_SETTINGS
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
@@ -1840,6 +1850,22 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
+            methods::GET_PI_SETTINGS | methods::SET_PI_SETTINGS => {
+                if method == methods::SET_PI_SETTINGS {
+                    let p: SetPiSettingsParams = parse_params(params)?;
+                    self.registry.set_pi_executable(
+                        p.executable
+                            .map(|path| path.trim().trim_matches('"').to_owned())
+                            .filter(|path| !path.is_empty())
+                            .map(std::path::PathBuf::from),
+                    );
+                }
+                let registry = self.registry.clone();
+                let settings = tokio::task::spawn_blocking(move || registry.pi_settings_blocking())
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&settings)
+            }
             methods::SET_TITLE_SETTINGS => {
                 let p: crate::registry::TitleSettings = parse_params(params)?;
                 self.registry

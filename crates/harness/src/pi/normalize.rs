@@ -128,8 +128,8 @@ impl Normalizer {
                     match name.as_str() {
                         "edit" => Some(ToolDiff {
                             path: string(args, "path").into(),
-                            old_text: Some(cap(string(args, "oldText"), 65536)),
-                            new_text: cap(string(args, "newText"), 65536),
+                            old_text: Some(cap(&edit_text(args, "oldText"), 65536)),
+                            new_text: cap(&edit_text(args, "newText"), 65536),
                         }),
                         "write" => Some(ToolDiff {
                             path: string(args, "path").into(),
@@ -154,6 +154,9 @@ impl Normalizer {
                     });
                 }
             }
+            // Pi reports an aborted run here even when no assistant message
+            // carried `stopReason: "aborted"` (aborted before the first token).
+            "agent_settled" if frame["aborted"] == true => self.aborted = true,
             "extension_error" => {
                 self.error = Some(string(frame, "error").into());
                 events.push(AgentEvent::Error {
@@ -178,9 +181,20 @@ fn cap(text: &str, limit: usize) -> String {
     }
     format!("{}\n… [truncated]", &text[..at])
 }
+/// Pi's `edit` takes `edits: [{oldText, newText}]`, applied against the
+/// original file. The transcript shows them as one change, in order.
+fn edit_text(args: &Value, key: &str) -> String {
+    args["edits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|edit| string(edit, key))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 fn tool(name: &str, args: &Value) -> ToolCall {
     match name {
-        "bash" => ToolCall::Exec {
+        "bash" | "powershell" => ToolCall::Exec {
             command: string(args, "command").into(),
         },
         "read" => ToolCall::ReadFile {
@@ -192,8 +206,8 @@ fn tool(name: &str, args: &Value) -> ToolCall {
         },
         "edit" => ToolCall::EditFile {
             path: string(args, "path").into(),
-            old_string: args["oldText"].as_str().map(str::to_owned),
-            new_string: args["newText"].as_str().map(str::to_owned),
+            old_string: Some(edit_text(args, "oldText")),
+            new_string: Some(edit_text(args, "newText")),
         },
         "grep" => ToolCall::Search {
             pattern: string(args, "pattern").into(),
@@ -230,12 +244,18 @@ mod tests {
     #[test]
     fn tools_preserve_identity_and_edit_diff() {
         let mut n = Normalizer::default();
-        let start = json!({"type":"tool_execution_start","toolCallId":"t","toolName":"edit","args":{"path":"a","oldText":"old","newText":"new"}});
+        let start = json!({"type":"tool_execution_start","toolCallId":"t","toolName":"edit","args":{"path":"a","edits":[{"oldText":"old","newText":"new"},{"oldText":"x","newText":"y"}]}});
         assert_eq!(n.map(&start).len(), 1);
         assert!(n.map(&start).is_empty());
         let events=n.map(&json!({"type":"tool_execution_end","toolCallId":"t","isError":false,"result":{"content":[{"type":"text","text":"ok"}]}}));
         assert!(
-            matches!(&events[0],AgentEvent::ToolResult{id,diff:Some(diff),..} if id=="t" && diff.new_text=="new")
+            matches!(&events[0],AgentEvent::ToolResult{id,diff:Some(diff),..} if id=="t" && diff.new_text=="new\ny" && diff.old_text.as_deref()==Some("old\nx"))
         );
+    }
+    #[test]
+    fn settled_abort_without_an_assistant_message_is_an_interruption() {
+        let mut n = Normalizer::default();
+        n.map(&json!({"type":"agent_settled","aborted":true}));
+        assert_eq!(n.status(), DoneStatus::Interrupted);
     }
 }

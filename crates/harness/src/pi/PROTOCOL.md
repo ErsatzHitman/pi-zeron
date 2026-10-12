@@ -1,30 +1,49 @@
 Pi RPC compatibility contract
 
-The native driver targets Pi >= 0.85.1. Requests and events are JSONL, never
-JSON-RPC. Responses and lifecycle events must retain stdout order.
+The native driver targets Pi >= 1.1.0 and refuses anything older (or a Pi whose
+`--version` cannot be read) with a visible error. There is no compatibility
+path for older releases. Requests and events are JSONL, never JSON-RPC.
+Responses and lifecycle events must retain stdout order.
 
-`prompt` success acknowledges preflight. Normal runs finish at `agent_settled`,
-not `agent_end`; a final error message determines the terminal status after
-retries. Extension commands and input handlers may acknowledge without a run.
+Executable: an explicit path, else the device setting (Settings → General →
+Pi, persisted in `harness-prefs.json` as `piExecutable`), else
+`PI_EXECUTABLE`. Zeron never searches PATH for Pi and never updates Pi.
 
-Legacy ACK barrier (verified against installed 0.85.1 and inspected 0.87.1):
-after prompt acceptance request `get_state`. In these versions AgentSession's
-`isStreaming` is `_isAgentRunActive`, covering retries/post-run continuations.
-The synchronous path sets it immediately after the preflight callback, before
-another stdin command can execute. A false isStreaming AND false isCompacting
-at this ordered barrier closes a handled prompt (or a run already settled).
-This is NOT polling for idle or a quiet timeout. Process all preceding events
-before the response, and scope barriers to the submitted execution. A future
-`data.disposition` is additive; the state barrier also catches extension-started
-work, which can accompany a handled disposition.
+`prompt` success acknowledges preflight with `data.disposition`
+(`started` | `queued` | `handled`). Normal runs finish at `agent_settled`
+(which carries `aborted`), not `agent_end`; a final error message determines
+the terminal status after retries (`auto_retry_start`/`auto_retry_end` frame
+them). Extension commands and input handlers acknowledge `handled` without a
+run; their handler is awaited before the ACK, so dialogs or a run it starts
+precede it on stdout.
+
+ACK barrier (verified against Pi 1.1.0 and main, `agent-session.ts`): after
+prompt acceptance request `get_state`. AgentSession's `isStreaming` is
+`_isAgentRunActive`, covering retries/post-run continuations. `_startRun` marks
+the run active before preparing it and before the `started` preflight callback,
+so `isStreaming` is already true when the ACK is written and before another
+stdin command can execute. A false isStreaming AND false isCompacting at this
+ordered barrier closes a handled prompt (or a run already settled). This is
+NOT polling for idle or a quiet timeout. Process all preceding events before
+the response, and scope barriers to the submitted execution. `disposition`
+alone is not enough: the state barrier also catches extension-started work,
+which can accompany a `handled` disposition.
+
+Pi reads stdin lines concurrently (`void handleInputLine`), so correlation is
+by id, never by order. Zeron never pipelines dependent commands: each barrier
+is sent only after the ACK it follows.
 
 Independent work started later by an extension is a new run (`agent_start`).
 Discovery/startup timeouts diagnose startup only; no active model run is timed
-out for lack of output. Interruption clears queues before aborting.
+out for lack of output. Interruption clears queues before aborting; Pi answers
+`abort` only after the run has settled.
 
 Steering uses `prompt` with `streamingBehavior: "steer"`. `set_steering_mode`
-persists globally, so Pi's native `all` mode is selected only while neither
-global nor project settings configure a mode.
+persists globally and is not validated by Pi, so Zeron only ever sends `all`
+or `one-at-a-time`, and selects `all` only while neither the global nor a
+trusted project's settings configure a mode. Pi loads `<cwd>/.pi/settings.json`
+only for a trusted project (`<agent dir>/trust.json`, nearest explicit
+decision); RPC mode never prompts, so an undecided project is untrusted.
 Preflight/state barriers remain serialized, but consumption does not gate the
 next submission after `queue_update` confirms an appended steering entry.
 Keep one FIFO delivery record per original input, including duplicate text.
@@ -34,14 +53,34 @@ wait for earlier deliveries, and unqueued/handled inputs block pipelining until
 consumed or settled. An idle barrier must not confirm queued inputs that never
 produced their consumption events.
 
-Sources inspected: Pi dist/core/agent-session.js and dist/modes/rpc/rpc-mode.js
-0.85.1, and upstream commit f07218c4d4bbc12bef056a7058c3dd49dfe41abe.
+Every command Pi advertises (extension, prompt template, skill) shadows Zeron's
+built-in mapping of the same name (`/session`, `/compact`, ...). Commands named
+`pi_ui_*` are GUI transport (PIUI) and are hidden from the palette.
+
+Dialogs (`select`, `confirm`, `input`, `editor`) are answered with
+`extension_ui_response`; one still open when a turn ends or is interrupted is
+answered `cancelled: true` (Pi's `editor` has no timeout and would otherwise
+stall `abort`).
+
+Frames: Pi writes `JSON + "\n"` with no size limit. Zeron splits on LF only and
+skips (with a warning) any single frame over 32 MiB rather than failing the
+session; such frames are `agent_end`/`message_end` replays whose content has
+already streamed.
+
+Tools: `edit` takes `{path, edits: [{oldText, newText}]}`; the transcript diff
+joins the edits in order. `bash` and `powershell` are both shell execution.
+
+Sources inspected: the Pi checkout at v1.1.0 plus main (`a1df620`):
+`packages/coding-agent/src/modes/rpc/rpc-mode.ts`, `rpc-types.ts`,
+`src/core/agent-session.ts`, `src/core/trust-manager.ts`,
+`src/core/tools/edit.ts`, and `docs/rpc*.md`.
 
 Session identity is refreshed from every accepted state barrier, including
-extension-driven new/switch/fork operations. Pi defers file creation until an
-assistant message. Only a host-owned empty-session record, checked with
-get_entries (model/thinking changes only) and a second idle get_state, permits
-recreation using --session-id in the same cwd. Any submitted input revokes that
-proof before the write to stdin. Missing history/custom entries never authorize
-recreating the same UUID; an unrestorable session starts a new one with a
-visible "without the previous context" notice, like the other harnesses.
+extension-driven new/switch/fork operations (Pi emits no session-switch event).
+Since 0.99 Pi creates the session file at the first user message. Only a
+host-owned empty-session record, checked with get_entries (model/thinking
+changes only) and a second idle get_state, permits recreation using
+--session-id in the same cwd. Any submitted input revokes that proof before the
+write to stdin. Missing history/custom entries never authorize recreating the
+same UUID; an unrestorable session starts a new one with a visible "without the
+previous context" notice, like the other harnesses.

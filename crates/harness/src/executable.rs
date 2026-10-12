@@ -163,6 +163,13 @@ pub(crate) fn invalidate_versions(names: &[&str]) {
 /// Probe once per executable identity. Failures are cached too, including timeout.
 /// Keep the lock during the short probe so concurrent descriptor requests coalesce.
 pub fn binary_version(path: &Path) -> Option<semver::Version> {
+    binary_version_within(path, std::time::Duration::from_secs(2))
+}
+
+/// [`binary_version`] with a caller-chosen probe deadline, for launchers that
+/// start slowly (Pi run from source through Node takes about a second).
+pub fn binary_version_within(path: &Path, limit: std::time::Duration) -> Option<semver::Version> {
+    #[cfg(not(windows))]
     use std::time::Duration;
     let canonical = path.canonicalize().ok()?;
     let metadata = canonical.metadata().ok()?;
@@ -208,7 +215,7 @@ pub fn binary_version(path: &Path) -> Option<semver::Version> {
         let success = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
-                Ok(None) if start.elapsed() < Duration::from_secs(2) => {
+                Ok(None) if start.elapsed() < limit => {
                     std::thread::sleep(Duration::from_millis(10))
                 }
                 _ => {
@@ -227,7 +234,7 @@ pub fn binary_version(path: &Path) -> Option<semver::Version> {
         }
         let mut bytes = Vec::new();
         for reader in readers {
-            while !reader.is_finished() && start.elapsed() < Duration::from_secs(2) {
+            while !reader.is_finished() && start.elapsed() < limit {
                 std::thread::sleep(Duration::from_millis(5));
             }
             if !reader.is_finished() {
@@ -256,7 +263,7 @@ pub fn binary_version(path: &Path) -> Option<semver::Version> {
                         .stdout(crate::process::Stdio::piped())
                         .stderr(crate::process::Stdio::piped())
                         .kill_on_drop(true);
-                    let output = tokio::time::timeout(Duration::from_secs(2), command.output())
+                    let output = tokio::time::timeout(limit, command.output())
                         .await
                         .ok()?
                         .ok()?;

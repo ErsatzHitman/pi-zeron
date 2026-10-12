@@ -93,10 +93,56 @@ struct HarnessPrefsFile {
     /// on without a trip to Settings.
     disabled: Vec<HarnessId>,
     titles: TitleSettings,
+    /// The Pi executable this device runs (Settings → General → Pi). Empty
+    /// falls back to `PI_EXECUTABLE`; Zeron never searches PATH for Pi.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pi_executable: Option<PathBuf>,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
     #[serde(skip_serializing)]
     enabled: Option<Vec<HarnessId>>,
+}
+
+/// Settings → General → Pi: the device's configured executable and what it
+/// resolves to right now. Only `executable` is written back by the UI.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PiSettings {
+    /// The saved path; `None` uses `PI_EXECUTABLE`.
+    pub executable: Option<String>,
+    /// `PI_EXECUTABLE` as this engine sees it, shown as the fallback.
+    pub env_executable: Option<String>,
+    /// The executable the next session will launch, once verified.
+    pub resolved: Option<String>,
+    pub version: Option<String>,
+    /// Why Pi cannot start (missing, unreadable, older than 1.1.0).
+    pub error: Option<String>,
+}
+
+impl HarnessRegistry {
+    /// The saved setting plus a live check of what it resolves to. Probes
+    /// `--version`, so call it off the async runtime.
+    pub fn pi_settings_blocking(&self) -> PiSettings {
+        let harness =
+            zeron_harness::PiHarness::new().with_executable_setting(self.pi_executable_setting());
+        let (resolved, version, error) = match harness.verified_executable() {
+            Ok((path, version)) => (
+                Some(path.display().to_string()),
+                Some(version.to_string()),
+                None,
+            ),
+            Err(error) => (None, None, Some(error.to_string())),
+        };
+        PiSettings {
+            executable: self.pi_executable().map(|path| path.display().to_string()),
+            env_executable: std::env::var_os("PI_EXECUTABLE")
+                .filter(|value| !value.is_empty())
+                .map(|value| PathBuf::from(value).display().to_string()),
+            resolved,
+            version,
+            error,
+        }
+    }
 }
 
 /// Per-device automatic session title preferences.
@@ -138,6 +184,8 @@ pub struct HarnessRegistry {
     gates: Mutex<HashMap<HarnessId, Arc<tokio::sync::RwLock<()>>>>,
     pending_updates: Mutex<std::collections::HashSet<HarnessId>>,
     update_generation: tokio::sync::watch::Sender<u64>,
+    /// Live copy of `prefs.pi_executable`, shared with the Pi harness.
+    pi_executable: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl Default for HarnessRegistry {
@@ -220,7 +268,27 @@ impl HarnessRegistry {
             gates: Mutex::new(HashMap::new()),
             pending_updates: Mutex::new(std::collections::HashSet::new()),
             update_generation,
+            pi_executable: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The shared Pi executable setting, read by the Pi harness on every
+    /// resolve so a change applies to the next spawn without a restart.
+    pub fn pi_executable_setting(&self) -> zeron_harness::pi::ExecutableSetting {
+        let setting = self.pi_executable.clone();
+        Arc::new(move || setting.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+
+    pub fn pi_executable(&self) -> Option<PathBuf> {
+        self.prefs().pi_executable.clone()
+    }
+
+    /// Store (or clear, with `None`/empty) the device's Pi executable.
+    pub fn set_pi_executable(&self, path: Option<PathBuf>) {
+        let path = path.filter(|path| !path.as_os_str().is_empty());
+        self.prefs().pi_executable = path.clone();
+        *self.pi_executable.lock().unwrap_or_else(PoisonError::into_inner) = path;
+        self.persist_prefs();
     }
 
     fn gate(&self, id: HarnessId) -> Arc<tokio::sync::RwLock<()>> {
@@ -324,6 +392,8 @@ impl HarnessRegistry {
             .ok()
             .and_then(|text| serde_json::from_str::<HarnessPrefsFile>(&text).ok())
             .unwrap_or_default();
+        *self.pi_executable.lock().unwrap_or_else(PoisonError::into_inner) =
+            loaded.pi_executable.clone();
         *self.prefs() = loaded;
         *self
             .prefs_path
@@ -710,8 +780,22 @@ pub fn default_registry() -> HarnessRegistry {
             can_install: false,
             enabled: None,
         },
-        Box::new(|| zeron_harness::PiHarness::new().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::PiHarness::new()) as Arc<dyn Harness>)),
+        {
+            let setting = registry.pi_executable_setting();
+            Box::new(move || {
+                zeron_harness::PiHarness::new()
+                    .with_executable_setting(setting.clone())
+                    .installed()
+            })
+        },
+        {
+            let setting = registry.pi_executable_setting();
+            Box::new(move || {
+                Ok(Arc::new(
+                    zeron_harness::PiHarness::new().with_executable_setting(setting.clone()),
+                ) as Arc<dyn Harness>)
+            })
+        },
     );
     // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
     // desktop app speaks — `opencode serve` + the /global/event bus), same
@@ -933,6 +1017,34 @@ mod tests {
             ..parse("grok")
         };
         assert!(!descriptor_enabled(&missing));
+    }
+
+    /// Settings → General → Pi persists per device, feeds the live setting
+    /// the Pi harness reads, and older prefs files without it still load.
+    #[test]
+    fn pi_executable_setting_persists_and_reaches_the_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("harness-prefs.json"),
+            r#"{"disabled":[],"titles":{}}"#,
+        )
+        .unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        let setting = registry.pi_executable_setting();
+        assert_eq!(setting(), None);
+        let exe = dir.path().join("pi-dev.cmd");
+        registry.set_pi_executable(Some(exe.clone()));
+        assert_eq!(setting(), Some(exe.clone()));
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(reloaded.pi_executable(), Some(exe.clone()));
+        assert_eq!(reloaded.pi_executable_setting()(), Some(exe));
+        reloaded.set_pi_executable(Some(PathBuf::new()));
+        assert_eq!(reloaded.pi_executable(), None);
+        // A missing executable is reported, never silently replaced by PATH.
+        let status = reloaded.pi_settings_blocking();
+        assert!(status.resolved.is_none() || std::env::var_os("PI_EXECUTABLE").is_some());
     }
 
     /// A registry slot for the tests below: installed probe fixed, factory
