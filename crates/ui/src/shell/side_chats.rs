@@ -228,6 +228,8 @@ impl Shell {
                         // never runs worktree setup of its own.
                         ComposerEvent::NewThreadTransitionStarted
                         | ComposerEvent::WorktreeSetup { .. } => {}
+                        // Screens open from the main conversation's tray.
+                        ComposerEvent::OpenExtensionScreen { .. } => {}
                         ComposerEvent::Sent {
                             chat_id,
                             message_id,

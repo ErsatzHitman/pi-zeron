@@ -719,6 +719,9 @@ pub enum RightSurface {
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
     SideChat(u64),
+    /// A live extension screen (btw, a subagent viewer); the handle keys
+    /// [`Shell::extension_tabs`].
+    Extension(u64),
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -1878,6 +1881,12 @@ struct OrgGateUi {
 
 /// One right-pane subagent tab: the doc it shows, its strip title, and the
 /// read-only transcript entity whose drop tears the view down.
+/// An extension screen's tab: the view follows its element by key.
+struct ExtensionTab {
+    view: Entity<crate::extension_ui::ScreenView>,
+    _closed: Subscription,
+}
+
 struct SubagentTab {
     doc_id: String,
     title: SharedString,
@@ -2021,6 +2030,10 @@ pub struct Shell {
     /// [`Transcript`] pinned to its subagent doc.
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
+    extension_tabs: std::collections::HashMap<u64, ExtensionTab>,
+    /// Screens whose element went away; closed on the next frame (closing
+    /// a tab needs the window).
+    closed_screens: Vec<u64>,
     side_chats: std::collections::HashMap<u64, SideChatTab>,
     side_chat_seq: u64,
     side_chat_creating: bool,
@@ -2385,6 +2398,11 @@ impl Shell {
                     this.pending_workspace_command = Some(*command);
                     cx.notify();
                 }
+                ComposerEvent::OpenExtensionScreen {
+                    chat_id,
+                    key,
+                    title,
+                } => this.open_extension_screen(chat_id.clone(), key.clone(), title.clone(), cx),
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
                     cx.notify();
@@ -2542,6 +2560,8 @@ impl Shell {
             diff_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
+            extension_tabs: std::collections::HashMap::new(),
+            closed_screens: Vec::new(),
             side_chats: std::collections::HashMap::new(),
             side_chat_seq: 0,
             side_chat_creating: false,
@@ -3449,6 +3469,10 @@ impl Shell {
                     .subagent_tabs
                     .get(id)
                     .map(|tab| (*surface, tab.title.clone(), false, None)),
+                RightSurface::Extension(id) => self
+                    .extension_tabs
+                    .get(id)
+                    .map(|tab| (*surface, tab.view.read(cx).title(cx), false, None)),
                 RightSurface::Browser(id) => self.browsers.get(id).map(|browser| {
                     let browser = browser.read(cx);
                     (
@@ -3508,6 +3532,7 @@ impl Shell {
             | RightSurface::Terminal(_)
             | RightSurface::SideChat(_)
             | RightSurface::Subagent(_)
+            | RightSurface::Extension(_)
             | RightSurface::Browser(_) => {
                 return None;
             }
@@ -3649,7 +3674,7 @@ impl Shell {
                     });
                 }
             }
-            RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
+            RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::Extension(_) => {}
             RightSurface::Picker => {}
         }
         self.sync_explorer_selection(cx);
@@ -4306,6 +4331,49 @@ impl Shell {
         self.set_right_active(RightSurface::Subagent(id), cx);
     }
 
+    /// Open (or focus) a live extension screen of `chat_id` as a tab.
+    fn open_extension_screen(
+        &mut self,
+        chat_id: String,
+        key: String,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_surfaces_open(true, cx);
+        if let Some((&id, _)) = self.extension_tabs.iter().find(|(_, tab)| {
+            let view = tab.view.read(cx);
+            view.chat_id == chat_id && view.key == key
+        }) {
+            self.set_right_active(RightSurface::Extension(id), cx);
+            return;
+        }
+        self.subagent_seq += 1;
+        let id = self.subagent_seq;
+        let state = self.state.clone();
+        let view =
+            cx.new(|cx| crate::extension_ui::ScreenView::new(state, chat_id, key, title, cx));
+        let closed = cx.subscribe(
+            &view,
+            move |this: &mut Self, _, _: &crate::extension_ui::ScreenClosed, cx| {
+                this.closed_screens.push(id);
+                cx.notify();
+            },
+        );
+        self.extension_tabs.insert(
+            id,
+            ExtensionTab {
+                view,
+                _closed: closed,
+            },
+        );
+        let panel = self.panel_key(cx);
+        self.right_tabs
+            .entry(panel)
+            .or_default()
+            .push(RightSurface::Extension(id));
+        self.set_right_active(RightSurface::Extension(id), cx);
+    }
+
     /// Fetch a finished subagent's frozen transcript blob
     /// (`{chat_id}/{doc_id}`); on ANY failure fall back to watching the doc
     /// — the blob upload is best-effort engine-side.
@@ -4465,6 +4533,9 @@ impl Shell {
                     self.state
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
+            }
+            RightSurface::Extension(id) => {
+                self.extension_tabs.remove(&id);
             }
             RightSurface::Picker => {}
         }
@@ -11730,6 +11801,13 @@ impl Shell {
                     panel.into_any_element()
                 }
                 RightSurface::SideChat(id) => self.render_side_chat(id, cx),
+                RightSurface::Extension(id) if self.extension_tabs.contains_key(&id) => self
+                    .extension_tabs
+                    .get(&id)
+                    .expect("checked")
+                    .view
+                    .clone()
+                    .into_any_element(),
                 RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {
                     let transcript = self
                         .subagent_tabs
@@ -12096,6 +12174,11 @@ impl Shell {
                     .unwrap_or(icons::LIST),
                 RightSurface::SideChat(_) => icons::CHAT_ROUND_LINE,
                 RightSurface::Subagent(_) => icons::BOT,
+                RightSurface::Extension(id) => self
+                    .extension_tabs
+                    .get(&id)
+                    .map(|tab| crate::extension_ui::screen_icon(&tab.view.read(cx).ns()))
+                    .unwrap_or(icons::WIDGET),
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::Picker => icons::PLUS,
@@ -12130,6 +12213,10 @@ impl Shell {
                         .last()
                         .is_some_and(|e| e.status == Some(zeron_doc::MessageStatus::Streaming))
                 }),
+                RightSurface::Extension(id) => self
+                    .extension_tabs
+                    .get(&id)
+                    .is_some_and(|tab| tab.view.read(cx).working(cx)),
                 _ => false,
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
@@ -13294,6 +13381,11 @@ fn header_icon_button_with(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for id in std::mem::take(&mut self.closed_screens) {
+            if self.extension_tabs.contains_key(&id) {
+                self.close_right_surface(RightSurface::Extension(id), window, cx);
+            }
+        }
         // Every repaint (state frame, input, or the clock firing) reschedules
         // the next clock-driven one; the sidebar and transcript follow this
         // view's notifications.

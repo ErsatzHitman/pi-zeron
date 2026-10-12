@@ -5356,6 +5356,12 @@ impl Render for ComposerInput {
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
     WorkspaceCommand(WorkspaceCommand),
+    /// Open a live extension screen (btw, a subagent viewer) as a tab.
+    OpenExtensionScreen {
+        chat_id: String,
+        key: String,
+        title: String,
+    },
     /// Arm the shared-element transition before the draft route is replaced
     /// by the newly-created session. Emitting this before `select_chat` keeps
     /// the first destination frame on the same timeline as the source frame.
@@ -6039,6 +6045,8 @@ pub struct Composer {
     failure_key: Option<String>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
+    /// Live extension UI: sheets, trays, chips (see `crate::extension_ui`).
+    pub(crate) extension: crate::extension_ui::ComposerExtension,
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
@@ -6136,7 +6144,7 @@ pub struct Composer {
     /// account, and context occupancy — each opening a popover.
     account_usage: Entity<crate::account_usage::AccountUsage>,
     /// A side chat's composer: its footer keeps only the context ring.
-    side_chat: bool,
+    pub(crate) side_chat: bool,
     _picker_focus: Subscription,
     _input_events: Subscription,
     _dictation_events: Subscription,
@@ -6339,6 +6347,7 @@ impl Composer {
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
+            extension: crate::extension_ui::ComposerExtension::new(cx),
             answered_requests: HashSet::new(),
             failure_key: None,
             action_task: None,
@@ -8416,6 +8425,15 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+        // An extension put text in the input box (`set_editor_text`).
+        if let Some(text) = self
+            .state
+            .update(cx, |state, _| state.extension_ui.editor_text.take())
+            && self.editing_queued.is_none()
+        {
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
+        }
+        self.open_new_extension_screens(cx);
         {
             let state = self.state.read(cx);
             // AppState also notifies at clock-only transitions, so a run that
@@ -10924,6 +10942,10 @@ impl Render for Composer {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
+        // An extension's question sheet takes the composer's place the same way.
+        if let Some(sheet) = self.render_extension_sheet(window, cx) {
+            return container.child(motion::fade_quick("composer-extension-sheet", div().child(sheet)));
+        }
 
         // What is waiting to be sent, stacked directly above the box it was
         // typed in — the queue is a property of this composer, not a panel
@@ -10939,6 +10961,7 @@ impl Render for Composer {
         // The checklist tray stacks above the queue (or directly above the
         // composer), one step narrower than what follows it.
         let has_queue = !self.state.read(cx).queue.is_empty();
+        let container = container.children(self.render_extension_trays(has_queue, window, cx));
         let container = container.when_some(
             self.render_todo_panel(has_queue, window, cx),
             |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
@@ -11600,6 +11623,9 @@ impl Render for Composer {
                 self.pickers
                     .update(cx, |pickers, cx| pickers.render_footer(cx))
             });
+            let extension_footer = (session_chrome_opacity > 0.0)
+                .then(|| self.render_extension_footer(cx))
+                .flatten();
             if session_chrome_opacity > 0.0 {
                 let harness = (!self.side_chat)
                     .then(|| self.pickers.read(cx).resolved(cx).harness)
@@ -11644,6 +11670,7 @@ impl Render for Composer {
                                 .items_center()
                                 .opacity(session_chrome_opacity)
                                 .child(div().flex_1().min_w_0().children(footer.flatten()))
+                                .children(extension_footer)
                                 .child(
                                     // The footer row's own 4px gap: the PR badge
                                     // ends flush with the row, so the rings keep

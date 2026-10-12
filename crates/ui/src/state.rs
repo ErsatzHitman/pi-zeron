@@ -866,6 +866,8 @@ pub struct AppState {
     change_requests: ChangeRequestClientState,
     change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
     queue_task: Option<Task<()>>,
+    /// The selected chat's live extension UI (see [`crate::extension_ui`]).
+    pub(crate) extension_ui: crate::extension_ui::LiveExtensionUi,
     change_requests_visible: bool,
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
@@ -971,6 +973,7 @@ impl AppState {
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
             queue_task: None,
+            extension_ui: Default::default(),
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
@@ -1190,6 +1193,7 @@ impl AppState {
             self.transcript_task = None;
             self.queue.clear();
             self.queue_task = None;
+            self.stop_extension_ui_watch();
         }
         changed
     }
@@ -2519,6 +2523,7 @@ impl AppState {
             return;
         };
         self.transcript_task = Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+        self.start_extension_ui_watch(&chat_id, cx);
         if handle
             .engine_info()
             .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
@@ -2648,6 +2653,7 @@ impl AppState {
         if let Some(chat_id) = self.selected_chat.clone() {
             self.transcript_task =
                 Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.start_extension_ui_watch(&chat_id, cx);
             if handle
                 .engine_info()
                 .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
@@ -2853,6 +2859,7 @@ impl AppState {
         self.transcript_task = None;
         self.queue.clear();
         self.queue_task = None;
+        self.stop_extension_ui_watch();
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) restores the pick set aside above.
@@ -3060,6 +3067,8 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                     let linked = state.apply_pending_deep_link(cx);
                     if changed {
                         state.reconcile_change_request_watches(cx);
+                        // A chat selected before its row (or host) was known.
+                        state.ensure_extension_ui_watch(cx);
                     }
                     if changed || linked {
                         cx.notify();

@@ -43,6 +43,8 @@ pub enum ToastKind {
     Error,
     Success,
     Info,
+    /// Needs attention but nothing failed (an extension's warning notice).
+    Warning,
 }
 
 /// A value easing from one target to the next, restarting from wherever it
@@ -318,6 +320,7 @@ fn kind_icon(kind: ToastKind, theme: &Theme) -> AnyElement {
         ToastKind::Error => (crate::icons::DANGER_TRIANGLE, theme.danger),
         ToastKind::Success => (crate::icons::CHECK, theme.success),
         ToastKind::Info => (crate::icons::INFO_CIRCLE, theme.text_muted),
+        ToastKind::Warning => (crate::icons::DANGER_TRIANGLE, theme.warning),
     };
     crate::icons::icon(path)
         .size(px(16.0))
