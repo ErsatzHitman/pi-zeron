@@ -18,6 +18,9 @@ pub mod capabilities {
     /// The host creates a projectless chat's scratch folder
     /// (`crate::projectless`) when it runs; older hosts only know `~`.
     pub const PROJECTLESS_SCRATCH_V1: &str = "projectless-scratch-v1";
+    /// The host serves `WatchExtensionUi`/`ExtensionUiAction` (live harness
+    /// extension UI, `crate::extension_ui`).
+    pub const EXTENSION_UI_V1: &str = "extension-ui-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -28,6 +31,7 @@ pub mod capabilities {
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
         PROJECTLESS_SCRATCH_V1,
+        EXTENSION_UI_V1,
         crate::voice::remote::CAPABILITY,
     ];
 
@@ -110,6 +114,7 @@ mod tests {
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
                     "projectless-scratch-v1",
+                    "extension-ui-v1",
                     "voice-client-media-v1"
                 ],
             })

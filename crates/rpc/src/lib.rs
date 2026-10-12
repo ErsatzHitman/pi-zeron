@@ -53,6 +53,12 @@ pub mod methods {
     pub const GET_PI_SETTINGS: &str = "GetPiSettings";
     /// Save the Pi executable (`{executable: string|null}`); replies like `GetPiSettings`.
     pub const SET_PI_SETTINGS: &str = "SetPiSettings";
+    /// A chat's live extension UI (`ExtensionUiState` frames) on its host
+    /// device; while any watcher is connected, Pi's extensions render rich
+    /// elements instead of dialogs. Gated by `EXTENSION_UI_V1`.
+    pub const WATCH_EXTENSION_UI: &str = "WatchExtensionUi";
+    /// `{chatId, action: ExtensionUiAction}`: act on a live extension element.
+    pub const EXTENSION_UI_ACTION: &str = "ExtensionUiAction";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";

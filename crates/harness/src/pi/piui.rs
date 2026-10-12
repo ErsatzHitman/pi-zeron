@@ -8,7 +8,10 @@
 //! use plain dialogs, `setWidget` and `setStatus`. See the user's `PIUI.md`.
 use base64::Engine as _;
 use serde_json::{Value, json};
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use tokio::sync::watch;
 use zeron_proto::extension_ui::{
     DurableElement, ExtensionNotice, ExtensionStatus, ExtensionUiAction, ExtensionUiState,
@@ -23,6 +26,19 @@ pub(super) const EVENT_COMMAND: &str = "pi_ui_event";
 const CHUNK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Bounded like notices: the host folds each durable element once.
 const DURABLE_HISTORY: usize = 16;
+/// Namespace of the sheets the host draws for Pi's own dialogs.
+const DIALOG_NS: &str = "pi";
+
+/// A plain Pi dialog (`select`, `confirm`, `input`, `editor`) that arrived
+/// with no turn to answer it in, shown to the watching UI as a sheet.
+struct HostDialog {
+    key: String,
+    id: Value,
+    method: String,
+    options: Vec<String>,
+    deadline: Option<Instant>,
+    element: Value,
+}
 
 /// What [`ExtensionUi::handle`] did with an `extension_ui_request`.
 #[derive(Debug, PartialEq)]
@@ -50,6 +66,9 @@ pub(super) struct ExtensionUi {
     last_seq: u64,
     chunks: HashMap<String, Chunks>,
     seq: u64,
+    /// Published after the PIUI elements; a PIUI `reset` never clears them.
+    dialogs: Vec<HostDialog>,
+    dialog_seq: u64,
 }
 
 pub(super) fn element_key(element: &Value) -> String {
@@ -108,8 +127,139 @@ impl ExtensionUi {
     fn publish(&mut self) {
         self.state.revision += 1;
         if let Some(sink) = &self.sink {
-            sink.send_replace(self.state.clone());
+            let mut state = self.state.clone();
+            state
+                .elements
+                .extend(self.dialogs.iter().map(|dialog| dialog.element.clone()));
+            sink.send_replace(state);
         }
+    }
+
+    /// Show a plain dialog as a sheet; false for a method no sheet answers.
+    pub fn open_dialog(&mut self, frame: &Value) -> bool {
+        let method = frame["method"].as_str().unwrap_or("");
+        if !matches!(method, "select" | "confirm" | "input" | "editor") {
+            return false;
+        }
+        let options: Vec<String> = frame["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        self.dialog_seq += 1;
+        let id = format!("dialog-{}", self.dialog_seq);
+        let submit = json!({"id":"submit","label":"Submit","variant":"primary"});
+        let text_field = |kind: &str| {
+            let mut field = json!({"id":"value","kind":kind});
+            if let Some(placeholder) = frame["placeholder"].as_str() {
+                field["placeholder"] = json!(placeholder);
+            }
+            if let Some(prefill) = frame["prefill"].as_str() {
+                field["value"] = json!(prefill);
+            }
+            field
+        };
+        let (fields, actions) = match method {
+            "select" => {
+                let choices: Vec<Value> = options
+                    .iter()
+                    .map(|o| json!({"value":o,"label":o}))
+                    .collect();
+                let searchable = choices.len() > 7;
+                (
+                    vec![json!({"id":"value","kind":"select","options":choices,
+                        "searchable":searchable,"required":true})],
+                    vec![submit],
+                )
+            }
+            "confirm" => (
+                vec![],
+                vec![
+                    json!({"id":"yes","label":"Yes","variant":"primary"}),
+                    json!({"id":"no","label":"No","variant":"secondary"}),
+                ],
+            ),
+            "input" => (vec![text_field("text")], vec![submit]),
+            _ => (vec![text_field("textarea")], vec![submit]),
+        };
+        let mut element = json!({
+            "id":id, "ns":DIALOG_NS, "kind":"panel", "placement":"sheet",
+            "title":frame["title"].as_str().unwrap_or("Pi"),
+            "sections":[{"kind":"form","id":"dialog","fields":fields,"actions":actions}],
+            "actions":[{"id":"cancel","label":"Cancel","variant":"secondary"}],
+        });
+        if let Some(message) = frame["message"].as_str().filter(|m| !m.is_empty()) {
+            element["text"] = json!(message);
+        }
+        self.dialogs.push(HostDialog {
+            key: format!("{DIALOG_NS}:{id}"),
+            id: frame["id"].clone(),
+            method: method.to_owned(),
+            options,
+            deadline: frame["timeout"]
+                .as_u64()
+                .map(|ms| Instant::now() + Duration::from_millis(ms)),
+            element,
+        });
+        self.publish();
+        true
+    }
+
+    /// The `extension_ui_response` for an action on a dialog sheet, which
+    /// closes it; `None` when the action answers no open dialog.
+    pub fn answer_dialog(&mut self, action: &ExtensionUiAction) -> Option<Value> {
+        let at = self
+            .dialogs
+            .iter()
+            .position(|dialog| dialog.key == action.element_id)?;
+        let dialog = &self.dialogs[at];
+        let value = action
+            .value
+            .as_ref()
+            .map(|value| value.get("fields").unwrap_or(value))
+            .and_then(|fields| fields.get("value"))
+            .and_then(Value::as_str);
+        let mut response = json!({"type":"extension_ui_response","id":dialog.id});
+        match (dialog.method.as_str(), action.action_id.as_str(), value) {
+            ("confirm", "yes" | "no", _) => {
+                response["confirmed"] = json!(action.action_id == "yes")
+            }
+            ("select", "submit", Some(value)) if dialog.options.iter().any(|o| o == value) => {
+                response["value"] = json!(value)
+            }
+            ("input" | "editor", "submit", value) => {
+                response["value"] = json!(value.unwrap_or(""))
+            }
+            (_, "cancel", _) => response["cancelled"] = json!(true),
+            // Not an answer (an empty select): the sheet stays open.
+            _ => return None,
+        }
+        self.dialogs.remove(at);
+        self.publish();
+        Some(response)
+    }
+
+    /// When the earliest open dialog times out.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.dialogs.iter().filter_map(|d| d.deadline).min()
+    }
+
+    /// Cancel responses for the dialogs past their deadline (every dialog
+    /// with `all`), closing their sheets.
+    pub fn close_dialogs(&mut self, all: bool) -> Vec<Value> {
+        let now = Instant::now();
+        let (closed, open): (Vec<_>, Vec<_>) = std::mem::take(&mut self.dialogs)
+            .into_iter()
+            .partition(|d| all || d.deadline.is_some_and(|at| at <= now));
+        self.dialogs = open;
+        if !closed.is_empty() {
+            self.publish();
+        }
+        closed
+            .into_iter()
+            .map(|d| json!({"type":"extension_ui_response","id":d.id,"cancelled":true}))
+            .collect()
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -233,6 +383,7 @@ impl ExtensionUi {
         };
         self.keys.clear();
         self.chunks.clear();
+        self.dialogs.clear();
         self.last_seq = 0;
         self.publish();
     }
@@ -492,6 +643,50 @@ mod tests {
         assert!(ui.state().elements.is_empty());
         assert_eq!(ui.state().durable.len(), 1);
         assert_eq!(ui.state().durable[0].element["title"], "ñ".repeat(10));
+    }
+
+    #[test]
+    fn idle_dialogs_become_sheets_answered_by_actions() {
+        let (tx, rx) = watch::channel(ExtensionUiState::default());
+        let mut ui = ExtensionUi::new(Some(tx));
+        let act = |element: &str, action: &str, value: Option<Value>| ExtensionUiAction {
+            element_id: element.into(),
+            action_id: action.into(),
+            value,
+            row_id: None,
+        };
+        assert!(ui.open_dialog(&json!({"id":"s","method":"select","title":"Pick",
+            "options":["a","b"]})));
+        assert!(ui.open_dialog(&json!({"id":"c","method":"confirm","title":"Sure?",
+            "message":"really"})));
+        assert!(ui.open_dialog(&json!({"id":"e","method":"editor","title":"Edit","prefill":"x"})));
+        assert!(!ui.open_dialog(&json!({"id":"n","method":"notify"})));
+        // A PIUI reset leaves the host's sheets alone.
+        ui.handle(&notify(json!({"v":1,"agentSeq":1,"instance":"a","op":"reset"})));
+        let sheets = rx.borrow().typed_elements();
+        assert_eq!(sheets.len(), 3);
+        assert_eq!(sheets[0].key(), "pi:dialog-1");
+        assert_eq!(sheets[1].text.as_deref(), Some("really"));
+        assert_eq!(sheets[2].form().unwrap().0[0].initial_text(), "x");
+        let pick = |value: &str| Some(json!({"fields":{"value":value}}));
+        assert_eq!(ui.answer_dialog(&act("pi:dialog-1", "submit", pick("z"))), None);
+        assert_eq!(
+            ui.answer_dialog(&act("pi:dialog-1", "submit", pick("b"))),
+            Some(json!({"type":"extension_ui_response","id":"s","value":"b"}))
+        );
+        assert_eq!(
+            ui.answer_dialog(&act("pi:dialog-2", "no", None)),
+            Some(json!({"type":"extension_ui_response","id":"c","confirmed":false}))
+        );
+        assert_eq!(ui.answer_dialog(&act("bash:jobs", "kill", None)), None);
+        assert_eq!(
+            ui.close_dialogs(true),
+            vec![json!({"type":"extension_ui_response","id":"e","cancelled":true})]
+        );
+        assert!(rx.borrow().elements.is_empty());
+        ui.open_dialog(&json!({"id":"t","method":"input","title":"t","timeout":0}));
+        assert!(ui.next_deadline().is_some());
+        assert_eq!(ui.close_dialogs(false).len(), 1);
     }
 
     #[test]

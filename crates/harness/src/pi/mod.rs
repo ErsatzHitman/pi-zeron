@@ -316,6 +316,11 @@ impl Harness for PiHarness {
     fn deterministic_turn_end(&self) -> bool {
         true
     }
+    /// `clear_queue` + `abort` end the turn; Pi keeps reading stdin and its
+    /// extensions' background work (subagents, background shells) runs on.
+    fn stops_turn_in_place(&self) -> bool {
+        true
+    }
     /// `set_model` and `set_thinking_level` change the live process. Clearing
     /// either back to the default cannot be expressed that way.
     fn reconfigures_in_place(&self, live: &RunRequest, next: &RunRequest) -> bool {
@@ -538,6 +543,10 @@ impl Runner {
         let event = if watched { piui::hello() } else { piui::bye() };
         if !watched {
             self.ui.disconnect();
+            // Nobody is left to answer the sheets the host drew for dialogs.
+            for response in self.ui.close_dialogs(true) {
+                self.process.transport.client.send(response)?;
+            }
         }
         self.process.transport.client.request(json!({
             "type":"prompt",
@@ -549,6 +558,10 @@ impl Runner {
         &mut self,
         action: zeron_proto::extension_ui::ExtensionUiAction,
     ) -> Result<(), HarnessError> {
+        if let Some(response) = self.ui.answer_dialog(&action) {
+            self.process.transport.client.send(response)?;
+            return Ok(());
+        }
         // The advisor panel has no cancel handler of its own: esc in the
         // terminal is an RPC abort, so its Cancel is too.
         if action.element_id.starts_with("advisor-live-panel:") && action.action_id == "cancel" {
@@ -793,6 +806,7 @@ impl Runner {
         let mut open = true;
         loop {
             if self.deliveries.iter().all(|delivery| delivery.queued)
+                && !(self.interrupted && self.active)
                 && !self.initial_pending
                 && !self.pending.values().any(|p| {
                     matches!(
@@ -828,6 +842,7 @@ impl Runner {
                         }
                         if !self.active {
                             self.norm.reset();
+                            self.interrupted = false;
                         }
                         self.epoch += 1;
                         self.active = true;
@@ -856,6 +871,12 @@ impl Runner {
                     true=>self.sync_piui()?,
                     false=>self.ui_watched=None,
                 },
+                _=sleep_until(self.ui.next_deadline())=>{
+                    for response in self.ui.close_dialogs(false) {
+                        self.process.transport.client.send(response)?;
+                    }
+                },
+                _=self.turn.stop_requested()=>self.stop_turn()?,
             }
         }
     }
@@ -868,6 +889,23 @@ impl Runner {
             })
             .await?;
         }
+        Ok(())
+    }
+    /// End the in-flight turn and keep Pi running with its background work
+    /// (subagents, background shells): the run settles `aborted` and its
+    /// barrier finishes the turn as interrupted. Steers not yet delivered are
+    /// dropped with it, as the host expects.
+    fn stop_turn(&mut self) -> Result<(), HarnessError> {
+        self.queued.clear();
+        self.deliveries.clear();
+        if !self.active {
+            return Ok(());
+        }
+        self.interrupted = true;
+        self.process.dialogs.cancel();
+        let client = &self.process.transport.client;
+        client.request(json!({"type":"clear_queue"}))?;
+        client.request(json!({"type":"abort"}))?;
         Ok(())
     }
     async fn interrupt(&mut self, grace: Duration) {
@@ -1016,6 +1054,8 @@ impl Runner {
                     .process
                     .dialogs
                     .request(self.process.transport.client.clone(), &frame),
+                // Between turns, a watching UI answers it as a sheet.
+                piui::Handled::Dialog if self.piui_on && self.ui.open_dialog(&frame) => {}
                 piui::Handled::Dialog => {
                     // No foreground run can own a dialog here, so cancel it explicitly.
                     ui::Dialogs::default().request(self.process.transport.client.clone(), &frame);
@@ -1093,6 +1133,7 @@ impl Runner {
         if frame["type"] == "agent_start" && !self.active {
             self.epoch += 1;
             self.active = true;
+            self.interrupted = false;
             self.norm.reset();
             self.assistant = uuid::Uuid::new_v4().to_string();
             self.started(
@@ -1129,6 +1170,12 @@ async fn next_action(
 ) -> Option<zeron_proto::extension_ui::ExtensionUiAction> {
     match actions {
         Some(actions) => actions.recv().await,
+        None => std::future::pending().await,
+    }
+}
+async fn sleep_until(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
         None => std::future::pending().await,
     }
 }

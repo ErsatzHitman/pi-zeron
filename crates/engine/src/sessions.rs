@@ -238,6 +238,8 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Live extension UI (Pi's PIUI) per chat; never persisted.
+    extension_ui: crate::extension_ui::ExtensionUiHub,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -279,8 +281,29 @@ impl SessionsEngine {
                 generated_images: OnceLock::new(),
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                extension_ui: Default::default(),
             }),
         }
+    }
+
+    /// Watch a chat's live extension UI; see [`crate::extension_ui`].
+    pub(crate) fn watch_extension_ui(
+        &self,
+        chat_id: &str,
+    ) -> (
+        watch::Receiver<zeron_proto::extension_ui::ExtensionUiState>,
+        crate::extension_ui::WatcherGuard,
+    ) {
+        self.inner.extension_ui.watch(chat_id)
+    }
+
+    /// Send an extension UI action to the chat's live harness process.
+    pub(crate) fn extension_ui_action(
+        &self,
+        chat_id: &str,
+        action: zeron_proto::extension_ui::ExtensionUiAction,
+    ) -> Result<(), String> {
+        self.inner.extension_ui.act(chat_id, action)
     }
 
     pub(crate) fn voice_manager(&self) -> crate::voice::VoiceManager {
@@ -800,7 +823,7 @@ impl SessionsEngine {
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
             turn: turn.clone(),
-            extension_ui: Default::default(),
+            extension_ui: self.inner.extension_ui.port(chat_id),
         };
 
         lock(&self.inner.runs).insert(

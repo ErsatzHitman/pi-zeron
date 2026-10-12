@@ -103,6 +103,13 @@ struct ListModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ExtensionUiActionParams {
+    chat_id: String,
+    action: zeron_proto::extension_ui::ExtensionUiAction,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetPiSettingsParams {
     /// `None` or blank clears the setting (falls back to `PI_EXECUTABLE`).
     #[serde(default)]
@@ -1058,6 +1065,7 @@ impl EngineRpc {
                     | methods::WATCH_CHECKOUT_CHANGE_REQUEST
                     | methods::WATCH_WORKSPACE_GIT_STATUS
                     | methods::WATCH_HARNESS_UPDATES
+                    | methods::WATCH_EXTENSION_UI
             ) {
                 let rx = match client.subscribe_checked(method, params).await {
                     Ok(rx) => rx,
@@ -1441,6 +1449,9 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_TITLE_SETTINGS
             | methods::GET_PI_SETTINGS
             | methods::SET_PI_SETTINGS
+            // Live extension UI is held by the chat's host engine.
+            | methods::WATCH_EXTENSION_UI
+            | methods::EXTENSION_UI_ACTION
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
@@ -1554,7 +1565,29 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_WORKSPACE_FILES
             | methods::UPDATE_STATUS
             | methods::WATCH_HARNESS_UPDATES
+            | methods::WATCH_EXTENSION_UI
     )
+}
+
+/// Frames of a chat's live extension UI, at most one per
+/// [`EXTENSION_UI_FRAME`]: Pi's advisor panel alone patches ten times a
+/// second and a watcher only needs the latest state. The guard keeps the chat
+/// watched for as long as the stream lives.
+const EXTENSION_UI_FRAME: Duration = Duration::from_millis(50);
+
+fn extension_ui_stream(
+    rx: watch::Receiver<zeron_proto::extension_ui::ExtensionUiState>,
+    guard: crate::extension_ui::WatcherGuard,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold((rx, guard, false), |(mut rx, guard, emitted)| async move {
+        if emitted {
+            tokio::time::sleep(EXTENSION_UI_FRAME).await;
+        }
+        rx.changed().await.ok()?;
+        let value = serde_json::to_value(&*rx.borrow_and_update()).ok()?;
+        Some((value, (rx, guard, true)))
+    })
+    .boxed()
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -2152,6 +2185,18 @@ impl RpcService for EngineRpc {
                         })
                         .boxed(),
                 ))
+            }
+            methods::WATCH_EXTENSION_UI => {
+                let p: ChatParams = parse_params(params)?;
+                let (rx, guard) = self.sessions.watch_extension_ui(&p.chat_id);
+                Ok(RpcReply::Stream(extension_ui_stream(rx, guard)))
+            }
+            methods::EXTENSION_UI_ACTION => {
+                let p: ExtensionUiActionParams = parse_params(params)?;
+                self.sessions
+                    .extension_ui_action(&p.chat_id, p.action)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_QUEUE => {
                 let p: ChatParams = parse_params(params)?;
@@ -4222,6 +4267,30 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn extension_ui_frames_are_coalesced_and_the_stream_keeps_the_chat_watched() {
+        use zeron_proto::extension_ui::ExtensionUiState;
+        let hub = crate::extension_ui::ExtensionUiHub::default();
+        let port = hub.port("chat");
+        let watched = port.watched.unwrap();
+        let state = port.state.unwrap();
+        let (rx, guard) = hub.watch("chat");
+        let mut stream = extension_ui_stream(rx, guard);
+        assert_eq!(stream.next().await.unwrap()["revision"], 0);
+        for revision in 1..=5 {
+            state.send_replace(ExtensionUiState {
+                revision,
+                ..Default::default()
+            });
+        }
+        // A burst inside one frame arrives as its latest state.
+        assert_eq!(stream.next().await.unwrap()["revision"], 5);
+        assert!(*watched.borrow());
+        drop(stream);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!*watched.borrow());
+    }
+
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
@@ -4259,6 +4328,10 @@ mod tests {
         assert!(is_stream_method(methods::WATCH_WORKSPACE_GIT_STATUS));
         assert!(forwardable(methods::WATCH_HARNESS_UPDATES));
         assert!(is_stream_method(methods::WATCH_HARNESS_UPDATES));
+        assert!(forwardable(methods::WATCH_EXTENSION_UI));
+        assert!(is_stream_method(methods::WATCH_EXTENSION_UI));
+        assert!(forwardable(methods::EXTENSION_UI_ACTION));
+        assert!(!is_stream_method(methods::EXTENSION_UI_ACTION));
         assert!(forwardable(methods::CHECK_HARNESS_UPDATES));
         assert!(forwardable(methods::APPLY_HARNESS_UPDATE));
         assert!(forwardable(methods::LIST_CHANGE_REQUEST_PAGE));

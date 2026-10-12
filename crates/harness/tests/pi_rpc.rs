@@ -1046,6 +1046,123 @@ async fn piui_follows_watchers_flows_while_idle_and_round_trips_actions() {
     assert!(state.is_empty());
 }
 
+/// A plain dialog Pi raises between turns has no transcript turn to ask in:
+/// a watching UI gets it as a sheet, and its answer goes back to Pi.
+#[tokio::test]
+async fn an_idle_dialog_becomes_a_sheet_for_a_watching_ui() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, tx, _) = controls();
+    let (port, mut ui) = ui_port(true);
+    c.extension_ui = port;
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "idle-dialog"), c)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let state = wait_ui(&mut ui, "dialog sheet", |s| {
+        keys(s).contains(&"pi:dialog-1".to_string())
+    })
+    .await;
+    let sheet = state
+        .typed_elements()
+        .into_iter()
+        .find(|e| e.key() == "pi:dialog-1")
+        .unwrap();
+    assert_eq!(sheet.title.as_deref(), Some("Keep the worktree?"));
+    assert_eq!(sheet.form().unwrap().0[0].options.len(), 2);
+    ui.actions
+        .send(zeron_proto::extension_ui::ExtensionUiAction {
+            element_id: "pi:dialog-1".into(),
+            action_id: "submit".into(),
+            value: Some(serde_json::json!({"fields":{"value":"Remove"}})),
+            row_id: None,
+        })
+        .unwrap();
+    wait_ui(&mut ui, "sheet closed", |s| {
+        !keys(s).contains(&"pi:dialog-1".to_string())
+    })
+    .await;
+    let path = dir.path().join("dialog-responses.jsonl");
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Some(line) = text.lines().next()
+            {
+                return serde_json::from_str::<serde_json::Value>(line).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        response,
+        serde_json::json!({"type":"extension_ui_response","id":"idle","value":"Remove"})
+    );
+    drop(tx);
+}
+
+/// Stop ends only the turn: Pi aborts and keeps running, and the next
+/// message goes to the same process.
+#[tokio::test]
+async fn stopping_a_turn_keeps_the_pi_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, tx, _) = controls();
+    let turn = zeron_harness::TurnControl::default();
+    c.turn = turn.clone();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "slow"), c)
+        .await
+        .unwrap();
+    let mut first = None;
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::SessionStarted { .. } if first.is_none() => {
+                    first = Some(std::fs::read_to_string(dir.path().join("pi.pid")).unwrap());
+                    turn.stop_turn();
+                }
+                AgentEvent::Done { status, .. } if text.is_empty() => {
+                    assert_eq!(status, zeron_proto::DoneStatus::Interrupted);
+                    text.push('|');
+                    tx.send(SteerMessage {
+                        prompt: "after".into(),
+                        message_id: None,
+                        attachments: Vec::new(),
+                        config: None,
+                    })
+                    .await
+                    .unwrap();
+                }
+                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                AgentEvent::Done { status, .. } => {
+                    assert_eq!(status, zeron_proto::DoneStatus::Completed);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(text.ends_with("reply:after"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("pi.pid")).unwrap(),
+        first.unwrap()
+    );
+}
+
 /// Without a watching UI the extensions are never switched to PIUI, so a
 /// plain client keeps getting dialogs and nothing is left waiting on a sheet.
 #[tokio::test]

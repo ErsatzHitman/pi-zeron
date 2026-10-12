@@ -409,6 +409,14 @@ fn main() {
                                     "placement":"status","text":"uniichat: folding 2 messages into the tree…"}}));
                             });
                         }
+                        if text == "idle-dialog" {
+                            // A background extension asks with a plain dialog.
+                            std::thread::spawn(|| {
+                                std::thread::sleep(Duration::from_millis(30));
+                                emit(json!({"type":"extension_ui_request","id":"idle","method":"select",
+                                    "title":"Keep the worktree?","options":["Keep","Remove"]}));
+                            });
+                        }
                         if text == "late-notify" {
                             std::thread::spawn(|| {
                                 std::thread::sleep(Duration::from_millis(30));
@@ -440,6 +448,14 @@ fn main() {
                     drop(pending);
                     ack(&v);
                 }
+            }
+            "extension_ui_response" if v["id"] == "idle" => {
+                let mut log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("dialog-responses.jsonl")
+                    .unwrap();
+                writeln!(log, "{v}").unwrap();
             }
             "extension_ui_response" => {
                 if let Some(prompt) = dialog.take() {

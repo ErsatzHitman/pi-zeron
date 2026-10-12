@@ -18,6 +18,8 @@ pub mod capability {
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
     /// The host creates projectless chats' scratch folders.
     pub const PROJECTLESS_SCRATCH_V1: &str = zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1;
+    /// The host serves live harness extension UI.
+    pub const EXTENSION_UI_V1: &str = zeron_proto::capabilities::EXTENSION_UI_V1;
 
     /// Every queue capability (demo hosts advertise the full surface).
     pub const ALL_QUEUE: &[&str] = &[
