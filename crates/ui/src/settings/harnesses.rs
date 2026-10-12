@@ -1227,6 +1227,10 @@ impl Render for HarnessesPage {
         let switcher = self.render_device_switcher(&theme, cx);
 
         let can_control = self.can_control_updates(cx);
+        // Zeron never updates Pi: with nothing else listed there is nothing
+        // to check.
+        let updatable = matches!(&self.harnesses, Loadable::Ready(list)
+            if visible_harnesses(list).iter().any(|d| d.id != HarnessId::Pi));
         let check = div()
             .id("check-harness-updates")
             .flex_none()
@@ -1278,7 +1282,9 @@ impl Render for HarnessesPage {
                                                 .flex()
                                                 .items_center()
                                                 .gap(px(6.0))
-                                                .when(supports_updates, |el| el.child(check))
+                                                .when(supports_updates && updatable, |el| {
+                                                    el.child(check)
+                                                })
                                                 .child(switcher),
                                         ),
                                 )
