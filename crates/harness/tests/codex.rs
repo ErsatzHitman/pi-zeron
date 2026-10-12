@@ -132,6 +132,7 @@ fn controls(
         steering: steer_rx,
         interrupt: token.clone(),
         turn: Default::default(),
+        extension_ui: Default::default(),
     };
     (controls, steer_tx, token)
 }
@@ -626,6 +627,7 @@ async fn approvals_round_trip_as_input_requests() {
         steering: steer_rx,
         interrupt: token.clone(),
         turn: Default::default(),
+        extension_ui: Default::default(),
     };
     let mut req = request("scenario:approve");
     req.auto_approve = false;

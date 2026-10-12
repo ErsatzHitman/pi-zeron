@@ -44,6 +44,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         steering,
         interrupt: CancellationToken::new(),
         turn: Default::default(),
+        extension_ui: Default::default(),
     };
     let request = RunRequest {
         mcp: None,

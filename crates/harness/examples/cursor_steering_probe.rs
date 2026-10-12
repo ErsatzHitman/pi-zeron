@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
                     rx
                 }),
                 turn: Default::default(),
+                extension_ui: Default::default(),
             },
         )
         .await?;

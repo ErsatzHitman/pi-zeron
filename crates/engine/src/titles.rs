@@ -287,6 +287,7 @@ async fn collect_text(
         steering: steer_rx,
         interrupt: interrupt.clone(),
         turn: Default::default(),
+        extension_ui: Default::default(),
     };
     let mut stream = harness.run_title(request, controls).await?;
     let mut text = String::new();

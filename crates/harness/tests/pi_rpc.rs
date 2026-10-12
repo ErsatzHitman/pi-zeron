@@ -42,6 +42,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
                 rx
             }),
             turn: Default::default(),
+            extension_ui: Default::default(),
         },
         tx,
         token,
@@ -897,3 +898,222 @@ async fn edit_diffs_come_from_pi_edits_array_and_transport_commands_stay_hidden(
     assert!(commands.iter().all(|c| !c.name.starts_with("pi_ui_")));
 }
 
+struct UiPort {
+    state: tokio::sync::watch::Receiver<zeron_proto::extension_ui::ExtensionUiState>,
+    actions: mpsc::UnboundedSender<zeron_proto::extension_ui::ExtensionUiAction>,
+    watched: tokio::sync::watch::Sender<bool>,
+}
+fn ui_port(watched: bool) -> (zeron_harness::ExtensionUiPort, UiPort) {
+    let (state_tx, state) = tokio::sync::watch::channel(Default::default());
+    let (actions, actions_rx) = mpsc::unbounded_channel();
+    let (watched, watched_rx) = tokio::sync::watch::channel(watched);
+    (
+        zeron_harness::ExtensionUiPort {
+            state: Some(state_tx),
+            actions: Some(actions_rx),
+            watched: Some(watched_rx),
+        },
+        UiPort {
+            state,
+            actions,
+            watched,
+        },
+    )
+}
+async fn wait_ui(
+    port: &mut UiPort,
+    what: &str,
+    ready: impl Fn(&zeron_proto::extension_ui::ExtensionUiState) -> bool,
+) -> zeron_proto::extension_ui::ExtensionUiState {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let state = port.state.borrow_and_update();
+                if ready(&state) {
+                    return state.clone();
+                }
+            }
+            port.state.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}: {:?}", port.state.borrow()))
+}
+fn keys(state: &zeron_proto::extension_ui::ExtensionUiState) -> Vec<String> {
+    state
+        .elements
+        .iter()
+        .map(|e| format!("{}:{}", e["ns"].as_str().unwrap(), e["id"].as_str().unwrap()))
+        .collect()
+}
+fn piui_events(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(dir.join("piui-events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// PIUI is on only while a UI that renders it watches the chat; elements keep
+/// flowing between turns, chunks reassemble, actions reach the extensions
+/// without opening a turn, and `bye` hands questions back to dialogs.
+#[tokio::test]
+async fn piui_follows_watchers_flows_while_idle_and_round_trips_actions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, tx, _) = controls();
+    let turn = zeron_harness::TurnControl::default();
+    c.turn = turn.clone();
+    let (port, mut ui) = ui_port(true);
+    c.extension_ui = port;
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "piui-idle"), c)
+        .await
+        .unwrap();
+    let mut dones = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                dones += 1;
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let state = wait_ui(&mut ui, "hello snapshot + idle element", |s| {
+        s.connected && s.elements.len() == 4
+    })
+    .await;
+    assert_eq!(
+        keys(&state),
+        vec!["ask-user:question", "bash:jobs", "todo:list", "uniichat:working"]
+    );
+    assert_eq!(state.instance.as_deref(), Some("fixture-instance"));
+    assert_eq!(
+        state.elements[2]["sections"][0]["items"][0]["text"],
+        "ñ".repeat(40)
+    );
+    assert!(turn.background_live(), "a running background shell holds the process");
+
+    let action = |element: &str, action: &str, row: Option<&str>| {
+        zeron_proto::extension_ui::ExtensionUiAction {
+            element_id: element.into(),
+            action_id: action.into(),
+            value: Some(serde_json::json!({"fields":{"selection":"Blue"}})),
+            row_id: row.map(str::to_owned),
+        }
+    };
+    ui.actions.send(action("ask-user:question", "submit", None)).unwrap();
+    wait_ui(&mut ui, "answered sheet removed", |s| s.elements.len() == 3).await;
+    ui.actions.send(action("bash:jobs", "kill", Some("j1"))).unwrap();
+    let state = wait_ui(&mut ui, "killed row", |s| {
+        s.elements[0]["rows"][0]["state"] == "error"
+    })
+    .await;
+    assert_eq!(state.elements[0]["title"], "Background bash · 0 running");
+    assert!(!turn.background_live());
+
+    // The last watcher left: bye, and nothing stale lingers.
+    ui.watched.send(false).unwrap();
+    wait_ui(&mut ui, "disconnected", |s| !s.connected && s.elements.is_empty()).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while piui_events(dir.path()).last().map(|e| e["type"].clone()) != Some("bye".into()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let events = piui_events(dir.path());
+    assert_eq!(events[0], serde_json::json!({"type":"hello","protocol":1,"client":"zeron"}));
+    assert_eq!(events[1]["elementId"], "ask-user:question");
+    assert_eq!(events[1]["value"]["fields"]["selection"], "Blue");
+    assert_eq!(events[2]["rowId"], "j1");
+    assert_eq!(events.len(), 4);
+
+    // No action ever opened a turn; closing the process clears the UI.
+    drop(tx);
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        rest.iter()
+            .all(|e| !matches!(e, Ok(AgentEvent::SessionStarted { .. }))),
+        "{rest:?}"
+    );
+    assert_eq!(dones, 1);
+    let state = wait_ui(&mut ui, "cleared on exit", |s| s.instance.is_none()).await;
+    assert!(state.is_empty());
+}
+
+/// Without a watching UI the extensions are never switched to PIUI, so a
+/// plain client keeps getting dialogs and nothing is left waiting on a sheet.
+#[tokio::test]
+async fn an_unwatched_chat_never_turns_piui_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, tx, _) = controls();
+    let (port, ui) = ui_port(false);
+    c.extension_ui = port;
+    drop(tx);
+    let events: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness()
+            .with_session_store(dir.path().join("index"))
+            .run(request(dir.path(), "piui-idle"), c)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    assert!(events.iter().any(|e| matches!(e, Ok(AgentEvent::Done { .. }))));
+    assert!(piui_events(dir.path()).is_empty());
+    assert!(ui.state.borrow().elements.is_empty());
+}
+
+/// Plain `notify`/`setStatus`/`setWidget`/`setTitle`/`set_editor_text` are
+/// live state for a watching UI: a toast, not transcript text.
+#[tokio::test]
+async fn plain_extension_ui_requests_become_live_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, tx, _) = controls();
+    let (port, mut ui) = ui_port(true);
+    c.extension_ui = port;
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "plain-ui"), c)
+        .await
+        .unwrap();
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!text.contains("Saved the plan"), "{text}");
+    assert!(text.contains("reply:plain-ui"));
+    let state = wait_ui(&mut ui, "plain UI", |s| s.editor_text.is_some()).await;
+    assert_eq!(state.notices.len(), 1);
+    assert_eq!(state.notices[0].message, "Saved the plan");
+    assert_eq!(
+        state.notices[0].level,
+        zeron_proto::extension_ui::NoticeLevel::Warning
+    );
+    assert_eq!(state.statuses[0].key, "!mode");
+    assert_eq!(state.statuses[0].text, "Plan");
+    assert_eq!(state.widgets[0].lines, vec!["q: why?", "a: because"]);
+    assert_eq!(state.title.as_ref().unwrap().text, "Pi fixture");
+    assert_eq!(state.editor_text.as_ref().unwrap().text, "rewritten prompt");
+    drop(tx);
+    let _: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let state = wait_ui(&mut ui, "process closed", |s| s.statuses.is_empty()).await;
+    assert!(state.notices.is_empty() && state.editor_text.is_none());
+}

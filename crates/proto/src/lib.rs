@@ -8,6 +8,7 @@ pub mod attachment_mentions;
 pub mod chat_mentions;
 pub mod change_request_assessment;
 pub mod entities;
+pub mod extension_ui;
 pub mod file_mentions;
 pub mod invocation;
 pub mod motion;

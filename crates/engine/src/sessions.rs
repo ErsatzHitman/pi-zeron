@@ -800,6 +800,7 @@ impl SessionsEngine {
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
             turn: turn.clone(),
+            extension_ui: Default::default(),
         };
 
         lock(&self.inner.runs).insert(

@@ -2,6 +2,7 @@
 mod catalog;
 mod mcp;
 mod normalize;
+mod piui;
 mod rpc;
 mod sessions;
 mod ui;
@@ -250,9 +251,11 @@ impl Process {
             if frame["type"] == "response" && frame["id"] == id {
                 return response_data(frame);
             }
-            if frame["type"] == "extension_ui_request" {
+            if frame["type"] == "extension_ui_request" && is_dialog(&frame) {
                 self.dialogs.request(self.transport.client.clone(), &frame);
             } else {
+                // Includes notify/setStatus/setWidget: extensions publish
+                // while Pi starts, and the runner replays these once it is up.
                 backlog.push(frame);
             }
         }
@@ -261,6 +264,12 @@ impl Process {
         self.dialogs.cancel();
         self.child.shutdown(grace).await;
     }
+}
+fn is_dialog(frame: &Value) -> bool {
+    matches!(
+        frame["method"].as_str(),
+        Some("select" | "confirm" | "input" | "editor")
+    )
 }
 /// Whether `request` picks a thinking level (an effort, or thinking off).
 fn thinking_selected(request: &RunRequest) -> bool {
@@ -422,6 +431,11 @@ impl Harness for PiHarness {
                 session: String::new(),
                 assistant: uuid::Uuid::new_v4().to_string(),
                 lost_context,
+                ui: piui::ExtensionUi::default(),
+                ui_actions: None,
+                ui_watched: None,
+                piui_on: false,
+                turn: Default::default(),
             };
             // The lease lives through shutdown even if the consumer drops its stream.
             let RunControls {
@@ -430,8 +444,13 @@ impl Harness for PiHarness {
                 request_input,
                 mut steering,
                 interrupt,
-                turn: _,
+                turn,
+                extension_ui,
             } = controls;
+            runner.ui = piui::ExtensionUi::new(extension_ui.state);
+            runner.ui_actions = extension_ui.actions;
+            runner.ui_watched = extension_ui.watched;
+            runner.turn = turn;
             runner.process.dialogs.input = Some(std::sync::Arc::from(request_input));
             let consumer = runner.tx.clone();
             let result = tokio::select! {
@@ -448,6 +467,9 @@ impl Harness for PiHarness {
                 });
             }
             runner.process.shutdown(kill_grace).await;
+            // The process (and every element its extensions drew) is gone.
+            runner.ui.closed();
+            runner.turn.set_background(0);
             let _ = runner.finish().await;
         });
         Ok(
@@ -491,8 +513,61 @@ struct Runner {
     session: String,
     assistant: String,
     lost_context: Option<String>,
+    /// Live extension UI (PIUI + plain UI requests) for the host.
+    ui: piui::ExtensionUi,
+    ui_actions: Option<mpsc::UnboundedReceiver<zeron_proto::extension_ui::ExtensionUiAction>>,
+    ui_watched: Option<tokio::sync::watch::Receiver<bool>>,
+    /// We sent `hello` (and no `bye` since): extensions publish elements.
+    piui_on: bool,
+    turn: crate::TurnControl,
 }
 impl Runner {
+    /// Opt in to PIUI only while a UI that renders it is watching, and opt
+    /// out when the last one leaves, so Pi falls back to dialogs a plain
+    /// client (or an older Zeron) can answer. Sent as a raw command: it must
+    /// not open a turn, and its `handled` ACK matches no pending entry.
+    fn sync_piui(&mut self) -> Result<(), HarnessError> {
+        let watched = self
+            .ui_watched
+            .as_ref()
+            .is_some_and(|watched| *watched.borrow());
+        if watched == self.piui_on {
+            return Ok(());
+        }
+        self.piui_on = watched;
+        let event = if watched { piui::hello() } else { piui::bye() };
+        if !watched {
+            self.ui.disconnect();
+        }
+        self.process.transport.client.request(json!({
+            "type":"prompt",
+            "message":piui::encode_client_event(&event),
+        }))?;
+        Ok(())
+    }
+    fn send_action(
+        &mut self,
+        action: zeron_proto::extension_ui::ExtensionUiAction,
+    ) -> Result<(), HarnessError> {
+        // The advisor panel has no cancel handler of its own: esc in the
+        // terminal is an RPC abort, so its Cancel is too.
+        if action.element_id.starts_with("advisor-live-panel:") && action.action_id == "cancel" {
+            self.process
+                .transport
+                .client
+                .request(json!({"type":"abort"}))?;
+            return Ok(());
+        }
+        if !self.piui_on {
+            tracing::debug!(element = %action.element_id, "extension UI action without PIUI; dropped");
+            return Ok(());
+        }
+        self.process.transport.client.request(json!({
+            "type":"prompt",
+            "message":piui::encode_client_event(&piui::action_event(&action)),
+        }))?;
+        Ok(())
+    }
     async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
         self.tx
             .send(Ok(event))
@@ -712,6 +787,7 @@ impl Runner {
         for frame in backlog {
             self.frame(frame).await?;
         }
+        self.sync_piui()?;
         let images = load_images(&self.request.attachments).await;
         self.prompt(self.request.prompt.clone(), images)?;
         let mut open = true;
@@ -771,7 +847,15 @@ impl Runner {
             }
             tokio::select! {
                 incoming=self.process.next()=>self.frame(incoming?).await?,
-                steer=steering.recv(),if open=>match steer {Some(steer)=>self.queued.push_back(steer),None=>open=false}
+                steer=steering.recv(),if open=>match steer {Some(steer)=>self.queued.push_back(steer),None=>open=false},
+                action=next_action(&mut self.ui_actions)=>match action {
+                    Some(action)=>self.send_action(action)?,
+                    None=>self.ui_actions=None,
+                },
+                watched=watch_changed(&mut self.ui_watched)=>match watched {
+                    true=>self.sync_piui()?,
+                    false=>self.ui_watched=None,
+                },
             }
         }
     }
@@ -913,21 +997,30 @@ impl Runner {
             return Ok(());
         }
         if frame["type"] == "extension_ui_request" {
-            if !self.active {
-                // A background notification must not reopen a completed engine turn.
-                // No foreground run can own a dialog here, so cancel it explicitly.
-                ui::Dialogs::default().request(self.process.transport.client.clone(), &frame);
-                tracing::debug!(method = %string(&frame, "method"), "Pi UI request outside a run");
-                return Ok(());
-            }
-            self.process
-                .dialogs
-                .request(self.process.transport.client.clone(), &frame);
-            if frame["method"] == "notify" {
-                self.emit(AgentEvent::TextDelta {
-                    text: format!("\n{}\n", string(&frame, "message")),
-                })
-                .await?;
+            match self.ui.handle(&frame) {
+                piui::Handled::Consumed => {
+                    self.turn.set_background(self.ui.background_tasks());
+                }
+                // A UI watching this chat shows it as a toast. Without one, a
+                // notice during a turn stays visible as transcript text; a
+                // background one must not reopen a completed engine turn.
+                piui::Handled::Notice(message) => {
+                    if self.active && !self.piui_on {
+                        self.emit(AgentEvent::TextDelta {
+                            text: format!("\n{message}\n"),
+                        })
+                        .await?;
+                    }
+                }
+                piui::Handled::Dialog if self.active => self
+                    .process
+                    .dialogs
+                    .request(self.process.transport.client.clone(), &frame),
+                piui::Handled::Dialog => {
+                    // No foreground run can own a dialog here, so cancel it explicitly.
+                    ui::Dialogs::default().request(self.process.transport.client.clone(), &frame);
+                    tracing::debug!(method = %string(&frame, "method"), "Pi dialog outside a run");
+                }
             }
             return Ok(());
         }
@@ -1029,6 +1122,21 @@ impl Runner {
             self.pending.insert(id, Pending::Barrier(self.epoch));
         }
         Ok(())
+    }
+}
+async fn next_action(
+    actions: &mut Option<mpsc::UnboundedReceiver<zeron_proto::extension_ui::ExtensionUiAction>>,
+) -> Option<zeron_proto::extension_ui::ExtensionUiAction> {
+    match actions {
+        Some(actions) => actions.recv().await,
+        None => std::future::pending().await,
+    }
+}
+/// Resolves true on a change, false once the host dropped the sender.
+async fn watch_changed(watched: &mut Option<tokio::sync::watch::Receiver<bool>>) -> bool {
+    match watched {
+        Some(watched) => watched.changed().await.is_ok(),
+        None => std::future::pending().await,
     }
 }
 /// Inline attachments as native image blocks, best-effort like the Claude

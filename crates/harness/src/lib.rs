@@ -143,6 +143,26 @@ pub struct RunControls {
     pub interrupt: CancellationToken,
     /// Turn-level stop and background-work reporting (see [`TurnControl`]).
     pub turn: TurnControl,
+    /// Live extension UI outside the transcript (see [`ExtensionUiPort`]).
+    pub extension_ui: ExtensionUiPort,
+}
+
+/// The side channel for a harness's live extension UI (Pi's PIUI elements,
+/// status, widgets, toasts). It bypasses the turn machinery on purpose: these
+/// update while no turn is running, and must never open or close one.
+///
+/// The default port is disconnected: the harness publishes nothing and never
+/// opts in to rich extension UI, so its extensions keep using plain dialogs.
+#[derive(Default)]
+pub struct ExtensionUiPort {
+    /// Harness → host: the chat's latest live extension UI.
+    pub state: Option<tokio::sync::watch::Sender<zeron_proto::extension_ui::ExtensionUiState>>,
+    /// Host → harness: actions taken in a UI.
+    pub actions: Option<mpsc::UnboundedReceiver<zeron_proto::extension_ui::ExtensionUiAction>>,
+    /// Host → harness: whether any UI that renders extension elements is
+    /// watching this chat. Only then do extensions switch from dialogs to
+    /// elements, so a UI without that renderer never strands a question.
+    pub watched: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// Catalog provenance stays internal; RPC clients retain the Vec<Model> shape.

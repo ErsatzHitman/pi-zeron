@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         steering,
         interrupt: CancellationToken::new(),
         turn: Default::default(),
+        extension_ui: Default::default(),
     };
     let request = RunRequest {
         mcp: None,

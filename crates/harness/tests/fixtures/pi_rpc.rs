@@ -28,6 +28,94 @@ fn message(text: &str, stop: &str) {
         json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":text}],"stopReason":stop,"errorMessage":"mock provider failure","usage":{"input":12,"output":3}}}),
     );
 }
+/// PIUI emulation (the user's `00-piui.ts` hub): one envelope per notify,
+/// a process-wide `agentSeq`, and nothing published before `hello`.
+struct PiUi {
+    on: AtomicBool,
+    seq: std::sync::atomic::AtomicU64,
+}
+static PIUI: PiUi = PiUi {
+    on: AtomicBool::new(false),
+    seq: std::sync::atomic::AtomicU64::new(0),
+};
+const INSTANCE: &str = "fixture-instance";
+fn piui(body: Value) {
+    if !PIUI.on.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut envelope = json!({"v":1,"agentSeq":PIUI.seq.fetch_add(1, Ordering::SeqCst) + 1,"instance":INSTANCE});
+    for (key, value) in body.as_object().unwrap() {
+        envelope[key] = value.clone();
+    }
+    piui_notify(&envelope.to_string());
+}
+fn piui_notify(message: &str) {
+    emit(json!({"type":"extension_ui_request","id":uuid(),"method":"notify","message":format!("PIUI {message}"),"notifyType":"info"}));
+}
+fn uuid() -> String {
+    format!("ui-{}", PIUI.seq.load(Ordering::SeqCst))
+}
+fn ask_user_sheet() -> Value {
+    json!({"id":"question","ns":"ask-user","kind":"panel","placement":"sheet","title":"Pick a color",
+        "sections":[{"kind":"form","id":"ask-form","fields":[
+            {"id":"selection","kind":"select","searchable":true,"options":[
+                {"value":"Red","label":"Red"},{"value":"Blue","label":"Blue","description":"calm"}]},
+            {"id":"freeform","kind":"text","placeholder":"Type something"}],
+            "actions":[{"id":"submit","label":"Submit","variant":"primary"}]}],
+        "actions":[{"id":"cancel","label":"Cancel"}]})
+}
+/// `/pi_ui_event <base64url JSON>`: the client's half of the protocol.
+fn piui_event(args: &str) {
+    use base64::Engine as _;
+    let event: Value = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(args.trim())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("piui-events.jsonl")
+        .unwrap();
+    writeln!(log, "{event}").unwrap();
+    match event["type"].as_str().unwrap_or("action") {
+        "hello" => {
+            PIUI.on.store(true, Ordering::SeqCst);
+            piui(json!({"op":"hello","protocol":1,"kinds":["panel","roster","status"],"sectionKinds":["form","checklist"]}));
+            piui(json!({"op":"reset","reason":"snapshot"}));
+            piui(json!({"op":"set","el":ask_user_sheet()}));
+            piui(json!({"op":"set","el":{"id":"jobs","ns":"bash","kind":"roster","placement":"pinned",
+                "title":"Background bash · 1 running",
+                "rows":[{"id":"j1","label":"npm test","state":"running","detail":"3s",
+                    "actions":[{"id":"kill","label":"Kill","variant":"danger","confirm":"Kill this job?"}]}]}}));
+            piui(json!({"op":"channel","channel":"bash-bg:fleet","payload":{"entries":[],"active":1,"selected":0}}));
+            // A large element arrives in UTF-8-safe chunks without agentSeq.
+            let big = json!({"v":1,"agentSeq":PIUI.seq.fetch_add(1, Ordering::SeqCst) + 1,"instance":INSTANCE,
+                "op":"set","el":{"id":"list","ns":"todo","kind":"panel","placement":"pinned",
+                "title":"Todos 0/1","sections":[{"kind":"checklist","id":"tasks",
+                "items":[{"id":"1","text":"ñ".repeat(40),"state":"active"}]}]}})
+            .to_string();
+            let mid = big.char_indices().nth(big.chars().count() / 2).unwrap().0;
+            let (first, second) = big.split_at(mid);
+            for (i, data) in [(1, second), (0, first)] {
+                piui_notify(&json!({"v":1,"op":"chunk","id":"c1","i":i,"n":2,"data":data}).to_string());
+            }
+        }
+        "bye" => PIUI.on.store(false, Ordering::SeqCst),
+        "snapshot" => piui(json!({"op":"reset","reason":"snapshot"})),
+        _ => match (event["elementId"].as_str(), event["actionId"].as_str()) {
+            (Some("ask-user:question"), Some("submit" | "cancel")) => {
+                piui(json!({"op":"remove","ns":"ask-user","id":"question"}))
+            }
+            (Some("bash:jobs"), Some("kill")) => {
+                piui(json!({"op":"patch","ns":"bash","id":"jobs","patch":{"title":"Background bash · 0 running",
+                    "rows":[{"id":"j1","label":"npm test","state":"error","detail":"killed"}]}}));
+                piui(json!({"op":"channel","channel":"bash-bg:fleet","payload":{"entries":[],"active":0,"selected":0}}));
+            }
+            _ => {}
+        },
+    }
+}
 fn queue_update(queue: &std::collections::VecDeque<String>) {
     emit(json!({"type":"queue_update","steering":queue,"followUp":[]}));
 }
@@ -146,6 +234,26 @@ fn main() {
                 if text == "/noop" || text == "handled" {
                     disposition(&v, "handled");
                     continue;
+                }
+                // Extension commands run at once, even mid-turn, and start no run.
+                if let Some(args) = text.strip_prefix("/pi_ui_event ") {
+                    piui_event(args);
+                    disposition(&v, "handled");
+                    continue;
+                }
+                if text == "plain-ui" {
+                    for request in [
+                        json!({"method":"notify","message":"Saved the plan","notifyType":"warning"}),
+                        json!({"method":"setStatus","statusKey":"!mode","statusText":"Plan"}),
+                        json!({"method":"setWidget","widgetKey":"btw","widgetLines":["q: why?","a: because"],"widgetPlacement":"aboveEditor"}),
+                        json!({"method":"setTitle","title":"Pi fixture"}),
+                        json!({"method":"set_editor_text","text":"rewritten prompt"}),
+                    ] {
+                        let mut request = request;
+                        request["type"] = json!("extension_ui_request");
+                        request["id"] = json!(uuid());
+                        emit(request);
+                    }
                 }
                 if text.starts_with("/dialog") {
                     dialog = Some(v.clone());
@@ -292,6 +400,14 @@ fn main() {
                         );
                         if let Some(abort) = pending_abort.lock().unwrap().take() {
                             ack(&abort);
+                        }
+                        if text == "piui-idle" {
+                            // Fleets and timers publish between turns.
+                            std::thread::spawn(|| {
+                                std::thread::sleep(Duration::from_millis(30));
+                                piui(json!({"op":"set","el":{"id":"working","ns":"uniichat","kind":"status",
+                                    "placement":"status","text":"uniichat: folding 2 messages into the tree…"}}));
+                            });
                         }
                         if text == "late-notify" {
                             std::thread::spawn(|| {

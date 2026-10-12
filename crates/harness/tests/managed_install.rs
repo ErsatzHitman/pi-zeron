@@ -35,6 +35,7 @@ async fn managed_install_reaches_session_started() {
         steering,
         interrupt: interrupt.clone(),
         turn: Default::default(),
+        extension_ui: Default::default(),
     };
     let request = RunRequest {
         mcp: None,

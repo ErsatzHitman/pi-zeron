@@ -276,6 +276,7 @@ impl TurnWire {
                 steering,
                 interrupt: interrupt.clone(),
                 turn: Default::default(),
+                extension_ui: Default::default(),
             },
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),

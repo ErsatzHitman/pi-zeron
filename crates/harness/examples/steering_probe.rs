@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
             rx
         }),
         turn: Default::default(),
+        extension_ui: Default::default(),
     };
     let mut stream =
         tokio::time::timeout(Duration::from_secs(90), harness.run(request, controls)).await??;

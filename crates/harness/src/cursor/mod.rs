@@ -532,6 +532,7 @@ async fn run_session(session: Session) {
         mut steering,
         interrupt,
         turn,
+        extension_ui: _,
     } = controls;
 
     let mut assistant_message_id = new_message_id();
