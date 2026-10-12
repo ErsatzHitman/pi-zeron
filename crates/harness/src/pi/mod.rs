@@ -109,7 +109,8 @@ impl PiHarness {
             })
             .ok_or_else(|| {
                 HarnessError::NotInstalled(
-                    "Pi is not configured: choose its executable in Settings → General → Pi                      (or set PI_EXECUTABLE)"
+                    "Pi is not configured: choose its executable in Settings → General → Pi \
+                     (or set PI_EXECUTABLE)"
                         .into(),
                 )
             })?;
