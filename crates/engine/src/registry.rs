@@ -551,6 +551,20 @@ impl HarnessRegistry {
         }
     }
 
+    pub fn is_registered(&self, id: HarnessId) -> bool {
+        self.slots().contains_key(&id)
+    }
+
+    /// The harness a run for `id` uses. Chats created before Zeron became a
+    /// Pi client name harnesses it no longer runs; they continue on Pi.
+    pub fn runnable(&self, id: HarnessId) -> HarnessId {
+        if self.is_registered(id) || !self.is_registered(HarnessId::Pi) {
+            id
+        } else {
+            HarnessId::Pi
+        }
+    }
+
     pub fn resolve(&self, id: HarnessId) -> Result<Arc<dyn Harness>, HarnessError> {
         let mut slots = self.slots();
         match slots.get(&id) {
@@ -592,8 +606,9 @@ impl HarnessRegistry {
 }
 
 /// The production registry: MockHarness (hidden from production pickers) plus a lazy
-/// `claude-code` slot resolved through `zeron_harness` on first use (subprocess
-/// discovery only happens when a run/model call actually needs it).
+/// Pi slot resolved on first use (subprocess discovery only happens when a run or
+/// model call actually needs it). Zeron is a Pi client; see
+/// [`register_other_harnesses`] for the adapters it no longer runs.
 pub fn default_registry() -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
@@ -643,6 +658,42 @@ pub fn default_registry() -> HarnessRegistry {
             },
         ],
     }));
+    // Native Pi RPC. Thinking levels are discovered per model.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Pi,
+            name: "Pi".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            can_install: false,
+            enabled: None,
+        },
+        {
+            let setting = registry.pi_executable_setting();
+            Box::new(move || {
+                zeron_harness::PiHarness::new()
+                    .with_executable_setting(setting.clone())
+                    .installed()
+            })
+        },
+        {
+            let setting = registry.pi_executable_setting();
+            Box::new(move || {
+                Ok(Arc::new(
+                    zeron_harness::PiHarness::new().with_executable_setting(setting.clone()),
+                ) as Arc<dyn Harness>)
+            })
+        },
+    );
+    registry
+}
+
+/// The harnesses Zeron orchestrated before it became a Pi client. Production
+/// never registers them; tests and fixtures that exercise the shared engine
+/// paths against other adapters opt in.
+pub fn register_other_harnesses(registry: &HarnessRegistry) {
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::ClaudeCode,
@@ -768,35 +819,6 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
     );
-    // Native Pi RPC. Thinking levels are discovered per model.
-    registry.register_lazy(
-        HarnessDescriptor {
-            id: HarnessId::Pi,
-            name: "Pi".into(),
-            supports_steering: true,
-            steering_mode: SteeringMode::StepBoundary,
-            reasoning_levels: Vec::new(),
-            installed: true,
-            can_install: false,
-            enabled: None,
-        },
-        {
-            let setting = registry.pi_executable_setting();
-            Box::new(move || {
-                zeron_harness::PiHarness::new()
-                    .with_executable_setting(setting.clone())
-                    .installed()
-            })
-        },
-        {
-            let setting = registry.pi_executable_setting();
-            Box::new(move || {
-                Ok(Arc::new(
-                    zeron_harness::PiHarness::new().with_executable_setting(setting.clone()),
-                ) as Arc<dyn Harness>)
-            })
-        },
-    );
     // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
     // desktop app speaks — `opencode serve` + the /global/event bus), same
     // lazy pattern: the static descriptor mirrors OpencodeHarness exactly.
@@ -840,7 +862,6 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
     );
-    registry
 }
 
 #[cfg(test)]
@@ -907,20 +928,30 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_codex_and_grok_slots() {
+    fn default_registry_runs_only_pi_and_others_are_opt_in() {
         let registry = default_registry();
-        let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
+        let ids = |registry: &HarnessRegistry| -> Vec<HarnessId> {
+            registry.descriptors().iter().map(|d| d.id).collect()
+        };
+        assert_eq!(ids(&registry), vec![HarnessId::Mock, HarnessId::Pi]);
+        assert!(registry.resolve(HarnessId::Codex).is_err());
+        assert!(!registry.descriptors()[1].can_install, "Zeron never installs Pi");
+        // Chats from other harnesses continue on Pi; registered ones stay put.
+        assert_eq!(registry.runnable(HarnessId::Codex), HarnessId::Pi);
+        assert_eq!(registry.runnable(HarnessId::Mock), HarnessId::Mock);
+        register_other_harnesses(&registry);
+        assert_eq!(registry.runnable(HarnessId::Codex), HarnessId::Codex);
         assert_eq!(
-            ids,
+            ids(&registry),
             vec![
                 HarnessId::Mock,
+                HarnessId::Pi,
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
                 HarnessId::Cursor,
                 HarnessId::Devin,
                 HarnessId::Grok,
                 HarnessId::Hermes,
-                HarnessId::Pi,
                 HarnessId::Opencode,
                 HarnessId::Antigravity
             ]
@@ -1329,6 +1360,7 @@ mod tests {
     #[test]
     fn codex_lazy_descriptor_matches_resolved_harness() {
         let registry = default_registry();
+        register_other_harnesses(&registry);
         let before = registry
             .descriptors()
             .into_iter()

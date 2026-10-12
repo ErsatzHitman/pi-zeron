@@ -599,6 +599,10 @@ impl SessionsEngine {
         startup_retry: bool,
         idle: bool,
     ) -> Result<String, EngineError> {
+        let harness_id = self.inner.registry.runnable(harness_id);
+        if request.harness.is_some() {
+            request.harness = Some(harness_id);
+        }
         // Project-less chats store a home-relative cwd (the creating device
         // can't know the host's home); expand it here, on the host, where the
         // run spawns, creating a new chat's scratch folder.

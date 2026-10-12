@@ -69,6 +69,10 @@ fn offers_install(harness: HarnessId, installed: bool, can_install: bool) -> boo
 }
 
 fn install_hint(harness: HarnessId, enabled: bool, can_install: bool) -> String {
+    if harness == HarnessId::Pi {
+        // Zeron never installs Pi or looks for it on PATH.
+        return "Choose the Pi executable in Settings → General → Pi (Pi 1.1 or newer)".into();
+    }
     if harness == HarnessId::Antigravity {
         return if can_install {
             "Install Antigravity to enable"
@@ -283,6 +287,10 @@ impl HarnessesPage {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        // Zeron never updates Pi: no policy to choose.
+        if harness == HarnessId::Pi {
+            return None;
+        }
         let Loadable::Ready(statuses) = &self.updates else {
             return None;
         };

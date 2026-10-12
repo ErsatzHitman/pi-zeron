@@ -191,6 +191,12 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
 ];
 
+/// Whether the Accounts page lists `harness`. Zeron is a Pi client: the other
+/// providers' flows stay for the engine's sake but are not offered.
+fn listed(harness: HarnessId) -> bool {
+    harness == HarnessId::Pi
+}
+
 /// Whether `harness` has an Accounts section (and sign-in flow). Pure.
 pub fn signs_in(harness: HarnessId) -> bool {
     PROVIDERS
@@ -1922,6 +1928,7 @@ impl Render for AccountsPage {
         let sections: Vec<AnyElement> = match &self.snapshot {
             Loadable::Idle | Loadable::Loading => PROVIDERS
                 .into_iter()
+                .filter(|(harness, ..)| listed(*harness))
                 .map(|(harness, name, _cli)| {
                     let skeleton_id = match harness {
                         HarnessId::Codex => "accounts-skeleton-codex",
@@ -2003,6 +2010,7 @@ impl Render for AccountsPage {
                 let snapshot = snapshot.clone();
                 PROVIDERS
                     .into_iter()
+                    .filter(|(harness, ..)| listed(*harness))
                     .map(|(harness, name, cli)| {
                         let accounts = provider_accounts(&snapshot, harness);
                         // EVERY warning renders its own strip (zeron maps them).

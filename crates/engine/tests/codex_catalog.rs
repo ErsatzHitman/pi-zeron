@@ -1,7 +1,7 @@
 //! Windows npm Codex must survive the production registry and ListHarnesses RPC.
 #![cfg(windows)]
 
-use zeron_engine::{EngineCore, registry::default_registry};
+use zeron_engine::{EngineCore, register_other_harnesses, registry::default_registry};
 use zeron_proto::HarnessId;
 
 #[tokio::test]
@@ -12,7 +12,11 @@ async fn catalog_child() {
     let dir = tempfile::tempdir().unwrap();
     let core = EngineCore::assemble(
         dir.path(),
-        default_registry().into(),
+        {
+            let registry = default_registry();
+            register_other_harnesses(&registry);
+            registry.into()
+        },
         HarnessId::Codex,
         None,
     )

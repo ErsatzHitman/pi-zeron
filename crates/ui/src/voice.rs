@@ -70,10 +70,11 @@ impl Default for VoiceController {
     }
 }
 impl VoiceController {
-    /// Voice can be offered here. An unread catalog counts as yes, so a slow
-    /// or failed read never hides it; a live call or its failure stays.
+    /// Voice can be offered here: only once the device's catalog lists Codex
+    /// (a Pi-only engine never does, so the trigger never flashes in while it
+    /// loads); a live call or its failure stays.
     pub fn offered(&self) -> bool {
-        self.codex_ready != Some(false) || self.is_live() || self.reason.is_some()
+        self.codex_ready == Some(true) || self.is_live() || self.reason.is_some()
     }
 
     /// Read whether `engine`'s device can take a call: installed and enabled
@@ -460,9 +461,9 @@ mod tests {
     }
 
     #[test]
-    fn voice_is_offered_unless_codex_is_known_missing() {
+    fn voice_is_offered_only_once_codex_is_listed() {
         let mut voice = VoiceController::default();
-        assert!(voice.offered(), "an unread catalog never hides voice");
+        assert!(!voice.offered(), "an unread catalog never flashes voice in");
         voice.codex_ready = Some(true);
         assert!(voice.offered());
         voice.codex_ready = Some(false);

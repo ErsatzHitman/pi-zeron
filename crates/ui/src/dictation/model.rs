@@ -34,6 +34,7 @@ pub(crate) fn init(root: PathBuf, cx: &mut App) {
         host_select: widgets::SelectState::default(),
         hosts: Vec::new(),
         call_live: false,
+        codex_offered: false,
         voices: zeron_proto::voice::DEFAULT_VOICES
             .iter()
             .map(|voice| (*voice).to_owned())
@@ -72,6 +73,9 @@ pub(crate) struct VoiceCard {
     host_select: widgets::SelectState,
     hosts: Vec<(Option<String>, String, bool, String)>,
     call_live: bool,
+    /// Codex voice rows show only where Codex voice can run (never on a
+    /// Pi-only engine); dictation is independent of it.
+    codex_offered: bool,
     /// Native voice styles, refreshed with the live session's reported catalog.
     voices: Vec<String>,
     /// Created on first render (it needs this card's context).
@@ -92,11 +96,13 @@ impl VoiceCard {
         &mut self,
         hosts: Vec<(Option<String>, String, bool, String)>,
         live: bool,
+        codex_offered: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.hosts != hosts || self.call_live != live {
+        if self.hosts != hosts || self.call_live != live || self.codex_offered != codex_offered {
             self.hosts = hosts;
             self.call_live = live;
+            self.codex_offered = codex_offered;
             cx.notify();
         }
     }
@@ -622,7 +628,9 @@ impl Render for VoiceCard {
                         .child(
                             widgets::page_column()
                                 .child(widgets::page_header(&theme, "Voice", None))
-                                .child(conversation_card)
+                                .when(self.codex_offered, |column| {
+                                    column.child(conversation_card)
+                                })
                                 .child(
                                     widgets::section_card(&theme)
                                         .child(dictation_row)

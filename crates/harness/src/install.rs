@@ -131,6 +131,10 @@ fn available(
 }
 
 fn selected(id: HarnessId) -> Option<Method> {
+    // Pi is the user's own build, chosen in settings; Zeron never installs it.
+    if id == HarnessId::Pi {
+        return None;
+    }
     let platform = Platform::current();
     methods(id, platform).into_iter().find(|method| {
         available(
