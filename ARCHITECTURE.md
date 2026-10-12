@@ -139,9 +139,9 @@ zeron/
     sync/         zeron-sync     # loro room client (join/VV backfill/fragments/backoff),
                                  # ephemeral presence, DocsStore (SQLite snapshots +
                                  # processed-command ledger)
-    harness/      zeron-harness  # Harness trait + claude-code (stream-json subprocess),
-                                 # codex (app-server JSON-RPC), mock; steering mailbox,
-                                 # requestInput, models/reasoning/options catalogs
+    harness/      zeron-harness  # Harness trait + pi (`pi --mode rpc` JSONL, PIUI client;
+                                 # the default), claude-code, codex, ACP adapters, mock;
+                                 # steering mailbox, requestInput, model catalogs
     engine/       zeron-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
                                  # checkout-diff sync, terminals (portable-pty), uploads,
@@ -198,6 +198,11 @@ feature spec `docs/research/feature-inventory.md` §1.
   images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance) replacing the composer while input
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade.
+- **Pi extension UI** (`zeron-ui::extension_ui`): the selected chat's live PIUI state, watched
+  from the chat's host. Sheets replace the composer like the QuestionPanel, pinned elements are
+  trays above the todo panel, status elements and channels are footer chips, screens are
+  right-pane tabs (`RightSurface::Extension`). Everything reuses the composer/transcript
+  components and theme roles; actions go back through `ExtensionUiAction`.
 - **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
   engine side; custom gpui grid element; tabs w/ drag-reorder (150ms sliding transforms), height
   drag 160px–55vh, 12ms input coalescing / 80ms resize debounce, 1MB replay, detach ≠ close.
@@ -232,6 +237,12 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
   `HarnessShape`; Claude Code via `claude` CLI stream-json in/out (control protocol for
   permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
   `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
+- **Pi extension UI**: Pi's live extension UI (PIUI elements, statuses, widgets, notices) is
+  host-only state in `engine::extension_ui::ExtensionUiHub`, never written to the session doc.
+  Desktops subscribe with `WatchExtensionUi` (forwarded to the host by `targetDeviceId`); the
+  first watcher makes the Pi driver send PIUI `hello`, the last one leaving sends `bye` after a
+  3 s grace, so unwatched chats (iOS, closed desktops) keep Pi on plain dialogs. Stop ends a Pi
+  turn in place (`clear_queue` + `abort`) and keeps the process. See `docs/pi.md`.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches zeron, avoids libgit2 edge
   cases); worktrees under `~/.zeron/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff

@@ -84,3 +84,43 @@ changes only) and a second idle get_state, permits recreation using
 write to stdin. Missing history/custom entries never authorize recreating the
 same UUID; an unrestorable session starts a new one with a visible "without the
 previous context" notice, like the other harnesses.
+
+PIUI (extension UI, `piui.rs`; spec: the user's `~/.pi/agent/extensions/PIUI.md`)
+
+Transport: extensions publish `notify` messages whose text is `PIUI ` + JSON
+envelope `{v:1, agentSeq, instance, ...op}`; large envelopes arrive as `chunk`
+ops (`id`, `i`, `n`, `data`) and incomplete sets are dropped after 60 s (a
+snapshot repairs state). The client answers by sending the prompt
+`/pi_ui_event <base64url JSON>` (an extension command: it acknowledges
+`handled` and never starts a run). Client events are
+`{type:"hello", protocol:1, client:"zeron"}`, `{type:"bye"}` and
+`{type:"action", elementId, actionId, value?, rowId?}`; a form's submit value
+is `{fields: {id: value}}`. A new `instance` (the Pi runtime restarted) clears
+all state; an envelope whose `agentSeq` is not newer than the last is dropped.
+
+Gating: the driver says `hello` only while its chat is watched (at least one
+`WatchExtensionUi` stream on the host; the engine's `ExtensionUiHub` releases a
+chat 3 s after its last watcher) and `bye` when it stops being watched. Before `hello` and after `bye`, extensions use plain
+dialogs/`setWidget`/`setStatus`, so an unwatched chat never waits on PIUI. On
+`bye` all live elements are dropped and host dialog sheets are cancelled.
+
+Ops: `set` (whole element, keyed `ns:id`), `patch` (merge into an element),
+`remove`, `reset` (everything), `channel` (keyed payload, e.g.
+`minimal-status:footer`, `pi-goal:status`, `subagents:fleet`, `bash-bg:fleet`,
+`workflow:progress`). A removed element with `durable: true` is kept (last 16)
+in the live state only.
+
+Plain RPC UI requests are folded into the same live state: `notify` (a notice;
+also transcript text during a turn when no UI watches), `setStatus`,
+`setWidget`, `setTitle`, `set_editor_text`. A blocking dialog with no turn to
+answer it in becomes a `pi:dialog-N` sheet element for a watching UI (its
+timeout honoured, cancelled on `bye`); with no watcher it is cancelled.
+
+Custom messages: `message_end` with `message.role == "custom"` and
+`display: true` maps to a `pi`/`<customType>` tool call with `details` as input
+and the text content as output. `display: false` messages are dropped, and so
+is any custom message arriving while no turn is active.
+
+Stop: `stops_turn_in_place` — interrupt sends `clear_queue` then `abort`,
+cancels open dialogs and keeps the process, its extensions and background work
+alive for the next message.

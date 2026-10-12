@@ -22,6 +22,7 @@ not built yet).
 | 1.11 Changes viewer | done | Patch → file/hunk/line rows, per-file collapse, ±gutters, time-sliced highlighting, preparing/clean/error states, checkout_id → device+cwd resolution. |
 | 1.12 Motion catalog | partial | Motion kit (cubic-bezier curves, fade-in/quick, splash-out, pulse/gradient spinners, menu/dialog-in, resort glide). Gap: prefers-reduced-motion switch. |
 | 1.13 State & connection | done | All subscriptions (AuthStatus, WatchDevices/Chats/Sessions/CheckoutDiffs, per-chat WatchDocMessages, LocalDevice probe); reconnect from scratch. |
+| 1.14 Pi extension UI | done | PIUI sheets (replace the composer), pinned trays, footer status chips, screen tabs in the right pane, toasts, chat title and composer text from extensions (`ui/src/extension_ui*`). Live state from the chat's host (`WatchExtensionUi`), actions via `ExtensionUiAction`. Not on iOS: unwatched chats fall back to dialogs. |
 
 ## §2 Control plane
 
@@ -33,6 +34,7 @@ not built yet).
 | Uploads / ReadAttachmentChunk | done | Chunked staging → durable file; path-jailed reads; attachments live only on the host device. |
 | Terminals RPCs | done | Open/Subscribe/Write/Resize/Close, forwardable. |
 | Agent-account RPCs | done | Full login/activate/forget/poll surface, forwardable. |
+| WatchExtensionUi / ExtensionUiAction | done | Pi live extension UI, capability `extension-ui-v1`, forwardable to the chat's host; the stream keeps the chat watched (hello/bye) and coalesces to one frame per 50 ms. |
 | LocalDevice | done | `{deviceId}`; IPC-only (never forwarded). |
 | DataRpc watches + QueueCommand | done | — |
 | Mutate ops | partial | createChat/renameChat/setChatArchived/deleteChat/renameDevice done; markChatSeen accepted as a no-op (unseen markers UI-local); `SetChatConfig` exists on the doc layer but is not yet exposed as a Mutate op. |
@@ -60,7 +62,7 @@ not built yet).
 | Devin (ACP) | done | Shared `AcpHarness` spec; `devin acp` (Cognition's native ACP server), turn-boundary steering, no effort ladder (effort rides the advertised model ids). Unattended mode via the `bypass` mode value. Subagent lifecycle and nested transcripts ride Devin's `cognition.ai/subagentSupport` extension. **Live-verified against the real `devin` CLI 3000.6.14** (2026-09-04): model discovery (193 rows), an edit + `cargo test` turn settled on the truthful `end_turn`, `run_subagent` rendered as a link chip with a nested child transcript, stop → `session/cancel` → `stopReason: cancelled`, and `session/load` resume. |
 | Grok (ACP) | done | Shared `AcpHarness` spec; `grok agent stdio`, turn-boundary steering. |
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
-| Pi (RPC) | done | Native `PiHarness` (Pi ≥0.85.1), step-boundary steering, native/legacy session resume, per-model thinking levels including off, extension dialogs and Zeron MCP delegation. See [Pi integration](pi.md). |
+| Pi (RPC) | done | Native `PiHarness` (Pi ≥1.1.0, configured executable only, never PATH or self-updated), step-boundary steering, stop in place (the process and its extensions survive), native/legacy session resume, per-model thinking levels including off, extension dialogs, PIUI extension UI and displayed custom messages, Zeron MCP delegation. The default harness. See [Pi integration](pi.md). |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema
@@ -106,6 +108,6 @@ not built yet).
 
 ## Summary
 
-Table rows above: **40 done · 6 partial**, plus the cross-cutting deferrals
+Table rows above: **42 done · 6 partial**, plus the cross-cutting deferrals
 (mobile, E2EE, macOS packaging execution, engine hardening) — the last
 overlaps the named gaps in the partial rows.
