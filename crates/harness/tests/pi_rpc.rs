@@ -898,6 +898,25 @@ async fn edit_diffs_come_from_pi_edits_array_and_transport_commands_stay_hidden(
     assert!(commands.iter().all(|c| !c.name.starts_with("pi_ui_")));
 }
 
+#[tokio::test]
+async fn displayed_custom_messages_become_transcript_chips() {
+    let events = collect("custom").await;
+    let chips: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCall {
+                id,
+                call: zeron_proto::ToolCall::Mcp { server, tool, .. },
+            } if server == "pi" => Some((id.clone(), tool.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(chips.len(), 1, "{events:?}");
+    assert_eq!(chips[0].1, "workflow-result");
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::ToolResult { id, output: Some(output), .. } if *id == chips[0].0 && output == "# Done")));
+}
+
 struct UiPort {
     state: tokio::sync::watch::Receiver<zeron_proto::extension_ui::ExtensionUiState>,
     actions: mpsc::UnboundedSender<zeron_proto::extension_ui::ExtensionUiAction>,

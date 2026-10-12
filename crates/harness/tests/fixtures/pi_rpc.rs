@@ -107,6 +107,17 @@ fn piui_event(args: &str) {
             (Some("ask-user:question"), Some("submit" | "cancel")) => {
                 piui(json!({"op":"remove","ns":"ask-user","id":"question"}))
             }
+            (Some("btw:thread"), Some("submit")) => {
+                let question = event["value"]["fields"]["q"].as_str().unwrap_or("").to_owned();
+                piui(btw_thread(json!([
+                    {"role":"user","text":"why is the sky blue?"},
+                    {"role":"assistant","text":"**Rayleigh scattering**: shorter wavelengths scatter more."},
+                    {"role":"user","text":question},
+                    {"role":"assistant","text":format!("btw:{question}")}])));
+            }
+            (Some("btw:thread"), Some("close")) => {
+                piui(json!({"op":"remove","ns":"btw","id":"thread"}))
+            }
             (Some("bash:jobs"), Some("kill")) => {
                 piui(json!({"op":"patch","ns":"bash","id":"jobs","patch":{"title":"Background bash · 0 running",
                     "rows":[{"id":"j1","label":"npm test","state":"error","detail":"killed"}]}}));
@@ -115,6 +126,17 @@ fn piui_event(args: &str) {
             _ => {}
         },
     }
+}
+/// The btw side thread, as a screen with a pinned question box.
+fn btw_thread(turns: Value) -> Value {
+    json!({"op":"set","el":{"id":"thread","ns":"btw","kind":"panel","placement":"screen","title":"btw",
+        "sections":[
+            {"kind":"meta","id":"btw-meta","text":"mock/mock · medium"},
+            {"kind":"turns","id":"btw-transcript","turns":turns},
+            {"kind":"form","id":"btw-composer","placement":"pinned",
+             "fields":[{"id":"q","kind":"text","placeholder":"Ask a side question"}],
+             "actions":[{"id":"submit","label":"Send","variant":"primary"}]}],
+        "actions":[{"id":"close","label":"Close"}]}})
 }
 fn queue_update(queue: &std::collections::VecDeque<String>) {
     emit(json!({"type":"queue_update","steering":queue,"followUp":[]}));
@@ -360,6 +382,15 @@ fn main() {
                                 json!({"type":"tool_execution_end","toolCallId":"edit-1","toolName":"edit","isError":false,"durationMs":3,"result":{"content":[{"type":"text","text":"Edited a.txt"}],"details":{"diff":"-one\n+uno"}}}),
                             );
                         }
+                        if text == "custom" {
+                            // Extensions deliver results as custom messages.
+                            for (kind, display) in [("workflow-result", true), ("jev-decompose", false)] {
+                                let message = json!({"role":"custom","customType":kind,"display":display,
+                                    "details":{"status":"completed"},"content":[{"type":"text","text":"# Done"}]});
+                                emit(json!({"type":"message_start","message":message}));
+                                emit(json!({"type":"message_end","message":message}));
+                            }
+                        }
                         if abort.load(Ordering::SeqCst) {
                             message("", "aborted");
                         } else if text == "error" {
@@ -400,6 +431,14 @@ fn main() {
                         );
                         if let Some(abort) = pending_abort.lock().unwrap().take() {
                             ack(&abort);
+                        }
+                        if text == "piui-btw" {
+                            std::thread::spawn(|| {
+                                std::thread::sleep(Duration::from_millis(30));
+                                piui(btw_thread(json!([
+                                    {"role":"user","text":"why is the sky blue?"},
+                                    {"role":"assistant","text":"**Rayleigh scattering**: shorter wavelengths scatter more."}])));
+                            });
                         }
                         if text == "piui-idle" {
                             // Fleets and timers publish between turns.

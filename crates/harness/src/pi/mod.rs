@@ -1151,6 +1151,11 @@ impl Runner {
                 self.confirm_delivery().await?;
             }
         }
+        // An extension message appended between turns must not reopen a
+        // completed engine turn; it is in Pi's history for the next one.
+        if !self.active && frame["message"]["role"] == "custom" {
+            return Ok(());
+        }
         for event in self.norm.map(&frame) {
             self.emit(event).await?;
         }

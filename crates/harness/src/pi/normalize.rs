@@ -11,6 +11,20 @@ pub(super) struct Normalizer {
     pub aborted: bool,
     pub window: Option<u64>,
 }
+
+/// The text of a message's `content` (a string, or text parts).
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
 impl Normalizer {
     pub fn reset(&mut self) {
         self.error = None;
@@ -33,6 +47,31 @@ impl Normalizer {
             "message_start" if frame["message"]["role"] == "assistant" => {
                 self.text.clear();
                 self.thinking.clear();
+            }
+            // An extension's message meant for the user (`display: true`:
+            // memory, workflow results, subagent deliveries) is a chip in the
+            // transcript: its type, details and content.
+            "message_end"
+                if frame["message"]["role"] == "custom" && frame["message"]["display"] == true =>
+            {
+                let message = &frame["message"];
+                let id = format!("pi-custom-{}", uuid::Uuid::new_v4());
+                let details = &message["details"];
+                events.push(AgentEvent::ToolCall {
+                    id: id.clone(),
+                    call: ToolCall::Mcp {
+                        server: "pi".into(),
+                        tool: string(message, "customType").into(),
+                        input: (!details.is_null()).then(|| details.clone()),
+                    },
+                });
+                let text = content_text(&message["content"]);
+                events.push(AgentEvent::ToolResult {
+                    id,
+                    is_error: false,
+                    output: (!text.is_empty()).then_some(text),
+                    diff: None,
+                });
             }
             "message_update" => {
                 let update = &frame["assistantMessageEvent"];
@@ -257,5 +296,38 @@ mod tests {
         let mut n = Normalizer::default();
         n.map(&json!({"type":"agent_settled","aborted":true}));
         assert_eq!(n.status(), DoneStatus::Interrupted);
+    }
+
+    #[test]
+    fn displayed_custom_messages_become_chips_and_hidden_ones_vanish() {
+        let mut n = Normalizer::default();
+        let events = n.map(&json!({"type":"message_end","message":{"role":"custom",
+            "customType":"workflow-result","display":true,"details":{"runId":"r1","status":"completed"},
+            "content":[{"type":"text","text":"# Done"},{"type":"image","data":""}]}}));
+        assert_eq!(events.len(), 2);
+        let AgentEvent::ToolCall {
+            id,
+            call:
+                ToolCall::Mcp {
+                    server,
+                    tool,
+                    input,
+                },
+        } = &events[0]
+        else {
+            panic!("{events:?}");
+        };
+        assert!(id.starts_with("pi-custom-"));
+        assert_eq!((server.as_str(), tool.as_str()), ("pi", "workflow-result"));
+        assert_eq!(input.as_ref().unwrap()["status"], "completed");
+        let AgentEvent::ToolResult { output, .. } = &events[1] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(output.as_deref(), Some("# Done"));
+        assert!(
+            n.map(&json!({"type":"message_end","message":{"role":"custom",
+            "customType":"jev-decompose","display":false,"content":"x"}}))
+                .is_empty()
+        );
     }
 }
