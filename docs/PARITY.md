@@ -54,6 +54,10 @@ not built yet).
 
 ## §4 Harness
 
+Since the Pi client fork only Pi (and the mock) are registered in production;
+the other adapters below stay in the tree, tested, behind
+`register_other_harnesses`.
+
 | Item | Status | Notes |
 | --- | --- | --- |
 | Claude Code adapter | done | stream-json, model discovery/effort ladders, AskUserQuestion → requestInput, steering via persistent input, init dedup, subagent filtering. **Live-verified against the real `claude` CLI 2.1.215**: doc-queued run → host executor → subprocess → streamed reply landed complete in the doc. |

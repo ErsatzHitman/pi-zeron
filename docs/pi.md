@@ -1,6 +1,8 @@
 # Pi native RPC
 
-Zeron is a front end for the Pi agent. It launches `pi --mode rpc` directly and
+Zeron is a front end for the Pi agent: Pi is the only harness it registers
+(the other adapters remain in the tree for tests, and chats created with them
+continue on Pi). It launches `pi --mode rpc` directly and
 requires Pi 1.1.0 or newer; an older Pi, or one whose `--version` cannot be
 read, is refused with a visible error. Protocol details and the acceptance
 barrier are in [PROTOCOL.md](../crates/harness/src/pi/PROTOCOL.md).
@@ -52,6 +54,10 @@ in Pi's global or trusted project settings (including one chosen with
 `/steering`) is never overwritten. Zeron confirms each original message only
 when Pi consumes it. Extension commands and inputs handled without a model run
 retain serialized delivery.
+
+Automatic chat titles use a throwaway Pi process with no session, tools,
+extensions, skills, prompt templates or context files; the title instructions
+are its whole system prompt. A failure falls back to the prompt's first words.
 
 Stop ends the turn in place: Zeron clears Pi's queues and sends `abort`, and
 the Pi process keeps running with its extensions, subagents and background
