@@ -244,6 +244,9 @@ fn main() {
                 if text == "env" {
                     text = format!("env:{}", std::env::var_os("CLAUDECODE").is_some());
                 }
+                if text == "args" {
+                    text = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+                }
                 if text == "which-model" {
                     text = format!("{model}/{thinking}");
                 }

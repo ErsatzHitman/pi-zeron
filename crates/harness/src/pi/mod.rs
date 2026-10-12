@@ -386,6 +386,85 @@ impl Harness for PiHarness {
             options: vec![],
         }]
     }
+    /// A throwaway process with no session, tools, extensions, skills,
+    /// templates or context files: the title instructions are its whole
+    /// system prompt and the request is its only input.
+    async fn run_title(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut args: Vec<String> = [
+            "--no-session",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--thinking",
+            "off",
+            "--system-prompt",
+            crate::TITLE_INSTRUCTIONS,
+        ]
+        .map(String::from)
+        .into();
+        if let Some(model) = request.model.as_deref().filter(|m| *m != "default") {
+            args.extend(["--model".into(), model.into()]);
+        }
+        let mut process = self.spawn(Path::new(&request.cwd), &args, None)?;
+        let grace = self.kill_grace;
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let result = async {
+                let mut backlog = vec![];
+                process
+                    .query(json!({"type":"prompt","message":request.prompt}), &mut backlog)
+                    .await?;
+                let mut norm = normalize::Normalizer::default();
+                let mut text = String::new();
+                let mut backlog = VecDeque::from(backlog);
+                loop {
+                    let frame = match backlog.pop_front() {
+                        Some(frame) => frame,
+                        None => process.next().await?,
+                    };
+                    if frame["type"] == "agent_settled" {
+                        break;
+                    }
+                    if frame["type"] == "tool_execution_start" {
+                        return Err(HarnessError::Protocol("Pi title run used a tool".into()));
+                    }
+                    for event in norm.map(&frame) {
+                        if let AgentEvent::TextDelta { text: delta } = event {
+                            text.push_str(&delta);
+                        }
+                    }
+                }
+                Ok((text, norm.status(), norm.error.clone()))
+            }
+            .await;
+            process.shutdown(grace).await;
+            let events = match result {
+                Ok((text, status, error)) => vec![
+                    Ok(AgentEvent::TextDelta { text }),
+                    Ok(AgentEvent::Done {
+                        status,
+                        result: None,
+                        error,
+                        session_id: None,
+                    }),
+                ],
+                Err(error) => vec![Err(error)],
+            };
+            for event in events {
+                let _ = tx.send(event).await;
+            }
+        });
+        Ok(
+            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) })
+                .boxed(),
+        )
+    }
     async fn run(
         &self,
         request: RunRequest,

@@ -899,6 +899,38 @@ async fn edit_diffs_come_from_pi_edits_array_and_transport_commands_stay_hidden(
 }
 
 #[tokio::test]
+async fn titles_run_in_a_bare_process_and_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, _tx, _) = controls();
+    let mut req = request(dir.path(), "args");
+    req.model = Some("mock/mock".into());
+    let events: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness().run_title(req, c).await.unwrap().map(Result::unwrap).collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    let AgentEvent::TextDelta { text } = &events[0] else {
+        panic!("{events:?}");
+    };
+    for flag in [
+        "--no-session",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--system-prompt",
+        "--model mock/mock",
+    ] {
+        assert!(text.contains(flag), "{flag} missing from {text}");
+    }
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done { status: DoneStatus::Completed, .. })
+    ));
+}
+
+#[tokio::test]
 async fn displayed_custom_messages_become_transcript_chips() {
     let events = collect("custom").await;
     let chips: Vec<_> = events
