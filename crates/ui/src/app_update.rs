@@ -429,12 +429,6 @@ pub fn strip_for(
 }
 
 /// "Check for Updates…" from a menu: surface the main window, then check.
-/// False in this fork: self-update is off ([`zeron_update::self_update_disabled`]),
-/// so no checker runs and every update control stays hidden.
-pub fn enabled() -> bool {
-    !zeron_update::self_update_disabled()
-}
-
 pub fn check_for_updates(cx: &mut App) {
     crate::activate_main_window(cx);
     if let Some(update) = AppUpdate::global(cx) {

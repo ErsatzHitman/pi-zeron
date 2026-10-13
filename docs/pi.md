@@ -23,6 +23,17 @@ authenticate Pi through its own CLI. `PI_CODING_AGENT_DIR` continues to control
 Pi settings, credentials and extensions. `PI_ACP_EXECUTABLE` and
 `PI_ACP_PI_COMMAND` are no longer used.
 
+## Updates
+
+Zeron for Pi updates itself from this fork's GitHub releases
+(`github.com/ErsatzHitman/pi-zeron/releases/latest/download`), never from
+upstream Zeron's feed. Each download is checked against the release's
+`manifest.json` sha256 and installs on "Restart to update" or at the next
+quit. The Windows zip and installer, the macOS app and a Linux `install.sh`
+install update in place; other copies (the bare Windows exe, source builds)
+get a link to the release page.
+`ZERON_RELEASES_URL` overrides the feed. Pi itself is never updated.
+
 ## Sessions
 
 Sessions retain their native UUID and JSONL history. Zeron records the UUID to

@@ -3,11 +3,11 @@
 //! (its own report-only checker, the "Check for Updates…" menu item, the
 //! sidebar update strip, and the desktop install paths).
 //!
-//! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
-//! artifacts live in the `comet-native-releases` R2 bucket, served pre-auth at
-//! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
-//! sha256 per artifact; `latest.txt` (version only) remains as the fallback for
-//! releases published before the manifest existed.
+//! Release layout (see `.github/workflows/release.yml`): this fork's artifacts
+//! are the assets of its GitHub releases, read through [`RELEASE_FEED`].
+//! `manifest.json` carries the latest version plus a sha256 per artifact;
+//! `latest.txt` (version only) remains as the fallback for releases published
+//! before the manifest existed.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.zeron/app/<ver>` + `current` symlink — the curl|sh
@@ -317,28 +317,18 @@ fn validate_release_override(value: &str) -> anyhow::Result<String> {
 /// The project's GitHub releases page — the advisory update strip opens this
 /// for unmanaged installs (source builds, hand-copied binaries), where no
 /// updater flow exists to drive.
-pub const RELEASES_PAGE: &str = "https://github.com/zeronsh/zeron/releases";
+pub const RELEASES_PAGE: &str = "https://github.com/ErsatzHitman/pi-zeron/releases";
 
 /// The newest release's page — the download destination offered when this
 /// installation cannot replace itself.
-pub const LATEST_RELEASE_PAGE: &str = "https://github.com/zeronsh/zeron/releases/latest";
+pub const LATEST_RELEASE_PAGE: &str = "https://github.com/ErsatzHitman/pi-zeron/releases/latest";
 
-/// This fork (pi-zeron) never updates from upstream Zeron releases: an
-/// upstream build would replace the fork. Every check, download and apply
-/// path resolves its release URL here, so this one gate covers them all.
-/// Unit tests keep exercising the machinery against local servers.
-pub const SELF_UPDATE_DISABLED: &str =
-    "self-update is disabled in this fork; rebuild it from source to update";
-
-/// True when release checks, downloads and installs are switched off.
-pub fn self_update_disabled() -> bool {
-    !cfg!(test)
-}
+/// This fork's release feed: GitHub serves every asset of the newest release
+/// (`manifest.json` included) under this base. The fork never reads upstream
+/// Zeron's `{edge}/releases`, whose builds would replace it.
+pub const RELEASE_FEED: &str = "https://github.com/ErsatzHitman/pi-zeron/releases/latest/download";
 
 fn release_base(edge_url: &str) -> anyhow::Result<String> {
-    if self_update_disabled() {
-        bail!(SELF_UPDATE_DISABLED);
-    }
     if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
         && !url.trim().is_empty()
     {
@@ -348,7 +338,16 @@ fn release_base(edge_url: &str) -> anyhow::Result<String> {
     if let Some(url) = windows::release_url()? {
         return Ok(url.trim_end_matches('/').to_owned());
     }
-    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
+    Ok(default_release_base(edge_url, cfg!(test)))
+}
+
+/// Unit tests serve releases from a local edge; real builds use [`RELEASE_FEED`].
+fn default_release_base(edge_url: &str, local_edge: bool) -> String {
+    if local_edge {
+        format!("{}/releases", edge_url.trim_end_matches('/'))
+    } else {
+        RELEASE_FEED.to_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,11 +1078,6 @@ impl Updater {
             shutdown_tx: Arc::new(shutdown_tx),
             check_task: Arc::new(std::sync::Mutex::new(None)),
         };
-        // No background polling at all while self-update is disabled: the
-        // status stays "up to date" and nothing is downloaded or restarted.
-        if self_update_disabled() {
-            return updater;
-        }
         // Subscribe before spawning so an immediate `check_now` cannot land
         // before the background task first polls and be lost behind the
         // initial delay.
@@ -1624,6 +1618,22 @@ mod tests {
         ] {
             assert!(validate_release_override(url).is_err(), "accepted {url}");
         }
+    }
+
+    #[test]
+    fn builds_update_from_the_forks_github_releases_never_upstreams_edge() {
+        assert_eq!(
+            default_release_base("https://edge.zeron.sh", false),
+            "https://github.com/ErsatzHitman/pi-zeron/releases/latest/download"
+        );
+        assert!(validate_release_override(RELEASE_FEED).is_ok());
+        for page in [RELEASES_PAGE, LATEST_RELEASE_PAGE] {
+            assert!(page.starts_with("https://github.com/ErsatzHitman/pi-zeron/releases"));
+        }
+        assert_eq!(
+            default_release_base("http://127.0.0.1:9/", true),
+            "http://127.0.0.1:9/releases"
+        );
     }
 
     #[test]

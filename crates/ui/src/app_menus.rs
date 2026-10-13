@@ -170,17 +170,13 @@ pub fn app_menus() -> Vec<Menu> {
     let mut app_items = vec![
         // The native AppKit about panel; no equivalent elsewhere yet.
         MenuItem::action("About Zeron", About).disabled(!macos),
-    ];
-    // Sparkle's placement: directly under About. Other platforms reach the
-    // same check from the account menu. Absent when self-update is off.
-    if crate::app_update::enabled() {
-        app_items.push(MenuItem::action("Check for Updates…", CheckForUpdates));
-    }
-    app_items.extend([
+        // Sparkle's placement: directly under About. Other platforms reach
+        // the same check from the account menu.
+        MenuItem::action("Check for Updates…", CheckForUpdates),
         MenuItem::separator(),
         MenuItem::action("Settings", shell::OpenSettings),
         MenuItem::separator(),
-    ]);
+    ];
     if macos {
         app_items.extend([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -282,14 +278,20 @@ mod tests {
     }
 
     #[test]
-    fn check_for_updates_is_absent_while_self_update_is_off() {
-        assert!(!crate::app_update::enabled());
+    fn check_for_updates_follows_about() {
         let menus = app_menus();
-        assert!(menus[0].items.iter().all(|item| !matches!(
-            item,
-            MenuItem::Action { action, .. } if action.name() == CheckForUpdates.name()
-        )));
-        assert!(matches!(menus[0].items.get(1), Some(MenuItem::Separator)));
+        let Some(MenuItem::Action {
+            name,
+            action,
+            disabled,
+            ..
+        }) = menus[0].items.get(1)
+        else {
+            panic!("second app-menu item must be an action");
+        };
+        assert_eq!(name.as_ref(), "Check for Updates…");
+        assert_eq!(action.name(), CheckForUpdates.name());
+        assert!(!disabled);
     }
 
     #[test]

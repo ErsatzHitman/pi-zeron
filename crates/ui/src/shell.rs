@@ -9965,9 +9965,7 @@ impl Shell {
                 })
                 // macOS keeps "Check for Updates…" in the app menu under
                 // About; elsewhere there is no app menu, so it lives here.
-                .when(
-                    !cfg!(target_os = "macos") && crate::app_update::enabled(),
-                    |menu| {
+                .when(!cfg!(target_os = "macos"), |menu| {
                     menu.child(
                         popover::menu_row(theme, false, "user-menu-check-updates")
                             .id("user-menu-check-updates")
