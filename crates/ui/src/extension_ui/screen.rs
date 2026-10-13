@@ -97,6 +97,8 @@ pub(crate) fn screen_icon(ns: &str) -> &'static str {
         "usage" | "clinepass" => icons::FILE_DATA,
         "workflows" => icons::FILE_MARKDOWN,
         "todo" => icons::CHECKLIST,
+        "llama" => icons::HARD_DRIVE,
+        "mcp" => icons::REMOTE_SERVER,
         _ => icons::WIDGET,
     }
 }
