@@ -9,7 +9,7 @@ import time
 import uuid
 
 if '--version' in sys.argv:
-    print('0.85.1')
+    print('1.1.0')
     sys.exit(0)
 
 resumed = '--session' in sys.argv

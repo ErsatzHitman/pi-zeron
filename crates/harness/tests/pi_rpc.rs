@@ -1063,7 +1063,14 @@ async fn piui_follows_watchers_flows_while_idle_and_round_trips_actions() {
     })
     .await;
     assert_eq!(state.elements[0]["title"], "Background bash · 0 running");
-    assert!(!turn.background_live());
+    // The fleet channel follows the patch in its own frame.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while turn.background_live() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("killing the last job frees the process");
 
     // The last watcher left: bye, and nothing stale lingers.
     ui.watched.send(false).unwrap();
@@ -1282,6 +1289,9 @@ async fn plain_extension_ui_requests_become_live_state() {
     let _: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
         .await
         .unwrap();
+    // The process's elements go with it; its last notice and draft stay.
     let state = wait_ui(&mut ui, "process closed", |s| s.statuses.is_empty()).await;
-    assert!(state.notices.is_empty() && state.editor_text.is_none());
+    assert!(state.widgets.is_empty());
+    assert_eq!(state.notices.len(), 1);
+    assert_eq!(state.editor_text.as_ref().unwrap().text, "rewritten prompt");
 }

@@ -23,7 +23,7 @@ async fn cli_on_login_shell_path_only_is_resolved() {
     std::fs::create_dir(&shell_bin).unwrap();
     write_executable(&shell_bin.join("devin"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("hermes"), "#!/bin/sh\nexit 0\n");
-    // Native discovery prefers the newest installed version; outrank any real CLI.
+    // On the login-shell PATH, but Pi must still be configured explicitly.
     write_executable(&shell_bin.join("pi"), "#!/bin/sh\necho 9999.0.0\n");
     write_executable(&shell_bin.join("claude"), "#!/bin/sh\nexit 0\n");
 
@@ -78,8 +78,10 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         .launch_program()
         .expect("hermes resolves via login-shell PATH");
     assert_eq!(hermes, shell_bin.join("hermes"), "{hermes:?}");
-    let pi = zeron_harness::PiHarness::new()
-        .resolve_executable()
-        .expect("pi resolves via login-shell PATH");
-    assert_eq!(pi, shell_bin.join("pi"), "{pi:?}");
+    // Pi is the exception: it is never looked up on PATH, only configured.
+    let pi = zeron_harness::PiHarness::new().resolve_executable();
+    assert!(
+        pi.is_err(),
+        "pi must not resolve via login-shell PATH: {pi:?}"
+    );
 }
