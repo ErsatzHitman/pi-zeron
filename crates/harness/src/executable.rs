@@ -144,7 +144,12 @@ fn newest_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
 }
 
 type VersionKey = (PathBuf, Option<std::time::SystemTime>, u64);
-type VersionEntry = (Option<semver::Version>, std::collections::HashSet<String>);
+/// The version, the names the file was probed under, and the probe deadline.
+type VersionEntry = (
+    Option<semver::Version>,
+    std::collections::HashSet<String>,
+    std::time::Duration,
+);
 static VERSION_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<VersionKey, VersionEntry>>,
 > = std::sync::OnceLock::new();
@@ -156,7 +161,7 @@ pub(crate) fn invalidate_versions(names: &[&str]) {
         cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, (_, aliases)| !names.iter().any(|name| aliases.contains(*name)));
+            .retain(|_, (_, aliases, _)| !names.iter().any(|name| aliases.contains(*name)));
     }
 }
 
@@ -183,9 +188,13 @@ pub fn binary_version_within(path: &Path, limit: std::time::Duration) -> Option<
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    if let Some((version, aliases)) = cache.get_mut(&key) {
-        aliases.insert(alias);
-        return version.clone();
+    if let Some((version, aliases, probed_within)) = cache.get_mut(&key) {
+        aliases.insert(alias.clone());
+        // A failure under a shorter deadline says nothing about a longer one:
+        // Pi run from source can miss the default 2 s on a busy machine.
+        if version.is_some() || *probed_within >= limit {
+            return version.clone();
+        }
     }
     #[cfg(not(windows))]
     let probe = || -> Option<semver::Version> {
@@ -278,8 +287,15 @@ pub fn binary_version_within(path: &Path, limit: std::time::Duration) -> Option<
         .flatten()
     };
     let version = probe();
-    cache.retain(|(p, _, _), _| p != &key.0);
-    cache.insert(key, (version.clone(), [alias].into_iter().collect()));
+    let mut aliases: std::collections::HashSet<String> = [alias].into_iter().collect();
+    cache.retain(|(p, _, _), (_, known, _)| {
+        if p == &key.0 {
+            aliases.extend(known.drain());
+            return false;
+        }
+        true
+    });
+    cache.insert(key, (version.clone(), aliases, limit));
     version
 }
 
@@ -661,6 +677,33 @@ mod tests {
             assert!(started.elapsed() < std::time::Duration::from_secs(3));
             assert_eq!(newest_candidate(vec![path.clone()]), Some(path));
         }
+    }
+
+    #[test]
+    fn a_short_probe_failure_does_not_hide_a_slow_launcher_from_a_longer_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let path = {
+            let path = dir.path().join("slow-pi.cmd");
+            std::fs::write(&path, "@ping -n 4 127.0.0.1 >nul\r\n@echo 1.2.3\r\n").unwrap();
+            path
+        };
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join("slow-pi");
+            std::fs::write(&path, "#!/bin/sh\nsleep 3\necho 1.2.3\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        assert_eq!(binary_version(&path), None);
+        let within = std::time::Duration::from_secs(20);
+        assert_eq!(
+            binary_version_within(&path, within).map(|v| v.to_string()),
+            Some("1.2.3".into())
+        );
+        // Now known, the short probe answers from the cache.
+        assert_eq!(binary_version(&path).unwrap().to_string(), "1.2.3");
     }
 
     fn env(values: &[(&str, OsString)]) -> impl Fn(&str) -> Option<OsString> + use<> {
