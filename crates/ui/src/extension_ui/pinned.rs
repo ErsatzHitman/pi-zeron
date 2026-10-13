@@ -116,6 +116,42 @@ fn working(element: &PiUiElement) -> bool {
     }) || element.kind != PiUiKind::Roster
 }
 
+/// What a footer chip says about an element still at work: `Background
+/// bash · 2 running`, `Advisor · working`; `None` once it is idle.
+fn busy_text(element: &PiUiElement) -> Option<String> {
+    let running = roster_rows(element)
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.state,
+                Some(PiUiRowState::Running | PiUiRowState::Waiting)
+            )
+        })
+        .count();
+    let busy = running > 0
+        || element.extra_str("state") == Some("running")
+        || element.sections.iter().any(|s| {
+            matches!(s, PiUiSection::Status { tone, .. }
+                if *tone == Some(zeron_proto::extension_ui::PiUiTone::Busy))
+        });
+    if !busy {
+        return None;
+    }
+    // A title that already counts its work (`Background bash · 1 running`)
+    // gives its name only.
+    let name = element
+        .title
+        .as_deref()
+        .map(|title| title.split(" · ").next().unwrap_or(title).trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| zeron_proto::view::pi_extension_label(&element.ns).to_owned());
+    Some(match running {
+        0 => format!("{name} · working"),
+        n => format!("{name} · {n} running"),
+    })
+}
+
 /// The one line a collapsed tray shows after its title.
 fn summary(element: &PiUiElement) -> Option<String> {
     if let Some(text) = element
@@ -189,6 +225,25 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
                 // Zeron's own chips (Pi retrying a request) stand out.
                 active: s.key.starts_with("zeron:"),
                 action: None,
+            }),
+    );
+    // Work an extension goes on with between turns (background jobs, a
+    // fleet, the advisor's review) has its row in the last turn; the footer
+    // says it is still going.
+    chips.extend(
+        state
+            .typed_elements()
+            .into_iter()
+            .filter(|e| matches!(e.placement, PiUiPlacement::Pinned | PiUiPlacement::Inline))
+            .filter(|e| e.kind != PiUiKind::Status && e.ns != "todo")
+            .filter_map(|e| {
+                let text = busy_text(&e)?;
+                Some(Chip {
+                    key: format!("work:{}", e.key()),
+                    text,
+                    active: true,
+                    action: None,
+                })
             }),
     );
     if let Some(goal) = state.channels.get("pi-goal:status")
@@ -628,6 +683,7 @@ mod tests {
                 "Plan",
                 "Build",
                 "Retrying · attempt 1/3",
+                "Background bash · 1 running",
                 "Goal · ship it",
                 "42 tok/s · $0.042"
             ]
