@@ -93,8 +93,20 @@ pub(crate) fn screen_icon(ns: &str) -> &'static str {
     match ns {
         "btw" => icons::CHAT_ROUND_LINE,
         "subagents" => icons::BOT,
+        "workspace" => icons::TUNING,
+        "usage" | "clinepass" => icons::FILE_DATA,
+        "workflows" => icons::FILE_MARKDOWN,
+        "todo" => icons::CHECKLIST,
         _ => icons::WIDGET,
     }
+}
+
+/// Header actions that no longer fit beside the title (the usage dashboard's
+/// period buttons) move to a wrapping toolbar under it.
+const HEADER_ACTIONS: usize = 3;
+
+fn actions_in_toolbar(element: &PiUiElement) -> bool {
+    element.actions.len() > HEADER_ACTIONS
 }
 
 impl ScreenView {
@@ -274,6 +286,19 @@ impl Render for ScreenView {
         let key = element.key();
         let form = composer_form(&element);
 
+        let toolbar = actions_in_toolbar(&element);
+        let action_buttons = || {
+            element.actions.iter().enumerate().map(|(ix, action)| {
+                parts::action_button(
+                    &theme,
+                    SharedString::from(format!("{key}-screen-action-{ix}")),
+                    &key,
+                    None,
+                    action,
+                    &actions,
+                )
+            })
+        };
         let header = div()
             .flex_none()
             .px(px(12.0))
@@ -312,16 +337,20 @@ impl Render for ScreenView {
                         )
                     }),
             )
-            .children(element.actions.iter().enumerate().map(|(ix, action)| {
-                parts::action_button(
-                    &theme,
-                    SharedString::from(format!("{key}-screen-action-{ix}")),
-                    &key,
-                    None,
-                    action,
-                    &actions,
-                )
-            }));
+            .when(!toolbar, |el| el.children(action_buttons()));
+        let toolbar = toolbar.then(|| {
+            div()
+                .flex_none()
+                .px(px(12.0))
+                .py(px(6.0))
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.0))
+                .border_b_1()
+                .border_color(theme.hairline(0.06))
+                .children(action_buttons())
+        });
 
         let mut body = Vec::new();
         for (ix, section) in element.sections.iter().enumerate() {
@@ -394,6 +423,7 @@ impl Render for ScreenView {
             .flex()
             .flex_col()
             .child(header)
+            .children(toolbar)
             .children(parts::confirm_row(&theme, &key, &actions))
             .child(
                 div()
@@ -523,5 +553,27 @@ mod tests {
         .unwrap();
         assert!(composer_form(&viewer).is_none());
         assert_eq!(screen_title(&viewer), "sub-agent scout");
+        assert!(!actions_in_toolbar(&viewer));
+    }
+
+    #[test]
+    fn many_actions_wrap_into_a_toolbar_and_known_screens_get_icons() {
+        let actions: Vec<_> = ["today", "week", "lastweek", "30d", "all"]
+            .iter()
+            .map(|p| json!({"id": format!("period:{p}"), "label": p}))
+            .chain([
+                json!({"id":"refresh","label":"Refresh"}),
+                json!({"id":"close","label":"Close"}),
+            ])
+            .collect();
+        let usage: PiUiElement = serde_json::from_value(json!({"id":"dashboard","ns":"usage",
+            "kind":"panel","placement":"screen","title":"Usage · Today","sections":[],
+            "actions": actions}))
+        .unwrap();
+        assert!(actions_in_toolbar(&usage));
+        assert_eq!(screen_icon("usage"), icons::FILE_DATA);
+        assert_eq!(screen_icon("workspace"), icons::TUNING);
+        assert_eq!(screen_icon("workflows"), icons::FILE_MARKDOWN);
+        assert_eq!(screen_icon("someone-else"), icons::WIDGET);
     }
 }

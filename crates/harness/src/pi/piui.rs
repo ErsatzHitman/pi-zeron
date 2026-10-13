@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
+
+use crate::redact::strip_ansi;
 use zeron_proto::extension_ui::{
     DurableElement, ExtensionNotice, ExtensionStatus, ExtensionUiAction, ExtensionUiState,
     ExtensionWidget, NOTICE_HISTORY, NoticeLevel, SequencedText,
@@ -162,9 +164,11 @@ impl ExtensionUi {
         };
         let (fields, actions) = match method {
             "select" => {
+                // The value goes back verbatim (Pi matches it against its own
+                // options); only the label loses terminal escapes.
                 let choices: Vec<Value> = options
                     .iter()
-                    .map(|o| json!({"value":o,"label":o}))
+                    .map(|o| json!({"value":o,"label":strip_ansi(o)}))
                     .collect();
                 let searchable = choices.len() > 7;
                 (
@@ -185,12 +189,12 @@ impl ExtensionUi {
         };
         let mut element = json!({
             "id":id, "ns":DIALOG_NS, "kind":"panel", "placement":"sheet",
-            "title":frame["title"].as_str().unwrap_or("Pi"),
+            "title":strip_ansi(frame["title"].as_str().unwrap_or("Pi")),
             "sections":[{"kind":"form","id":"dialog","fields":fields,"actions":actions}],
             "actions":[{"id":"cancel","label":"Cancel","variant":"secondary"}],
         });
         if let Some(message) = frame["message"].as_str().filter(|m| !m.is_empty()) {
-            element["text"] = json!(message);
+            element["text"] = json!(strip_ansi(message));
         }
         self.dialogs.push(HostDialog {
             key: format!("{DIALOG_NS}:{id}"),
@@ -282,6 +286,9 @@ impl ExtensionUi {
                     }
                     return Handled::Consumed;
                 }
+                // Extensions colour terminal output (and OSC-8 link it); a GUI
+                // shows the plain text.
+                let message = strip_ansi(&message);
                 let level = match frame["notifyType"].as_str() {
                     Some("warning") => NoticeLevel::Warning,
                     Some("error") => NoticeLevel::Error,
@@ -302,13 +309,13 @@ impl ExtensionUi {
                 let key = text("statusKey");
                 let statuses = &mut self.state.statuses;
                 match frame["statusText"].as_str() {
-                    Some(value) => match statuses.iter_mut().find(|s| s.key == key) {
-                        Some(status) => status.text = value.into(),
-                        None => statuses.push(ExtensionStatus {
-                            key,
-                            text: value.into(),
-                        }),
-                    },
+                    Some(value) => {
+                        let value = strip_ansi(value);
+                        match statuses.iter_mut().find(|s| s.key == key) {
+                            Some(status) => status.text = value,
+                            None => statuses.push(ExtensionStatus { key, text: value }),
+                        }
+                    }
                     None => statuses.retain(|s| s.key != key),
                 }
                 self.publish();
@@ -323,7 +330,7 @@ impl ExtensionUi {
                             key: key.clone(),
                             lines: lines
                                 .iter()
-                                .map(|line| line.as_str().unwrap_or("").to_owned())
+                                .map(|line| strip_ansi(line.as_str().unwrap_or("")))
                                 .collect(),
                             placement: frame["widgetPlacement"].as_str().map(str::to_owned),
                         };
@@ -341,7 +348,7 @@ impl ExtensionUi {
                 let seq = self.next_seq();
                 self.state.title = Some(SequencedText {
                     seq,
-                    text: text("title"),
+                    text: strip_ansi(&text("title")),
                 });
                 self.publish();
                 Handled::Consumed
@@ -717,5 +724,35 @@ mod tests {
         assert_eq!(state.editor_text.as_ref().unwrap().text, "draft");
         ui.handle(&json!({"method":"setWidget","widgetKey":"btw"}));
         assert!(ui.state().widgets.is_empty());
+    }
+
+    #[test]
+    fn terminal_escapes_are_stripped_from_plain_ui_but_select_values_stay_verbatim() {
+        let (tx, rx) = watch::channel(ExtensionUiState::default());
+        let mut ui = ExtensionUi::new(Some(tx));
+        let red = "\u{1b}[31mred\u{1b}[39m";
+        let link = "\u{1b}]8;;https://x.test\u{7}docs\u{1b}]8;;\u{7}";
+        assert_eq!(
+            ui.handle(&json!({"method":"notify","message":format!("{red} {link}")})),
+            Handled::Notice("red docs".into())
+        );
+        ui.handle(&json!({"method":"setStatus","statusKey":"mcp","statusText":red}));
+        ui.handle(&json!({"method":"setWidget","widgetKey":"w","widgetLines":[red]}));
+        ui.handle(&json!({"method":"setTitle","title":red}));
+        let state = ui.state();
+        assert_eq!(state.statuses[0].text, "red");
+        assert_eq!(state.widgets[0].lines, vec!["red"]);
+        assert_eq!(state.title.as_ref().unwrap().text, "red");
+
+        ui.open_dialog(
+            &json!({"id":"s","method":"select","title":red,"message":link,
+            "options":[red, "plain"]}),
+        );
+        let sheet = serde_json::to_value(rx.borrow().elements.last().cloned().unwrap()).unwrap();
+        assert_eq!(sheet["title"], "red");
+        assert_eq!(sheet["text"], "docs");
+        let choice = &sheet["sections"][0]["fields"][0]["options"][0];
+        assert_eq!(choice["label"], "red");
+        assert_eq!(choice["value"], red);
     }
 }

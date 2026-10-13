@@ -60,6 +60,9 @@ fn tray_elements(state: &ExtensionUiState, screens: bool) -> Vec<PiUiElement> {
 }
 
 fn tray_icon(element: &PiUiElement) -> &'static str {
+    if element.placement == PiUiPlacement::Screen {
+        return super::screen_icon(&element.ns);
+    }
     match (element.ns.as_str(), element.kind) {
         ("todo", _) => icons::CHECKLIST,
         ("subagents", _) => icons::BOT,
@@ -89,8 +92,19 @@ fn roster_rows(element: &PiUiElement) -> Vec<&zeron_proto::extension_ui::PiUiRos
         .unwrap_or_default()
 }
 
-/// Whether the element reports live work (it opens by default).
+/// Whether the element reports live work (it opens by default). A screen's
+/// tray only previews it while it is busy; its tab holds the full view.
 fn working(element: &PiUiElement) -> bool {
+    if element.placement == PiUiPlacement::Screen {
+        return element.extra_str("state") == Some("running")
+            || element.sections.iter().any(|s| match s {
+                PiUiSection::Status { tone, .. } => {
+                    *tone == Some(zeron_proto::extension_ui::PiUiTone::Busy)
+                }
+                PiUiSection::Turns { turns, .. } => turns.iter().any(|t| t.streaming),
+                _ => false,
+            });
+    }
     roster_rows(element).iter().any(|row| {
         matches!(
             row.state,
@@ -160,11 +174,15 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
             })
         })
         .collect();
+    // Extensions with a status element often also set a plain status line for
+    // clients without PIUI (plan mode's "!mode"); show the text once.
+    let element_texts: Vec<String> = chips.iter().map(|c| c.text.clone()).collect();
     chips.extend(
         state
             .statuses
             .iter()
             .filter(|s| !s.text.trim().is_empty())
+            .filter(|s| !element_texts.iter().any(|t| t == s.text.trim()))
             .map(|s| Chip {
                 key: format!("status:{}", s.key),
                 text: s.text.trim().to_owned(),
@@ -385,16 +403,20 @@ impl Composer {
             .items_center()
             .gap(px(2.0))
             .child(toggle)
-            .children(element.actions.iter().enumerate().map(|(ix, action)| {
-                parts::action_button(
-                    theme,
-                    SharedString::from(format!("{key}-tray-action-{ix}")),
-                    &key,
-                    None,
-                    action,
-                    actions,
-                )
-            }))
+            // A screen with a toolbar of actions keeps them in its tab: the
+            // tray row has room for the title and a few buttons at most.
+            .when(!is_screen || element.actions.len() <= 3, |el| {
+                el.children(element.actions.iter().enumerate().map(|(ix, action)| {
+                    parts::action_button(
+                        theme,
+                        SharedString::from(format!("{key}-tray-action-{ix}")),
+                        &key,
+                        None,
+                        action,
+                        actions,
+                    )
+                }))
+            })
             .into_any_element()
     }
 
@@ -596,5 +618,43 @@ mod tests {
         assert!(!working(&element));
         assert_eq!(summary(&element).as_deref(), Some("1 finished"));
         assert_eq!(tray_icon(&element), icons::BOT);
+    }
+
+    #[test]
+    fn a_status_line_repeating_an_element_chip_shows_once() {
+        let state = ExtensionUiState {
+            elements: vec![
+                json!({"id":"mode","ns":"plan","kind":"status","placement":"status",
+                "text":"Build","mode":"build"}),
+            ],
+            statuses: vec![
+                ExtensionStatus {
+                    key: "!mode".into(),
+                    text: "Build".into(),
+                },
+                ExtensionStatus {
+                    key: "rtk".into(),
+                    text: "RTK on".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let texts: Vec<String> = footer_chips(&state).into_iter().map(|c| c.text).collect();
+        assert_eq!(texts, vec!["Build", "RTK on"]);
+    }
+
+    #[test]
+    fn a_screen_tray_previews_only_while_busy_and_wears_its_screen_icon() {
+        let idle: PiUiElement = serde_json::from_value(json!({"id":"dashboard","ns":"usage",
+            "kind":"panel","placement":"screen","title":"Usage · Today",
+            "sections":[{"kind":"status","id":"total","text":"$0.00"}]}))
+        .unwrap();
+        assert!(!working(&idle));
+        assert_eq!(tray_icon(&idle), icons::FILE_DATA);
+        let streaming: PiUiElement = serde_json::from_value(json!({"id":"thread","ns":"btw",
+            "kind":"panel","placement":"screen","title":"btw",
+            "sections":[{"kind":"turns","id":"t","turns":[{"role":"assistant","text":"…","streaming":true}]}]}))
+        .unwrap();
+        assert!(working(&streaming));
     }
 }
