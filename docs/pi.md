@@ -106,7 +106,7 @@ live state; it never enters the synced chat document.
 | --- | --- |
 | `sheet` (ask-user, decisions, model picker, idle Pi dialogs) | the prompt panel in the composer's place; keyboard picks, Enter submits, Esc cancels |
 | `screen` (btw, subagent viewer, `/usage`, `/workspace`, `/workflow` reports, `/clinepass`, `/llama-models`, `/mcp-servers`) | the prompt panel too, drawn like the question panel: header, the body scrolling under it (btw's thread in the chat's own bubbles), and its form as the panel's input row. The X (or Esc) closes it; Esc stops a streaming btw reply first. More than three actions wrap into a toolbar |
-| `pinned`, `inline` (advisor, Jev and decision cards, bash jobs, subagent fleet, workflows, todo), `setWidget` | the agent's own work: a `pi` tool row in the turn's transcript, like a command or a read (see below) |
+| `pinned`, `inline` (advisor, Jev and decision cards, bash jobs, subagent fleet, workflows, todo), `setWidget` | the agent's own work: a `pi` tool row in the turn's transcript, like a command or a read (see below). While the element is up, its live controls (Kill a job, Stop or Pause a workflow, Cancel the advisor, Open the web curator) sit at the row's right end; one that asks first takes a second click |
 | `status`, `setStatus`, goal/footer channels, plan mode | chips in the composer footer (a `setStatus` line repeating an element chip shows once) |
 | `notify` (plain) | during a turn, a `pi · notice` row in the transcript; between turns, a toast. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
 | `setTitle` | renames the chat |

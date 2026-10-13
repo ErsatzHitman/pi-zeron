@@ -955,6 +955,78 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
     })
 }
 
+/// Live controls a Pi extension row offers at most.
+const PI_CONTROLS_MAX: usize = 3;
+
+/// The element a Pi extension row records (`pi-ui-<run>-<n>-<ns:id>`);
+/// notices and plain widgets have none.
+fn pi_element_key(part_id: &str) -> Option<&str> {
+    let rest = &part_id[part_id.find("pi-ui-")? + "pi-ui-".len()..];
+    rest.splitn(3, '-')
+        .nth(2)
+        .filter(|key| key.contains(':') && !key.starts_with("widget:"))
+}
+
+/// One thing the user can still do from a Pi extension's row.
+#[derive(Debug, Clone, PartialEq)]
+struct PiControl {
+    row: Option<String>,
+    action: String,
+    label: String,
+    confirm: Option<String>,
+    danger: bool,
+}
+
+/// What a live element lets the user do from its row: kill a background
+/// job, stop a workflow, cancel the advisor. Closing or dismissing a panel
+/// means nothing for a row, and finished roster rows offer nothing.
+fn pi_controls(element: &zeron_proto::extension_ui::PiUiElement) -> Vec<PiControl> {
+    use zeron_proto::extension_ui::{PiUiAction, PiUiRowState, PiUiSection, PiUiVariant};
+    let control = |row: Option<(&str, &str)>, action: &PiUiAction| {
+        let name = if action.label.is_empty() {
+            action.id.clone()
+        } else {
+            action.label.clone()
+        };
+        PiControl {
+            row: row.map(|(id, _)| id.to_owned()),
+            action: action.id.clone(),
+            label: match row {
+                Some((_, label)) if !label.is_empty() => format!("{name} {label}"),
+                _ => name,
+            },
+            confirm: action.confirm.clone(),
+            danger: action.variant == Some(PiUiVariant::Danger),
+        }
+    };
+    let mut controls: Vec<PiControl> = element
+        .actions
+        .iter()
+        .filter(|action| !action.disabled && !matches!(action.id.as_str(), "close" | "dismiss"))
+        .map(|action| control(None, action))
+        .collect();
+    for section in &element.sections {
+        let PiUiSection::Roster { rows, .. } = section else {
+            continue;
+        };
+        for row in rows.iter().filter(|row| {
+            matches!(
+                row.state,
+                Some(PiUiRowState::Running | PiUiRowState::Waiting)
+            )
+        }) {
+            controls.extend(
+                row.actions
+                    .iter()
+                    .filter(|action| !action.disabled && action.id != "select")
+                    .map(|action| control(Some((row.id.as_str(), row.label.as_str())), action)),
+            );
+        }
+    }
+    controls.truncate(PI_CONTROLS_MAX);
+    controls
+}
+
 /// A Pi extension row's body: its `lines`, else its `message`.
 fn pi_extension_text(input: Option<&serde_json::Value>) -> Option<String> {
     let input = input?;
@@ -3192,6 +3264,8 @@ pub struct Transcript {
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
     tool_details: HashMap<SharedString, FoldState>,
+    /// A Pi row control waiting for its confirming second click.
+    pi_confirm: Option<SharedString>,
     /// Expand/collapse state for user bubbles past [`USER_COLLAPSED_LINES`],
     /// keyed by row id. Render-local like `folds` — never part of the row
     /// fingerprint, so toggling one costs a repaint, not a rebuild.
@@ -3485,6 +3559,113 @@ impl Transcript {
     /// File badges on tool chips open through the same workspace-link route
     /// as Markdown file links, so only chats with a link handler get
     /// clickable badges.
+    /// The live controls of a Pi extension's row while its element is up,
+    /// drawn over the row's right end (rows keep their measured heights).
+    fn pi_row_controls(
+        &mut self,
+        tool: &ToolItem,
+        id: &str,
+        height: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let ToolCall::Mcp { server, .. } = &tool.call else {
+            return None;
+        };
+        if server != zeron_proto::view::PI_EXTENSION_SERVER {
+            return None;
+        }
+        let key = pi_element_key(&tool.part_id)?.to_owned();
+        let controls = {
+            let state = self.state.read(cx);
+            let chat = state.selected_chat.as_deref()?;
+            let element = state
+                .extension_ui
+                .of(chat)?
+                .typed_elements()
+                .into_iter()
+                .find(|element| element.key() == key)?;
+            pi_controls(&element)
+        };
+        if controls.is_empty() {
+            return None;
+        }
+        let buttons: Vec<AnyElement> = controls
+            .into_iter()
+            .enumerate()
+            .map(|(ix, control)| {
+                let button = SharedString::from(format!("{id}-{ix}"));
+                let armed = self.pi_confirm.as_ref() == Some(&button);
+                let label = if armed {
+                    control.confirm.clone().unwrap_or_else(|| "Confirm".into())
+                } else {
+                    control.label.clone()
+                };
+                let color = if control.danger || armed {
+                    theme.danger
+                } else {
+                    theme.text_muted
+                };
+                let key = key.clone();
+                let armed_id = button.clone();
+                div()
+                    .id(button)
+                    .flex_none()
+                    .max_w(px(180.0))
+                    .h(px(20.0))
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.08))
+                    .bg(theme.bg)
+                    .hover(|style| style.bg(theme.element_hover))
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label(SharedString::from(label.clone()))
+                    .text_size(px(11.5))
+                    .text_color(color)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        // An action that asks first takes a second click.
+                        if control.confirm.is_some() && this.pi_confirm.as_ref() != Some(&armed_id)
+                        {
+                            this.pi_confirm = Some(armed_id.clone());
+                            cx.notify();
+                            return;
+                        }
+                        this.pi_confirm = None;
+                        let action = zeron_proto::extension_ui::ExtensionUiAction {
+                            element_id: key.clone(),
+                            action_id: control.action.clone(),
+                            value: control
+                                .row
+                                .as_ref()
+                                .map(|row| serde_json::json!({ "rowId": row })),
+                            row_id: control.row.clone(),
+                        };
+                        this.state
+                            .update(cx, |state, cx| state.extension_ui_action(action, cx));
+                        cx.notify();
+                    }))
+                    .child(div().min_w_0().truncate().child(SharedString::from(label)))
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            div()
+                .h(px(height))
+                .pl(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .bg(theme.bg)
+                .children(buttons)
+                .into_any_element(),
+        )
+    }
+
     fn tool_file_opener(&mut self, cx: &mut Context<Self>) -> Option<ToolFileOpener> {
         self.link_ui(cx).map(|link| ToolFileOpener { link })
     }
@@ -3595,6 +3776,7 @@ impl Transcript {
             last_replay_baseline: None,
             historical_markdown: HashMap::new(),
             tool_details: HashMap::new(),
+            pi_confirm: None,
             user_folds: HashMap::new(),
             user_heights: HashMap::new(),
             user_hold_task: None,
@@ -8277,7 +8459,33 @@ impl Transcript {
                 .into_any_element();
         }
 
+        // A Pi extension row's live controls float over its right end, placed
+        // by the measured row heights so no row changes size.
+        let mut pi_controls: Vec<AnyElement> = Vec::new();
+        let mut row_top = CHIPS_TOP_PAD;
+        for (ix, tool) in tools.iter().enumerate() {
+            if reveal_progress[ix] >= 1.0
+                && let Some(controls) = self.pi_row_controls(
+                    tool,
+                    &format!("{row_id}#pi{ix}"),
+                    base_row_height,
+                    theme,
+                    cx,
+                )
+            {
+                pi_controls.push(
+                    div()
+                        .absolute()
+                        .top(px(row_top))
+                        .right_0()
+                        .child(controls)
+                        .into_any_element(),
+                );
+            }
+            row_top += row_heights[ix] * reveal_progress[ix] + CHIP_GAP;
+        }
         let chips = div()
+            .relative()
             .pt(px(CHIPS_TOP_PAD))
             .flex()
             .flex_col()
@@ -8488,7 +8696,8 @@ impl Transcript {
                     }))
                     .into_any_element();
                 reveal_tool_row(row, row_height, reveal)
-            }));
+            }))
+            .children(pi_controls);
 
         let chips = chips.into_any_element();
 
@@ -16128,5 +16337,46 @@ impl Transcript {
         if let Some(action) = action {
             self.dispatch_image_menu(action, cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod pi_row_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_pi_row_finds_its_element_and_offers_its_live_controls() {
+        assert_eq!(
+            pi_element_key("pi-ui-0a1b2c3d-4-advisor-live-panel:panel"),
+            Some("advisor-live-panel:panel")
+        );
+        assert_eq!(pi_element_key("pi-ui-0a1b2c3d-5-notice"), None);
+        assert_eq!(
+            pi_element_key("pi-ui-0a1b2c3d-6-widget:jev-decompose"),
+            None
+        );
+        assert_eq!(pi_element_key("call_1"), None);
+        let jobs: zeron_proto::extension_ui::PiUiElement = serde_json::from_value(json!({
+            "id":"jobs","ns":"bash","kind":"roster","placement":"pinned",
+            "actions":[{"id":"close","label":"Close"}],
+            "sections":[{"kind":"roster","rows":[
+                {"id":"j1","label":"npm test","state":"running",
+                 "actions":[{"id":"kill","label":"Kill","variant":"danger","confirm":"Kill npm test?"}]},
+                {"id":"j2","label":"build","state":"done","actions":[{"id":"kill","label":"Kill"}]}]}]
+        }))
+        .unwrap();
+        let controls = pi_controls(&jobs);
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].label, "Kill npm test");
+        assert_eq!(controls[0].row.as_deref(), Some("j1"));
+        assert_eq!(controls[0].confirm.as_deref(), Some("Kill npm test?"));
+        assert!(controls[0].danger);
+        let card: zeron_proto::extension_ui::PiUiElement = serde_json::from_value(json!({
+            "id":"card","ns":"jev","kind":"panel","placement":"pinned",
+            "actions":[{"id":"dismiss","label":"Dismiss"}]
+        }))
+        .unwrap();
+        assert!(pi_controls(&card).is_empty());
     }
 }
