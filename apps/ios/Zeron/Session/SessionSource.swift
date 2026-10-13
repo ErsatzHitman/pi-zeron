@@ -22,6 +22,8 @@ struct SessionChrome: Equatable {
         let multiSelect: Bool
         var prefill: String? = nil
         var multiline: Bool = false
+        /// A credential (an API key): typed as dots.
+        var secret: Bool = false
     }
 
     /// Attachment upload progress (0…1) while images are escorted to the

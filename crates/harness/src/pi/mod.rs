@@ -527,6 +527,8 @@ impl Harness for PiHarness {
                 extension_commands: HashSet::new(),
                 pi_commands: HashSet::new(),
                 auto_compaction: true,
+                live_model: request.model.clone().filter(|model| model != "default"),
+                refresh_commands: false,
                 initial_pending: true,
                 deliveries: VecDeque::new(),
                 native_queue: Vec::new(),
@@ -597,6 +599,9 @@ enum Pending {
     Command(u64),
     EmptyEntries(u64, String),
     EmptyState(u64, String, bool),
+    /// The command list again, after a slash command that may change it
+    /// (`/reload`, an extension that registers commands).
+    Commands,
 }
 struct Delivery {
     epoch: u64,
@@ -609,6 +614,12 @@ struct Runner {
     /// Each shadows Zeron's built-in mapping of the same name.
     pi_commands: HashSet<String>,
     auto_compaction: bool,
+    /// The model Pi last answered with (`provider/id`), to tell when an
+    /// extension switched it (a refusal's fallback, a model picker).
+    live_model: Option<String>,
+    /// A slash command ran this turn: fetch the command list again once
+    /// it settles.
+    refresh_commands: bool,
     interrupted: bool,
     initial_pending: bool,
     deliveries: VecDeque<Delivery>,
@@ -681,6 +692,21 @@ impl Runner {
         &mut self,
         action: zeron_proto::extension_ui::ExtensionUiAction,
     ) -> Result<(), HarnessError> {
+        if let Some(question) = action
+            .element_id
+            .strip_prefix(zeron_proto::SECRET_ANSWER_ELEMENT)
+        {
+            let value = action
+                .value
+                .as_ref()
+                .and_then(|value| value["value"].as_str())
+                .unwrap_or_default();
+            let client = self.process.transport.client.clone();
+            if !self.process.dialogs.answer_secret(&client, question, value) {
+                tracing::debug!("secret answer for a question no longer waiting; dropped");
+            }
+            return Ok(());
+        }
         if let Some(response) = self.ui.answer_dialog(&action) {
             self.process.transport.client.send(response)?;
             return Ok(());
@@ -763,6 +789,9 @@ impl Runner {
     fn submit(&mut self, text: String, images: Value, steer: bool) -> Result<(), HarnessError> {
         self.store.mark_submitted(&self.session)?;
         let control = self.control_command(&text);
+        if control.is_none() && text.trim_start().starts_with('/') {
+            self.refresh_commands = true;
+        }
         let command=control.clone().unwrap_or_else(||json!({"type":"prompt","message":text,"images":images,"streamingBehavior":if steer {"steer"}else{"followUp"}}));
         let id = self.process.transport.client.request(command)?;
         self.pending.insert(
@@ -800,6 +829,17 @@ impl Runner {
             .process
             .query(json!({"type":"get_commands"}), backlog)
             .await?;
+        self.take_commands(&commands, true).await?;
+        self.process
+            .query(json!({"type":"get_state"}), backlog)
+            .await
+    }
+    /// Adopt Pi's command list; `announce` tells the UI's palette.
+    async fn take_commands(
+        &mut self,
+        commands: &Value,
+        announce: bool,
+    ) -> Result<(), HarnessError> {
         self.pi_commands = commands["commands"]
             .as_array()
             .into_iter()
@@ -813,16 +853,16 @@ impl Runner {
             .filter(|c| c["source"] == "extension")
             .map(|c| string(c, "name").to_owned())
             .collect();
-        let available = catalog::commands(&commands);
+        let available = catalog::commands(commands);
         let (cache, file, key) = &self.commands_cache;
         cache.store(file, key, available.clone());
-        self.emit(AgentEvent::AvailableCommands {
-            commands: available,
-        })
-        .await?;
-        self.process
-            .query(json!({"type":"get_state"}), backlog)
-            .await
+        if announce {
+            self.emit(AgentEvent::AvailableCommands {
+                commands: available,
+            })
+            .await?;
+        }
+        Ok(())
     }
     /// Select `request`'s model and thinking level on the live process.
     async fn configure(
@@ -968,6 +1008,9 @@ impl Runner {
                             let mut backlog = vec![];
                             self.configure(next, &mut backlog).await?;
                             self.request.model = next.model.clone();
+                            if let Some(model) = next.model.clone().filter(|m| m != "default") {
+                                self.live_model = Some(model);
+                            }
                             self.request.reasoning = next.reasoning;
                             self.request.model_options = next.model_options.clone();
                             for frame in backlog {
@@ -1249,6 +1292,10 @@ impl Runner {
                 Pending::Barrier(epoch) if epoch == self.epoch && self.active => {
                     self.state(data, None).await?;
                 }
+                Pending::Commands => {
+                    let announce = self.active;
+                    self.take_commands(&data, announce).await?;
+                }
                 Pending::EmptyEntries(epoch, session) if epoch == self.epoch && self.active => {
                     let clean = data["entries"].as_array().is_some_and(|entries| {
                         entries.iter().all(|entry| {
@@ -1303,6 +1350,27 @@ impl Runner {
                 self.confirm_delivery().await?;
             }
         }
+        // An extension switched the model (a refusal's fallback): the turn
+        // says so where it happened.
+        if self.active
+            && frame["type"] == "message_end"
+            && frame["message"]["role"] == "assistant"
+            && let Some(model) = frame["message"]["model"].as_str().filter(|m| !m.is_empty())
+        {
+            let full = format!("{}/{model}", string(&frame["message"], "provider"));
+            let switched = self
+                .live_model
+                .as_deref()
+                .is_some_and(|live| live != full && live != model);
+            if switched {
+                let message = format!("Pi switched the model to {full}");
+                let level = zeron_proto::extension_ui::NoticeLevel::Info;
+                for event in self.rows.notice(&message, level) {
+                    self.emit(event).await?;
+                }
+            }
+            self.live_model = Some(full);
+        }
         // Pi retrying a failed request shows as a footer chip until the
         // retry ends (or the run does).
         match string(&frame, "type") {
@@ -1326,6 +1394,16 @@ impl Runner {
             self.emit(event).await?;
         }
         if frame["type"] == "agent_settled" {
+            // Asked before the barrier, so the answer comes while the turn
+            // is still open.
+            if std::mem::take(&mut self.refresh_commands) {
+                let id = self
+                    .process
+                    .transport
+                    .client
+                    .request(json!({"type":"get_commands"}))?;
+                self.pending.insert(id, Pending::Commands);
+            }
             let id = self
                 .process
                 .transport

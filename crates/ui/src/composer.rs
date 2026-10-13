@@ -524,6 +524,28 @@ pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> 
     !text.trim().is_empty() || attachments > 0 || comments > 0
 }
 
+/// Take the typed answers to secret questions out of `answers`, leaving
+/// [`zeron_proto::SECRET_ANSWER_SENT`] in their place: `(question id,
+/// secret)` for each.
+fn split_secrets(
+    questions: &[UserInputQuestion],
+    answers: &mut [UserInputAnswer],
+) -> Vec<(String, String)> {
+    answers
+        .iter_mut()
+        .filter(|answer| {
+            questions
+                .iter()
+                .any(|q| q.secret && q.id == answer.question_id)
+        })
+        .filter_map(|answer| {
+            let secret = answer.labels.first()?.clone();
+            answer.labels = vec![zeron_proto::SECRET_ANSWER_SENT.to_owned()];
+            Some((answer.question_id.clone(), secret))
+        })
+        .collect()
+}
+
 /// How API keys and tokens begin (OpenAI-style, GitHub, Slack, AWS, Google).
 const KEY_PREFIXES: [&str; 8] = [
     "sk-",
@@ -9827,10 +9849,13 @@ impl Composer {
     }
 
     /// Submit RespondInput and retire the panel.
-    fn wizard_finish(&mut self, answers: Vec<UserInputAnswer>, cx: &mut Context<Self>) {
+    fn wizard_finish(&mut self, mut answers: Vec<UserInputAnswer>, cx: &mut Context<Self>) {
         let Some(wizard) = self.wizard.take() else {
             return;
         };
+        // A secret goes to the agent on its own; the answer kept in the
+        // chat's synced history carries a placeholder.
+        let secrets = split_secrets(&wizard.questions, &mut answers);
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
         let draft = self
@@ -9851,6 +9876,29 @@ impl Composer {
             return;
         };
         let request_id = wizard.request_id.clone();
+        let device = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map(|chat| chat.device_id.clone());
+        let secret_calls: Vec<serde_json::Value> = secrets
+            .into_iter()
+            .map(|(question_id, value)| {
+                let action = zeron_proto::extension_ui::ExtensionUiAction {
+                    element_id: format!("{}{question_id}", zeron_proto::SECRET_ANSWER_ELEMENT),
+                    action_id: "submit".into(),
+                    value: Some(serde_json::json!({ "value": value })),
+                    row_id: None,
+                };
+                let mut params = serde_json::json!({ "chatId": chat_id, "action": action });
+                if let Some(device) = &device {
+                    params["targetDeviceId"] = device.clone().into();
+                }
+                params
+            })
+            .collect();
         let command = SessionCommandPayload::RespondInput {
             request_id: request_id.clone(),
             answers,
@@ -9862,6 +9910,17 @@ impl Composer {
         };
         // `action_task`, NOT `send_task` — see `interrupt`.
         self.action_task = Some(cx.spawn(async move |this, cx| {
+            // The secrets first, so the agent has them before the answer
+            // that stands in for them.
+            for call in secret_calls {
+                if let Err(err) = engine
+                    .client()
+                    .call(methods::EXTENSION_UI_ACTION, call)
+                    .await
+                {
+                    tracing::warn!(error = %err, "secret answer not delivered");
+                }
+            }
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
@@ -16077,6 +16136,34 @@ mod tests {
         assert!(composer_has_content("hi", 0, 0));
         assert!(composer_has_content("", 1, 0));
         assert!(composer_has_content("", 0, 1));
+    }
+
+    #[test]
+    fn a_secret_answer_leaves_only_a_placeholder_in_the_history() {
+        let question = |id: &str, secret: bool| UserInputQuestion {
+            id: id.into(),
+            header: "Pi".into(),
+            question: "Key?".into(),
+            options: Vec::new(),
+            multi_select: false,
+            prefill: None,
+            multiline: false,
+            secret,
+        };
+        let mut answers = vec![
+            UserInputAnswer {
+                question_id: "k".into(),
+                labels: vec!["sk-or-v1-abc".into()],
+            },
+            UserInputAnswer {
+                question_id: "n".into(),
+                labels: vec!["main".into()],
+            },
+        ];
+        let secrets = split_secrets(&[question("k", true), question("n", false)], &mut answers);
+        assert_eq!(secrets, vec![("k".to_owned(), "sk-or-v1-abc".to_owned())]);
+        assert_eq!(answers[0].labels, vec![zeron_proto::SECRET_ANSWER_SENT]);
+        assert_eq!(answers[1].labels, vec!["main"]);
     }
 
     #[test]

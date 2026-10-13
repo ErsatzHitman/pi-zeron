@@ -539,6 +539,14 @@ pub struct UserInputAnswer {
     pub labels: Vec<String>,
 }
 
+/// The label a secret question's answer carries in the chat's command
+/// history: the secret itself went to the agent directly, as an
+/// [`crate::extension_ui::ExtensionUiAction`] on
+/// `SECRET_ANSWER_ELEMENT` + the question's id (`value: {"value": …}`).
+pub const SECRET_ANSWER_SENT: &str = "\u{2063}secret-sent";
+/// Element id prefix of a secret question's direct answer.
+pub const SECRET_ANSWER_ELEMENT: &str = "pi:secret:";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DoneStatus {

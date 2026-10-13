@@ -196,6 +196,8 @@ pub struct UserInputQuestion {
     pub multi_select: bool,
     pub prefill: Option<String>,
     pub multiline: bool,
+    /// The free-text answer is a credential: typed as dots.
+    pub secret: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -337,6 +339,7 @@ impl From<&zc::ComposerState> for ComposerState {
                         multi_select: q.multi_select,
                         prefill: q.prefill.clone(),
                         multiline: q.multiline,
+                        secret: q.secret,
                     })
                     .collect(),
             }),

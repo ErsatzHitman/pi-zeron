@@ -137,6 +137,9 @@ final class QuestionPanel: UIView, UITextFieldDelegate, UITextViewDelegate {
         }
         other.isHidden = q.multiline
         editor.isHidden = !q.multiline
+        // A key is typed as dots and kept out of autocorrect's memory.
+        other.isSecureTextEntry = q.secret
+        other.autocorrectionType = q.secret ? .no : .default
         other.text = custom[q.id]
         editor.text = custom[q.id]
         back.isHidden = page == 0

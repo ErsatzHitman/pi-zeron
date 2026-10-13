@@ -177,6 +177,8 @@ fn summary(element: &PiUiElement) -> Option<String> {
 pub(crate) struct Chip {
     pub key: String,
     pub text: String,
+    /// What hovering says when it is more than the text: what a click does.
+    pub hint: Option<String>,
     pub active: bool,
     pub action: Option<(String, String)>,
 }
@@ -198,8 +200,20 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
         .filter_map(|e| {
             let text = e.text.clone().or_else(|| e.title.clone())?;
             let plan = e.key() == "plan:mode";
+            let hint = e
+                .actions
+                .first()
+                .map(|a| {
+                    if a.label.is_empty() {
+                        a.id.clone()
+                    } else {
+                        a.label.clone()
+                    }
+                })
+                .map(|label| format!("{text} — {label}"));
             Some(Chip {
                 key: e.key(),
+                hint,
                 active: plan && e.extra_str("mode") == Some("plan"),
                 action: e
                     .actions
@@ -221,6 +235,7 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
             .filter(|s| !element_texts.iter().any(|t| t == s.text.trim()))
             .map(|s| Chip {
                 key: format!("status:{}", s.key),
+                hint: None,
                 text: s.text.trim().to_owned(),
                 // Zeron's own chips (Pi retrying a request) stand out.
                 active: s.key.starts_with("zeron:"),
@@ -240,6 +255,7 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
                 let text = busy_text(&e)?;
                 Some(Chip {
                     key: format!("work:{}", e.key()),
+                    hint: None,
                     text,
                     active: true,
                     action: None,
@@ -258,6 +274,7 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
         let waiting = goal["status"] == "waiting";
         chips.push(Chip {
             key: "channel:goal".into(),
+            hint: None,
             text: match (text.is_empty(), waiting) {
                 (true, false) => "Goal".into(),
                 (true, true) => "Goal · waiting".into(),
@@ -279,6 +296,7 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
         if !parts.is_empty() {
             chips.push(Chip {
                 key: "channel:footer".into(),
+                hint: None,
                 text: parts.join(" · "),
                 active: false,
                 action: None,
@@ -533,7 +551,9 @@ impl Composer {
                                 .truncate()
                                 .child(SharedString::from(chip.text.clone())),
                         )
-                        .tooltip(crate::settings::widgets::text_tooltip(chip.text.clone()))
+                        .tooltip(crate::settings::widgets::text_tooltip(
+                            chip.hint.clone().unwrap_or_else(|| chip.text.clone()),
+                        ))
                         .tooltip_show_delay(Duration::from_millis(350));
                     match chip.action.clone() {
                         Some((element, action)) => {
@@ -691,6 +711,7 @@ mod tests {
         assert!(chips[0].active);
         assert!(chips[2].active);
         assert_eq!(chips[0].action, Some(("plan:mode".into(), "toggle".into())));
+        assert_eq!(chips[0].hint, None, "a toggle with no action of its own");
         assert_eq!(chips[1].action, None);
     }
 

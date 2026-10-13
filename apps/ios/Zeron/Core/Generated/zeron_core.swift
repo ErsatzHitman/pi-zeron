@@ -9086,10 +9086,17 @@ public struct UserInputQuestion: Equatable, Hashable {
     public var multiSelect: Bool
     public var prefill: String?
     public var multiline: Bool
+    /**
+     * The free-text answer is a credential: typed as dots.
+     */
+    public var secret: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, header: String, question: String, options: [String], multiSelect: Bool, prefill: String?, multiline: Bool) {
+    public init(id: String, header: String, question: String, options: [String], multiSelect: Bool, prefill: String?, multiline: Bool, 
+        /**
+         * The free-text answer is a credential: typed as dots.
+         */secret: Bool) {
         self.id = id
         self.header = header
         self.question = question
@@ -9097,6 +9104,7 @@ public struct UserInputQuestion: Equatable, Hashable {
         self.multiSelect = multiSelect
         self.prefill = prefill
         self.multiline = multiline
+        self.secret = secret
     }
 
     
@@ -9121,7 +9129,8 @@ public struct FfiConverterTypeUserInputQuestion: FfiConverterRustBuffer {
                 options: FfiConverterSequenceString.read(from: &buf), 
                 multiSelect: FfiConverterBool.read(from: &buf), 
                 prefill: FfiConverterOptionString.read(from: &buf), 
-                multiline: FfiConverterBool.read(from: &buf)
+                multiline: FfiConverterBool.read(from: &buf), 
+                secret: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -9133,6 +9142,7 @@ public struct FfiConverterTypeUserInputQuestion: FfiConverterRustBuffer {
         FfiConverterBool.write(value.multiSelect, into: &buf)
         FfiConverterOptionString.write(value.prefill, into: &buf)
         FfiConverterBool.write(value.multiline, into: &buf)
+        FfiConverterBool.write(value.secret, into: &buf)
     }
 }
 
