@@ -242,6 +242,15 @@ async fn wait_for_deferred_engine(
     }
 }
 
+/// Probes a remote viewer makes before giving up (half a second apart).
+const ATTACH_ONLY_TRIES: usize = 20;
+
+/// `ZERON_ATTACH_ONLY`: this window only views an engine already serving the
+/// IPC port (one on another machine, through a tunnel).
+fn attach_only(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+}
+
 /// External daemon over `ws://127.0.0.1:{port}`.
 struct RemoteEngine {
     client: Arc<RpcClient>,
@@ -296,6 +305,22 @@ impl EngineHandle {
 
         if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
             return Ok(handle);
+        }
+        // A viewer of an engine on another machine (`ZERON_ATTACH_ONLY=1`, the
+        // port an SSH tunnel forwards) never embeds an engine of its own: a
+        // tunnel still coming up gets a few seconds, then the window says so.
+        if attach_only(std::env::var("ZERON_ATTACH_ONLY").ok().as_deref()) {
+            for _ in 0..ATTACH_ONLY_TRIES {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
+                    return Ok(handle);
+                }
+            }
+            anyhow::bail!(
+                "No Zeron engine answers on 127.0.0.1:{}. Start the SSH tunnel to the machine \
+                 running it (`zeron daemon install`), then reopen Zeron.",
+                config.ipc_port
+            );
         }
 
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
@@ -3632,6 +3657,15 @@ mod tests {
 
         handle.shutdown().await;
         server.abort();
+    }
+
+    #[test]
+    fn attach_only_is_an_explicit_opt_in() {
+        assert!(attach_only(Some("1")));
+        assert!(attach_only(Some(" true ")));
+        assert!(!attach_only(Some("0")));
+        assert!(!attach_only(Some("")));
+        assert!(!attach_only(None));
     }
 
     #[tokio::test]

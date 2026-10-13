@@ -154,6 +154,28 @@ Zeron's existing delegation uses a temporary MCP bridge loaded with
 `--extension`. Image attachments are sent as native image blocks; image-only
 tool results do not yet render inline.
 
+## Pi on another machine
+
+The engine runs Pi, so Pi lives wherever the engine does. To keep Zeron's
+window on one computer and Pi on another (a Linux box with the repos and
+keys):
+
+1. **On the Pi machine**, install Zeron from the release tarball
+   (`install.sh`, no root), then write `~/.zeron/env` (mode 600; the systemd
+   unit reads it) with `PI_EXECUTABLE=/path/to/pi` and the provider keys Pi
+   needs (`OPENROUTER_API_KEY=…`). Run `zeron daemon install` (and
+   `loginctl enable-linger $USER` so it starts at boot). `zeron status` should
+   show the engine listening on `127.0.0.1:27654`; it stays loopback-only.
+2. **On the desktop**, run `dist/windows/Zeron Remote.cmd user@host` (next to
+   `zeron.exe`). It forwards local port 27755 to the engine over SSH and
+   opens a window with `ZERON_IPC_PORT=27755`, its own data dir
+   (`%LOCALAPPDATA%\ZeronRemote`) and `ZERON_ATTACH_ONLY=1`: that window only
+   views the remote engine, and says so rather than starting a local one when
+   the tunnel is down. The normal Zeron keeps running beside it.
+
+Projects, chats and terminals are the remote machine's; paths are its paths.
+SSH (a key, over the LAN or Tailscale) is the only way in.
+
 ## Validation
 
 ```sh
