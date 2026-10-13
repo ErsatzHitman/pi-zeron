@@ -10,7 +10,8 @@ use gpui::{
     Subscription, Window, div, prelude::*, px,
 };
 use zeron_proto::extension_ui::{
-    PiUiElement, PiUiField, PiUiFieldKind, PiUiPlacement, PiUiSection, PiUiTone, PiUiVariant,
+    PiUiAction, PiUiElement, PiUiField, PiUiFieldKind, PiUiPlacement, PiUiSection, PiUiTone,
+    PiUiVariant,
 };
 
 use super::parts::{self, Actions, MarkdownCache, PendingConfirm};
@@ -37,10 +38,14 @@ pub(crate) struct ScreenView {
     seen: bool,
     /// What the body last held, to follow a growing thread to its end.
     tail: usize,
+    /// What the body is made of: a new view (btw's history) starts over.
+    shape: u64,
     /// Drawn in the composer's place rather than as a pane tab.
     docked: bool,
     /// The form's input takes the keyboard once it exists.
     autofocus: bool,
+    /// The element's form is out of view; its input (and draft) is kept.
+    form_hidden: bool,
     _state: Subscription,
 }
 
@@ -113,7 +118,16 @@ pub(crate) fn screen_icon(ns: &str) -> &'static str {
 const HEADER_ACTIONS: usize = 3;
 
 fn actions_in_toolbar(element: &PiUiElement) -> bool {
-    element.actions.len() > HEADER_ACTIONS
+    header_actions(element).count() > HEADER_ACTIONS
+}
+
+/// The element's actions drawn as buttons: all but the one its X takes.
+fn header_actions(element: &PiUiElement) -> impl Iterator<Item = &PiUiAction> {
+    let close = close_action(element);
+    element
+        .actions
+        .iter()
+        .filter(move |action| action.id != close)
 }
 
 /// What a docked screen is, over its title, as the question panel's header
@@ -132,19 +146,38 @@ fn screen_kind(ns: &str) -> &str {
     }
 }
 
-/// The action that closes a screen from its header's X, when its own
-/// actions offer none.
-fn close_action(element: &PiUiElement) -> Option<String> {
-    let offered = element
-        .actions
-        .iter()
-        .any(|action| action.id == "close" || action.id == "cancel");
-    (!offered).then(|| {
-        element
-            .extra_str("closeActionId")
-            .unwrap_or("close")
-            .to_owned()
-    })
+/// The action the header's X (and Escape) takes, as the question panel
+/// closes: the element's `closeActionId`, else the `close` or `cancel` it
+/// offers, else `close`. Its own button gives way to the X.
+fn close_action(element: &PiUiElement) -> String {
+    let offered = |id: &str| element.actions.iter().any(|action| action.id == id);
+    element
+        .extra_str("closeActionId")
+        .or_else(|| offered("close").then_some("close"))
+        .or_else(|| offered("cancel").then_some("cancel"))
+        .unwrap_or("close")
+        .to_owned()
+}
+
+/// What a screen's body is made of (its sections' kinds and ids).
+fn body_shape(element: &PiUiElement) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    element.key().hash(&mut hasher);
+    for section in &element.sections {
+        std::mem::discriminant(section).hash(&mut hasher);
+        section.id().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// A conversation or a log follows its newest line; a report or a
+/// dashboard reads from the top.
+fn follows_tail(element: &PiUiElement) -> bool {
+    element.extra_str("follow") == Some("end")
+        || element
+            .sections
+            .iter()
+            .any(|section| matches!(section, PiUiSection::Turns { .. } | PiUiSection::Log { .. }))
 }
 
 /// How much a screen's body holds, to tell when it grew.
@@ -193,8 +226,10 @@ impl ScreenView {
             focus: cx.focus_handle(),
             seen: false,
             tail: 0,
+            shape: 0,
             docked: false,
             autofocus: false,
+            form_hidden: false,
             _state: observe,
         }
     }
@@ -266,11 +301,15 @@ impl ScreenView {
     }
 
     fn sync_input(&mut self, element: &PiUiElement, cx: &mut Context<Self>) {
+        // A view without the form (btw's history) keeps the draft for when
+        // the form comes back.
         let Some((fields, _)) = composer_form(element) else {
-            self.input = None;
-            self._input = None;
+            self.form_hidden = true;
             return;
         };
+        if std::mem::take(&mut self.form_hidden) {
+            self.autofocus = true;
+        }
         let Some(field) = fields
             .iter()
             .find(|f| matches!(f.kind, PiUiFieldKind::Text | PiUiFieldKind::Textarea))
@@ -305,6 +344,19 @@ impl ScreenView {
         let Some((_, field, input)) = self.input.clone() else {
             return;
         };
+        // Enter while the action is off (a reply still streaming) keeps the
+        // question in the box rather than sending it to be refused.
+        let disabled = self
+            .element(cx)
+            .and_then(|element| composer_form(&element))
+            .is_some_and(|(_, actions)| {
+                actions
+                    .iter()
+                    .any(|action| action.id == action_id && action.disabled)
+            });
+        if disabled {
+            return;
+        }
         let text = input.read(cx).text().trim().to_owned();
         let value = if action_id == "submit" || action_id == "send" {
             if text.is_empty() {
@@ -337,17 +389,34 @@ impl ScreenView {
         };
         self.seen = true;
         self.sync_input(&element, cx);
-        if self.autofocus
-            && let Some((_, _, input)) = self.input.as_ref()
-        {
-            self.autofocus = false;
-            let handle = input.read(cx).focus_handle(cx);
+        if std::mem::take(&mut self.autofocus) {
+            // The form's input takes the keyboard; a screen without one
+            // takes it itself, for Escape.
+            let handle = match self.input.as_ref().filter(|_| !self.form_hidden) {
+                Some((_, _, input)) => input.read(cx).focus_handle(cx),
+                None => self.focus.clone(),
+            };
             window.focus(&handle, cx);
         }
         let size = body_size(&element);
-        if size != self.tail {
+        let shape = body_shape(&element);
+        if shape != self.shape {
+            self.shape = shape;
             self.tail = size;
-            self.scroll.scroll_to_bottom();
+            if follows_tail(&element) {
+                self.scroll.scroll_to_bottom();
+            } else {
+                self.scroll.set_offset(gpui::Point::default());
+            }
+        } else if size != self.tail {
+            // Follow a growing thread only while its end is in view: someone
+            // scrolled up to read is left there.
+            let scrolled = -f32::from(self.scroll.offset().y);
+            let at_end = scrolled >= f32::from(self.scroll.max_offset().y) - 24.0;
+            self.tail = size;
+            if follows_tail(&element) && at_end {
+                self.scroll.scroll_to_bottom();
+            }
         }
         let actions = self.actions(cx);
         let view = cx.entity_id();
@@ -363,11 +432,11 @@ impl ScreenView {
                     .find(|action| action.id == "cancel")
                     .map(|action| action.id.clone())
             })
-            .or_else(|| close.clone());
+            .unwrap_or_else(|| close.clone());
 
         let toolbar = actions_in_toolbar(&element);
         let action_buttons = || {
-            element.actions.iter().enumerate().map(|(ix, action)| {
+            header_actions(&element).enumerate().map(|(ix, action)| {
                 parts::action_button(
                     &theme,
                     SharedString::from(format!("{key}-screen-action-{ix}")),
@@ -444,27 +513,25 @@ impl ScreenView {
                         .children(action_buttons()),
                 )
             })
-            .when_some(close, |el, close| {
-                el.child(
-                    div()
-                        .id(SharedString::from(format!("{key}-screen-close")))
-                        .flex_none()
-                        .size(px(24.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(8.0))
-                        .hover(|style| style.bg(crate::theme::ink(0.06)))
-                        .cursor_pointer()
-                        .role(gpui::Role::Button)
-                        .aria_label("Close")
-                        .on_click(cx.listener(move |this, _, _, cx| this.send_action(&close, cx)))
-                        .child(
-                            icon(icons::CLOSE)
-                                .size(px(14.0))
-                                .text_color(theme.text_muted),
-                        ),
-                )
+            .child({
+                div()
+                    .id(SharedString::from(format!("{key}-screen-close")))
+                    .flex_none()
+                    .size(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .hover(|style| style.bg(crate::theme::ink(0.06)))
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label("Close")
+                    .on_click(cx.listener(move |this, _, _, cx| this.send_action(&close, cx)))
+                    .child(
+                        icon(icons::CLOSE)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
             });
         let toolbar = toolbar.then(|| {
             div()
@@ -555,13 +622,20 @@ impl ScreenView {
             .id(SharedString::from(format!("{key}-screen")))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape"
-                    && let Some(escape) = escape.as_deref()
-                {
+                if event.keystroke.key == "escape" {
+                    let draft = this
+                        .input
+                        .as_ref()
+                        .filter(|_| !this.form_hidden)
+                        .map(|(_, _, input)| input.clone())
+                        .filter(|input| !input.read(cx).text().trim().is_empty());
                     if this.pending.take().is_some() {
                         cx.notify();
+                    } else if let Some(input) = draft {
+                        // As the terminal does: a draft goes before the view.
+                        input.update(cx, |input, cx| input.set_text(String::new(), cx));
                     } else {
-                        this.send_action(escape, cx);
+                        this.send_action(&escape, cx);
                     }
                     cx.stop_propagation();
                 }
@@ -853,5 +927,35 @@ mod tests {
         assert_eq!(screen_icon("workspace"), icons::TUNING);
         assert_eq!(screen_icon("workflows"), icons::FILE_MARKDOWN);
         assert_eq!(screen_icon("someone-else"), icons::WIDGET);
+        // Its own Close becomes the header's X, out of the toolbar.
+        assert_eq!(close_action(&usage), "close");
+        assert!(header_actions(&usage).all(|action| action.id != "close"));
+        assert!(!follows_tail(&usage));
+    }
+
+    #[test]
+    fn the_x_takes_the_offered_close_and_a_thread_follows_its_end() {
+        let screen =
+            |value: serde_json::Value| -> PiUiElement { serde_json::from_value(value).unwrap() };
+        let history = screen(
+            json!({"id":"thread","ns":"btw","kind":"panel","placement":"screen",
+            "closeActionId":"history","sections":[{"kind":"markdown","text":"older"}],
+            "actions":[{"id":"history","label":"Back"},{"id":"close","label":"Close"}]}),
+        );
+        assert_eq!(close_action(&history), "history");
+        let report = screen(
+            json!({"id":"report","ns":"advisor","kind":"panel","placement":"screen",
+            "actions":[{"id":"cancel","label":"Cancel"}]}),
+        );
+        assert_eq!(close_action(&report), "cancel");
+        assert_eq!(header_actions(&report).count(), 0);
+        let bare = screen(json!({"id":"r","ns":"x","kind":"panel","placement":"screen"}));
+        assert_eq!(close_action(&bare), "close");
+        let thread = screen(
+            json!({"id":"thread","ns":"btw","kind":"panel","placement":"screen",
+            "sections":[{"kind":"turns","id":"t","turns":[]}]}),
+        );
+        assert!(follows_tail(&thread));
+        assert_ne!(body_shape(&thread), body_shape(&history));
     }
 }

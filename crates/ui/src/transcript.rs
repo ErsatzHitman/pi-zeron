@@ -956,7 +956,7 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
 }
 
 /// Live controls a Pi extension row offers at most.
-const PI_CONTROLS_MAX: usize = 3;
+const PI_CONTROLS_MAX: usize = 4;
 
 /// The element a Pi extension row records (`pi-ui-<run>-<n>-<ns:id>`);
 /// notices and plain widgets have none.
@@ -979,7 +979,7 @@ struct PiControl {
 
 /// What a live element lets the user do from its row: kill a background
 /// job, stop a workflow, cancel the advisor. Closing or dismissing a panel
-/// means nothing for a row, and finished roster rows offer nothing.
+/// means nothing for a row, and finished roster rows offer only View.
 fn pi_controls(element: &zeron_proto::extension_ui::PiUiElement) -> Vec<PiControl> {
     use zeron_proto::extension_ui::{PiUiAction, PiUiRowState, PiUiSection, PiUiVariant};
     let control = |row: Option<(&str, &str)>, action: &PiUiAction| {
@@ -1005,23 +1005,37 @@ fn pi_controls(element: &zeron_proto::extension_ui::PiUiElement) -> Vec<PiContro
         .filter(|action| !action.disabled && !matches!(action.id.as_str(), "close" | "dismiss"))
         .map(|action| control(None, action))
         .collect();
-    for section in &element.sections {
-        let PiUiSection::Roster { rows, .. } = section else {
-            continue;
-        };
-        for row in rows.iter().filter(|row| {
-            matches!(
-                row.state,
-                Some(PiUiRowState::Running | PiUiRowState::Waiting)
-            )
-        }) {
-            controls.extend(
-                row.actions
-                    .iter()
-                    .filter(|action| !action.disabled && action.id != "select")
-                    .map(|action| control(Some((row.id.as_str(), row.label.as_str())), action)),
-            );
-        }
+    // A roster's rows sit on the element (a fleet, background shells) or in
+    // its roster sections. A live row offers what it can do (Kill, Stop); a
+    // finished one only what still means something: viewing what it did.
+    let rows: Vec<_> = element
+        .rows
+        .iter()
+        .chain(element.sections.iter().flat_map(|section| match section {
+            PiUiSection::Roster { rows, .. } => rows.as_slice(),
+            _ => [].as_slice(),
+        }))
+        .collect();
+    let live = |row: &&zeron_proto::extension_ui::PiUiRosterRow| {
+        matches!(
+            row.state,
+            Some(PiUiRowState::Running | PiUiRowState::Waiting)
+        )
+    };
+    for (running, row) in rows
+        .iter()
+        .filter(|row| live(row))
+        .map(|row| (true, row))
+        .chain(rows.iter().filter(|row| !live(row)).map(|row| (false, row)))
+    {
+        controls.extend(
+            row.actions
+                .iter()
+                .filter(|action| {
+                    !action.disabled && action.id != "select" && (running || action.id == "view")
+                })
+                .map(|action| control(Some((row.id.as_str(), row.label.as_str())), action)),
+        );
     }
     controls.truncate(PI_CONTROLS_MAX);
     controls
@@ -3556,6 +3570,18 @@ impl Transcript {
             .linked_tree(tree, roots, ui.source_local)
     }
 
+    /// The newest transcript row recording the Pi element `key`.
+    fn newest_pi_row(&self, key: &str) -> Option<&str> {
+        self.rows.iter().rev().find_map(|row| match &row.kind {
+            RowKind::ToolGroup { tools, .. } => tools
+                .iter()
+                .rev()
+                .find(|tool| pi_element_key(&tool.part_id) == Some(key))
+                .map(|tool| tool.part_id.as_str()),
+            _ => None,
+        })
+    }
+
     /// File badges on tool chips open through the same workspace-link route
     /// as Markdown file links, so only chats with a link handler get
     /// clickable badges.
@@ -3587,7 +3613,9 @@ impl Transcript {
                 .find(|element| element.key() == key)?;
             pi_controls(&element)
         };
-        if controls.is_empty() {
+        // An element recorded across turns (each advisor consultation) keeps
+        // its controls on its newest row only.
+        if controls.is_empty() || self.newest_pi_row(&key) != Some(tool.part_id.as_str()) {
             return None;
         }
         let buttons: Vec<AnyElement> = controls
@@ -3596,11 +3624,18 @@ impl Transcript {
             .map(|(ix, control)| {
                 let button = SharedString::from(format!("{id}-{ix}"));
                 let armed = self.pi_confirm.as_ref() == Some(&button);
+                // Armed, the button says so; what it asks is its tooltip
+                // ("Kill this sub-agent? Its work is lost" does not fit).
                 let label = if armed {
-                    control.confirm.clone().unwrap_or_else(|| "Confirm".into())
+                    "Confirm".to_owned()
                 } else {
                     control.label.clone()
                 };
+                let hint = control
+                    .confirm
+                    .clone()
+                    .filter(|_| armed)
+                    .unwrap_or_else(|| control.label.clone());
                 let color = if control.danger || armed {
                     theme.danger
                 } else {
@@ -3623,7 +3658,8 @@ impl Transcript {
                     .hover(|style| style.bg(theme.element_hover))
                     .cursor_pointer()
                     .role(gpui::Role::Button)
-                    .aria_label(SharedString::from(label.clone()))
+                    .aria_label(SharedString::from(hint.clone()))
+                    .tooltip(crate::settings::widgets::text_tooltip(hint))
                     .text_size(px(11.5))
                     .text_color(color)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -9320,6 +9356,7 @@ fn pi_extension_icon(tool: &str) -> &'static str {
         "Note" => crate::icons::INFO_CIRCLE,
         "Workflow" => crate::icons::FILE_MARKDOWN,
         "Memory" => crate::icons::HARD_DRIVE,
+        "Goal" => crate::icons::CHECKLIST,
         _ => crate::icons::WIDGET,
     }
 }
@@ -16360,10 +16397,10 @@ mod pi_row_tests {
         let jobs: zeron_proto::extension_ui::PiUiElement = serde_json::from_value(json!({
             "id":"jobs","ns":"bash","kind":"roster","placement":"pinned",
             "actions":[{"id":"close","label":"Close"}],
-            "sections":[{"kind":"roster","rows":[
+            "rows":[
                 {"id":"j1","label":"npm test","state":"running",
                  "actions":[{"id":"kill","label":"Kill","variant":"danger","confirm":"Kill npm test?"}]},
-                {"id":"j2","label":"build","state":"done","actions":[{"id":"kill","label":"Kill"}]}]}]
+                {"id":"j2","label":"build","state":"done","actions":[{"id":"kill","label":"Kill"}]}]
         }))
         .unwrap();
         let controls = pi_controls(&jobs);
@@ -16378,5 +16415,17 @@ mod pi_row_tests {
         }))
         .unwrap();
         assert!(pi_controls(&card).is_empty());
+        // A fleet in a roster section: a live job's Kill, a finished one's View.
+        let fleet: zeron_proto::extension_ui::PiUiElement = serde_json::from_value(json!({
+            "id":"fleet","ns":"subagents","kind":"roster","placement":"pinned",
+            "sections":[{"kind":"roster","rows":[
+                {"id":"a","label":"scout","state":"done",
+                 "actions":[{"id":"view","label":"View"},{"id":"kill","label":"Kill"}]},
+                {"id":"b","label":"fixer","state":"running",
+                 "actions":[{"id":"view","label":"View"},{"id":"select","label":"Select"}]}]}]
+        }))
+        .unwrap();
+        let labels: Vec<_> = pi_controls(&fleet).into_iter().map(|c| c.label).collect();
+        assert_eq!(labels, vec!["View fixer", "View scout"]);
     }
 }

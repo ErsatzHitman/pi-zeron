@@ -45,10 +45,27 @@ pub(crate) struct SheetForm {
 
 /// The form a sheet answers: its first `form` section, else top-level fields.
 pub(crate) fn sheet_form(element: &PiUiElement) -> (Vec<PiUiField>, Vec<PiUiAction>) {
-    match element.form() {
+    let (fields, actions) = match element.form() {
         Some((fields, actions)) => (fields.to_vec(), actions.to_vec()),
         None => (element.fields.clone(), Vec::new()),
+    };
+    // A form whose answer sits on the element (`ask_user`, a subagent's
+    // question, the model picker's Save): those actions send the form.
+    if !actions.is_empty() {
+        return (fields, actions);
     }
+    let answers = element
+        .actions
+        .iter()
+        .filter(|action| !is_dismissal(&action.id))
+        .cloned()
+        .collect();
+    (fields, answers)
+}
+
+/// An action that closes a sheet rather than answering it.
+fn is_dismissal(id: &str) -> bool {
+    matches!(id, "cancel" | "close" | "dismiss" | "skip")
 }
 
 fn signature(element: &PiUiElement) -> u64 {
@@ -427,7 +444,17 @@ impl Composer {
         });
         let key = event.keystroke.key.as_str();
         if key == "escape" {
+            let stuck = self
+                .extension
+                .sheet
+                .as_mut()
+                .filter(|form| form.submitted && form.key == element.key());
             if self.extension.pending.take().is_some() {
+                cx.notify();
+            } else if let Some(form) = stuck {
+                // Sent, but the extension left the sheet as it was: give the
+                // controls back rather than lock the composer behind it.
+                form.submitted = false;
                 cx.notify();
             } else if let Some(dismiss) = dismiss_action(&element, &actions) {
                 self.submit_extension_sheet(Some(dismiss), cx);
@@ -479,11 +506,13 @@ impl Composer {
         if let Some(form) = self.extension.sheet.as_mut()
             && std::mem::take(&mut form.focus_pending)
         {
-            // The first text field takes the keyboard; otherwise the sheet
-            // does, for digits, Enter and Escape.
+            // A form that starts with a text field gives it the keyboard;
+            // one that starts with options keeps it on the sheet, for
+            // digits, Enter and Escape (a freeform box below the options
+            // must not swallow the digit that picks one).
             let target = fields
-                .iter()
-                .find_map(|f| form.inputs.get(&f.id))
+                .first()
+                .and_then(|f| form.inputs.get(&f.id))
                 .map(|input| input.read(cx).focus_handle(cx))
                 .unwrap_or_else(|| focus.clone());
             window.focus(&target, cx);
@@ -991,6 +1020,18 @@ mod tests {
             "actions":[{"id":"cancel","label":"Cancel"}]}),
         );
         assert_eq!(primary_action(&sheet_form(&confirm).1).unwrap().id, "yes");
+        // ask_user and the model picker put their answer on the element:
+        // it still sends the form; dismissals stay dismissals.
+        let picker = element(
+            json!({"id":"picker","ns":"model-select","kind":"panel","placement":"sheet",
+            "sections":[{"kind":"form","id":"models","fields":[{"id":"models","kind":"multiselect"}]}],
+            "actions":[{"id":"save","label":"Save","variant":"primary"},
+                       {"id":"skip","label":"Skip"},{"id":"cancel","label":"Cancel"}]}),
+        );
+        let actions = sheet_form(&picker).1;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(primary_action(&actions).unwrap().id, "save");
+        assert_eq!(dismiss_action(&picker, &actions).as_deref(), Some("cancel"));
         // A re-set with new fields is a new form; the same fields are not.
         let mut next = ask.clone();
         assert_eq!(signature(&ask), signature(&next));

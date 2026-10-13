@@ -38,6 +38,9 @@ pub(crate) struct ComposerExtension {
     pub seen: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// The screens docked in the composer's place, by element key.
     pub screen_views: std::collections::HashMap<String, gpui::Entity<ScreenView>>,
+    /// Per chat, the screen a Pi dialog came forward over, to return to
+    /// once it is answered.
+    pub covered: std::collections::HashMap<String, String>,
 }
 
 impl ComposerExtension {
@@ -51,6 +54,7 @@ impl ComposerExtension {
             picked: Default::default(),
             seen: Default::default(),
             screen_views: Default::default(),
+            covered: Default::default(),
         }
     }
 }

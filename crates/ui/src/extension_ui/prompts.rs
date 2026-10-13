@@ -22,6 +22,8 @@ use crate::theme::Theme;
 /// The message box's own tab, offered while only non-blocking prompts wait.
 pub(crate) const MESSAGE_TAB: &str = "message";
 const QUESTION_PREFIX: &str = "question:";
+/// Pi's own dialogs, drawn as sheets (`pi:dialog-N`).
+const DIALOG_PREFIX: &str = "pi:dialog-";
 
 /// What the composer shows in its place.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,11 +106,12 @@ pub(crate) fn front<'a>(tabs: &'a [PromptTab], picked: Option<&str>) -> Option<&
 
 /// The pick after the open prompts changed from `known` to `tabs`. `known`
 /// is `None` for a chat just opened: what was already up then waits behind
-/// the message box.
+/// the message box. `covered` is the screen a Pi dialog came forward over.
 pub(crate) fn repick(
     picked: Option<&str>,
     known: Option<&HashSet<String>>,
     tabs: &[PromptTab],
+    covered: Option<&str>,
 ) -> Option<String> {
     if tabs.is_empty() {
         return None;
@@ -120,18 +123,28 @@ pub(crate) fn repick(
     };
     let open = |id: &str| tabs.iter().any(|tab| tab.id == id);
     let picked = match picked {
-        // The picked prompt went away: back to the message box when it is
-        // offered, else the first in line.
-        Some(id) if id != MESSAGE_TAB && !open(id) => {
-            offers_message(tabs).then(|| MESSAGE_TAB.to_owned())
-        }
+        // The picked prompt went away: back to the screen its dialog came
+        // over, else the message box when it is offered, else the first in
+        // line.
+        Some(id) if id != MESSAGE_TAB && !open(id) => covered
+            .filter(|covered| open(covered))
+            .map(str::to_owned)
+            .or_else(|| offers_message(tabs).then(|| MESSAGE_TAB.to_owned())),
         other => other.map(str::to_owned),
     };
     // A new prompt comes to the front only over the message box; behind
-    // another prompt it waits as a tab.
+    // another prompt it waits as a tab. A dialog Pi opens over a screen
+    // answers what was just done there (btw's thinking picker, a model's
+    // Load), so it comes forward.
     let fresh = tabs.iter().find(|tab| !known.contains(&tab.id));
+    let on_screen = |picked: &str| tabs.iter().any(|tab| tab.id == picked && !tab.blocking);
     match (fresh, picked) {
         (Some(fresh), Some(picked)) if picked == MESSAGE_TAB => Some(fresh.id.clone()),
+        (Some(fresh), Some(picked))
+            if fresh.id.starts_with(DIALOG_PREFIX) && on_screen(&picked) =>
+        {
+            Some(fresh.id.clone())
+        }
         (_, picked) => picked,
     }
 }
@@ -198,7 +211,27 @@ impl Composer {
         }
         let ids: HashSet<String> = tabs.iter().map(|tab| tab.id.clone()).collect();
         let before = self.extension.picked.get(&chat_id).cloned();
-        let picked = repick(before.as_deref(), self.extension.seen.get(&chat_id), &tabs);
+        let covered = self.extension.covered.get(&chat_id).cloned();
+        let picked = repick(
+            before.as_deref(),
+            self.extension.seen.get(&chat_id),
+            &tabs,
+            covered.as_deref(),
+        );
+        // A dialog that came over a screen returns to it once answered.
+        let over_screen = before
+            .as_deref()
+            .is_some_and(|before| tabs.iter().any(|tab| tab.id == before && !tab.blocking));
+        match picked.as_deref() {
+            Some(dialog) if dialog.starts_with(DIALOG_PREFIX) => {
+                if over_screen && let Some(before) = before.clone() {
+                    self.extension.covered.insert(chat_id.clone(), before);
+                }
+            }
+            _ => {
+                self.extension.covered.remove(&chat_id);
+            }
+        }
         // Back on the message box: the keyboard goes with it.
         if picked.as_deref() == Some(MESSAGE_TAB) && before.as_deref() != Some(MESSAGE_TAB) {
             self.focus_pending = true;
@@ -507,31 +540,34 @@ mod tests {
     fn new_prompts_come_forward_over_the_message_box_and_queue_behind_a_prompt() {
         // Opening a chat: a screen already up waits behind the message box.
         let screen = prompt_tabs(None, &[btw()]);
-        assert_eq!(repick(None, None, &screen).as_deref(), Some(MESSAGE_TAB));
+        assert_eq!(
+            repick(None, None, &screen, None).as_deref(),
+            Some(MESSAGE_TAB)
+        );
         // `/btw` typed in the message box comes to the front.
         let none = HashSet::new();
         assert_eq!(
-            repick(Some(MESSAGE_TAB), Some(&none), &screen).as_deref(),
+            repick(Some(MESSAGE_TAB), Some(&none), &screen, None).as_deref(),
             Some("btw:thread")
         );
         // With nothing picked the first in line shows: the new btw.
-        assert_eq!(repick(None, Some(&none), &screen), None);
+        assert_eq!(repick(None, Some(&none), &screen, None), None);
         assert_eq!(front(&screen, None), Some("btw:thread"));
         // The agent asks while btw is in front: btw stays, the question waits.
         let both = prompt_tabs(None, &[btw(), ask()]);
-        let picked = repick(Some("btw:thread"), Some(&known(&screen)), &both);
+        let picked = repick(Some("btw:thread"), Some(&known(&screen)), &both, None);
         assert_eq!(picked.as_deref(), Some("btw:thread"));
         assert_eq!(front(&both, picked.as_deref()), Some("btw:thread"));
         // btw closes: the question is next in line.
         let question = prompt_tabs(None, &[ask()]);
-        let picked = repick(picked.as_deref(), Some(&known(&both)), &question);
+        let picked = repick(picked.as_deref(), Some(&known(&both)), &question, None);
         assert_eq!(
             front(&question, picked.as_deref()),
             Some("ask-user:question")
         );
         // The last prompt closes: back to the plain composer.
         assert_eq!(
-            repick(picked.as_deref(), Some(&known(&question)), &[]),
+            repick(picked.as_deref(), Some(&known(&question)), &[], None),
             None
         );
         // A screen closing beside another screen returns to the message box.
@@ -541,8 +577,23 @@ mod tests {
         let two = prompt_tabs(None, &[btw(), report.clone()]);
         let one = prompt_tabs(None, &[report]);
         assert_eq!(
-            repick(Some("btw:thread"), Some(&known(&two)), &one).as_deref(),
+            repick(Some("btw:thread"), Some(&known(&two)), &one, None).as_deref(),
             Some(MESSAGE_TAB)
+        );
+        // btw's thinking picker (a Pi dialog) comes over btw, then returns.
+        let dialog = element(json!({"id":"dialog-1","ns":"pi","kind":"panel","placement":"sheet"}));
+        let picker = prompt_tabs(None, &[btw(), dialog]);
+        let picked = repick(Some("btw:thread"), Some(&known(&screen)), &picker, None);
+        assert_eq!(picked.as_deref(), Some("pi:dialog-1"));
+        assert_eq!(
+            repick(
+                picked.as_deref(),
+                Some(&known(&picker)),
+                &screen,
+                Some("btw:thread")
+            )
+            .as_deref(),
+            Some("btw:thread")
         );
     }
 }
