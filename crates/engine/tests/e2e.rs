@@ -1580,6 +1580,7 @@ async fn respond_input_resolves_pending_question() {
                     prefill: None,
                     multiline: false,
                     multi_select: false,
+                    secret: false,
                 }])
                 .await
                 .unwrap_or_default();
@@ -1735,6 +1736,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
                     prefill: None,
                     multiline: false,
                     multi_select: false,
+                    secret: false,
                 }])
                 .await
                 .unwrap_or_default();
@@ -1928,6 +1930,7 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
                         prefill: None,
                         multiline: false,
                         multi_select: false,
+                        secret: false,
                     }])
                     .await;
                     interrupt.cancelled().await;
@@ -2077,6 +2080,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
                     prefill: None,
                     multiline: false,
                     multi_select: false,
+                    secret: false,
                 };
                 // The pre-fix Claude/Codex shape: surface the question under
                 // the harness's own id BEFORE asking through the bridge.

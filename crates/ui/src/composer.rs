@@ -987,6 +987,9 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
         .collect()
 }
 
+/// What a masked field shows in place of each character.
+const MASK_CHAR: char = '•';
+
 #[derive(Debug, Clone, Default)]
 struct TextProjection {
     display: String,
@@ -1330,6 +1333,20 @@ impl TextProjection {
             projection.mappings.push((range, display));
         }
         projection.display.push_str(&raw[raw_at..]);
+        projection
+    }
+
+    /// Every character shown as a dot, one mapping per character so the
+    /// caret, selection and clicks still land on the real text.
+    fn masked(raw: &str) -> Self {
+        let mut projection = Self::default();
+        for (at, ch) in raw.char_indices() {
+            let start = projection.display.len();
+            projection.display.push(MASK_CHAR);
+            projection
+                .mappings
+                .push((at..at + ch.len_utf8(), start..projection.display.len()));
+        }
         projection
     }
 
@@ -1915,6 +1932,7 @@ struct InputLayoutKey {
     placeholder: SharedString,
     mentions_enabled: bool,
     active_line: Option<Range<usize>>,
+    masked: bool,
 }
 
 /// A soft-wrap boundary is both the previous row's end and the next row's
@@ -1979,6 +1997,8 @@ pub struct ComposerInput {
     text_size: f32,
     configured_line_height: f32,
     single_line: bool,
+    /// Shown as dots ([`Self::with_masked`]).
+    masked: bool,
     scroll_left: f32,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
@@ -2097,6 +2117,7 @@ impl ComposerInput {
             text_size: INPUT_TEXT_SIZE,
             configured_line_height: INPUT_LINE_HEIGHT,
             single_line: false,
+            masked: false,
             scroll_left: 0.0,
             last_lines: Vec::new(),
             line_starts: vec![0],
@@ -2159,6 +2180,24 @@ impl ComposerInput {
     pub fn with_single_line(mut self) -> Self {
         self.single_line = true;
         self
+    }
+
+    /// Show the text as dots (API keys, passwords). The text itself, what
+    /// `text()` returns and submits, is unchanged.
+    pub(crate) fn with_masked(mut self) -> Self {
+        self.masked = true;
+        self
+    }
+
+    /// Mask or unmask a live field: the composer's shared input while a
+    /// question asks for a credential.
+    pub(crate) fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        if self.masked == masked {
+            return;
+        }
+        self.masked = masked;
+        self.refresh_projection();
+        cx.notify();
     }
 
     /// Join the window's Tab order, for a field the keyboard must reach.
@@ -2244,6 +2283,10 @@ impl ComposerInput {
     }
 
     fn refresh_projection(&mut self) {
+        if self.masked {
+            self.projection = TextProjection::masked(&self.content);
+            return;
+        }
         self.projection = if self.mentions_enabled {
             let live: Option<HashSet<u32>> = self
                 .attachment_chips
@@ -3418,6 +3461,10 @@ impl ComposerInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        // A masked field's secret never reaches the clipboard.
+        if self.masked {
+            return;
+        }
         if let Some((raw, text)) = self.clipboard_selection() {
             cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
                 text.clone(),
@@ -3435,7 +3482,7 @@ impl ComposerInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only {
+        if self.read_only || self.masked {
             return;
         }
         if let Some((raw, text)) = self.clipboard_selection() {
@@ -4205,6 +4252,7 @@ impl ComposerInput {
             placeholder: self.placeholder.clone(),
             mentions_enabled: self.mentions_enabled,
             active_line: self.mentions_enabled.then(|| self.editing_source_range()),
+            masked: self.masked,
         };
         // Height-only animation, scrolling, selection and caret blinking do
         // not change shaping. Reuse the entity's single retained layout,
@@ -10661,6 +10709,17 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The shared input is the question panel's free-text answer; a
+        // credential question shows it as dots.
+        let secret = self
+            .wizard
+            .as_ref()
+            .and_then(|w| w.questions.get(w.page))
+            .is_some_and(|q| q.secret);
+        if self.input.read(cx).masked != secret {
+            self.input
+                .update(cx, |input, cx| input.set_masked(secret, cx));
+        }
         if self.dictation_blur.is_none() {
             // Stop, Send and keyboard navigation within the composer must not
             // discard capture. Only leaving the whole composer invalidates it.
@@ -11761,6 +11820,79 @@ mod tests {
                 composer
                     .input
                     .update(cx, |input, cx| test(input, window, cx));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_credential_question_masks_the_shared_input_until_it_is_answered(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let question = |resolved: bool| SessionMessageEntry {
+            duration_ms: None,
+            id: "question-message".into(),
+            role: MessageRole::Assistant,
+            created_at: 0,
+            device_id: "host".into(),
+            status: None,
+            continuation_of: None,
+            parts: vec![MessagePart::Input {
+                id: "input".into(),
+                request_id: "request".into(),
+                resolved,
+                questions: vec![UserInputQuestion {
+                    id: "q".into(),
+                    header: "Pi".into(),
+                    question: "RunInfra API key".into(),
+                    options: vec![],
+                    multi_select: false,
+                    prefill: None,
+                    multiline: false,
+                    secret: true,
+                }],
+            }],
+        };
+        let draw = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+        };
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, cx| {
+                    state.transcript = vec![question(false)];
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        draw(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                assert!(composer.wizard.is_some());
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("rk_live_secret", cx);
+                    assert_eq!(input.text(), "rk_live_secret");
+                    assert_eq!(input.projection.display, "\u{2022}".repeat(14));
+                });
+            })
+            .unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, cx| {
+                    state.transcript = vec![question(true)];
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        draw(cx);
+        draw(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                assert!(composer.wizard.is_none());
+                assert!(
+                    !composer.input.read(cx).masked,
+                    "the composer is plain again"
+                );
             })
             .unwrap();
     }
@@ -13013,6 +13145,19 @@ mod tests {
         );
         for (display, _) in projection.display.char_indices() {
             assert!(raw.is_char_boundary(projection.display_to_raw(display)));
+        }
+    }
+
+    #[test]
+    fn a_masked_projection_hides_every_character_but_keeps_caret_mapping() {
+        let raw = "ab€1";
+        let projection = TextProjection::masked(raw);
+        assert_eq!(projection.display, "•".repeat(4));
+        let dot = MASK_CHAR.len_utf8();
+        // Raw char boundaries map to dot boundaries and back.
+        for (n, (at, _)) in raw.char_indices().chain([(raw.len(), ' ')]).enumerate() {
+            assert_eq!(projection.raw_to_display(at), n * dot);
+            assert_eq!(projection.display_to_raw(n * dot), at);
         }
     }
 
@@ -15210,6 +15355,7 @@ mod tests {
             prefill: None,
             multiline: false,
             multi_select: multi,
+            secret: false,
         }
     }
 

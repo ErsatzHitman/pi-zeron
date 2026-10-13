@@ -82,6 +82,31 @@ pub(super) fn element_key(element: &Value) -> String {
 }
 
 /// The prompt text that delivers `event` to the extensions.
+/// Whether an `input` dialog asks for a credential: Pi's dialogs carry no
+/// such flag, so the title, message and placeholder are read for the usual
+/// words (`/runinfra-key`, `/login` API keys, MCP tokens).
+pub(super) fn asks_for_secret(frame: &Value) -> bool {
+    // "token" alone also names counts ("token threshold"), so only the
+    // credential phrases.
+    const WORDS: [&str; 9] = [
+        "api key",
+        "api-key",
+        "apikey",
+        "password",
+        "passphrase",
+        "secret",
+        "access token",
+        "auth token",
+        "bearer",
+    ];
+    ["title", "message", "placeholder"].iter().any(|key| {
+        frame[*key].as_str().is_some_and(|text| {
+            let text = strip_ansi(text).to_lowercase().replace('_', " ");
+            WORDS.iter().any(|word| text.contains(word))
+        })
+    })
+}
+
 pub(super) fn encode_client_event(event: &Value) -> String {
     let json = serde_json::to_vec(event).expect("JSON value");
     format!(
@@ -184,7 +209,13 @@ impl ExtensionUi {
                     json!({"id":"no","label":"No","variant":"secondary"}),
                 ],
             ),
-            "input" => (vec![text_field("text")], vec![submit]),
+            "input" => {
+                let mut field = text_field("text");
+                if asks_for_secret(frame) {
+                    field["secret"] = json!(true);
+                }
+                (vec![field], vec![submit])
+            }
             _ => (vec![text_field("textarea")], vec![submit]),
         };
         let mut element = json!({
@@ -724,6 +755,25 @@ mod tests {
         assert_eq!(state.editor_text.as_ref().unwrap().text, "draft");
         ui.handle(&json!({"method":"setWidget","widgetKey":"btw"}));
         assert!(ui.state().widgets.is_empty());
+    }
+
+    #[test]
+    fn an_input_asking_for_a_credential_is_marked_secret() {
+        let (tx, rx) = watch::channel(ExtensionUiState::default());
+        let mut ui = ExtensionUi::new(Some(tx));
+        let field = |rx: &watch::Receiver<ExtensionUiState>| {
+            let sheet =
+                serde_json::to_value(rx.borrow().elements.last().cloned().unwrap()).unwrap();
+            sheet["sections"][0]["fields"][0].clone()
+        };
+        ui.open_dialog(&json!({"id":"k","method":"input","title":"RunInfra API key"}));
+        assert_eq!(field(&rx)["secret"], true);
+        ui.open_dialog(
+            &json!({"id":"p","method":"input","title":"Login","placeholder":"PERSONAL_ACCESS_TOKEN"}),
+        );
+        assert_eq!(field(&rx)["secret"], true);
+        ui.open_dialog(&json!({"id":"t","method":"input","title":"Token threshold"}));
+        assert_eq!(field(&rx).get("secret"), None);
     }
 
     #[test]

@@ -526,6 +526,10 @@ pub struct UserInputQuestion {
     pub prefill: Option<String>,
     #[serde(default)]
     pub multiline: bool,
+    /// The free-text answer is a credential (an API key, a password): shown
+    /// as dots and never copied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

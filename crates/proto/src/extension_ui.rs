@@ -239,6 +239,9 @@ pub struct PiUiField {
     pub value: Option<Value>,
     pub searchable: bool,
     pub required: bool,
+    /// A one-line text field whose value is a secret (an API key, a
+    /// password): shown as dots and never copied.
+    pub secret: bool,
 }
 
 impl PiUiField {

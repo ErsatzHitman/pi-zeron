@@ -90,7 +90,7 @@ live state; it never enters the synced chat document.
 | `sheet` (ask-user, decisions, model picker, idle Pi dialogs) | replaces the composer; keyboard picks, Enter submits, Esc cancels |
 | `pinned` (bash jobs, subagent fleet, workflows, todo) | collapsible trays above the todo panel, with row actions |
 | `status`, `setStatus`, goal/footer channels, plan mode | chips in the composer footer (a `setStatus` line repeating an element chip shows once) |
-| `screen` (subagent viewer, btw, `/usage`, `/workspace`, `/workflow` reports, `/clinepass`) | a right-pane tab, opened once, closed when the element goes away; more than three actions wrap into a toolbar under the title. In the chat, a one-line tray opens the tab and previews the screen only while it is busy |
+| `screen` (subagent viewer, btw, `/usage`, `/workspace`, `/workflow` reports, `/clinepass`, `/llama-models`, `/mcp-servers`) | a right-pane tab, opened once, closed when the element goes away; more than three actions wrap into a toolbar under the title. In the chat, a one-line tray opens the tab and previews the screen only while it is busy |
 | `setWidget` | a tray of plain lines |
 | `notify` (plain) | a toast while watched; transcript text otherwise. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
 | `setTitle` | renames the chat |
@@ -98,6 +98,12 @@ live state; it never enters the synced chat document.
 
 A dialog Pi raises between turns has no turn to ask in; for a watching UI it
 becomes a `pi:dialog-N` sheet (timeouts honoured), otherwise it is cancelled.
+
+An `input` dialog asking for a credential (its title, message or placeholder
+names an API key, password, passphrase, secret, access/auth token or bearer)
+is masked: the sheet's field (`PiUiField.secret`) and, during a turn, the
+question's free-text answer (`UserInputQuestion.secret`) show dots and refuse
+copy and cut. PIUI forms can set `secret` on a text field themselves.
 
 Extension messages with `display: true` (workflow results, subagent
 deliveries, memory) appear in the transcript as `pi/<customType>` tool chips

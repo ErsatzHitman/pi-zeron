@@ -152,6 +152,8 @@ impl SheetForm {
                         let input = ComposerInput::new(placeholder, cx);
                         let mut input = if multiline {
                             input.with_viewport_height(TEXTAREA_HEIGHT)
+                        } else if field.secret {
+                            input.with_single_line().with_masked()
                         } else {
                             input.with_single_line()
                         };

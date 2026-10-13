@@ -49,6 +49,7 @@ impl Dialogs {
             multi_select: false,
             prefill: frame["prefill"].as_str().map(str::to_owned),
             multiline: method == "editor",
+            secret: method == "input" && super::piui::asks_for_secret(frame),
         };
         let question_id = question.id.clone();
         let answer = (input)(vec![question]);
@@ -151,5 +152,36 @@ mod tests {
                 "type":"extension_ui_response", "id":"stopped", "cancelled":true
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_credential_input_during_a_run_asks_a_secret_question() {
+        let (writer, _peer) = tokio::io::duplex(4096);
+        let (_peer_writer, reader) = tokio::io::duplex(4096);
+        let transport = super::super::rpc::Transport::new(writer, reader);
+        let (bridge, mut asked) = tokio::sync::mpsc::unbounded_channel();
+        let mut dialogs = Dialogs::default();
+        dialogs.input = Some(Arc::new(move |questions: Vec<UserInputQuestion>| {
+            bridge.send(questions[0].secret).unwrap();
+            oneshot::channel().1
+        }));
+        let ask =
+            |dialogs: &mut Dialogs, frame: Value| dialogs.request(transport.client.clone(), &frame);
+        ask(
+            &mut dialogs,
+            json!({"id":"k", "method":"input", "title":"RunInfra API key", "placeholder":"rk_..."}),
+        );
+        ask(
+            &mut dialogs,
+            json!({"id":"n", "method":"input", "title":"Session name"}),
+        );
+        ask(
+            &mut dialogs,
+            json!({"id":"s", "method":"select", "title":"Pick an API key", "options":["a"]}),
+        );
+        assert_eq!(asked.recv().await, Some(true));
+        assert_eq!(asked.recv().await, Some(false));
+        assert_eq!(asked.recv().await, Some(false), "only free text is masked");
+        dialogs.cancel();
     }
 }

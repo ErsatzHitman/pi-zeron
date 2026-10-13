@@ -117,6 +117,7 @@ impl Harness for HeldHarness {
                 prefill: None,
                 multiline: false,
                 multi_select: false,
+                secret: false,
             }])
         });
         let finish = self.finish.subscribe();
