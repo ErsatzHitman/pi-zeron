@@ -14,6 +14,8 @@ if "%ZERON_REMOTE%"=="" (
 )
 if "%ZERON_REMOTE_PORT%"=="" set "ZERON_REMOTE_PORT=27755"
 start "Zeron tunnel to %ZERON_REMOTE%" /min ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L %ZERON_REMOTE_PORT%:127.0.0.1:27654 %ZERON_REMOTE%
+rem Give the tunnel a moment to listen before the window probes it.
+timeout /t 3 /nobreak >nul
 set "ZERON_IPC_PORT=%ZERON_REMOTE_PORT%"
 set "ZERON_DATA_DIR=%LOCALAPPDATA%\ZeronRemote"
 set "ZERON_ATTACH_ONLY=1"
