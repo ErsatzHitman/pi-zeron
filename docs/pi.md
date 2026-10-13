@@ -50,6 +50,12 @@ templates and skills are discovered in the workspace; a command Pi advertises
 shadows Zeron's built-in mapping of the same name. Pi controls
 project-extension trust.
 
+The `/` menu never starts a Pi process. It lists what the chat's own Pi
+reported when it started, kept in `zeron-sessions/commands.json` so it is
+there after a restart. A workspace no chat has run in yet shows the latest
+list from the same Pi until its first run. Only a Pi with no list anywhere is
+asked once by a no-session process.
+
 Steering queues at a model step boundary and starts immediately when idle.
 When no steering mode is configured, Zeron selects Pi's `all` mode, so messages
 queued before the next model call enter that call together. A mode already set

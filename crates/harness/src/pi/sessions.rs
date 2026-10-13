@@ -62,6 +62,10 @@ impl Store {
             legacy: home.join(".pi/pi-acp/session-map.json"),
         }
     }
+    /// Where Zeron keeps its own files: the session map, the command lists.
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
     /// Whether a steering mode is already set in the settings Pi loads for
     /// `cwd` (global, then project).
     pub fn steering_mode_configured(&self, cwd: &Path) -> bool {

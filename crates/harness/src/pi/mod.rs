@@ -1,5 +1,6 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
 mod catalog;
+mod commands;
 mod mcp;
 mod normalize;
 mod piui;
@@ -42,6 +43,7 @@ pub struct PiHarness {
     models_cache: crate::catalog::Catalog,
     executable_setting: Option<ExecutableSetting>,
     workspace_commands: crate::skills::CommandDiscovery,
+    commands: commands::Cache,
     session_store: Option<PathBuf>,
     agent_dir: Option<PathBuf>,
     executable: Option<PathBuf>,
@@ -57,6 +59,7 @@ impl Default for PiHarness {
             agent_dir: None,
             models_cache: Default::default(),
             workspace_commands: Default::default(),
+            commands: Default::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
         }
@@ -147,6 +150,12 @@ impl PiHarness {
         });
         rx.await
             .map_err(|_| HarnessError::Protocol("Pi discovery task failed".into()))?
+    }
+    /// Beside the session map: Zeron's own files in Pi's agent directory.
+    fn commands_file(&self) -> PathBuf {
+        sessions::Store::new(self.session_store.clone(), self.agent_dir.clone())
+            .root()
+            .join("commands.json")
     }
     fn spawn(
         &self,
@@ -358,15 +367,25 @@ impl Harness for PiHarness {
     async fn commands(&self) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
         self.commands_for(&std::env::current_dir()?).await
     }
+    /// The list the chat's own Pi reported (`commands.rs`): the `/` menu
+    /// never starts a Pi process, except once for a Pi with no list at all.
     async fn commands_for(
         &self,
         cwd: &Path,
     ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
-        self.workspace_commands
+        let key = commands::key(&self.resolve_executable()?, cwd);
+        let file = self.commands_file();
+        if let Some(commands) = self.commands.lookup(&file, &key) {
+            return Ok(commands);
+        }
+        let commands = self
+            .workspace_commands
             .get(cwd, async {
                 Ok(catalog::commands(&self.probe(cwd, false).await?))
             })
-            .await
+            .await?;
+        self.commands.store(&file, &key, commands.clone());
+        Ok(commands)
     }
     async fn skills(
         &self,
@@ -492,6 +511,11 @@ impl Harness for PiHarness {
             request.resume = None;
         }
         let process = self.spawn(Path::new(&request.cwd), &args, request.mcp.as_ref())?;
+        let commands_cache = (
+            self.commands.clone(),
+            self.commands_file(),
+            commands::key(&self.resolve_executable()?, Path::new(&request.cwd)),
+        );
         let (tx, rx) = mpsc::channel(256);
         let kill_grace = self.kill_grace;
         let interrupt_grace = self.interrupt_grace;
@@ -521,6 +545,7 @@ impl Harness for PiHarness {
                 ui_watched: None,
                 piui_on: false,
                 turn: Default::default(),
+                commands_cache,
             };
             // The lease lives through shutdown even if the consumer drops its stream.
             let RunControls {
@@ -605,6 +630,8 @@ struct Runner {
     /// We sent `hello` (and no `bye` since): extensions publish elements.
     piui_on: bool,
     turn: crate::TurnControl,
+    /// Where this run's command list refreshes the `/` menu's cache.
+    commands_cache: (commands::Cache, PathBuf, String),
 }
 impl Runner {
     /// Opt in to PIUI only while a UI that renders it is watching, and opt
@@ -753,8 +780,11 @@ impl Runner {
             .filter(|c| c["source"] == "extension")
             .map(|c| string(c, "name").to_owned())
             .collect();
+        let available = catalog::commands(&commands);
+        let (cache, file, key) = &self.commands_cache;
+        cache.store(file, key, available.clone());
         self.emit(AgentEvent::AvailableCommands {
-            commands: catalog::commands(&commands),
+            commands: available,
         })
         .await?;
         self.process
