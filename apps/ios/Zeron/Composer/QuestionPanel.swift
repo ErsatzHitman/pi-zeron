@@ -137,10 +137,14 @@ final class QuestionPanel: UIView, UITextFieldDelegate, UITextViewDelegate {
         }
         other.isHidden = q.multiline
         editor.isHidden = !q.multiline
-        // A key is typed as dots and kept out of autocorrect's memory.
+        // A key is never answered from the phone: what is answered here is
+        // kept in the chat's synced history, while the computer hands it to
+        // the agent directly. The field stays as dots, and closed.
         other.isSecureTextEntry = q.secret
         other.autocorrectionType = q.secret ? .no : .default
-        other.text = custom[q.id]
+        other.isEnabled = !q.secret
+        other.placeholder = q.secret ? "Answer this on your computer: keys stay off the phone" : "Other…"
+        other.text = q.secret ? nil : custom[q.id]
         editor.text = custom[q.id]
         back.isHidden = page == 0
         var n = nextButton.configuration
@@ -151,7 +155,8 @@ final class QuestionPanel: UIView, UITextFieldDelegate, UITextViewDelegate {
     }
 
     private func answered(_ q: SessionChrome.Question) -> Bool {
-        q.multiline || !(picks[q.id] ?? []).isEmpty || !(custom[q.id] ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        if q.secret { return false }
+        return q.multiline || !(picks[q.id] ?? []).isEmpty || !(custom[q.id] ?? "").trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     private func pick(_ option: String) {
