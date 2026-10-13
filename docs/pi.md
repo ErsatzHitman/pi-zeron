@@ -99,6 +99,11 @@ live state; it never enters the synced chat document.
 A dialog Pi raises between turns has no turn to ask in; for a watching UI it
 becomes a `pi:dialog-N` sheet (timeouts honoured), otherwise it is cancelled.
 
+Pi runs once per turn, and its elements go when the process does. What an
+extension sends as the turn settles (a last notice, a title, the composer
+draft) outlives the process instead, and the next run numbers its requests
+after them, so a toast sent at the very end still shows once.
+
 An `input` dialog asking for a credential (its title, message or placeholder
 names an API key, password, passphrase, secret, access/auth token or bearer)
 is masked: the sheet's field (`PiUiField.secret`) and, during a turn, the

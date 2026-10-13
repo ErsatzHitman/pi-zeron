@@ -73,6 +73,28 @@ pub(super) struct ExtensionUi {
     dialog_seq: u64,
 }
 
+/// `state` without anything a process drew: its revision and one-shot requests.
+fn one_shot_requests(state: &ExtensionUiState) -> ExtensionUiState {
+    ExtensionUiState {
+        revision: state.revision,
+        notices: state.notices.clone(),
+        title: state.title.clone(),
+        editor_text: state.editor_text.clone(),
+        durable: state.durable.clone(),
+        ..Default::default()
+    }
+}
+
+fn last_request_seq(state: &ExtensionUiState) -> u64 {
+    let notices = state.notices.iter().map(|n| n.seq);
+    let durable = state.durable.iter().map(|d| d.seq);
+    let texts = [&state.title, &state.editor_text]
+        .into_iter()
+        .flatten()
+        .map(|t| t.seq);
+    notices.chain(durable).chain(texts).max().unwrap_or(0)
+}
+
 pub(super) fn element_key(element: &Value) -> String {
     format!(
         "{}:{}",
@@ -139,9 +161,19 @@ pub(super) fn action_event(action: &ExtensionUiAction) -> Value {
 }
 
 impl ExtensionUi {
+    /// A chat's runs share one state. A new run keeps the last run's
+    /// one-shot requests ([`Self::closed`]) and numbers its own after them, so
+    /// a UI that applied those still applies these.
     pub fn new(sink: Option<watch::Sender<ExtensionUiState>>) -> Self {
+        let state = sink
+            .as_ref()
+            .map(|sink| one_shot_requests(&sink.borrow()))
+            .unwrap_or_default();
+        let seq = last_request_seq(&state);
         Self {
             sink,
+            state,
+            seq,
             ..Default::default()
         }
     }
@@ -412,13 +444,13 @@ impl ExtensionUi {
         }
     }
 
-    /// The Pi process ended: nothing it drew survives it.
+    /// The Pi process ended: nothing it drew survives it. Its notices, title,
+    /// editor text and durable elements stay: a UI applies each once by
+    /// `seq`, and a run's last ones (a command's closing report, a draft put
+    /// back) arrive just before the process ends, often within the UI's next
+    /// frame.
     pub fn closed(&mut self) {
-        let revision = self.state.revision;
-        self.state = ExtensionUiState {
-            revision,
-            ..Default::default()
-        };
+        self.state = one_shot_requests(&self.state);
         self.keys.clear();
         self.chunks.clear();
         self.dialogs.clear();
@@ -648,6 +680,34 @@ mod tests {
             "channel":"bash-bg:fleet","payload":{"active":2}})));
         assert_eq!(ui.state().elements[0]["lines"], json!(["line"]));
         assert_eq!(ui.background_tasks(), 2);
+    }
+
+    #[test]
+    fn a_runs_last_notice_and_draft_outlive_its_process_and_the_next_run_numbers_after_them() {
+        let (tx, rx) = watch::channel(ExtensionUiState::default());
+        let mut ui = ExtensionUi::new(Some(tx.clone()));
+        let card = json!({"id":"card","ns":"x","kind":"panel","placement":"pinned"});
+        ui.handle(&set(1, "a", card));
+        let report = json!({"type":"extension_ui_request","method":"notify",
+            "message":"Calibration complete","notifyType":"info"});
+        ui.handle(&report);
+        ui.handle(&json!({"method":"set_editor_text","text":"draft"}));
+        ui.closed();
+        let closed = rx.borrow().clone();
+        assert!(closed.elements.is_empty());
+        assert!(!closed.connected);
+        assert_eq!(closed.notices[0].message, "Calibration complete");
+        assert_eq!(closed.editor_text.as_ref().unwrap().text, "draft");
+        let last = closed.editor_text.unwrap().seq;
+
+        let mut next = ExtensionUi::new(Some(tx));
+        let notice = json!({"type":"extension_ui_request","method":"notify",
+            "message":"next run","notifyType":"info"});
+        next.handle(&notice);
+        let state = rx.borrow().clone();
+        assert_eq!(state.notices.len(), 2);
+        assert!(state.notices[1].seq > last);
+        assert!(state.revision > closed.revision);
     }
 
     #[test]
