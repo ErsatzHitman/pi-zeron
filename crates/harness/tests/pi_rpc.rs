@@ -435,12 +435,17 @@ async fn extension_dialogs_roundtrip_without_autoaccepting_and_preserve_editor_t
         )
         .await
         .unwrap();
+        // The fixture reports the reply as a notice: a row in the turn.
         let reply = events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::TextDelta { text } => {
-                    serde_json::from_str::<serde_json::Value>(text.trim()).ok()
-                }
+                AgentEvent::ToolCall {
+                    call: zeron_proto::ToolCall::Mcp { tool, input, .. },
+                    ..
+                } if tool == "notice" => input
+                    .as_ref()
+                    .and_then(|input| input["message"].as_str())
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok()),
                 _ => None,
             })
             .expect("dialog reply notification");
