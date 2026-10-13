@@ -1152,10 +1152,12 @@ async fn an_idle_dialog_becomes_a_sheet_for_a_watching_ui() {
     let path = dir.path().join("dialog-responses.jsonl");
     let response = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            // The fake Pi may still be writing the line: retry until it parses.
             if let Ok(text) = std::fs::read_to_string(&path)
                 && let Some(line) = text.lines().next()
+                && let Ok(response) = serde_json::from_str::<serde_json::Value>(line)
             {
-                return serde_json::from_str::<serde_json::Value>(line).unwrap();
+                return response;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
