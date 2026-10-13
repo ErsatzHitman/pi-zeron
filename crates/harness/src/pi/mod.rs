@@ -642,15 +642,6 @@ impl Runner {
             self.process.transport.client.send(response)?;
             return Ok(());
         }
-        // The advisor panel has no cancel handler of its own: esc in the
-        // terminal is an RPC abort, so its Cancel is too.
-        if action.element_id.starts_with("advisor-live-panel:") && action.action_id == "cancel" {
-            self.process
-                .transport
-                .client
-                .request(json!({"type":"abort"}))?;
-            return Ok(());
-        }
         if !self.piui_on {
             tracing::debug!(element = %action.element_id, "extension UI action without PIUI; dropped");
             return Ok(());
