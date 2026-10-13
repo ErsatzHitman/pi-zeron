@@ -8473,12 +8473,21 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
-        // An extension put text in the input box (`set_editor_text`).
-        if let Some(text) = self
-            .state
-            .update(cx, |state, _| state.extension_ui.editor_text.take())
-            && self.editing_queued.is_none()
+        // An extension put text in the input box (`set_editor_text`). It
+        // waits while a queued message is being edited. Over RPC an
+        // extension reads the box as empty, so what it sends goes after a
+        // draft rather than over it.
+        if self.editing_queued.is_none()
+            && let Some(text) = self
+                .state
+                .update(cx, |state, _| state.extension_ui.editor_text.take())
         {
+            let draft = self.input.read(cx).text().trim_end().to_owned();
+            let text = if draft.trim().is_empty() || text.starts_with(&draft) {
+                text
+            } else {
+                format!("{draft}\n{text}")
+            };
             self.input.update(cx, |input, cx| input.set_text(text, cx));
         }
         self.track_new_prompts(cx);
@@ -8803,11 +8812,11 @@ impl Composer {
             self.execute_workspace_command(action, 0..self.input.read(cx).text().len(), cx);
             return;
         }
-        let no_content = !composer_has_content(
-            &text,
-            self.staged().len() + self.staged_appshots().len(),
-            self.staged_comments(cx).len(),
-        );
+        let attached = self.staged().len() + self.staged_appshots().len();
+        let comments = self.staged_comments(cx).len();
+        // A lone "/" is a command not picked yet, not a message.
+        let no_content = !composer_has_content(&text, attached, comments)
+            || (text.trim() == "/" && attached == 0 && comments == 0);
         match self.button_mode(cx) {
             // Enter never stops a run: Stop mode implies an empty composer,
             // so a stray extra Enter right after sending landed an interrupt

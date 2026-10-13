@@ -248,6 +248,26 @@ impl ExtensionUi {
         self.in_turn = in_turn;
     }
 
+    /// A footer chip Zeron keeps itself (Pi retrying a failed request);
+    /// `None` takes it away.
+    pub fn host_status(&mut self, key: &str, text: Option<String>) {
+        let statuses = &mut self.state.statuses;
+        let at = statuses.iter().position(|status| status.key == key);
+        match (text, at) {
+            (Some(text), Some(at)) if statuses[at].text == text => return,
+            (Some(text), Some(at)) => statuses[at].text = text,
+            (Some(text), None) => statuses.push(ExtensionStatus {
+                key: key.to_owned(),
+                text,
+            }),
+            (None, Some(at)) => {
+                statuses.remove(at);
+            }
+            (None, None) => return,
+        }
+        self.publish();
+    }
+
     fn publish(&mut self) {
         self.state.revision += 1;
         if let Some(sink) = &self.sink {
@@ -939,6 +959,11 @@ mod tests {
         assert_eq!(state.editor_text.as_ref().unwrap().text, "draft");
         ui.handle(&json!({"method":"setWidget","widgetKey":"btw"}));
         assert!(ui.state().widgets.is_empty());
+        // Zeron's own chip comes and goes beside the extensions'.
+        ui.host_status("zeron:retry", Some("Retrying · attempt 1/3".into()));
+        assert_eq!(ui.state().statuses[1].text, "Retrying · attempt 1/3");
+        ui.host_status("zeron:retry", None);
+        assert_eq!(ui.state().statuses.len(), 1);
         // During a turn a notice is the turn's to record, never a toast.
         ui.set_in_turn(true);
         assert_eq!(

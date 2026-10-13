@@ -186,22 +186,30 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
             .map(|s| Chip {
                 key: format!("status:{}", s.key),
                 text: s.text.trim().to_owned(),
-                active: false,
+                // Zeron's own chips (Pi retrying a request) stand out.
+                active: s.key.starts_with("zeron:"),
                 action: None,
             }),
     );
     if let Some(goal) = state.channels.get("pi-goal:status")
         && goal["active"] == true
     {
+        // The goal's channel says it all: its plain status line and
+        // element would say it again.
+        chips.retain(|chip| {
+            chip.action.is_some() || !chip.key.to_ascii_lowercase().contains("goal")
+        });
         let text = goal["text"].as_str().unwrap_or_default();
+        let waiting = goal["status"] == "waiting";
         chips.push(Chip {
             key: "channel:goal".into(),
-            text: if text.is_empty() {
-                "Goal".into()
-            } else {
-                format!("Goal · {text}")
+            text: match (text.is_empty(), waiting) {
+                (true, false) => "Goal".into(),
+                (true, true) => "Goal · waiting".into(),
+                (false, false) => format!("Goal · {text}"),
+                (false, true) => format!("Goal · {text} · waiting"),
             },
-            active: true,
+            active: !waiting,
             action: None,
         });
     }
@@ -580,10 +588,21 @@ mod tests {
                 lines: vec!["thinking".into()],
                 placement: None,
             }],
-            statuses: vec![ExtensionStatus {
-                key: "!mode".into(),
-                text: "Build".into(),
-            }],
+            statuses: vec![
+                ExtensionStatus {
+                    key: "!mode".into(),
+                    text: "Build".into(),
+                },
+                // pi-goal's plain status line, for clients without channels.
+                ExtensionStatus {
+                    key: "goal".into(),
+                    text: "goal: ship it".into(),
+                },
+                ExtensionStatus {
+                    key: "zeron:retry".into(),
+                    text: "Retrying · attempt 1/3".into(),
+                },
+            ],
             ..Default::default()
         };
         state.channels.insert(
@@ -605,9 +624,16 @@ mod tests {
         let texts: Vec<&str> = chips.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
             texts,
-            vec!["Plan", "Build", "Goal · ship it", "42 tok/s · $0.042"]
+            vec![
+                "Plan",
+                "Build",
+                "Retrying · attempt 1/3",
+                "Goal · ship it",
+                "42 tok/s · $0.042"
+            ]
         );
         assert!(chips[0].active);
+        assert!(chips[2].active);
         assert_eq!(chips[0].action, Some(("plan:mode".into(), "toggle".into())));
         assert_eq!(chips[1].action, None);
     }

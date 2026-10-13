@@ -637,16 +637,21 @@ struct Runner {
     /// Where this run's command list refreshes the `/` menu's cache.
     commands_cache: (commands::Cache, PathBuf, String),
 }
+/// The footer chip Zeron shows while Pi retries a failed request.
+const RETRY_STATUS: &str = "zeron:retry";
 impl Runner {
     /// Opt in to PIUI only while a UI that renders it is watching, and opt
     /// out when the last one leaves, so Pi falls back to dialogs a plain
     /// client (or an older Zeron) can answer. Sent as a raw command: it must
     /// not open a turn, and its `handled` ACK matches no pending entry.
     fn sync_piui(&mut self) -> Result<(), HarnessError> {
-        let watched = self
-            .ui_watched
-            .as_ref()
-            .is_some_and(|watched| *watched.borrow());
+        let watched = self.watched();
+        if !watched {
+            // Nobody is left to answer the sheets the host drew for dialogs.
+            for response in self.ui.close_dialogs(true) {
+                self.process.transport.client.send(response)?;
+            }
+        }
         if watched == self.piui_on {
             return Ok(());
         }
@@ -659,16 +664,18 @@ impl Runner {
         let event = if watched { piui::hello() } else { piui::bye() };
         if !watched {
             self.ui.disconnect();
-            // Nobody is left to answer the sheets the host drew for dialogs.
-            for response in self.ui.close_dialogs(true) {
-                self.process.transport.client.send(response)?;
-            }
         }
         self.process.transport.client.request(json!({
             "type":"prompt",
             "message":piui::encode_client_event(&event),
         }))?;
         Ok(())
+    }
+    /// A UI that draws extension elements is watching this chat.
+    fn watched(&self) -> bool {
+        self.ui_watched
+            .as_ref()
+            .is_some_and(|watched| *watched.borrow())
     }
     fn send_action(
         &mut self,
@@ -1190,7 +1197,10 @@ impl Runner {
                 // during a turn or between turns: the sheet keeps the
                 // dialog's placeholder, search and secret field, and a
                 // dialog nobody asked for (a peer's letter) outlives the turn.
-                piui::Handled::Dialog if self.piui_on && self.ui.open_dialog(&frame) => {}
+                // A sheet's answer is live, never written to the chat's
+                // synced command history as a question's answer is: a key
+                // typed into it stays out of the history.
+                piui::Handled::Dialog if self.watched() && self.ui.open_dialog(&frame) => {}
                 piui::Handled::Dialog if self.active => self
                     .process
                     .dialogs
@@ -1292,6 +1302,20 @@ impl Runner {
             } else {
                 self.confirm_delivery().await?;
             }
+        }
+        // Pi retrying a failed request shows as a footer chip until the
+        // retry ends (or the run does).
+        match string(&frame, "type") {
+            "auto_retry_start" => {
+                let attempt = frame["attempt"].as_u64().unwrap_or(1);
+                let text = match frame["maxAttempts"].as_u64() {
+                    Some(max) => format!("Retrying · attempt {attempt}/{max}"),
+                    None => format!("Retrying · attempt {attempt}"),
+                };
+                self.ui.host_status(RETRY_STATUS, Some(text));
+            }
+            "auto_retry_end" | "agent_settled" => self.ui.host_status(RETRY_STATUS, None),
+            _ => {}
         }
         // An extension message appended between turns must not reopen a
         // completed engine turn; it is in Pi's history for the next one.

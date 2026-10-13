@@ -5984,12 +5984,14 @@ pub fn respond_input_prompt(
 ) -> String {
     let mut lines = vec!["Answering your earlier question:".to_string()];
     for answer in answers {
-        let picked = answer.labels.join(", ");
-        let question = questions
-            .iter()
-            .find(|q| q.id == answer.question_id)
-            .map(|q| q.question.trim())
-            .filter(|q| !q.is_empty());
+        let asked = questions.iter().find(|q| q.id == answer.question_id);
+        // A secret (an API key) is never written into the chat as a message.
+        let picked = if asked.is_some_and(|q| q.secret) {
+            "[secret withheld; ask for it again]".to_string()
+        } else {
+            answer.labels.join(", ")
+        };
+        let question = asked.map(|q| q.question.trim()).filter(|q| !q.is_empty());
         match question {
             Some(question) => lines.push(format!("{question} — {picked}")),
             None => lines.push(picked),
@@ -6013,6 +6015,40 @@ fn encode_part_segment(part_id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod respond_input_prompt_tests {
+    use super::respond_input_prompt;
+    use zeron_proto::{UserInputAnswer, UserInputQuestion};
+
+    #[test]
+    fn a_late_answer_to_a_secret_question_never_carries_the_secret() {
+        let question = |id: &str, text: &str, secret: bool| UserInputQuestion {
+            id: id.into(),
+            header: "Pi".into(),
+            question: text.into(),
+            options: Vec::new(),
+            multi_select: false,
+            prefill: None,
+            multiline: false,
+            secret,
+        };
+        let answer = |id: &str, label: &str| UserInputAnswer {
+            question_id: id.into(),
+            labels: vec![label.into()],
+        };
+        let prompt = respond_input_prompt(
+            &[
+                question("k", "OpenRouter API key", true),
+                question("m", "Model", false),
+            ],
+            &[answer("k", "sk-or-v1-abcdef"), answer("m", "gpt")],
+        );
+        assert!(!prompt.contains("sk-or-v1"), "{prompt}");
+        assert!(prompt.contains("OpenRouter API key — [secret withheld"));
+        assert!(prompt.contains("Model — gpt"));
+    }
 }
 
 #[cfg(test)]
