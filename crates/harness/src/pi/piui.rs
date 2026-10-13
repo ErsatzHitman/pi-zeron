@@ -47,7 +47,8 @@ struct HostDialog {
 pub(super) enum Handled {
     /// PIUI or plain UI state; nothing else to do.
     Consumed,
-    /// A plain (non-PIUI) `notify`, already recorded as a notice.
+    /// A plain (non-PIUI) `notify`. Between turns it is recorded as a notice
+    /// (a toast); during one it is not, and the turn records it as a row.
     Notice(String),
     /// A blocking dialog (`select`, `confirm`, `input`, `editor`).
     Dialog,
@@ -71,6 +72,8 @@ pub(super) struct ExtensionUi {
     /// Published after the PIUI elements; a PIUI `reset` never clears them.
     dialogs: Vec<HostDialog>,
     dialog_seq: u64,
+    /// A turn is running: its notices become transcript rows, not toasts.
+    in_turn: bool,
 }
 
 /// `state` without anything a process drew: its revision and one-shot requests.
@@ -93,6 +96,15 @@ fn last_request_seq(state: &ExtensionUiState) -> u64 {
         .flatten()
         .map(|t| t.seq);
     notices.chain(durable).chain(texts).max().unwrap_or(0)
+}
+
+/// A `notify`'s level.
+pub(super) fn notice_level(frame: &Value) -> NoticeLevel {
+    match frame["notifyType"].as_str() {
+        Some("warning") => NoticeLevel::Warning,
+        Some("error") => NoticeLevel::Error,
+        _ => NoticeLevel::Info,
+    }
 }
 
 pub(super) fn element_key(element: &Value) -> String {
@@ -178,9 +190,13 @@ impl ExtensionUi {
         }
     }
 
-    #[cfg(test)]
     pub fn state(&self) -> &ExtensionUiState {
         &self.state
+    }
+
+    /// Whether a turn is running (see [`Handled::Notice`]).
+    pub fn set_in_turn(&mut self, in_turn: bool) {
+        self.in_turn = in_turn;
     }
 
     fn publish(&mut self) {
@@ -352,11 +368,10 @@ impl ExtensionUi {
                 // Extensions colour terminal output (and OSC-8 link it); a GUI
                 // shows the plain text.
                 let message = strip_ansi(&message);
-                let level = match frame["notifyType"].as_str() {
-                    Some("warning") => NoticeLevel::Warning,
-                    Some("error") => NoticeLevel::Error,
-                    _ => NoticeLevel::Info,
-                };
+                if self.in_turn {
+                    return Handled::Notice(message);
+                }
+                let level = notice_level(frame);
                 let seq = self.next_seq();
                 self.state.notices.push(ExtensionNotice {
                     seq,
@@ -815,6 +830,17 @@ mod tests {
         assert_eq!(state.editor_text.as_ref().unwrap().text, "draft");
         ui.handle(&json!({"method":"setWidget","widgetKey":"btw"}));
         assert!(ui.state().widgets.is_empty());
+        // During a turn a notice is the turn's to record, never a toast.
+        ui.set_in_turn(true);
+        assert_eq!(
+            ui.handle(&json!({"method":"notify","message":"in turn","notifyType":"error"})),
+            Handled::Notice("in turn".into())
+        );
+        assert_eq!(ui.state().notices.len(), 1);
+        assert_eq!(
+            notice_level(&json!({"notifyType":"error"})),
+            NoticeLevel::Error
+        );
     }
 
     #[test]

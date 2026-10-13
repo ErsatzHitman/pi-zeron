@@ -16,9 +16,11 @@ use crate::state::{AppState, EngineHandle};
 
 mod parts;
 mod pinned;
+mod prompts;
 mod screen;
 mod sheet;
 
+pub(crate) use prompts::Front;
 pub(crate) use screen::{ScreenClosed, ScreenView, screen_icon};
 
 /// What the composer keeps to present the selected chat's live elements.
@@ -29,8 +31,13 @@ pub(crate) struct ComposerExtension {
     pub markdown: parts::MarkdownCache,
     /// The sheet's own focus, for digits, Enter and Escape.
     pub focus: gpui::FocusHandle,
-    /// Per chat, the screens already known (new ones open as tabs).
-    pub screens: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Per chat, the prompt tab the user picked (see `prompts`).
+    pub picked: std::collections::HashMap<String, String>,
+    /// Per chat, the prompts already known: a new one the user opened comes
+    /// to the front, one that arrives behind another waits as a tab.
+    pub seen: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// The screens docked in the composer's place, by element key.
+    pub screen_views: std::collections::HashMap<String, gpui::Entity<ScreenView>>,
 }
 
 impl ComposerExtension {
@@ -41,7 +48,9 @@ impl ComposerExtension {
             pending: None,
             markdown: Default::default(),
             focus: cx.focus_handle(),
-            screens: Default::default(),
+            picked: Default::default(),
+            seen: Default::default(),
+            screen_views: Default::default(),
         }
     }
 }

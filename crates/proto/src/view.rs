@@ -520,6 +520,11 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             let done = items.iter().filter(|i| i.done).count();
             ("Todo", format!("{done}/{} done", items.len()))
         }
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } if server == PI_EXTENSION_SERVER => pi_extension_chip(tool, input.as_ref()),
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
         // Subagent spawns decode as Unknown named "Agent[: <description>]"
         // (every native driver's convention): label them "Agent" with the
@@ -531,6 +536,50 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             None => ("Tool", name.clone()),
         },
     }
+}
+
+/// The `server` of the tool rows Pi's extensions put in the transcript: the
+/// agent's own work they draw (the advisor, Jev, subagent fleets, background
+/// jobs, notices) and the messages they display. `tool` names the extension
+/// (`advisor-live-panel`) or the message type (`subagent-result`).
+pub const PI_EXTENSION_SERVER: &str = "pi";
+
+/// The label a Pi extension's row wears, named like the stock tool it is
+/// closest to ("Run" for background shells, "Agent" for subagents).
+pub fn pi_extension_label(tool: &str) -> &'static str {
+    let family = tool.split([':', '-', '_', '.']).next().unwrap_or(tool);
+    match family {
+        "advisor" => "Advisor",
+        "jev" => "Jev",
+        "decisions" => "Decisions",
+        "subagent" | "subagents" | "delegate" => "Agent",
+        "bash" => "Run",
+        "workflow" | "workflows" => "Workflow",
+        "todo" => "Todo",
+        "web" => "Web",
+        "memory" => "Memory",
+        "refusal" | "claude" => "Claude",
+        "pi" if tool.contains("herdr") => "Agent",
+        "notice" => "Note",
+        _ => "Tool",
+    }
+}
+
+fn pi_extension_chip(tool: &str, input: Option<&serde_json::Value>) -> (&'static str, String) {
+    let text = |key: &str| {
+        input
+            .and_then(|input| input.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let detail = text("title")
+        .or_else(|| text("message"))
+        .or_else(|| text("description"))
+        .or_else(|| text("label"))
+        .unwrap_or_else(|| tool.to_owned());
+    (pi_extension_label(tool), detail)
 }
 
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
@@ -765,6 +814,50 @@ mod checkout_tests {
         assert_eq!(
             checkout_label(CheckoutKind::NewWorktree, Some(&plain("main"))),
             "New worktree"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pi_extension_tests {
+    use super::*;
+    use crate::ToolCall;
+
+    fn chip(tool: &str, input: serde_json::Value) -> (&'static str, String) {
+        tool_chip_content(&ToolCall::Mcp {
+            server: PI_EXTENSION_SERVER.into(),
+            tool: tool.into(),
+            input: Some(input),
+        })
+    }
+
+    #[test]
+    fn pi_extension_rows_are_named_like_the_stock_tool_they_resemble() {
+        assert_eq!(
+            chip("advisor-live-panel", serde_json::json!({"title":"Advisor · review"})),
+            ("Advisor", "Advisor · review".to_string())
+        );
+        assert_eq!(chip("jev", serde_json::json!({})), ("Jev", "jev".to_string()));
+        assert_eq!(
+            chip("bash", serde_json::json!({"title":"Background bash · 1 running"})).0,
+            "Run"
+        );
+        assert_eq!(chip("subagent-result", serde_json::json!({})).0, "Agent");
+        assert_eq!(chip("pi-herdr-delegate.monitor", serde_json::json!({})).0, "Agent");
+        assert_eq!(chip("workflow-result", serde_json::json!({})).0, "Workflow");
+        assert_eq!(
+            chip("notice", serde_json::json!({"message":"Saved\n the plan"})),
+            ("Note", "Saved the plan".to_string())
+        );
+        assert_eq!(chip("someone-else", serde_json::json!({})).0, "Tool");
+        // Other MCP servers keep their label.
+        assert_eq!(
+            tool_chip_content(&ToolCall::Mcp {
+                server: "gh".into(),
+                tool: "issues".into(),
+                input: None
+            }),
+            ("MCP", "gh · issues".to_string())
         );
     }
 }

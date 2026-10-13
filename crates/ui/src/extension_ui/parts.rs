@@ -625,6 +625,18 @@ pub(crate) fn markdown(
     window: &Window,
     cache: &MarkdownCache,
 ) -> AnyElement {
+    markdown_sized(theme, key, text, window, cache, px(TEXT_SIZE + 0.5).into())
+}
+
+/// Markdown at `size` (a reply in a conversation reads at the chat's size).
+fn markdown_sized(
+    theme: &Theme,
+    key: &str,
+    text: &str,
+    window: &Window,
+    cache: &MarkdownCache,
+    size: gpui::AbsoluteLength,
+) -> AnyElement {
     let hash = hash_text(text);
     let mut trees = cache.0.borrow_mut();
     if trees.len() > MARKDOWN_CACHE && !trees.contains_key(&hash) {
@@ -637,7 +649,7 @@ pub(crate) fn markdown(
         crate::markdown::render::RenderOptions::settled(SharedString::from(format!("{key}-md")));
     div()
         .px(px(8.0))
-        .text_size(px(TEXT_SIZE + 0.5))
+        .text_size(size)
         .text_color(theme.text)
         .child(crate::markdown::render::render_tree(
             tree,
@@ -649,7 +661,8 @@ pub(crate) fn markdown(
         .into_any_element()
 }
 
-/// A conversation (btw, a subagent's transcript): role-tinted turns.
+/// A conversation (btw, a subagent's transcript), drawn like the chat's
+/// own: the user's turns in the transcript's bubble, the replies as body text.
 pub(crate) fn turns(
     theme: &Theme,
     key: &str,
@@ -660,22 +673,39 @@ pub(crate) fn turns(
     div()
         .flex()
         .flex_col()
-        .gap(px(8.0))
+        .gap(px(12.0))
         .children(turns.iter().enumerate().map(|(ix, turn)| {
             let key = format!("{key}-turn-{ix}");
             match turn.role {
                 PiUiTurnRole::User => div()
-                    .mx(px(8.0))
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .rounded(px(10.0))
-                    .bg(theme.ink(0.06))
-                    .text_size(px(TEXT_SIZE + 0.5))
-                    .line_height(px(TEXT_LINE + 1.0))
-                    .text_color(theme.text)
-                    .child(SharedString::from(turn.text.clone()))
+                    .w_full()
+                    .px(px(8.0))
+                    .flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .max_w(gpui::relative(0.8))
+                            .bg(crate::theme::user_bubble_bg())
+                            .rounded(px(Theme::BUBBLE_RADIUS))
+                            .px(px(16.0))
+                            .py(px(10.0))
+                            .text_size(crate::typography::ui_rems(14.0))
+                            .line_height(crate::typography::ui_rems(
+                                crate::transcript::USER_LINE_HEIGHT,
+                            ))
+                            .text_color(theme.text)
+                            .child(SharedString::from(turn.text.clone())),
+                    )
                     .into_any_element(),
-                PiUiTurnRole::Assistant => markdown(theme, &key, &turn.text, window, cache),
+                PiUiTurnRole::Assistant => markdown_sized(
+                    theme,
+                    &key,
+                    &turn.text,
+                    window,
+                    cache,
+                    crate::typography::ui_rems(14.0).into(),
+                ),
                 PiUiTurnRole::Error => status_line(theme, &turn.text, Some(PiUiTone::Error)),
                 PiUiTurnRole::Tool => div()
                     .px(px(8.0))

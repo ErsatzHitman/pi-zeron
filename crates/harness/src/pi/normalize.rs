@@ -12,6 +12,35 @@ pub(super) struct Normalizer {
     pub window: Option<u64>,
 }
 
+/// A displayed custom message's chip input: its details, plus the message's
+/// text as the row's title and lines (what the transcript keeps of it).
+fn custom_input(details: &Value, text: &str) -> Option<Value> {
+    let mut input = match details {
+        Value::Object(details) => details.clone(),
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("details".into(), other.clone());
+            map
+        }
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if let Some(first) = lines.first()
+        && !input.contains_key("title")
+    {
+        let title = first.trim().trim_start_matches('#').trim();
+        input.insert("title".into(), Value::from(title));
+    }
+    if !lines.is_empty() && !input.contains_key("lines") {
+        input.insert("lines".into(), Value::from(lines));
+    }
+    (!input.is_empty()).then_some(Value::Object(input))
+}
+
 /// The text of a message's `content` (a string, or text parts).
 fn content_text(content: &Value) -> String {
     match content {
@@ -56,16 +85,15 @@ impl Normalizer {
             {
                 let message = &frame["message"];
                 let id = format!("pi-custom-{}", uuid::Uuid::new_v4());
-                let details = &message["details"];
+                let text = content_text(&message["content"]);
                 events.push(AgentEvent::ToolCall {
                     id: id.clone(),
                     call: ToolCall::Mcp {
-                        server: "pi".into(),
+                        server: zeron_proto::view::PI_EXTENSION_SERVER.into(),
                         tool: string(message, "customType").into(),
-                        input: (!details.is_null()).then(|| details.clone()),
+                        input: custom_input(&message["details"], &text),
                     },
                 });
-                let text = content_text(&message["content"]);
                 events.push(AgentEvent::ToolResult {
                     id,
                     is_error: false,

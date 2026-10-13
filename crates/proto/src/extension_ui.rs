@@ -507,6 +507,33 @@ impl PiUiElement {
         self.extra.get(key).and_then(Value::as_str)
     }
 
+    /// Something the user answers or works in (a question sheet, a picker,
+    /// the btw thread, a report they opened): a prompt in the panel on the
+    /// composer. Everything else is the agent's own work (the advisor, Jev,
+    /// fleets, background jobs), recorded in the transcript as a tool row.
+    pub fn is_prompt(&self) -> bool {
+        matches!(self.placement, PiUiPlacement::Sheet | PiUiPlacement::Screen)
+    }
+
+    /// Footer chips, neither a prompt nor a transcript row.
+    pub fn is_status(&self) -> bool {
+        self.placement == PiUiPlacement::Status || self.kind == PiUiKind::Status
+    }
+
+    /// The element reports a failure: an error tone, or a row that failed.
+    pub fn failed(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.state == Some(PiUiRowState::Error))
+            || self.sections.iter().any(|section| match section {
+                PiUiSection::Status { tone, .. } => *tone == Some(PiUiTone::Error),
+                PiUiSection::Roster { rows, .. } => rows
+                    .iter()
+                    .any(|row| row.state == Some(PiUiRowState::Error)),
+                _ => false,
+            })
+    }
+
     /// Plain-text rendering (port of `renderElementText`): the fallback for
     /// kinds and sections a UI does not draw natively.
     pub fn text_lines(&self) -> Vec<String> {
@@ -687,6 +714,23 @@ mod tests {
             vec!["Background bash · 1 running", "[running] npm test — 3s"]
         );
         assert_eq!(el.rows[0].actions[0].confirm.as_deref(), Some("Kill this job?"));
+    }
+
+    #[test]
+    fn prompts_are_sheets_and_screens_and_the_rest_is_the_agents_work() {
+        let el = |value: Value| serde_json::from_value::<PiUiElement>(value).unwrap();
+        let ask = el(json!({"id":"question","ns":"ask-user","kind":"panel","placement":"sheet"}));
+        let btw = el(json!({"id":"thread","ns":"btw","kind":"panel","placement":"screen"}));
+        let advisor = el(json!({"id":"panel","ns":"advisor-live-panel","kind":"panel",
+            "placement":"pinned","sections":[{"kind":"status","text":"failed","tone":"error"}]}));
+        let jobs = el(json!({"id":"jobs","ns":"bash","kind":"roster","placement":"pinned",
+            "rows":[{"id":"j1","label":"npm test","state":"done"}]}));
+        let mode = el(json!({"id":"mode","ns":"plan","kind":"status","placement":"status"}));
+        assert!(ask.is_prompt() && btw.is_prompt());
+        assert!(!advisor.is_prompt() && !jobs.is_prompt() && !mode.is_prompt());
+        assert!(mode.is_status() && !jobs.is_status());
+        assert!(advisor.failed());
+        assert!(!jobs.failed());
     }
 
     #[test]

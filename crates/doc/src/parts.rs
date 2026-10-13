@@ -581,6 +581,15 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
             url: url.clone(),
             prompt: None,
         },
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } if server == zeron_proto::view::PI_EXTENSION_SERVER => ToolCall::Mcp {
+            server: server.clone(),
+            tool: tool.clone(),
+            input: pi_extension_summary(input.as_ref()),
+        },
         ToolCall::Mcp { server, tool, .. } => ToolCall::Mcp {
             server: server.clone(),
             tool: tool.clone(),
@@ -618,6 +627,40 @@ fn spawn_badge(call: &ToolCall) -> Option<serde_json::Value> {
             (!value.is_empty()).then(|| ((*key).to_owned(), serde_json::Value::from(value)))
         })
         .collect();
+    (!kept.is_empty()).then(|| serde_json::Value::Object(kept))
+}
+
+/// Lines a Pi extension row keeps in the doc, and chars per line or text.
+const PI_SUMMARY_LINES: usize = 60;
+const PI_SUMMARY_CHARS: usize = 400;
+
+/// What a Pi extension's transcript row keeps (`pi · <ns>`, see
+/// `crates/harness/src/pi/rows.rs`): the short text the user is meant to see
+/// (a title, a notice, the panel's lines), capped. The extension published it
+/// to be read, unlike a tool's input; anything else in the input stays out.
+/// Idempotent.
+fn pi_extension_summary(input: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let input = input?;
+    let cap = |text: &str| -> String { text.chars().take(PI_SUMMARY_CHARS).collect() };
+    let mut kept = serde_json::Map::new();
+    for key in ["title", "message", "description", "label"] {
+        if let Some(text) = input.get(key).and_then(serde_json::Value::as_str)
+            && !text.trim().is_empty()
+        {
+            kept.insert(key.to_owned(), serde_json::Value::from(cap(text)));
+        }
+    }
+    if let Some(lines) = input.get("lines").and_then(serde_json::Value::as_array) {
+        let lines: Vec<serde_json::Value> = lines
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .take(PI_SUMMARY_LINES)
+            .map(|line| serde_json::Value::from(cap(line)))
+            .collect();
+        if !lines.is_empty() {
+            kept.insert("lines".to_owned(), serde_json::Value::Array(lines));
+        }
+    }
     (!kept.is_empty()).then(|| serde_json::Value::Object(kept))
 }
 
@@ -923,6 +966,36 @@ mod tests {
         );
         assert_eq!(clean.subagent_model(), Some("haiku"));
         assert_eq!(sanitize_tool_call(&clean), clean);
+    }
+
+    /// A Pi extension row keeps its title and lines, capped, and nothing else.
+    #[test]
+    fn sanitize_keeps_a_pi_extension_rows_text_only() {
+        let call = ToolCall::Mcp {
+            server: "pi".into(),
+            tool: "advisor-live-panel".into(),
+            input: Some(serde_json::json!({
+                "title": "Advisor",
+                "lines": ["THINKING", 7, "x".repeat(1000)],
+                "token": "secret",
+            })),
+        };
+        let clean = sanitize_tool_call(&call);
+        let ToolCall::Mcp { input: Some(input), .. } = &clean else {
+            panic!("kept input")
+        };
+        assert_eq!(input["title"], "Advisor");
+        assert_eq!(input["lines"][0], "THINKING");
+        assert_eq!(input["lines"][1].as_str().unwrap().len(), PI_SUMMARY_CHARS);
+        assert!(input.get("token").is_none());
+        assert_eq!(sanitize_tool_call(&clean), clean);
+        // Another server's input still goes.
+        let other = ToolCall::Mcp {
+            server: "gh".into(),
+            tool: "issues".into(),
+            input: Some(serde_json::json!({"title": "x"})),
+        };
+        assert!(matches!(sanitize_tool_call(&other), ToolCall::Mcp { input: None, .. }));
     }
 
     /// An ordinary tool's input still goes, even when it happens to carry a

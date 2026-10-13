@@ -104,14 +104,32 @@ live state; it never enters the synced chat document.
 
 | PIUI | Zeron |
 | --- | --- |
-| `sheet` (ask-user, decisions, model picker, idle Pi dialogs) | replaces the composer; keyboard picks, Enter submits, Esc cancels |
-| `pinned` (bash jobs, subagent fleet, workflows, todo) | collapsible trays above the todo panel, with row actions |
+| `sheet` (ask-user, decisions, model picker, idle Pi dialogs) | the prompt panel in the composer's place; keyboard picks, Enter submits, Esc cancels |
+| `screen` (btw, subagent viewer, `/usage`, `/workspace`, `/workflow` reports, `/clinepass`, `/llama-models`, `/mcp-servers`) | the prompt panel too, drawn like the question panel: header, the body scrolling under it (btw's thread in the chat's own bubbles), and its form as the panel's input row. The X (or Esc) closes it; Esc stops a streaming btw reply first. More than three actions wrap into a toolbar |
+| `pinned`, `inline` (advisor, Jev and decision cards, bash jobs, subagent fleet, workflows, todo), `setWidget` | the agent's own work: a `pi` tool row in the turn's transcript, like a command or a read (see below) |
 | `status`, `setStatus`, goal/footer channels, plan mode | chips in the composer footer (a `setStatus` line repeating an element chip shows once) |
-| `screen` (subagent viewer, btw, `/usage`, `/workspace`, `/workflow` reports, `/clinepass`, `/llama-models`, `/mcp-servers`) | a right-pane tab, opened once, closed when the element goes away; more than three actions wrap into a toolbar under the title. In the chat, a one-line tray opens the tab and previews the screen only while it is busy |
-| `setWidget` | a tray of plain lines |
-| `notify` (plain) | a toast while watched; transcript text otherwise. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
+| `notify` (plain) | during a turn, a `pi · notice` row in the transcript; between turns, a toast. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
 | `setTitle` | renames the chat |
 | `set_editor_text` | fills the composer |
+
+**The prompt queue.** Everything that waits on the user (the agent's question,
+sheets, screens) takes the composer's place one at a time. With more than one
+open they queue as tabs above the panel ("2 of 3"); Ctrl+Tab and Ctrl+Shift+Tab
+walk them, and a dot marks a question waiting behind another tab. A new prompt
+comes to the front only over the message box; one that arrives while another
+is shown waits as a tab. While only screens are open (btw, a report), a
+**Message** tab returns to the normal composer beside them. Opening a chat
+whose screen is still up starts on the message box.
+
+**The agent's work as rows.** The driver records what the extensions draw
+while the agent works (non-prompt elements and widgets) as `pi` tool calls in
+the turn: one row per element, labelled by what it is (Advisor, Jev,
+Decisions, Agent, Run, Workflow, Todo, Web, Memory, Note), its lines as the
+row's body. A row repaints at most once a second while its element streams
+and settles (failed when the element reports an error) when the element goes
+away or the turn ends. An element left up unchanged across turns (a card
+until dismissed) gets no new row; one that changes does. Only the title and
+up to 60 lines enter the chat document.
 
 A dialog Pi raises between turns has no turn to ask in; for a watching UI it
 becomes a `pi:dialog-N` sheet (timeouts honoured), otherwise it is cancelled.

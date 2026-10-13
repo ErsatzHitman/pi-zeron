@@ -233,6 +233,9 @@ impl Composer {
     }
 
     /// The pinned trays, outermost first. `below_queue`: a queue tray follows.
+    /// Retired: the agent's own extension work is in the transcript as tool
+    /// rows now; kept for a surface that wants the live view back.
+    #[allow(dead_code)]
     pub(crate) fn render_extension_trays(
         &mut self,
         below_queue: bool,

@@ -62,7 +62,7 @@ fn signature(element: &PiUiElement) -> u64 {
 }
 
 /// A short, human header for the extension that asks.
-fn header_label(ns: &str) -> &str {
+pub(crate) fn header_label(ns: &str) -> &str {
     match ns {
         "ask-user" => "Question",
         "subagents" => "Subagent question",
@@ -106,6 +106,16 @@ fn option_matches(option: &zeron_proto::extension_ui::PiUiOption, filter: &str) 
 }
 
 impl SheetForm {
+    /// The keyboard goes back to the form when it is next drawn.
+    pub(crate) fn refocus(&mut self) {
+        self.focus_pending = true;
+    }
+
+    /// The sheet this form answers (`ns:id`).
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
     fn new(element: &PiUiElement, fields: &[PiUiField], cx: &mut Context<Composer>) -> Self {
         let mut form = Self {
             key: element.key(),
@@ -297,17 +307,24 @@ fn dismiss_action(element: &PiUiElement, form_actions: &[PiUiAction]) -> Option<
 }
 
 impl Composer {
-    /// The selected chat's first sheet, and how many are waiting.
+    /// The sheet in front of the prompt queue, and how many are waiting.
     pub(crate) fn extension_sheet(&self, cx: &App) -> Option<(PiUiElement, usize)> {
+        let Some(super::Front::Element(front)) = self.front_prompt(cx) else {
+            return None;
+        };
         let state = self.state.read(cx);
         let chat = state.selected_chat.as_deref()?;
         let live = state.extension_ui.of(chat)?;
-        let mut sheets = live
+        let sheets: Vec<PiUiElement> = live
             .typed_elements()
             .into_iter()
-            .filter(|element| element.placement == PiUiPlacement::Sheet);
-        let first = sheets.next()?;
-        Some((first, 1 + sheets.count()))
+            .filter(|element| element.placement == PiUiPlacement::Sheet)
+            .collect();
+        let waiting = sheets.len();
+        sheets
+            .into_iter()
+            .find(|element| element.key() == front)
+            .map(|element| (element, waiting))
     }
 
     pub(crate) fn extension_actions(&self, cx: &mut Context<Self>) -> Actions {
@@ -445,8 +462,7 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let Some((element, waiting)) = self.extension_sheet(cx) else {
-            self.extension.sheet = None;
+        let Some((element, _)) = self.extension_sheet(cx) else {
             return None;
         };
         let (fields, form_actions) = sheet_form(&element);
@@ -482,8 +498,8 @@ impl Composer {
             (form.submitted, form.incomplete(&fields, cx))
         };
 
-        let counter =
-            step_label(&element).or_else(|| (waiting > 1).then(|| format!("1 of {waiting}")));
+        // Other prompts waiting show as tabs above the panel.
+        let counter = step_label(&element);
         let header = div()
             .flex()
             .items_center()

@@ -4,6 +4,7 @@ mod commands;
 mod mcp;
 mod normalize;
 mod piui;
+mod rows;
 mod rpc;
 mod sessions;
 mod ui;
@@ -541,6 +542,7 @@ impl Harness for PiHarness {
                 assistant: uuid::Uuid::new_v4().to_string(),
                 lost_context,
                 ui: piui::ExtensionUi::default(),
+                rows: rows::Rows::default(),
                 ui_actions: None,
                 ui_watched: None,
                 piui_on: false,
@@ -625,6 +627,8 @@ struct Runner {
     lost_context: Option<String>,
     /// Live extension UI (PIUI + plain UI requests) for the host.
     ui: piui::ExtensionUi,
+    /// The agent's own extension work, recorded in the turn as tool rows.
+    rows: rows::Rows,
     ui_actions: Option<mpsc::UnboundedReceiver<zeron_proto::extension_ui::ExtensionUiAction>>,
     ui_watched: Option<tokio::sync::watch::Receiver<bool>>,
     /// We sent `hello` (and no `bye` since): extensions publish elements.
@@ -679,6 +683,17 @@ impl Runner {
         }))?;
         Ok(())
     }
+    /// Bring the turn's rows for the extensions' own work up to date.
+    async fn record_ui(&mut self) -> Result<(), HarnessError> {
+        if !self.active {
+            return Ok(());
+        }
+        let events = self.rows.sync(self.ui.state(), std::time::Instant::now());
+        for event in events {
+            self.emit(event).await?;
+        }
+        Ok(())
+    }
     async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
         self.tx
             .send(Ok(event))
@@ -699,6 +714,9 @@ impl Runner {
     async fn finish(&mut self) -> Result<(), HarnessError> {
         if !self.active {
             return Ok(());
+        }
+        for event in self.rows.settle_all() {
+            self.emit(event).await?;
         }
         self.active = false;
         self.process.dialogs.cancel();
@@ -1136,19 +1154,21 @@ impl Runner {
             return Ok(());
         }
         if frame["type"] == "extension_ui_request" {
+            self.ui.set_in_turn(self.active);
             match self.ui.handle(&frame) {
                 piui::Handled::Consumed => {
                     self.turn.set_background(self.ui.background_tasks());
+                    self.record_ui().await?;
                 }
-                // A UI watching this chat shows it as a toast. Without one, a
-                // notice during a turn stays visible as transcript text; a
-                // background one must not reopen a completed engine turn.
+                // During a turn a notice is a row in its transcript; between
+                // turns it was recorded as a toast (it must not reopen a
+                // completed engine turn).
                 piui::Handled::Notice(message) => {
-                    if self.active && !self.piui_on {
-                        self.emit(AgentEvent::TextDelta {
-                            text: format!("\n{message}\n"),
-                        })
-                        .await?;
+                    if self.active {
+                        let level = piui::notice_level(&frame);
+                        for event in self.rows.notice(&message, level) {
+                            self.emit(event).await?;
+                        }
                     }
                 }
                 piui::Handled::Dialog if self.active => self
@@ -1244,6 +1264,9 @@ impl Runner {
                     .unwrap_or_else(|| "default".into()),
             )
             .await?;
+            // What the extensions still show (a running fleet) gets rows in
+            // the new turn.
+            self.record_ui().await?;
         }
         if frame["type"] == "message_start" && frame["message"]["role"] == "user" {
             if self.initial_pending {

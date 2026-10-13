@@ -1248,8 +1248,9 @@ async fn an_unwatched_chat_never_turns_piui_on() {
     assert!(ui.state.borrow().elements.is_empty());
 }
 
-/// Plain `notify`/`setStatus`/`setWidget`/`setTitle`/`set_editor_text` are
-/// live state for a watching UI: a toast, not transcript text.
+/// Plain `setStatus`/`setTitle`/`set_editor_text` are live state for a
+/// watching UI. A notice and a widget during a turn are the agent's work:
+/// rows in the turn's transcript, not toasts or trays.
 #[tokio::test]
 async fn plain_extension_ui_requests_become_live_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -1262,10 +1263,17 @@ async fn plain_extension_ui_requests_become_live_state() {
         .await
         .unwrap();
     let mut text = String::new();
+    let mut rows = Vec::new();
+    let mut settled = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(event) = stream.next().await {
             match event.unwrap() {
                 AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                AgentEvent::ToolCall {
+                    id,
+                    call: zeron_proto::ToolCall::Mcp { server, tool, input },
+                } if server == "pi" => rows.push((id, tool, input.unwrap_or_default())),
+                AgentEvent::ToolResult { id, .. } => settled.push(id),
                 AgentEvent::Done { .. } => break,
                 _ => {}
             }
@@ -1275,13 +1283,14 @@ async fn plain_extension_ui_requests_become_live_state() {
     .unwrap();
     assert!(!text.contains("Saved the plan"), "{text}");
     assert!(text.contains("reply:plain-ui"));
+    let notice = rows.iter().find(|(_, tool, _)| tool == "notice").unwrap();
+    assert_eq!(notice.2["message"], "Saved the plan");
+    let widget = rows.iter().find(|(_, tool, _)| tool == "btw").unwrap();
+    assert_eq!(widget.2["title"], "q: why?");
+    assert_eq!(widget.2["lines"], serde_json::json!(["a: because"]));
+    assert!(settled.contains(&notice.0) && settled.contains(&widget.0));
     let state = wait_ui(&mut ui, "plain UI", |s| s.editor_text.is_some()).await;
-    assert_eq!(state.notices.len(), 1);
-    assert_eq!(state.notices[0].message, "Saved the plan");
-    assert_eq!(
-        state.notices[0].level,
-        zeron_proto::extension_ui::NoticeLevel::Warning
-    );
+    assert!(state.notices.is_empty());
     assert_eq!(state.statuses[0].key, "!mode");
     assert_eq!(state.statuses[0].text, "Plan");
     assert_eq!(state.widgets[0].lines, vec!["q: why?", "a: because"]);
@@ -1294,6 +1303,5 @@ async fn plain_extension_ui_requests_become_live_state() {
     // The process's elements go with it; its last notice and draft stay.
     let state = wait_ui(&mut ui, "process closed", |s| s.statuses.is_empty()).await;
     assert!(state.widgets.is_empty());
-    assert_eq!(state.notices.len(), 1);
     assert_eq!(state.editor_text.as_ref().unwrap().text, "rewritten prompt");
 }

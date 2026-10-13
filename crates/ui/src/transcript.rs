@@ -913,6 +913,11 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        // A Pi extension's own work (the advisor, Jev, a fleet): its lines
+        // as the extension drew them, not its record as JSON.
+        ToolCall::Mcp { server, input, .. } if server == zeron_proto::view::PI_EXTENSION_SERVER => {
+            pi_extension_text(input.as_ref())?
+        }
         ToolCall::Mcp {
             server,
             tool,
@@ -948,6 +953,24 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
         lines,
         truncated_by,
     })
+}
+
+/// A Pi extension row's body: its `lines`, else its `message`.
+fn pi_extension_text(input: Option<&serde_json::Value>) -> Option<String> {
+    let input = input?;
+    let lines: Vec<&str> = input
+        .get("lines")
+        .and_then(|lines| lines.as_array())
+        .map(|lines| lines.iter().filter_map(|line| line.as_str()).collect())
+        .unwrap_or_default();
+    if !lines.is_empty() {
+        return Some(lines.join("\n"));
+    }
+    input
+        .get("message")
+        .and_then(|message| message.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Reduce an inline [`zeron_proto::ToolDiff`] to the changes pane's
@@ -9070,7 +9093,25 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Todo { .. } => crate::icons::CHECKLIST,
         call if is_agent_call(call) => crate::icons::BOT,
         ToolCall::Unknown { name, .. } if name == "Wait for agents" => crate::icons::BOT,
+        ToolCall::Mcp { server, tool, .. } if server == zeron_proto::view::PI_EXTENSION_SERVER => {
+            pi_extension_icon(tool)
+        }
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
+    }
+}
+
+/// A Pi extension row's glyph, by what the extension does.
+fn pi_extension_icon(tool: &str) -> &'static str {
+    match zeron_proto::view::pi_extension_label(tool) {
+        "Run" => crate::icons::TERMINAL,
+        "Agent" => crate::icons::BOT,
+        "Todo" => crate::icons::CHECKLIST,
+        "Web" => crate::icons::GLOBAL,
+        "Advisor" | "Jev" | "Decisions" | "Claude" => crate::icons::MAGIC_STICK_3,
+        "Note" => crate::icons::INFO_CIRCLE,
+        "Workflow" => crate::icons::FILE_MARKDOWN,
+        "Memory" => crate::icons::HARD_DRIVE,
+        _ => crate::icons::WIDGET,
     }
 }
 

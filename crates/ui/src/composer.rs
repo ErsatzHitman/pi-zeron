@@ -6091,8 +6091,8 @@ pub struct Composer {
     /// under their own chat — a blanket clear-on-switch erased the one
     /// visible trace of a failed send (2026-08-19).
     failure_key: Option<String>,
-    wizard: Option<Wizard>,
-    wizard_focus: FocusHandle,
+    pub(crate) wizard: Option<Wizard>,
+    pub(crate) wizard_focus: FocusHandle,
     /// Live extension UI: sheets, trays, chips (see `crate::extension_ui`).
     pub(crate) extension: crate::extension_ui::ComposerExtension,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -8481,7 +8481,7 @@ impl Composer {
         {
             self.input.update(cx, |input, cx| input.set_text(text, cx));
         }
-        self.open_new_extension_screens(cx);
+        self.track_new_prompts(cx);
         {
             let state = self.state.read(cx);
             // AppState also notifies at clock-only transitions, so a run that
@@ -8681,6 +8681,8 @@ impl Composer {
                 }
             }
         }
+        // The question just raised (or answered) joins the prompt queue.
+        self.track_new_prompts(cx);
         let input_context = message_input_context(self.wizard.is_some());
         self.input
             .update(cx, |input, cx| input.set_key_context(input_context, cx));
@@ -10997,13 +10999,34 @@ impl Render for Composer {
                 ))
             });
 
-        if wizard_active {
-            let wizard = self.render_wizard(cx);
-            return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
-        }
-        // An extension's question sheet takes the composer's place the same way.
-        if let Some(sheet) = self.render_extension_sheet(window, cx) {
-            return container.child(motion::fade_quick("composer-extension-sheet", div().child(sheet)));
+        // The prompt panel: the agent's question, an extension's sheet or a
+        // docked screen (btw, a report) takes the composer's place, one at a
+        // time. Several queue as tabs above it; Ctrl+Tab walks them.
+        let front = self.front_prompt(cx);
+        let tabs = front.as_ref().and_then(|_| self.render_prompt_tabs(cx));
+        let container = match tabs {
+            Some(tabs) => container
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.on_prompt_tabs_key(event, window, cx)
+                }))
+                .child(tabs),
+            None => container,
+        };
+        let panel = match front {
+            Some(crate::extension_ui::Front::Question) if wizard_active => {
+                let wizard = self.render_wizard(cx);
+                Some(motion::fade_quick("composer-wizard", div().child(wizard)).into_any_element())
+            }
+            Some(crate::extension_ui::Front::Element(key)) => {
+                let fade = SharedString::from(format!("composer-prompt-{key}"));
+                self.render_extension_sheet(window, cx)
+                    .or_else(|| self.render_extension_screen(&key, cx))
+                    .map(|panel| motion::fade_quick(fade, div().child(panel)).into_any_element())
+            }
+            _ => None,
+        };
+        if let Some(panel) = panel {
+            return container.child(panel);
         }
 
         // What is waiting to be sent, stacked directly above the box it was
@@ -11019,8 +11042,9 @@ impl Render for Composer {
             );
         // The checklist tray stacks above the queue (or directly above the
         // composer), one step narrower than what follows it.
+        // The extensions' own work (the advisor, Jev, a subagent fleet) is
+        // in the transcript as tool rows, not trays here.
         let has_queue = !self.state.read(cx).queue.is_empty();
-        let container = container.children(self.render_extension_trays(has_queue, window, cx));
         let container = container.when_some(
             self.render_todo_panel(has_queue, window, cx),
             |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
