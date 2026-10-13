@@ -65,8 +65,9 @@ pub(crate) fn tone_color(theme: &Theme, tone: Option<PiUiTone>) -> Hsla {
         Some(PiUiTone::Success) => theme.success,
         Some(PiUiTone::Warning) => theme.warning,
         Some(PiUiTone::Error) => theme.danger,
-        Some(PiUiTone::Busy) | Some(PiUiTone::Info) => theme.accent,
-        Some(PiUiTone::Muted) | Some(PiUiTone::Unknown) | None => theme.text_muted,
+        // A tone Zeron does not know yet still marks something (`accent`).
+        Some(PiUiTone::Busy) | Some(PiUiTone::Info) | Some(PiUiTone::Unknown) => theme.accent,
+        Some(PiUiTone::Muted) | None => theme.text_muted,
     }
 }
 
@@ -129,6 +130,10 @@ pub(crate) fn action_button(
         .text_size(px(11.5))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(color)
+        // The form's answer reads as one, as the transcript's row controls do.
+        .when(primary, |el| {
+            el.border_1().border_color(crate::theme::hairline(0.12))
+        })
         .when(pending, |el| el.bg(theme.element_hover))
         .child(SharedString::from(label));
     if action.disabled {
@@ -582,11 +587,41 @@ pub(crate) fn diff(theme: &Theme, text: &str) -> AnyElement {
 }
 
 pub(crate) fn table(theme: &Theme, columns: &[String], rows: &[Vec<String>]) -> AnyElement {
-    let cell = |text: &str, head: bool| {
+    let count = rows
+        .iter()
+        .map(Vec::len)
+        .chain([columns.len()])
+        .max()
+        .unwrap_or(0);
+    let body = |c: usize| rows.iter().filter_map(move |row| row.get(c));
+    // Columns share the width by how much they hold, as Zeron's Markdown
+    // tables do, and a column of numbers lines up on the right.
+    let weights: Vec<f32> = (0..count)
+        .map(|c| {
+            let longest = columns
+                .get(c)
+                .into_iter()
+                .chain(body(c))
+                .map(|text| text.chars().count())
+                .max()
+                .unwrap_or(0);
+            longest.clamp(3, 40) as f32
+        })
+        .collect();
+    let numeric: Vec<bool> = (0..count)
+        .map(|c| {
+            let mut cells = body(c).filter(|text| !text.trim().is_empty()).peekable();
+            cells.peek().is_some() && cells.all(|text| numeric_cell(text))
+        })
+        .collect();
+    let cell = |c: usize, text: &str, head: bool| {
         div()
-            .flex_1()
+            .flex_grow(weights[c])
+            .flex_shrink(weights[c])
+            .flex_basis(px(0.0))
             .min_w_0()
             .truncate()
+            .when(numeric[c], |el| el.text_right())
             .text_size(px(if head { META_SIZE } else { TEXT_SIZE }))
             .text_color(if head {
                 theme.text_faint
@@ -603,19 +638,34 @@ pub(crate) fn table(theme: &Theme, columns: &[String], rows: &[Vec<String>]) -> 
         .gap(px(2.0))
         .when(!columns.is_empty(), |el| {
             el.child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .children(columns.iter().map(|c| cell(c, true))),
+                div().flex().gap(px(8.0)).children(
+                    columns
+                        .iter()
+                        .enumerate()
+                        .map(|(c, text)| cell(c, text, true)),
+                ),
             )
         })
         .children(rows.iter().map(|row| {
             div()
                 .flex()
                 .gap(px(8.0))
-                .children(row.iter().map(|c| cell(c, false)))
+                .children(row.iter().enumerate().map(|(c, text)| cell(c, text, false)))
         }))
         .into_any_element()
+}
+
+/// A table cell that holds a number: `42`, `$0.04`, `12.5%`, `3/5`, `1.2s`,
+/// `41 tok/s`.
+fn numeric_cell(text: &str) -> bool {
+    let text = text
+        .trim()
+        .trim_start_matches(['$', '₹', '€', '£', '+', '-', '~'])
+        .trim_end_matches(|c: char| c == '%' || c == '/' || c == ' ' || c.is_ascii_alphabetic());
+    text.starts_with(|c: char| c.is_ascii_digit())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '/' | ':'))
 }
 
 pub(crate) fn markdown(
@@ -782,4 +832,21 @@ pub(crate) fn section(
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::numeric_cell;
+
+    #[test]
+    fn numbers_with_units_and_currency_read_as_numbers() {
+        for text in [
+            "42", "$0.042", "12.5%", "3/5", "1.2s", "41 tok/s", "₹1,200", "12:30",
+        ] {
+            assert!(numeric_cell(text), "{text}");
+        }
+        for text in ["npm test", "v1.2", "", "running", "-"] {
+            assert!(!numeric_cell(text), "{text}");
+        }
+    }
 }

@@ -66,6 +66,8 @@ fn thinking_option(data: &Value) -> Vec<ModelOption> {
         ],
     }]
 }
+/// Extension commands that act only on Pi's terminal screen.
+const TERMINAL_ONLY: [&str; 1] = ["claude-refusal-rewind"];
 pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
     let mut commands: Vec<_> = data["commands"]
         .as_array()
@@ -74,8 +76,9 @@ pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
         .filter_map(|v| {
             let name = v["name"].as_str()?;
             // Transport commands for GUI clients (PIUI's `pi_ui_event`), not
-            // something a person types.
-            if name.starts_with("pi_ui_") {
+            // something a person types, and commands that only redraw the
+            // terminal (pi-claude-auth's rewind after a refusal).
+            if name.starts_with("pi_ui_") || TERMINAL_ONLY.contains(&name) {
                 return None;
             }
             Some(SlashCommand {
@@ -143,9 +146,11 @@ mod tests {
     fn piui_transport_commands_are_hidden_from_the_palette() {
         let listed = commands(&json!({"commands":[
             {"name":"pi_ui_event","description":"Internal","source":"extension"},
+            {"name":"claude-refusal-rewind","description":"Redraw","source":"extension"},
             {"name":"todo","description":"Todos","source":"extension"},
         ]}));
         assert!(listed.iter().all(|c| !c.name.starts_with("pi_ui_")));
+        assert!(listed.iter().all(|c| c.name != "claude-refusal-rewind"));
         assert!(listed.iter().any(|c| c.name == "todo"));
     }
 

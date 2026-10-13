@@ -524,6 +524,33 @@ pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> 
     !text.trim().is_empty() || attachments > 0 || comments > 0
 }
 
+/// How API keys and tokens begin (OpenAI-style, GitHub, Slack, AWS, Google).
+const KEY_PREFIXES: [&str; 8] = [
+    "sk-",
+    "pk-",
+    "ghp_",
+    "gho_",
+    "github_pat_",
+    "xoxb-",
+    "AKIA",
+    "AIza",
+];
+
+/// A slash command with something shaped like an API key among its
+/// arguments (`/decisions key sk-or-v1-…`).
+fn command_carries_key(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with('/')
+        && text.split_whitespace().skip(1).any(|word| {
+            let key = word.trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
+            KEY_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+                && key.len() >= 20
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModifiedSubmitTarget {
     SubmitContent,
@@ -6103,6 +6130,9 @@ pub struct Composer {
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
+    /// A command carrying what looks like an API key, warned about once:
+    /// sent as typed only if Enter is pressed again.
+    key_warned: Option<String>,
     /// Host-issued generation protecting `editing_queued` from automatic
     /// delivery. The text buffer is kept until Finish receives an ACK.
     pub(crate) queue_edit_lease_id: Option<String>,
@@ -6404,6 +6434,7 @@ impl Composer {
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
+            key_warned: None,
             queue_edit_lease_id: None,
             queue_edit_base_text_hash: None,
             queue_edit_chat_id: None,
@@ -8817,6 +8848,20 @@ impl Composer {
         // A lone "/" is a command not picked yet, not a message.
         let no_content = !composer_has_content(&text, attached, comments)
             || (text.trim() == "/" && attached == 0 && comments == 0);
+        // A key typed into a command is kept in the chat's history; the
+        // command can usually ask for it privately instead.
+        if !no_content && command_carries_key(&text) && self.key_warned.as_ref() != Some(&text) {
+            self.key_warned = Some(text);
+            crate::toast::show(
+                cx,
+                crate::toast::ToastKind::Warning,
+                "This command has an API key in it, which would be saved in the chat's history. \
+                 Send it without the key to be asked for it privately, or press Enter again to \
+                 send it as typed.",
+            );
+            return;
+        }
+        self.key_warned = None;
         match self.button_mode(cx) {
             // Enter never stops a run: Stop mode implies an empty composer,
             // so a stray extra Enter right after sending landed an interrupt
@@ -16032,6 +16077,22 @@ mod tests {
         assert!(composer_has_content("hi", 0, 0));
         assert!(composer_has_content("", 1, 0));
         assert!(composer_has_content("", 0, 1));
+    }
+
+    #[test]
+    fn a_command_with_a_key_in_it_is_caught() {
+        assert!(command_carries_key(
+            "/decisions key sk-or-v1-0123456789abcdef0123"
+        ));
+        assert!(command_carries_key(
+            " /login \"ghp_0123456789abcdefABCDEF\""
+        ));
+        // Prose about keys, a short prefix and plain messages pass.
+        assert!(!command_carries_key("/decisions key"));
+        assert!(!command_carries_key("/rename sk-short"));
+        assert!(!command_carries_key(
+            "my key is sk-or-v1-0123456789abcdef0123"
+        ));
     }
 
     #[test]

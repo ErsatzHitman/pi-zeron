@@ -930,10 +930,7 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
             None => format!("{server} · {tool}"),
         },
         ToolCall::Unknown { name, input } => match input {
-            Some(input) => format!(
-                "{name}\n{}",
-                serde_json::to_string_pretty(input).unwrap_or_default()
-            ),
+            Some(input) => format!("{name}\n{}", readable_input(input)),
             None => name.clone(),
         },
     };
@@ -953,6 +950,26 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
         lines,
         truncated_by,
     })
+}
+
+/// A tool's input as `field: value` lines: text as written (a task, a
+/// question, a script), anything else as compact JSON.
+fn readable_input(input: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let compact = |value: &Value| serde_json::to_string(value).unwrap_or_default();
+    match input {
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(field, value)| match value {
+                Value::String(text) if text.contains('\n') => format!("{field}:\n{text}"),
+                Value::String(text) => format!("{field}: {text}"),
+                other => format!("{field}: {}", compact(other)),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    }
 }
 
 /// Live controls a Pi extension row offers at most.
@@ -9341,7 +9358,12 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Mcp { server, tool, .. } if server == zeron_proto::view::PI_EXTENSION_SERVER => {
             pi_extension_icon(tool)
         }
-        ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
+        // Pi's LSP tools check code; `ask_user` asks; an extension's own tool
+        // takes its family's glyph.
+        ToolCall::Unknown { name, .. } if name.starts_with("LSP: ") => crate::icons::ACTION_LINT,
+        ToolCall::Unknown { name, .. } if name == "ask_user" => crate::icons::CHAT_ROUND_LINE,
+        ToolCall::Unknown { name, .. } => pi_extension_icon(name),
+        ToolCall::Mcp { .. } => crate::icons::WIDGET,
     }
 }
 
@@ -16011,6 +16033,27 @@ mod tests {
             query: "line one\nline two".into(),
         });
         assert_eq!(q, "line one line two");
+    }
+
+    #[test]
+    fn an_unknown_tools_text_reads_as_written() {
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Unknown {
+            name: "workflow".into(),
+            input: Some(serde_json::json!({"steps":[1,2],"task":"Fix \"x\"\nthen test"})),
+        }) else {
+            panic!("an unknown tool has a body");
+        };
+        let lines: Vec<&str> = lines.iter().map(|l| l.as_ref()).collect();
+        assert_eq!(
+            lines,
+            [
+                "workflow",
+                "steps: [1,2]",
+                "task:",
+                "Fix \"x\"",
+                "then test"
+            ]
+        );
     }
 
     #[test]
