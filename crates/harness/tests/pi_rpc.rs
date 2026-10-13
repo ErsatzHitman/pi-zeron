@@ -951,7 +951,7 @@ async fn displayed_custom_messages_become_transcript_chips() {
     assert_eq!(chips.len(), 1, "{events:?}");
     assert_eq!(chips[0].1, "workflow-result");
     assert!(events.iter().any(|e| matches!(e,
-        AgentEvent::ToolResult { id, output: Some(output), .. } if *id == chips[0].0 && output == "# Done")));
+        AgentEvent::ToolResult { id, output: Some(output), .. } if *id == chips[0].0 && output == "All steps passed")));
 }
 
 struct UiPort {

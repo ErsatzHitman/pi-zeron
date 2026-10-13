@@ -1,6 +1,7 @@
+use crate::redact::strip_ansi;
 use serde_json::Value;
 use std::collections::HashMap;
-use zeron_proto::{AgentEvent, DoneStatus, ToolCall, ToolDiff};
+use zeron_proto::{AgentEvent, DoneStatus, TodoItem, TodoStatus, ToolCall, ToolDiff};
 
 #[derive(Default)]
 pub(super) struct Normalizer {
@@ -12,9 +13,11 @@ pub(super) struct Normalizer {
     pub window: Option<u64>,
 }
 
-/// A displayed custom message's chip input: its details, plus the message's
-/// text as the row's title and lines (what the transcript keeps of it).
-fn custom_input(details: &Value, text: &str) -> Option<Value> {
+/// A displayed custom message's chip: its input (the details, with a title
+/// from the text's first line unless the details name one) and the body the
+/// row expands to. Details that carry their own `lines` are the row's body,
+/// so the text (often written for the model) is not shown twice.
+fn custom_input(details: &Value, text: &str) -> (Option<Value>, Option<String>) {
     let mut input = match details {
         Value::Object(details) => details.clone(),
         Value::Null => serde_json::Map::new(),
@@ -24,21 +27,27 @@ fn custom_input(details: &Value, text: &str) -> Option<Value> {
             map
         }
     };
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    if let Some(first) = lines.first()
-        && !input.contains_key("title")
+    let mut body = text.trim_matches('\n');
+    if !input.contains_key("title")
+        && let Some(first) = body.lines().find(|line| !line.trim().is_empty())
     {
         let title = first.trim().trim_start_matches('#').trim();
         input.insert("title".into(), Value::from(title));
+        let start = body.find(first).unwrap_or(0) + first.len();
+        body = body[start..].trim_matches('\n');
     }
-    if !lines.is_empty() && !input.contains_key("lines") {
-        input.insert("lines".into(), Value::from(lines));
-    }
-    (!input.is_empty()).then_some(Value::Object(input))
+    let body = (!input.contains_key("lines") && !body.trim().is_empty()).then(|| body.to_owned());
+    ((!input.is_empty()).then_some(Value::Object(input)), body)
+}
+
+/// Whether a displayed custom message reports a failure (a failed subagent,
+/// a lost background shell).
+fn custom_failed(details: &Value) -> bool {
+    details["isError"] == true
+        || matches!(
+            details["state"].as_str().or(details["status"].as_str()),
+            Some("failed" | "error" | "lost")
+        )
 }
 
 /// The text of a message's `content` (a string, or text parts).
@@ -85,19 +94,21 @@ impl Normalizer {
             {
                 let message = &frame["message"];
                 let id = format!("pi-custom-{}", uuid::Uuid::new_v4());
-                let text = content_text(&message["content"]);
+                // Extensions colour their terminal output; a GUI shows text.
+                let text = strip_ansi(&content_text(&message["content"]));
+                let (input, body) = custom_input(&message["details"], &text);
                 events.push(AgentEvent::ToolCall {
                     id: id.clone(),
                     call: ToolCall::Mcp {
                         server: zeron_proto::view::PI_EXTENSION_SERVER.into(),
                         tool: string(message, "customType").into(),
-                        input: custom_input(&message["details"], &text),
+                        input,
                     },
                 });
                 events.push(AgentEvent::ToolResult {
                     id,
-                    is_error: false,
-                    output: (!text.is_empty()).then_some(text),
+                    is_error: custom_failed(&message["details"]),
+                    output: body.map(|body| cap(&body, 16384)),
                     diff: None,
                 });
             }
@@ -206,6 +217,19 @@ impl Normalizer {
                         _ => None,
                     }
                 });
+                // The todo extension's list is the checklist Zeron keeps above
+                // the composer: the call becomes a `Todo` once its result says
+                // what the list now is.
+                if let Some(items) = info
+                    .as_ref()
+                    .filter(|(name, _)| name == "todo" && frame["isError"] != true)
+                    .and_then(|_| todo_items(&result["details"]))
+                {
+                    events.push(AgentEvent::ToolCall {
+                        id: id.clone(),
+                        call: ToolCall::Todo { items },
+                    });
+                }
                 events.push(AgentEvent::ToolResult {
                     id,
                     is_error: frame["isError"].as_bool().unwrap_or(false),
@@ -235,6 +259,31 @@ impl Normalizer {
         events
     }
 }
+/// The list a `todo` call left, from its result's `details` (`{action,
+/// tasks}`); `None` for a read (`list`, `get`) or a failed write, whose
+/// `tasks` say nothing about the list.
+fn todo_items(details: &Value) -> Option<Vec<TodoItem>> {
+    if !matches!(
+        details["action"].as_str(),
+        Some("create" | "update" | "delete" | "clear")
+    ) || details.get("error").is_some_and(|error| !error.is_null())
+    {
+        return None;
+    }
+    let tasks = details["tasks"].as_array()?;
+    Some(
+        tasks
+            .iter()
+            .filter(|task| task["status"] != "deleted")
+            .map(|task| {
+                TodoItem::new(
+                    string(task, "subject"),
+                    TodoStatus::parse(string(task, "status")),
+                )
+            })
+            .collect(),
+    )
+}
 pub(super) fn string<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
 }
@@ -259,6 +308,37 @@ fn edit_text(args: &Value, key: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+/// Where a grep looks: its path, with the files it skips (`exclude` for
+/// pi-fff, `glob` for Pi's grep) when it names them.
+fn search_scope(args: &Value) -> Option<String> {
+    let path = args["path"].as_str().filter(|path| !path.is_empty());
+    let filter = args["exclude"]
+        .as_str()
+        .map(|exclude| format!("!{exclude}"))
+        .or_else(|| args["glob"].as_str().map(str::to_owned))
+        .filter(|filter| !filter.is_empty());
+    match (path, filter) {
+        (Some(path), Some(filter)) => Some(format!("{path} {filter}")),
+        (path, filter) => path.map(str::to_owned).or(filter),
+    }
+}
+/// What an LSP tool looks at: its file, its paths, else the workspace.
+fn lsp_target(args: &Value) -> String {
+    if let Some(path) = args["path"].as_str().filter(|p| !p.is_empty()) {
+        return path.to_owned();
+    }
+    let paths: Vec<&str> = args["paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if paths.is_empty() {
+        args["root"].as_str().unwrap_or("workspace").to_owned()
+    } else {
+        paths.join(", ")
+    }
+}
 fn tool(name: &str, args: &Value) -> ToolCall {
     match name {
         "bash" | "powershell" => ToolCall::Exec {
@@ -276,12 +356,51 @@ fn tool(name: &str, args: &Value) -> ToolCall {
             old_string: Some(edit_text(args, "oldText")),
             new_string: Some(edit_text(args, "newText")),
         },
-        "grep" => ToolCall::Search {
+        // `ffgrep`/`fffind` are pi-fff's names for its grep and find.
+        "grep" | "ffgrep" => ToolCall::Search {
             pattern: string(args, "pattern").into(),
-            path: args["path"].as_str().map(str::to_owned),
+            path: search_scope(args),
         },
-        "find" => ToolCall::Glob {
-            pattern: string(args, "pattern").into(),
+        "multi_grep" | "fff-multi-grep" => ToolCall::Search {
+            pattern: args["patterns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" | "),
+            path: args["constraints"]
+                .as_str()
+                .or(args["path"].as_str())
+                .map(str::to_owned),
+        },
+        // pi-fff's `path` carries the glob and its `pattern` a fuzzy query
+        // that may be empty; Pi's own `path` is the folder searched.
+        "find" | "fffind" => ToolCall::Glob {
+            pattern: match (string(args, "pattern"), string(args, "path")) {
+                ("", path) => path.into(),
+                (pattern, "") => pattern.into(),
+                (pattern, path) => format!("{pattern} in {path}"),
+            },
+        },
+        "lsp_fix" if args["write"] == true => ToolCall::EditFile {
+            path: string(args, "path").into(),
+            old_string: None,
+            new_string: None,
+        },
+        "lsp_diagnostics" | "lsp_fix" => ToolCall::Unknown {
+            name: format!(
+                "LSP: {} {}",
+                if name == "lsp_fix" {
+                    "fix"
+                } else {
+                    "diagnostics"
+                },
+                lsp_target(args)
+            )
+            .trim_end()
+            .to_owned(),
+            input: Some(args.clone()),
         },
         name if name.starts_with("zeron_") => ToolCall::Mcp {
             server: "zeron".into(),
@@ -348,14 +467,78 @@ mod tests {
         assert!(id.starts_with("pi-custom-"));
         assert_eq!((server.as_str(), tool.as_str()), ("pi", "workflow-result"));
         assert_eq!(input.as_ref().unwrap()["status"], "completed");
+        assert_eq!(input.as_ref().unwrap()["title"], "Done");
         let AgentEvent::ToolResult { output, .. } = &events[1] else {
             panic!("{events:?}");
         };
-        assert_eq!(output.as_deref(), Some("# Done"));
+        // The title line is the chip's header, not its body too.
+        assert_eq!(output.as_deref(), None);
+        let events = n.map(&json!({"type":"message_end","message":{"role":"custom",
+            "customType":"rtk-status","display":true,"details":{"state":"failed"},
+            "content":"\u{1b}[1mRTK\u{1b}[0m: ON\nsaved 42%"}}));
+        let AgentEvent::ToolCall {
+            call: ToolCall::Mcp { input, .. },
+            ..
+        } = &events[0]
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(input.as_ref().unwrap()["title"], "RTK: ON");
+        assert!(
+            matches!(&events[1], AgentEvent::ToolResult { is_error: true, output: Some(body), .. } if body == "saved 42%"),
+            "{events:?}"
+        );
         assert!(
             n.map(&json!({"type":"message_end","message":{"role":"custom",
             "customType":"jev-decompose","display":false,"content":"x"}}))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn todo_writes_become_the_checklist_and_fff_tools_read_as_searches() {
+        let mut n = Normalizer::default();
+        n.map(
+            &json!({"type":"tool_execution_start","toolCallId":"t","toolName":"todo",
+            "args":{"action":"update","id":1,"status":"completed"}}),
+        );
+        let events = n.map(&json!({"type":"tool_execution_end","toolCallId":"t","isError":false,
+            "result":{"content":[{"type":"text","text":"ok"}],"details":{"action":"update","params":{},
+            "nextId":3,"tasks":[{"id":1,"subject":"plan","status":"completed"},
+            {"id":2,"subject":"ship","status":"in_progress"},{"id":3,"subject":"old","status":"deleted"}]}}}));
+        let AgentEvent::ToolCall {
+            id,
+            call: ToolCall::Todo { items },
+        } = &events[0]
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(id, "t");
+        assert_eq!(items.len(), 2);
+        assert!(items[0].done);
+        assert_eq!(items[1].status, Some(TodoStatus::InProgress));
+        // A read says nothing about the list.
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"l","toolName":"todo","args":{"action":"list"}}));
+        let events = n.map(
+            &json!({"type":"tool_execution_end","toolCallId":"l","isError":false,
+            "result":{"content":[],"details":{"action":"list","tasks":[]}}}),
+        );
+        assert!(
+            matches!(&events[0], AgentEvent::ToolResult { .. }),
+            "{events:?}"
+        );
+
+        assert!(matches!(
+            tool("fffind", &json!({"pattern":"","path":"src/**"})),
+            ToolCall::Glob { pattern } if pattern == "src/**"
+        ));
+        assert!(matches!(
+            tool("multi_grep", &json!({"patterns":["a","b"]})),
+            ToolCall::Search { pattern, .. } if pattern == "a | b"
+        ));
+        assert!(matches!(
+            tool("lsp_diagnostics", &json!({"paths":["a.rs"]})),
+            ToolCall::Unknown { name, .. } if name == "LSP: diagnostics a.rs"
+        ));
     }
 }

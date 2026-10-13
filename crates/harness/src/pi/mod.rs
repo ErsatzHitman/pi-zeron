@@ -650,6 +650,11 @@ impl Runner {
         if watched == self.piui_on {
             return Ok(());
         }
+        // Without the hub's command, Pi would hand the event to the model as
+        // an ordinary prompt.
+        if !self.extension_commands.contains(piui::EVENT_COMMAND) {
+            return Ok(());
+        }
         self.piui_on = watched;
         let event = if watched { piui::hello() } else { piui::bye() };
         if !watched {
@@ -671,6 +676,9 @@ impl Runner {
     ) -> Result<(), HarnessError> {
         if let Some(response) = self.ui.answer_dialog(&action) {
             self.process.transport.client.send(response)?;
+            return Ok(());
+        }
+        if self.ui.close_report(&action) {
             return Ok(());
         }
         if !self.piui_on {
@@ -1022,6 +1030,10 @@ impl Runner {
         }
         self.interrupted = true;
         self.process.dialogs.cancel();
+        // Pi's `editor` has no timeout: an open sheet would stall the abort.
+        for response in self.ui.close_dialogs(true) {
+            self.process.transport.client.send(response)?;
+        }
         let client = &self.process.transport.client;
         client.request(json!({"type":"clear_queue"}))?;
         client.request(json!({"type":"abort"}))?;
@@ -1030,6 +1042,9 @@ impl Runner {
     async fn interrupt(&mut self, grace: Duration) {
         self.interrupted = true;
         self.process.dialogs.cancel();
+        for response in self.ui.close_dialogs(true) {
+            let _ = self.process.transport.client.send(response);
+        }
         self.queued.clear();
         self.deliveries.clear();
         if !self.active {
@@ -1171,12 +1186,15 @@ impl Runner {
                         }
                     }
                 }
+                // A watching UI answers it as a sheet in the prompt panel,
+                // during a turn or between turns: the sheet keeps the
+                // dialog's placeholder, search and secret field, and a
+                // dialog nobody asked for (a peer's letter) outlives the turn.
+                piui::Handled::Dialog if self.piui_on && self.ui.open_dialog(&frame) => {}
                 piui::Handled::Dialog if self.active => self
                     .process
                     .dialogs
                     .request(self.process.transport.client.clone(), &frame),
-                // Between turns, a watching UI answers it as a sheet.
-                piui::Handled::Dialog if self.piui_on && self.ui.open_dialog(&frame) => {}
                 piui::Handled::Dialog => {
                     // No foreground run can own a dialog here, so cancel it explicitly.
                     ui::Dialogs::default().request(self.process.transport.client.clone(), &frame);

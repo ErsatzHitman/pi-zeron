@@ -88,7 +88,9 @@ fn piui_event(args: &str) {
                 "title":"Background bash · 1 running",
                 "rows":[{"id":"j1","label":"npm test","state":"running","detail":"3s",
                     "actions":[{"id":"kill","label":"Kill","variant":"danger","confirm":"Kill this job?"}]}]}}));
-            piui(json!({"op":"channel","channel":"bash-bg:fleet","payload":{"entries":[],"active":1,"selected":0}}));
+            // As bash-background sends it: `active` is the terminal's manage mode.
+            piui(json!({"op":"channel","channel":"bash-bg:fleet","payload":{"entries":[
+                {"key":"j1","label":"npm test","state":"running"}],"active":false,"selected":"j1"}}));
             // A large element arrives in UTF-8-safe chunks without agentSeq.
             let big = json!({"v":1,"agentSeq":PIUI.seq.fetch_add(1, Ordering::SeqCst) + 1,"instance":INSTANCE,
                 "op":"set","el":{"id":"list","ns":"todo","kind":"panel","placement":"pinned",
@@ -121,7 +123,7 @@ fn piui_event(args: &str) {
             (Some("bash:jobs"), Some("kill")) => {
                 piui(json!({"op":"patch","ns":"bash","id":"jobs","patch":{"title":"Background bash · 0 running",
                     "rows":[{"id":"j1","label":"npm test","state":"error","detail":"killed"}]}}));
-                piui(json!({"op":"channel","channel":"bash-bg:fleet","payload":{"entries":[],"active":0,"selected":0}}));
+                piui(json!({"op":"channel","channel":"bash-bg:fleet","payload":{"entries":[],"active":false,"selected":""}}));
             }
             _ => {}
         },
@@ -389,7 +391,7 @@ fn main() {
                             // Extensions deliver results as custom messages.
                             for (kind, display) in [("workflow-result", true), ("jev-decompose", false)] {
                                 let message = json!({"role":"custom","customType":kind,"display":display,
-                                    "details":{"status":"completed"},"content":[{"type":"text","text":"# Done"}]});
+                                    "details":{"status":"completed"},"content":[{"type":"text","text":"# Done\nAll steps passed"}]});
                                 emit(json!({"type":"message_start","message":message}));
                                 emit(json!({"type":"message_end","message":message}));
                             }

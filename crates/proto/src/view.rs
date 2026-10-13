@@ -530,11 +530,41 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
         // (every native driver's convention): label them "Agent" with the
         // description as the detail — "Tool · Agent: scan repo" read as two
         // labels fighting.
-        ToolCall::Unknown { name, .. } => match name.strip_prefix("Agent: ") {
+        ToolCall::Unknown { name, input } => match name.strip_prefix("Agent: ") {
             Some(description) => ("Agent", description.to_owned()),
             None if name == "Agent" => ("Agent", String::new()),
-            None => ("Tool", name.clone()),
+            None => unknown_chip(name, input.as_ref()),
         },
+    }
+}
+
+/// A tool no driver decodes, named for what it is where the name says so:
+/// Pi's `ask_user`, the LSP tools, an extension's own tools (`workflow`,
+/// `memory_search`, `goal_plan`).
+fn unknown_chip(name: &str, input: Option<&serde_json::Value>) -> (&'static str, String) {
+    if let Some(target) = name.strip_prefix("LSP: ") {
+        return ("LSP", target.to_owned());
+    }
+    if name == "ask_user" {
+        let question = input
+            .and_then(|input| input.get("question"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let count = input
+            .and_then(|input| input.get("questions"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len);
+        let detail = match (question, count) {
+            (Some(question), _) => question,
+            (None, Some(1)) => "1 question".into(),
+            (None, Some(n)) => format!("{n} questions"),
+            (None, None) => String::new(),
+        };
+        return ("Question", detail);
+    }
+    match pi_extension_label(name) {
+        "Tool" | "Note" => ("Tool", name.to_owned()),
+        label => (label, name.to_owned()),
     }
 }
 
@@ -547,7 +577,9 @@ pub const PI_EXTENSION_SERVER: &str = "pi";
 /// The label a Pi extension's row wears, named like the stock tool it is
 /// closest to ("Run" for background shells, "Agent" for subagents).
 pub fn pi_extension_label(tool: &str) -> &'static str {
-    let family = tool.split([':', '-', '_', '.']).next().unwrap_or(tool);
+    // `pi-advisor-review`, `pi-herdr-peer`: the extension, not the prefix.
+    let named = tool.strip_prefix("pi-").unwrap_or(tool);
+    let family = named.split([':', '-', '_', '.']).next().unwrap_or(named);
     match family {
         "advisor" => "Advisor",
         "jev" => "Jev",
@@ -559,7 +591,10 @@ pub fn pi_extension_label(tool: &str) -> &'static str {
         "web" => "Web",
         "memory" => "Memory",
         "refusal" | "claude" => "Claude",
+        "herdr" => "Agent",
         "pi" if tool.contains("herdr") => "Agent",
+        "rtk" => "Run",
+        "goal" => "Goal",
         "notice" => "Note",
         _ => "Tool",
     }
@@ -850,6 +885,30 @@ mod pi_extension_tests {
             ("Note", "Saved the plan".to_string())
         );
         assert_eq!(chip("someone-else", serde_json::json!({})).0, "Tool");
+        assert_eq!(chip("pi-advisor-review", serde_json::json!({})).0, "Advisor");
+        assert_eq!(chip("pi-herdr-peer", serde_json::json!({})).0, "Agent");
+        assert_eq!(
+            tool_chip_content(&ToolCall::Unknown {
+                name: "ask_user".into(),
+                input: Some(serde_json::json!({"question":"Which port?"})),
+            }),
+            ("Question", "Which port?".to_string())
+        );
+        assert_eq!(
+            tool_chip_content(&ToolCall::Unknown {
+                name: "LSP: diagnostics src/main.rs".into(),
+                input: None,
+            }),
+            ("LSP", "diagnostics src/main.rs".to_string())
+        );
+        assert_eq!(
+            tool_chip_content(&ToolCall::Unknown {
+                name: "workflow".into(),
+                input: None,
+            })
+            .0,
+            "Workflow"
+        );
         // Other MCP servers keep their label.
         assert_eq!(
             tool_chip_content(&ToolCall::Mcp {

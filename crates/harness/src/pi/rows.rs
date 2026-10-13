@@ -35,12 +35,33 @@ struct Row {
 type Work = (String, String, Value, bool);
 
 fn input(title: &str, mut lines: Vec<String>) -> Value {
-    if lines.first().is_some_and(|line| line == title) {
+    // A panel whose title is its status line repeats it in its body.
+    while lines
+        .first()
+        .is_some_and(|line| line.trim() == title.trim())
+    {
         lines.remove(0);
     }
     lines.truncate(MAX_LINES);
     json!({ "title": title, "lines": lines })
 }
+
+/// `lines` capped at [`MAX_LINES`], saying how many more there were.
+fn capped(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<String> = lines
+        .iter()
+        .take(MAX_LINES)
+        .map(|l| (*l).to_owned())
+        .collect();
+    if lines.len() > MAX_LINES {
+        kept.push(format!("… {} more lines", lines.len() - MAX_LINES));
+    }
+    kept
+}
+
+/// What a notice row keeps as its message: enough to title it, not a dump.
+const NOTICE_MESSAGE_BYTES: usize = 2048;
 
 /// The non-prompt elements and plain widgets of `state`, in order.
 fn work(state: &ExtensionUiState) -> Vec<Work> {
@@ -48,6 +69,9 @@ fn work(state: &ExtensionUiState) -> Vec<Work> {
         .typed_elements()
         .into_iter()
         .filter(|element| !element.is_prompt() && !element.is_status())
+        // The todo list is the checklist above the composer (its `todo`
+        // calls become `Todo` items), not a row as well.
+        .filter(|element| element.ns != "todo")
         .map(|element| {
             let title = element
                 .title
@@ -69,12 +93,17 @@ fn work(state: &ExtensionUiState) -> Vec<Work> {
             .cloned()
             .filter(|line| !line.trim().is_empty())
             .unwrap_or_else(|| widget.key.clone());
-        (
-            format!("widget:{}", widget.key),
-            widget.key.clone(),
-            input(&title, widget.lines.clone()),
-            false,
-        )
+        // The PIUI hub's plain copy of an element (`piui:<ns>:<id>`, drawn
+        // while no client listens) continues that element's row.
+        let (key, tool) = match widget
+            .key
+            .strip_prefix("piui:")
+            .and_then(|key| Some((key, key.split_once(':')?.0)))
+        {
+            Some((key, ns)) => (key.to_owned(), ns.to_owned()),
+            None => (format!("widget:{}", widget.key), widget.key.clone()),
+        };
+        (key, tool, input(&title, widget.lines.clone()), false)
     });
     elements.chain(widgets).collect()
 }
@@ -168,7 +197,7 @@ impl Rows {
         gone.sort();
         for key in gone {
             if let Some(row) = self.open.remove(&key) {
-                events.extend(settle(row));
+                events.extend(self.settle(key, row));
             }
         }
         events
@@ -192,9 +221,13 @@ impl Rows {
     /// A notice during a turn: a settled row of its own, not a toast.
     pub fn notice(&mut self, message: &str, level: NoticeLevel) -> Vec<AgentEvent> {
         let id = self.next_id("notice");
+        let mut short = message.len().min(NOTICE_MESSAGE_BYTES);
+        while !message.is_char_boundary(short) {
+            short -= 1;
+        }
         let input = json!({
-            "message": message,
-            "lines": message.lines().take(MAX_LINES).collect::<Vec<_>>(),
+            "message": &message[..short],
+            "lines": capped(message),
         });
         vec![
             call(&id, "notice", &input),
@@ -336,5 +369,43 @@ mod tests {
             &notice[1],
             AgentEvent::ToolResult { is_error: true, .. }
         ));
+    }
+
+    #[test]
+    fn a_hub_copy_continues_its_elements_row_and_the_todo_list_is_no_row() {
+        let now = Instant::now();
+        let mut rows = Rows::default();
+        let todo = json!({"id":"list","ns":"todo","kind":"panel","placement":"pinned","title":"Todos 0/1"});
+        let first = rows.sync(&state(vec![advisor("THINKING"), todo]), now);
+        assert_eq!(
+            ids(&first),
+            vec![("1-advisor-live-panel:panel".into(), "call")]
+        );
+        let mut copy = state(vec![]);
+        copy.widgets.push(ExtensionWidget {
+            key: "piui:advisor-live-panel:panel".into(),
+            lines: vec!["Advisor".into(), "READING".into()],
+            placement: None,
+        });
+        // Same row, repainted: no settle, no second row.
+        let later = now + Duration::from_secs(2);
+        assert_eq!(
+            ids(&rows.sync(&copy, later)),
+            vec![("1-advisor-live-panel:panel".into(), "call")]
+        );
+        let long = (0..70)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let AgentEvent::ToolCall {
+            call: ToolCall::Mcp { input, .. },
+            ..
+        } = &rows.notice(&long, NoticeLevel::Info)[0]
+        else {
+            panic!("a notice row")
+        };
+        let lines = input.as_ref().unwrap()["lines"].as_array().unwrap().clone();
+        assert_eq!(lines.len(), MAX_LINES + 1);
+        assert_eq!(lines[MAX_LINES], "… 10 more lines");
     }
 }

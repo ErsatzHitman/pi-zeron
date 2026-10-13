@@ -30,6 +30,8 @@ const CHUNK_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const DURABLE_HISTORY: usize = 16;
 /// Namespace of the sheets the host draws for Pi's own dialogs.
 const DIALOG_NS: &str = "pi";
+/// A between-turn notice this long opens as a report screen, not a toast.
+const REPORT_LINES: usize = 4;
 
 /// A plain Pi dialog (`select`, `confirm`, `input`, `editor`) that arrived
 /// with no turn to answer it in, shown to the watching UI as a sheet.
@@ -72,6 +74,9 @@ pub(super) struct ExtensionUi {
     /// Published after the PIUI elements; a PIUI `reset` never clears them.
     dialogs: Vec<HostDialog>,
     dialog_seq: u64,
+    /// Long between-turn reports (`/lsp`, `/mcp` status), shown as closable
+    /// screens: a toast is gone before it is read. `(key, element)`.
+    reports: Vec<(String, Value)>,
     /// A turn is running: its notices become transcript rows, not toasts.
     in_turn: bool,
 }
@@ -122,7 +127,7 @@ pub(super) fn element_key(element: &Value) -> String {
 pub(super) fn asks_for_secret(frame: &Value) -> bool {
     // "token" alone also names counts ("token threshold"), so only the
     // credential phrases.
-    const WORDS: [&str; 9] = [
+    const WORDS: [&str; 12] = [
         "api key",
         "api-key",
         "apikey",
@@ -132,13 +137,21 @@ pub(super) fn asks_for_secret(frame: &Value) -> bool {
         "access token",
         "auth token",
         "bearer",
+        "openrouter key",
+        "license key",
+        "private key",
     ];
-    ["title", "message", "placeholder"].iter().any(|key| {
-        frame[*key].as_str().is_some_and(|text| {
-            let text = strip_ansi(text).to_lowercase().replace('_', " ");
-            WORDS.iter().any(|word| text.contains(word))
+    // Provider keys announce themselves by their prefix (`sk-or-v1-…`).
+    let key_placeholder = frame["placeholder"]
+        .as_str()
+        .is_some_and(|text| text.trim_start().starts_with("sk-"));
+    key_placeholder
+        || ["title", "message", "placeholder"].iter().any(|key| {
+            frame[*key].as_str().is_some_and(|text| {
+                let text = strip_ansi(text).to_lowercase().replace('_', " ");
+                WORDS.iter().any(|word| text.contains(word))
+            })
         })
-    })
 }
 
 pub(super) fn encode_client_event(event: &Value) -> String {
@@ -153,8 +166,44 @@ pub(super) fn hello() -> Value {
     json!({"type":"hello","protocol":PROTOCOL,"client":"zeron"})
 }
 
+/// `channels`: keep publishing data channels (fleets, shells, the goal) with
+/// nobody watching, so the host still sees background work it must not end.
 pub(super) fn bye() -> Value {
-    json!({"type":"bye"})
+    json!({"type":"bye","channels":true})
+}
+
+/// A long notice as a closable report screen: `Key: value` lines as a table,
+/// anything else as a log. `None` for a notice a toast holds.
+fn report_element(id: &str, message: &str) -> Option<Value> {
+    let lines: Vec<&str> = message
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.len() < REPORT_LINES {
+        return None;
+    }
+    let pair = |line: &str| {
+        line.split_once(": ")
+            .filter(|(key, _)| !key.trim().is_empty() && key.trim().len() <= 40)
+            .map(|(key, value)| vec![key.trim().to_owned(), value.trim().to_owned()])
+    };
+    let (title, body) = match lines.split_first() {
+        Some((first, rest)) if pair(first).is_none() && first.len() <= 80 => {
+            (first.trim().trim_end_matches(':').to_owned(), rest.to_vec())
+        }
+        _ => ("Report".to_owned(), lines.clone()),
+    };
+    let rows: Option<Vec<Vec<String>>> = body.iter().map(|line| pair(line)).collect();
+    let section = match rows {
+        Some(rows) => json!({"kind":"table","id":"report","rows":rows}),
+        None => json!({"kind":"log","id":"report","lines":body}),
+    };
+    Some(json!({
+        "id":id, "ns":DIALOG_NS, "kind":"panel", "placement":"screen",
+        "title":title, "sections":[section],
+        "actions":[{"id":"close","label":"Close"}],
+    }))
 }
 
 pub(super) fn action_event(action: &ExtensionUiAction) -> Value {
@@ -206,6 +255,9 @@ impl ExtensionUi {
             state
                 .elements
                 .extend(self.dialogs.iter().map(|dialog| dialog.element.clone()));
+            state
+                .elements
+                .extend(self.reports.iter().map(|(_, element)| element.clone()));
             sink.send_replace(state);
         }
     }
@@ -323,6 +375,17 @@ impl ExtensionUi {
         Some(response)
     }
 
+    /// Close a report screen; false when the action is for anything else.
+    pub fn close_report(&mut self, action: &ExtensionUiAction) -> bool {
+        let before = self.reports.len();
+        self.reports.retain(|(key, _)| *key != action.element_id);
+        if self.reports.len() == before {
+            return false;
+        }
+        self.publish();
+        true
+    }
+
     /// When the earliest open dialog times out.
     pub fn next_deadline(&self) -> Option<Instant> {
         self.dialogs.iter().filter_map(|d| d.deadline).min()
@@ -371,6 +434,15 @@ impl ExtensionUi {
                 if self.in_turn {
                     return Handled::Notice(message);
                 }
+                if let Some(element) =
+                    report_element(&format!("report-{}", self.dialog_seq + 1), &message)
+                {
+                    self.dialog_seq += 1;
+                    let key = format!("{DIALOG_NS}:report-{}", self.dialog_seq);
+                    self.reports.push((key, element));
+                    self.publish();
+                    return Handled::Consumed;
+                }
                 let level = notice_level(frame);
                 let seq = self.next_seq();
                 self.state.notices.push(ExtensionNotice {
@@ -388,7 +460,12 @@ impl ExtensionUi {
                 let statuses = &mut self.state.statuses;
                 match frame["statusText"].as_str() {
                     Some(value) => {
-                        let value = strip_ansi(value);
+                        // A chip draws its own frame: drop terminal box rails.
+                        let value = strip_ansi(value)
+                            .trim_matches(|c: char| {
+                                c.is_whitespace() || ('\u{2500}'..='\u{257F}').contains(&c)
+                            })
+                            .to_owned();
                         match statuses.iter_mut().find(|s| s.key == key) {
                             Some(status) => status.text = value,
                             None => statuses.push(ExtensionStatus { key, text: value }),
@@ -431,6 +508,12 @@ impl ExtensionUi {
                 self.publish();
                 Handled::Consumed
             }
+            // Over RPC an extension reads the editor as "" and may write that
+            // back (`getEditorText` then `setEditorText`): it would wipe what
+            // the user typed.
+            "set_editor_text" if frame["text"].as_str().is_none_or(str::is_empty) => {
+                Handled::Consumed
+            }
             "set_editor_text" => {
                 let seq = self.next_seq();
                 self.state.editor_text = Some(SequencedText {
@@ -453,7 +536,8 @@ impl ExtensionUi {
             self.state.connected = false;
             self.state.elements.clear();
             self.keys.clear();
-            self.state.channels.clear();
+            // Channels stay: `bye` asks the hub to keep them current, and they
+            // are how the host knows background work is still running.
             self.chunks.clear();
             self.publish();
         }
@@ -623,13 +707,38 @@ impl ExtensionUi {
     /// (subagent fleets, background shells, workflow runs). While any is
     /// live, retiring the idle Pi process would kill work nobody stopped.
     pub fn background_tasks(&self) -> usize {
-        let count = |channel: &str| match &self.state.channels.get(channel).map(|p| &p["active"]) {
-            Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as usize,
-            Some(Value::Bool(true)) => 1,
-            Some(Value::Array(items)) => items.len(),
-            _ => 0,
+        let count = |channel: &str| {
+            let Some(payload) = self.state.channels.get(channel) else {
+                return 0;
+            };
+            // A fleet lists its jobs; its `active` is the terminal's manage
+            // mode, not work.
+            if let Some(entries) = payload["entries"].as_array() {
+                return entries
+                    .iter()
+                    .filter(|entry| matches!(entry["state"].as_str(), Some("running" | "queued")))
+                    .count();
+            }
+            match &payload["active"] {
+                Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                Value::Bool(true) => 1,
+                Value::Array(items) => items.len(),
+                _ => 0,
+            }
         };
-        count("subagents:fleet") + count("bash-bg:fleet") + count("workflow:progress")
+        // A goal loop waits on timers (`goal_wait`, backoff, check-ins).
+        let goal = self
+            .state
+            .channels
+            .get("pi-goal:status")
+            .is_some_and(|goal| {
+                goal["active"] == true
+                    && matches!(goal["status"].as_str(), Some("active" | "waiting"))
+            });
+        count("subagents:fleet")
+            + count("bash-bg:fleet")
+            + count("workflow:progress")
+            + usize::from(goal)
     }
 }
 
@@ -890,5 +999,60 @@ mod tests {
         let choice = &sheet["sections"][0]["fields"][0]["options"][0];
         assert_eq!(choice["label"], "red");
         assert_eq!(choice["value"], red);
+    }
+
+    #[test]
+    fn long_idle_notices_open_as_reports_and_fleets_count_their_running_jobs() {
+        let (tx, rx) = watch::channel(ExtensionUiState::default());
+        let mut ui = ExtensionUi::new(Some(tx));
+        let report = "LSP servers\nrust: running\nts: stopped\npython: missing\n";
+        assert_eq!(
+            ui.handle(&json!({"method":"notify","message":report,"notifyType":"info"})),
+            Handled::Consumed
+        );
+        assert!(ui.state().notices.is_empty());
+        let screen = rx.borrow().typed_elements().remove(0);
+        assert_eq!(screen.key(), "pi:report-1");
+        assert_eq!(screen.title.as_deref(), Some("LSP servers"));
+        assert_eq!(
+            rx.borrow().elements[0]["sections"][0]["rows"][2],
+            json!(["python", "missing"])
+        );
+        let close = ExtensionUiAction {
+            element_id: "pi:report-1".into(),
+            action_id: "close".into(),
+            value: None,
+            row_id: None,
+        };
+        assert!(ui.close_report(&close));
+        assert!(rx.borrow().elements.is_empty());
+        // Short notices stay toasts.
+        assert_eq!(
+            ui.handle(&json!({"method":"notify","message":"saved"})),
+            Handled::Notice("saved".into())
+        );
+        // An empty editor write is the RPC read-back, not a draft.
+        ui.handle(&json!({"method":"set_editor_text","text":""}));
+        assert!(ui.state().editor_text.is_none());
+        // A fleet's `active` is manage mode; its running entries are the work.
+        let channel = |seq: u64, channel: &str, payload: Value| {
+            notify(json!({"v":1,"agentSeq":seq,"instance":"a","op":"channel",
+                "channel":channel,"payload":payload}))
+        };
+        ui.handle(&channel(1, "subagents:fleet", json!({"active":false,"entries":[
+            {"key":"a","state":"running"},{"key":"b","state":"queued"},{"key":"c","state":"completed"}]})));
+        ui.handle(&channel(
+            2,
+            "pi-goal:status",
+            json!({"active":true,"status":"waiting"}),
+        ));
+        assert_eq!(ui.background_tasks(), 3);
+        // Nobody watching: the channels still count.
+        ui.disconnect();
+        assert_eq!(ui.background_tasks(), 3);
+        assert!(asks_for_secret(
+            &json!({"title":"OpenRouter key","placeholder":"sk-or-v1-…"})
+        ));
+        assert!(!asks_for_secret(&json!({"title":"Token threshold"})));
     }
 }
