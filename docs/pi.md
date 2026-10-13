@@ -15,6 +15,9 @@ executable comes from, in order:
 1. Settings → General → Pi (per device, `piExecutable` in `harness-prefs.json`);
 2. `PI_EXECUTABLE`.
 
+A `.cmd`/`.bat` launcher (Pi run from source through Node) works; its
+`--version` gets 20 seconds, even after a quicker probe elsewhere timed out.
+
 With neither set, starting a chat shows "Pi is not configured" with where to set it. Install and
 authenticate Pi through its own CLI. `PI_CODING_AGENT_DIR` continues to control
 Pi settings, credentials and extensions. `PI_ACP_EXECUTABLE` and
@@ -86,10 +89,10 @@ live state; it never enters the synced chat document.
 | --- | --- |
 | `sheet` (ask-user, decisions, model picker, idle Pi dialogs) | replaces the composer; keyboard picks, Enter submits, Esc cancels |
 | `pinned` (bash jobs, subagent fleet, workflows, todo) | collapsible trays above the todo panel, with row actions |
-| `status`, `setStatus`, goal/footer channels, plan mode | chips in the composer footer |
-| `screen` (subagent viewer, btw) | a right-pane tab, opened once, closed when the element goes away |
+| `status`, `setStatus`, goal/footer channels, plan mode | chips in the composer footer (a `setStatus` line repeating an element chip shows once) |
+| `screen` (subagent viewer, btw, `/usage`, `/workspace`, `/workflow` reports, `/clinepass`) | a right-pane tab, opened once, closed when the element goes away; more than three actions wrap into a toolbar under the title. In the chat, a one-line tray opens the tab and previews the screen only while it is busy |
 | `setWidget` | a tray of plain lines |
-| `notify` (plain) | a toast while watched; transcript text otherwise |
+| `notify` (plain) | a toast while watched; transcript text otherwise. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
 | `setTitle` | renames the chat |
 | `set_editor_text` | fills the composer |
 
