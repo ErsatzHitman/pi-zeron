@@ -1,23 +1,30 @@
-//! Window-owned voice orchestrator. Each session runs in the host's own
-//! projectless Codex chat, resumed across calls, and survives navigation
-//! between threads; only an explicit end, an engine change or a provider
-//! failure closes it. No automatic reconnect or microphone resume.
+//! Window-owned voice mode. A call is a spoken conversation run on this
+//! device by `zeron_voice::call`: speech to text, an OpenRouter reply and an
+//! OpenRouter voice. The assistant hands real work to the coding agent in
+//! the user's chat ([`agent`]) and tells them when it finishes. A call
+//! survives navigation between threads; only an explicit end, losing the
+//! engine it reports to or a provider failure closes it.
 use crate::orb::OrbState;
 use crate::state::EngineHandle;
-use gpui::{Context, Task};
+use gpui::{App, Context, Task};
 use gpui_tokio::Tokio;
 use zeron_proto::voice::*;
+use zeron_voice::call;
+mod agent;
 mod permissions;
-mod remote;
 
-pub enum VoiceControl {
-    Mute(bool),
-}
+pub(crate) use agent::AgentBridge;
+
+/// Every local call reuses one generation: events never cross calls
+/// because the controller's epoch guards them.
+const GENERATION: u64 = 1;
 
 pub struct VoiceController {
     pub phase: VoicePhase,
     pub chat_id: Option<String>,
     pub reason: Option<VoiceRejection>,
+    /// The words for a failure no rejection names (a provider's answer).
+    pub failure: Option<String>,
     pub snapshot: Option<VoiceSnapshot>,
     /// The newest speaker turn's live text, then its final.
     pub caption: zeron_voice_session::Caption,
@@ -30,16 +37,18 @@ pub struct VoiceController {
     /// When the session first became active; drives the stage's call timer.
     pub active_since: Option<std::time::Instant>,
     engine: Option<EngineHandle>,
-    controls: Option<tokio::sync::mpsc::Sender<VoiceControl>>,
+    controls: Option<tokio::sync::mpsc::Sender<call::Command>>,
     epoch: u64,
     task: Option<Task<()>>,
     cancellation: tokio_util::sync::CancellationToken,
-    /// Whether this device's Codex is installed and enabled: no Codex, no
-    /// voice. `None` until the catalog answers.
-    codex_ready: Option<bool>,
-    /// The connection `codex_ready` was read from, and its read in flight.
-    codex_engine: Option<EngineHandle>,
-    codex_check: Option<Task<()>>,
+    /// The assistant is working out a reply.
+    thinking: bool,
+    /// The coding agent the assistant talks to, and the chat it works in.
+    agent: Option<AgentBridge>,
+    pub agent_chat: Option<String>,
+    agent_seen: zeron_proto::view::Indicator,
+    agent_watch: Option<gpui::Subscription>,
+    notices: u64,
     /// This call played its start sound and owes its end sound.
     cued: bool,
 }
@@ -49,6 +58,7 @@ impl Default for VoiceController {
             phase: VoicePhase::Closed,
             chat_id: None,
             reason: None,
+            failure: None,
             snapshot: None,
             caption: Default::default(),
             microphone_level: 0,
@@ -62,61 +72,21 @@ impl Default for VoiceController {
             epoch: 0,
             task: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
-            codex_ready: None,
-            codex_engine: None,
-            codex_check: None,
+            thinking: false,
+            agent: None,
+            agent_chat: None,
+            agent_seen: zeron_proto::view::Indicator::None,
+            agent_watch: None,
+            notices: 0,
             cued: false,
         }
     }
 }
 impl VoiceController {
-    /// Voice can be offered here: only once the device's catalog lists Codex
-    /// (a Pi-only engine never does, so the trigger never flashes in while it
-    /// loads); a live call or its failure stays.
-    pub fn offered(&self) -> bool {
-        self.codex_ready == Some(true) || self.is_live() || self.reason.is_some()
-    }
-
-    /// Read whether `engine`'s device can take a call: installed and enabled
-    /// in Settings → Agents. `force` re-reads a connection already read.
-    pub fn check_codex(&mut self, engine: &EngineHandle, force: bool, cx: &mut Context<Self>) {
-        let same = self
-            .codex_engine
-            .as_ref()
-            .is_some_and(|e| e.same_connection(engine));
-        if same && !force {
-            return;
-        }
-        if !same {
-            self.codex_ready = None;
-        }
-        self.codex_engine = Some(engine.clone());
-        let engine = engine.clone();
-        self.codex_check = Some(cx.spawn(async move |this, cx| {
-            let ready = engine
-                .client()
-                .call(zeron_rpc::methods::LIST_HARNESSES, serde_json::json!({}))
-                .await
-                .ok()
-                .and_then(|value| {
-                    serde_json::from_value::<Vec<zeron_engine::registry::HarnessDescriptor>>(value)
-                        .ok()
-                })
-                .map(|list| {
-                    list.iter().any(|d| {
-                        d.id == zeron_proto::HarnessId::Codex
-                            && d.installed
-                            && zeron_engine::registry::descriptor_enabled(d)
-                    })
-                });
-            this.update(cx, |voice, cx| {
-                if ready.is_some() && ready != voice.codex_ready {
-                    voice.codex_ready = ready;
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
+    /// Voice can be offered once Settings → Voice has its keys; a live call
+    /// or its failure stays.
+    pub fn offered(&self, cx: &App) -> bool {
+        self.is_live() || self.reason.is_some() || crate::dictation::call_config(cx).is_ok()
     }
 
     /// A session is underway (including its preparation and native stop).
@@ -124,73 +94,102 @@ impl VoiceController {
         matches!(self.phase, VoicePhase::Checking) || self.phase.replaces_composer()
     }
 
-    /// Start an orchestrator in a new projectless Codex chat on `host_device_id`.
-    /// `config` is the chat's Codex configuration; its harness must be Codex.
-    pub fn start(
+    /// Start a call. `agent` lets the assistant drive the coding agent;
+    /// `engine` is the connection it reports to.
+    pub(crate) fn start(
         &mut self,
-        engine: EngineHandle,
-        host_device_id: String,
-        config: zeron_proto::ChatConfig,
-        voice: Option<String>,
+        mut config: call::Config,
+        engine: Option<EngineHandle>,
+        agent: Option<AgentBridge>,
         cx: &mut Context<Self>,
     ) {
         self.cancel(cx);
         // The call sounds as it is placed, well before the microphone opens.
         crate::sound::play_voice(true);
         self.cued = true;
-        self.engine = Some(engine.clone());
+        self.engine = engine;
         self.phase = VoicePhase::Checking;
         self.chat_id = None;
         self.reason = None;
+        self.failure = None;
+        if let Some(agent) = &agent {
+            config.instructions = agent::INSTRUCTIONS.to_owned();
+            config.tools = agent::tools();
+            self.agent_chat = agent.state.read(cx).selected_chat.clone();
+            self.agent_seen = self.agent_indicator(agent, cx);
+            self.agent_watch =
+                Some(cx.observe(&agent.state, |voice, _, cx| voice.agent_changed(cx)));
+        }
+        self.agent = agent;
         let epoch = self.epoch;
+        self.reduce(
+            VoiceEvent::Snapshot {
+                snapshot: VoiceSnapshot {
+                    session_id: format!("local-{epoch}"),
+                    chat_id: format!("{ORCHESTRATOR_CHAT_PREFIX}local"),
+                    generation: GENERATION,
+                    phase: VoicePhase::Starting,
+                    muted: false,
+                    playing: false,
+                    work: VoiceWork::Idle,
+                    reason: None,
+                    voice: Some(config.voice.clone()),
+                    voices: Vec::new(),
+                },
+            },
+            cx,
+        );
         let cancellation = self.cancellation.clone();
-        let (controls, control_rx) = tokio::sync::mpsc::channel(8);
+        let (controls, control_rx) = tokio::sync::mpsc::channel(16);
         self.controls = Some(controls);
-        let (events, mut event_rx) = tokio::sync::mpsc::channel(32);
+        // Streamed reply deltas outnumber everything else; keep room for them.
+        let (events, mut event_rx) = tokio::sync::mpsc::channel(512);
         let query = Tokio::spawn(cx, async move {
-            // Media belongs to this viewport, even when the chosen host is
-            // this device. The execution host never opens audio devices.
-            remote::run(
-                engine,
-                host_device_id,
-                config,
-                voice,
-                cancellation,
-                events,
-                control_rx,
-            )
-            .await
+            permissions::microphone().await.map_err(Failure::Rejected)?;
+            let stop = call::Stop::default();
+            let run = call::run(config, control_rx, events, stop.clone());
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => result.map_err(Failure::Call),
+                _ = cancellation.cancelled() => {
+                    stop.stop();
+                    (&mut run).await.map_err(Failure::Call)
+                }
+            }
         });
         self.task = Some(cx.spawn(async move |this, cx| {
-            let receive = async {
-                while let Some(event) = event_rx.recv().await {
-                    if this
-                        .update(cx, |controller, cx| {
-                            if controller.epoch == epoch {
-                                controller.reduce(event, cx);
-                            }
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
+            while let Some(event) = event_rx.recv().await {
+                if this
+                    .update(cx, |controller, cx| {
+                        if controller.epoch == epoch {
+                            controller.on_call(event, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
                 }
-            };
-            receive.await;
-            let result = query.await.unwrap_or(Err(VoiceRejection::Protocol));
+            }
+            let result = query
+                .await
+                .unwrap_or(Err(Failure::Rejected(VoiceRejection::Protocol)));
             let _ = this.update(cx, |controller, cx| {
                 if controller.epoch != epoch {
                     return;
                 }
                 match result {
-                    // A provider failure already reduced to Failed keeps its reason.
-                    Ok(()) if controller.phase == VoicePhase::Failed => {}
-                    Ok(()) => {
-                        controller.phase = VoicePhase::Closed;
-                    }
-                    Err(reason) => {
+                    Ok(()) => controller.phase = VoicePhase::Closed,
+                    Err(Failure::Rejected(reason)) => {
                         controller.phase = VoicePhase::Failed;
                         controller.reason = Some(reason);
+                    }
+                    Err(Failure::Call(error)) => {
+                        controller.phase = VoicePhase::Failed;
+                        controller.reason = Some(match error {
+                            call::CallError::Devices(_) => VoiceRejection::DeviceUnavailable,
+                            call::CallError::Provider(_) => VoiceRejection::Unsupported,
+                        });
+                        controller.failure = Some(error.to_string());
                     }
                 }
                 controller.reset_session();
@@ -219,6 +218,9 @@ impl VoiceController {
         self.task = None;
         self.stage_open = false;
         self.active_since = None;
+        self.thinking = false;
+        self.agent = None;
+        self.agent_watch = None;
     }
 
     /// End the session (any phase). The provider stop runs in the background.
@@ -229,7 +231,9 @@ impl VoiceController {
         self.reset_session();
         self.phase = VoicePhase::Closed;
         self.chat_id = None;
+        self.agent_chat = None;
         self.reason = None;
+        self.failure = None;
         self.engine = None;
         cx.notify();
     }
@@ -245,6 +249,7 @@ impl VoiceController {
     /// Forget a failure once it has been seen.
     pub fn dismiss_reason(&mut self, cx: &mut Context<Self>) {
         if self.reason.take().is_some() {
+            self.failure = None;
             if self.phase == VoicePhase::Failed {
                 self.phase = VoicePhase::Closed;
             }
@@ -252,10 +257,11 @@ impl VoiceController {
         }
     }
 
-    pub fn belongs_to(&self, engine: &EngineHandle) -> bool {
+    /// The call reported to a connection that is gone or was replaced.
+    pub fn engine_lost(&self, engine: Option<&EngineHandle>) -> bool {
         self.engine
             .as_ref()
-            .is_some_and(|e| e.same_connection(engine))
+            .is_some_and(|mine| engine.is_none_or(|e| !mine.same_connection(e)))
     }
     pub fn muted(&self) -> bool {
         self.snapshot.as_ref().is_some_and(|s| s.muted)
@@ -266,11 +272,20 @@ impl VoiceController {
             snapshot.muted = !muted;
         }
         cx.notify();
-        if let Some(controls) = &self.controls {
-            if controls.try_send(VoiceControl::Mute(!muted)).is_err() {
-                self.cancel(cx);
-                self.reason = Some(VoiceRejection::Overflow);
-            }
+        self.command(call::Command::Mute(!muted), cx);
+    }
+
+    /// Stop the assistant mid-sentence.
+    pub fn interrupt(&mut self, cx: &mut Context<Self>) {
+        self.command(call::Command::Interrupt, cx);
+    }
+
+    fn command(&mut self, command: call::Command, cx: &mut Context<Self>) {
+        if let Some(controls) = &self.controls
+            && controls.try_send(command).is_err()
+        {
+            self.cancel(cx);
+            self.reason = Some(VoiceRejection::Overflow);
         }
     }
 
@@ -294,6 +309,92 @@ impl VoiceController {
     /// Normalized 0…1 speaker peak; the orb smooths each channel separately.
     pub fn speaker_level(&self) -> f32 {
         f32::from(self.speaker_level) / f32::from(u16::MAX)
+    }
+
+    fn session_id(&self) -> Option<String> {
+        self.snapshot.as_ref().map(|s| s.session_id.clone())
+    }
+
+    /// A call event, reduced into the same view state every surface reads.
+    fn on_call(&mut self, event: call::Event, cx: &mut Context<Self>) {
+        let Some(session_id) = self.session_id() else {
+            return;
+        };
+        let transcript = |item_id: String, role: VoiceRole, text: String| VoiceEvent::Final {
+            transcript: VoiceTranscript {
+                session_id: session_id.clone(),
+                item_id,
+                role,
+                text,
+                promoted_message_id: None,
+            },
+        };
+        match event {
+            call::Event::Ready => {
+                if let Some(mut snapshot) = self.snapshot.clone() {
+                    snapshot.phase = VoicePhase::Active;
+                    self.reduce(VoiceEvent::Snapshot { snapshot }, cx);
+                }
+            }
+            call::Event::Thinking(thinking) => {
+                self.thinking = thinking;
+                self.sync_work(cx);
+            }
+            call::Event::User { turn, text } => self.reduce(
+                transcript(format!("user-{turn}"), VoiceRole::User, text),
+                cx,
+            ),
+            call::Event::AssistantDelta { turn, text } => self.reduce(
+                VoiceEvent::Partial {
+                    generation: GENERATION,
+                    item_id: Some(format!("assistant-{turn}")),
+                    text,
+                },
+                cx,
+            ),
+            call::Event::AssistantDone { turn, text } => self.reduce(
+                transcript(format!("assistant-{turn}"), VoiceRole::Assistant, text),
+                cx,
+            ),
+            call::Event::Interrupted => {}
+            call::Event::Levels {
+                microphone,
+                speaker,
+            } => self.reduce(
+                VoiceEvent::Levels {
+                    generation: GENERATION,
+                    // Speech RMS sits far below its peak; lift it to the
+                    // range the orb's microphone channel expects.
+                    microphone: level(microphone * 4.0),
+                    speaker: level(speaker),
+                },
+                cx,
+            ),
+            call::Event::Tool(call) => self.run_tool(call, cx),
+            call::Event::Notice(text) => {
+                self.notices += 1;
+                let item = format!("notice-{}", self.notices);
+                self.reduce(transcript(item, VoiceRole::Assistant, text), cx);
+            }
+        }
+    }
+
+    /// The orb's work state: the agent waiting on the user, or work underway
+    /// (the agent running or the assistant thinking).
+    fn sync_work(&mut self, cx: &mut Context<Self>) {
+        let agent = self.agent_seen;
+        let work = match agent {
+            zeron_proto::view::Indicator::AwaitingInput => VoiceWork::AwaitingInput,
+            zeron_proto::view::Indicator::Working => VoiceWork::Working,
+            _ if self.thinking => VoiceWork::Working,
+            _ => VoiceWork::Idle,
+        };
+        if let Some(snapshot) = &mut self.snapshot
+            && snapshot.work != work
+        {
+            snapshot.work = work;
+            cx.notify();
+        }
     }
 
     pub fn reduce(&mut self, event: VoiceEvent, cx: &mut Context<Self>) {
@@ -387,24 +488,11 @@ impl VoiceController {
         }
         cx.notify();
     }
-    pub fn reason_text(&self) -> &'static str {
+    pub fn reason_text(&self) -> String {
+        if let Some(failure) = &self.failure {
+            return failure.clone();
+        }
         match self.reason {
-            Some(VoiceRejection::CreditExclusionUnverified) => {
-                "Codex controls subscription usage and any enabled additional credits."
-            }
-            Some(VoiceRejection::WrongHarness) => "Voice requires Codex.",
-            Some(VoiceRejection::RemoteHost) => "Voice runs on this device only.",
-            Some(VoiceRejection::IncludedUsageUnavailable) => {
-                "Codex usage is currently unavailable."
-            }
-            Some(VoiceRejection::AudioFormatUnverified) => {
-                "This Codex voice format has not been verified."
-            }
-            Some(VoiceRejection::ChatgptRequired) => "Sign in to Codex with ChatGPT to use voice.",
-            // Remote calls still play audio here, through this device's Codex helper.
-            Some(VoiceRejection::NativeRuntimeUnavailable) => {
-                "Install or update Codex on this device with its official installer to use voice. npm installs lack the voice runtime."
-            }
             Some(VoiceRejection::DeviceUnavailable) => {
                 "Check microphone permission and your audio devices."
             }
@@ -418,7 +506,19 @@ impl VoiceController {
             Some(_) => "Voice could not connect. Try again in a moment.",
             None => "",
         }
+        .to_owned()
     }
+}
+
+/// A 0–1 level as the orb's 16-bit meter.
+fn level(value: f32) -> u16 {
+    (value.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16
+}
+
+/// Why a call ended early.
+enum Failure {
+    Rejected(VoiceRejection),
+    Call(call::CallError),
 }
 
 /// Call-timer text: `m:ss`, or `h:mm:ss` past the hour.
@@ -460,20 +560,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn voice_is_offered_only_once_codex_is_listed() {
-        let mut voice = VoiceController::default();
-        assert!(!voice.offered(), "an unread catalog never flashes voice in");
-        voice.codex_ready = Some(true);
-        assert!(voice.offered());
-        voice.codex_ready = Some(false);
-        assert!(!voice.offered());
-        // A failure explains itself before the trigger goes away.
-        voice.reason = Some(VoiceRejection::NativeRuntimeUnavailable);
-        assert!(voice.offered());
-        voice.reason = None;
-        voice.phase = VoicePhase::Checking;
-        assert!(voice.offered(), "a call in progress keeps its trigger");
+    #[gpui::test]
+    fn voice_is_offered_once_its_keys_are_saved(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            crate::dictation::init(dir.path().into(), cx);
+        });
+        let voice = cx.new(|_| VoiceController::default());
+        voice.update(cx, |voice, cx| {
+            assert!(!voice.offered(cx), "no key, no voice");
+            // A failure explains itself before the trigger goes away.
+            voice.reason = Some(VoiceRejection::DeviceUnavailable);
+            assert!(voice.offered(cx));
+            voice.reason = None;
+            voice.phase = VoicePhase::Checking;
+            assert!(voice.offered(cx), "a call in progress keeps its trigger");
+        });
     }
 
     #[test]
@@ -542,8 +645,8 @@ mod tests {
         });
     }
 
-    /// Codex delivers the user's final after the answer started streaming:
-    /// the caption stays on the answer and keeps every streamed word.
+    /// A user's final can land after the answer started streaming: the
+    /// caption stays on the answer and keeps every streamed word.
     #[gpui::test]
     fn late_user_final_keeps_the_streaming_answer_captioned(cx: &mut gpui::TestAppContext) {
         let voice = cx.new(|_| VoiceController::default());
@@ -580,6 +683,72 @@ mod tests {
         });
     }
 
+    /// Call events drive the same caption, orb and call clock as before.
+    #[gpui::test]
+    fn call_events_become_captions_levels_and_work(cx: &mut gpui::TestAppContext) {
+        let voice = cx.new(|_| VoiceController::default());
+        voice.update(cx, |voice, cx| {
+            voice.phase = VoicePhase::Checking;
+            voice.reduce(
+                VoiceEvent::Snapshot {
+                    snapshot: VoiceSnapshot {
+                        session_id: "local-0".into(),
+                        chat_id: format!("{ORCHESTRATOR_CHAT_PREFIX}local"),
+                        generation: GENERATION,
+                        phase: VoicePhase::Starting,
+                        ..snapshot()
+                    },
+                },
+                cx,
+            );
+            assert_eq!(voice.orb_state(), OrbState::Connecting);
+            voice.on_call(call::Event::Ready, cx);
+            assert_eq!(voice.phase, VoicePhase::Active);
+            assert!(voice.active_since.is_some());
+            assert_eq!(voice.orb_state(), OrbState::Listening);
+            voice.on_call(
+                call::Event::User {
+                    turn: 1,
+                    text: "Run the tests.".into(),
+                },
+                cx,
+            );
+            assert_eq!(voice.caption.text(), "Run the tests.");
+            voice.on_call(call::Event::Thinking(true), cx);
+            assert_eq!(voice.orb_state(), OrbState::Working);
+            voice.on_call(call::Event::Thinking(false), cx);
+            for text in ["On it", ", I asked Pi."] {
+                voice.on_call(
+                    call::Event::AssistantDelta {
+                        turn: 1,
+                        text: text.into(),
+                    },
+                    cx,
+                );
+            }
+            assert_eq!(voice.caption.text(), "On it, I asked Pi.");
+            voice.on_call(
+                call::Event::Levels {
+                    microphone: 0.0,
+                    speaker: 0.5,
+                },
+                cx,
+            );
+            assert_eq!(voice.orb_state(), OrbState::Composing);
+            voice.on_call(
+                call::Event::AssistantDone {
+                    turn: 1,
+                    text: "On it, I asked Pi.".into(),
+                },
+                cx,
+            );
+            assert_eq!(voice.caption.role(), Some(VoiceRole::Assistant));
+            // A notice is its own caption once the reply has settled.
+            voice.on_call(call::Event::Notice("Deepgram is rate limiting.".into()), cx);
+            assert_eq!(voice.caption.text(), "Deepgram is rate limiting.");
+        });
+    }
+
     #[gpui::test]
     fn provider_failure_closes_the_stage_and_keeps_its_reason(cx: &mut gpui::TestAppContext) {
         let voice = cx.new(|_| VoiceController::default());
@@ -602,8 +771,11 @@ mod tests {
             assert_eq!(voice.phase, VoicePhase::Failed);
             assert!(!voice.stage_open);
             assert!(!voice.reason_text().is_empty());
+            voice.failure = Some("The OpenRouter API key was rejected.".into());
+            assert_eq!(voice.reason_text(), "The OpenRouter API key was rejected.");
             voice.dismiss_reason(cx);
             assert_eq!(voice.phase, VoicePhase::Closed);
+            assert!(voice.failure.is_none());
         });
     }
 
@@ -632,5 +804,7 @@ mod tests {
             orb_state(VoicePhase::Starting, Some(&s)),
             OrbState::Connecting
         );
+        assert_eq!(level(2.0), u16::MAX);
+        assert_eq!(level(-1.0), 0);
     }
 }

@@ -4075,6 +4075,20 @@ impl Transcript {
         &self.rows
     }
 
+    /// The newest settled reply's copyable text, when it answers the newest
+    /// prompt. Voice mode reads it to tell the user what the agent said.
+    pub(crate) fn latest_reply(&self) -> Option<String> {
+        for row in self.rows.iter().rev() {
+            if matches!(row.kind, RowKind::User { .. }) {
+                return None;
+            }
+            if let Some(text) = &row.copy_text {
+                return Some(text.to_string());
+            }
+        }
+        None
+    }
+
     pub(crate) fn list_state(&self) -> &ListState {
         &self.list
     }

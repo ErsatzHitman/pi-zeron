@@ -228,8 +228,9 @@ impl Shell {
                         // never runs worktree setup of its own.
                         ComposerEvent::NewThreadTransitionStarted
                         | ComposerEvent::WorktreeSetup { .. } => {}
-                        // Screens open from the main conversation's tray.
-                        ComposerEvent::OpenExtensionScreen { .. } => {}
+                        // Screens open from the main conversation's tray, and
+                        // voice mode lives in the main composer only.
+                        ComposerEvent::OpenExtensionScreen { .. } | ComposerEvent::Voice => {}
                         ComposerEvent::Sent {
                             chat_id,
                             message_id,

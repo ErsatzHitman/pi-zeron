@@ -30,50 +30,35 @@ pub(super) fn stage_reveal(open: bool, elapsed_ms: f32, reduced: bool) -> f32 {
 }
 
 impl Shell {
-    /// The footer microphone: a new orchestrator in a projectless Codex chat
-    /// on this device. The chat's model follows the composer when it already
-    /// targets Codex; otherwise Codex's own default model runs the delegations.
+    /// Start voice mode with the providers from Settings → Voice. The
+    /// assistant hands work to the agent in the selected chat (or a new one,
+    /// as the composer would) through the composer.
     pub(super) fn start_voice(&mut self, cx: &mut Context<Self>) {
-        let state = self.state.read(cx);
-        let (Some(engine), Some(device)) = (state.engine().cloned(), state.local_device_id.clone())
-        else {
-            return;
+        let config = match crate::dictation::call_config(cx) {
+            Ok(config) => config,
+            Err(message) => {
+                // The trigger explains what Settings → Voice still needs.
+                self.voice.update(cx, |voice, cx| {
+                    voice.cancel(cx);
+                    voice.phase = VoicePhase::Failed;
+                    voice.reason = Some(zeron_proto::voice::VoiceRejection::Unsupported);
+                    voice.failure = Some(message);
+                    cx.notify();
+                });
+                return;
+            }
         };
-        let config = self
-            .composer
-            .read(cx)
-            .pickers()
-            .read(cx)
-            .resolved(cx)
-            .chat_config()
-            .filter(|config| config.harness == HarnessId::Codex)
-            .unwrap_or_else(|| ChatConfig {
-                harness: HarnessId::Codex,
-                model: None,
-                reasoning: None,
-                model_options: Default::default(),
-                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
-            });
-        let host_name = state
-            .device_name(&device)
-            .unwrap_or("This device")
-            .to_owned();
+        let engine = self.state.read(cx).engine().cloned();
+        let agent = crate::voice::AgentBridge {
+            state: self.state.clone(),
+            composer: self.composer.downgrade(),
+            transcript: self.transcript.downgrade(),
+        };
         self.voice.update(cx, |controller, cx| {
-            controller.start(engine, device, config, None, cx);
-            controller.host_name = Some(host_name);
+            controller.start(config, engine, Some(agent), cx);
+            controller.host_name = None;
             controller.set_stage_open(true, cx);
         });
-    }
-
-    /// Read whether this device's Codex can take a call; `force` re-reads it
-    /// after Settings → Agents changes or on coming back to a window that
-    /// hides voice (Codex may have been installed meanwhile).
-    pub(super) fn check_voice_codex(&mut self, force: bool, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        self.voice
-            .update(cx, |voice, cx| voice.check_codex(&engine, force, cx));
     }
 
     pub(super) fn end_voice(&mut self, cx: &mut Context<Self>) {
@@ -123,10 +108,9 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        self.check_voice_codex(false, cx);
         let voice = self.voice.read(cx);
-        // Without Codex on this device a call could only fail.
-        if !voice.offered() {
+        // Without its keys a call could only fail.
+        if !voice.offered(cx) {
             return None;
         }
         let live = voice.is_live();
@@ -189,8 +173,9 @@ impl Shell {
         }
 
         let tooltip: SharedString = failure
+            .clone()
             .map(SharedString::from)
-            .unwrap_or_else(|| "Start voice · Codex orchestrator".into());
+            .unwrap_or_else(|| "Start voice mode".into());
         let button = button
             .aria_label("Start voice")
             .tooltip(move |_, cx| {
@@ -365,7 +350,8 @@ impl Shell {
             voice.caption.text().to_owned(),
         );
         let snapshot = voice.snapshot.clone();
-        let chat_id = voice.chat_id.clone();
+        // The transcript control opens the chat the agent works in.
+        let chat_id = voice.agent_chat.clone();
         let awaiting = snapshot
             .as_ref()
             .is_some_and(|s| s.work == VoiceWork::AwaitingInput);
@@ -631,14 +617,14 @@ impl Shell {
         let transcript = chat_id.map(|chat_id| {
             round_control("voice-bar-transcript", &popup, false)
                 .aria_label(if awaiting {
-                    "Answer Codex in the transcript"
+                    "Answer the agent in its chat"
                 } else {
-                    "Open the voice transcript"
+                    "Open the agent's chat"
                 })
                 .tooltip(stage_tooltip(if awaiting {
-                    "Codex is asking you something"
+                    "The agent is asking you something"
                 } else {
-                    "Transcript"
+                    "Agent chat"
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| this.open_chat(chat_id.clone(), cx)))
                 .child(

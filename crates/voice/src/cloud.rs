@@ -8,7 +8,7 @@ use std::time::Duration;
 
 const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
 const REWRITE_TIMEOUT: Duration = Duration::from_secs(20);
-const BOUNDARY: &str = "zeron-voice-7f3a9c1e5b";
+pub(crate) const BOUNDARY: &str = "zeron-voice-7f3a9c1e5b";
 /// A body this short is left as it is unless instructions say otherwise.
 const MIN_REWRITE_WORDS: usize = 4;
 
@@ -238,7 +238,7 @@ fn finish(config: &Config, text: &str) -> Outcome {
 }
 
 /// 16-bit PCM mono WAV at the model rate.
-fn wav(samples: &[f32]) -> Vec<u8> {
+pub(crate) fn wav(samples: &[f32]) -> Vec<u8> {
     let rate = resample::MODEL_RATE;
     let data = (samples.len() * 2) as u32;
     let mut out = Vec::with_capacity(44 + data as usize);
@@ -261,19 +261,21 @@ fn wav(samples: &[f32]) -> Vec<u8> {
 }
 
 fn multipart(model: &str, language: Option<&str>, wav: &[u8]) -> Vec<u8> {
+    let mut fields = vec![("model", model), ("response_format", "json")];
+    fields.extend(language.map(|language| ("language", language)));
+    form(&fields, wav)
+}
+
+/// A multipart body: text fields, then the recording as `audio.wav`.
+pub(crate) fn form(fields: &[(&str, &str)], wav: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(wav.len() + 512);
-    let mut field = |name: &str, value: &str| {
+    for (name, value) in fields {
         out.extend_from_slice(
             format!(
                 "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
             )
             .as_bytes(),
         );
-    };
-    field("model", model);
-    field("response_format", "json");
-    if let Some(language) = language {
-        field("language", language);
     }
     out.extend_from_slice(
         format!(
