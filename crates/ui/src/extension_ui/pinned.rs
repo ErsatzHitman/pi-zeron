@@ -172,7 +172,7 @@ fn summary(element: &PiUiElement) -> Option<String> {
 }
 
 /// A status chip: its text, whether it reads as active, and the action a
-/// click sends (`plan:mode` toggles).
+/// click sends (`plan:mode` toggles out of Plan).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Chip {
     pub key: String,
@@ -191,17 +191,25 @@ fn money(value: f64) -> String {
     }
 }
 
+/// Plan mode's element and plain status line. Build is its resting state, so
+/// only Plan (read-only) earns a chip.
+const MODE_ELEMENT_KEY: &str = "plan:mode";
+const MODE_STATUS_KEY: &str = "!mode";
+
+fn is_build_mode(text: &str) -> bool {
+    chip_label(text)
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("build")
+}
+
 /// The footer's monochrome glyph for a chip, like the checkout and branch
 /// labels beside it.
 fn chip_icon(chip: &Chip) -> &'static str {
     let key = chip.key.to_ascii_lowercase();
     let text = chip_label(&chip.text).to_ascii_lowercase();
-    if key == "plan:mode" {
-        if text.starts_with("plan") {
-            icons::CHECKLIST
-        } else {
-            icons::ACTION_BUILD
-        }
+    if key == MODE_ELEMENT_KEY || key == "status:!mode" {
+        icons::CHECKLIST
     } else if key == "channel:footer" {
         icons::FAST_TIER
     } else if key.starts_with("status:zeron:") {
@@ -244,7 +252,14 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
         .filter(|e| e.kind == PiUiKind::Status || e.placement == PiUiPlacement::Status)
         .filter_map(|e| {
             let text = e.text.clone().or_else(|| e.title.clone())?;
-            let plan = e.key() == "plan:mode";
+            // Build is plan mode's resting state: no chip. Older Pi configs
+            // still publish it.
+            if e.key() == MODE_ELEMENT_KEY
+                && (e.extra_str("mode") == Some("build") || is_build_mode(&text))
+            {
+                return None;
+            }
+            let plan = e.key() == MODE_ELEMENT_KEY;
             let hint = e
                 .actions
                 .first()
@@ -277,6 +292,7 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
             .statuses
             .iter()
             .filter(|s| !s.text.trim().is_empty())
+            .filter(|s| !(s.key == MODE_STATUS_KEY && is_build_mode(&s.text)))
             .filter(|s| !element_texts.iter().any(|t| t == s.text.trim()))
             .map(|s| Chip {
                 key: format!("status:{}", s.key),
@@ -738,14 +754,13 @@ mod tests {
             texts,
             vec![
                 "Plan",
-                "Build",
                 "Retrying · attempt 1/3",
                 "Background bash · 1 running",
                 "42 tok/s · $0.042"
             ]
         );
         assert!(chips[0].active);
-        assert!(chips[2].active);
+        assert!(chips[1].active);
         assert_eq!(chips[0].action, Some(("plan:mode".into(), "toggle".into())));
         assert_eq!(chips[0].hint, None, "a toggle with no action of its own");
         assert_eq!(chips[1].action, None);
@@ -767,12 +782,12 @@ mod tests {
         let state = ExtensionUiState {
             elements: vec![
                 json!({"id":"mode","ns":"plan","kind":"status","placement":"status",
-                "text":"Build","mode":"build"}),
+                "text":"Plan","mode":"plan"}),
             ],
             statuses: vec![
                 ExtensionStatus {
                     key: "!mode".into(),
-                    text: "Build".into(),
+                    text: "Plan".into(),
                 },
                 ExtensionStatus {
                     key: "rtk".into(),
@@ -782,7 +797,39 @@ mod tests {
             ..Default::default()
         };
         let texts: Vec<String> = footer_chips(&state).into_iter().map(|c| c.text).collect();
-        assert_eq!(texts, vec!["Build", "RTK on"]);
+        assert_eq!(texts, vec!["Plan", "RTK on"]);
+    }
+
+    #[test]
+    fn build_mode_shows_no_chip() {
+        let rtk = ExtensionStatus {
+            key: "rtk".into(),
+            text: "RTK on".into(),
+        };
+        let build_status = ExtensionStatus {
+            key: "!mode".into(),
+            text: "Build".into(),
+        };
+        let texts = |state: &ExtensionUiState| -> Vec<String> {
+            footer_chips(state).into_iter().map(|c| c.text).collect()
+        };
+        for element in [
+            json!({"id":"mode","ns":"plan","kind":"status","placement":"status",
+                "text":"Build","mode":"build"}),
+            json!({"id":"mode","ns":"plan","kind":"status","placement":"status","text":"Build"}),
+        ] {
+            let state = ExtensionUiState {
+                elements: vec![element],
+                statuses: vec![build_status.clone(), rtk.clone()],
+                ..Default::default()
+            };
+            assert_eq!(texts(&state), vec!["RTK on"]);
+        }
+        let bare = ExtensionUiState {
+            statuses: vec![build_status],
+            ..Default::default()
+        };
+        assert!(texts(&bare).is_empty());
     }
 
     #[test]
@@ -826,8 +873,8 @@ mod tests {
         assert_eq!(chip_label("$0.014"), "$0.014");
         assert_eq!(chip_label("Économie"), "Économie");
         assert_eq!(chip_label("✨"), "✨");
-        assert_eq!(chip_icon(&chip("plan:mode", "Build")), icons::ACTION_BUILD);
         assert_eq!(chip_icon(&chip("plan:mode", "Plan")), icons::CHECKLIST);
+        assert_eq!(chip_icon(&chip("status:!mode", "Plan")), icons::CHECKLIST);
         assert_eq!(
             chip_icon(&chip("status:mcp", "🔌 MCP: 8 servers enabled")),
             icons::REMOTE_SERVER
