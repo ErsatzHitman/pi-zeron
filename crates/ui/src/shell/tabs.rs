@@ -220,6 +220,7 @@ impl Shell {
         self.set_route(Route::Chat, cx);
         self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(chat_id.clone()));
+        self.follow_sidebar_tab(&chat_id, cx);
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
@@ -601,6 +602,8 @@ impl Shell {
             )
             .when(open, |button| button.bg(crate::theme::wash(0.09)))
         });
+        // In an orchestrator's tree the title is the path to the session.
+        let crumbs = self.render_orchestrator_crumbs(&theme, cx);
         let inner = div()
             .size_full()
             .flex()
@@ -613,6 +616,9 @@ impl Shell {
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.
             .when(!takeover, |el| {
+                if let Some(crumbs) = crumbs {
+                    return el.child(crumbs);
+                }
                 el.child(
                     div()
                         .min_w_0()

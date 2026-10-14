@@ -76,6 +76,7 @@ mod harness_updates;
 mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
+mod orchestrator;
 mod panel_layout;
 use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_tween};
 #[cfg(test)]
@@ -2138,6 +2139,13 @@ pub struct Shell {
     chat_hover_resync: bool,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
+    /// Scroll position of the Orchestrator tab's lists.
+    orchestrator_scroll: gpui::ScrollHandle,
+    /// The session each sidebar tab comes back to.
+    normal_return: Option<String>,
+    orchestrator_return: Option<String>,
+    /// A new orchestrator being created.
+    orchestrator_task: Option<Task<()>>,
     /// In-flight reorder for the pinned section only.
     pinned_session_drag: Option<PinnedSessionDragState>,
     pinned_session_drag_generation: u64,
@@ -2634,6 +2642,10 @@ impl Shell {
             chat_status_hover: None,
             chat_hover_resync: false,
             sidebar_scroll: gpui::ScrollHandle::new(),
+            orchestrator_scroll: gpui::ScrollHandle::new(),
+            normal_return: None,
+            orchestrator_return: None,
+            orchestrator_task: None,
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
             sidebar_session_transfer: None,
@@ -7350,6 +7362,8 @@ impl Shell {
                     )),
             )
             .children(show_plus.then(|| {
+                // On the Orchestrator tab, + starts another orchestrator.
+                let orchestrators = self.settings.sidebar_tab == settings::SidebarTab::Orchestrator;
                 div()
                     .flex_none()
                     .ml(px(TITLEBAR_GROUP_GAP))
@@ -7357,9 +7371,19 @@ impl Shell {
                     .child(window_control_button(
                         "titlebar-new-session",
                         icons::PLUS,
-                        ShortcutId::NewSession.label(),
+                        if orchestrators {
+                            "New orchestrator"
+                        } else {
+                            ShortcutId::NewSession.label()
+                        },
                         &theme,
-                        cx.listener(|this, _, _, cx| this.open_new_session(None, cx)),
+                        cx.listener(move |this, _, _, cx| {
+                            if orchestrators {
+                                this.start_orchestrator(cx)
+                            } else {
+                                this.open_new_session(None, cx)
+                            }
+                        }),
                     ))
             }))
             .into_any_element()
@@ -8977,6 +9001,56 @@ impl Shell {
             self.cancel_pinned_session_drag(cx);
         }
 
+        let (filter_row, sidebar_lists) =
+            if self.settings.sidebar_tab == settings::SidebarTab::Orchestrator {
+                self.render_orchestrator_lists(theme, cx)
+            } else {
+                self.render_session_lists(theme, cx)
+            };
+        let sidebar_tabs = self.render_sidebar_tabs(theme, cx);
+
+        let update_strip = self.render_update_strip(theme, cx);
+        // Stacked above the update strip, the banner needs its own gap; alone
+        // it leans on the user-menu block's padding like the strip does.
+        let github_star_banner = self.render_github_star_banner(update_strip.is_some(), theme, cx);
+
+        div()
+            .w(px(self.sidebar_content_width()))
+            .h_full()
+            .flex()
+            .flex_col()
+            // (No titlebar strip: the unified window titlebar spans the whole
+            // window above this column.)
+            .child(sidebar_tabs)
+            .child(filter_row)
+            .child(sidebar_lists)
+            // Global connection pill (durable-by-design UI truth): appears
+            // whenever the edge posture is degraded; hidden while healthy —
+            // appearing IS the signal.
+            .when_some(self.render_connection_pill(theme, cx), |el, pill| {
+                el.child(pill)
+            })
+            // "Star on GitHub" banner until dismissed (persisted), then the
+            // update strip — both above the user menu, below the lists.
+            .when_some(github_star_banner, |el, banner| el.child(banner))
+            .when_some(update_strip, |el, strip| el.child(strip))
+            .child(
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(self.render_sidebar_footer_row(theme, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// The Normal tab: the project filter and the session lists.
+    fn render_session_lists(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, AnyElement) {
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -9333,40 +9407,7 @@ impl Shell {
             ),
         )
         .fade_overflow_y(&self.sidebar_scroll);
-
-        let update_strip = self.render_update_strip(theme, cx);
-        // Stacked above the update strip, the banner needs its own gap; alone
-        // it leans on the user-menu block's padding like the strip does.
-        let github_star_banner = self.render_github_star_banner(update_strip.is_some(), theme, cx);
-
-        div()
-            .w(px(self.sidebar_content_width()))
-            .h_full()
-            .flex()
-            .flex_col()
-            // (No titlebar strip: the unified window titlebar spans the whole
-            // window above this column.)
-            .child(filter_row)
-            .child(sidebar_lists)
-            // Global connection pill (durable-by-design UI truth): appears
-            // whenever the edge posture is degraded; hidden while healthy —
-            // appearing IS the signal.
-            .when_some(self.render_connection_pill(theme, cx), |el, pill| {
-                el.child(pill)
-            })
-            // "Star on GitHub" banner until dismissed (persisted), then the
-            // update strip — both above the user menu, below the lists.
-            .when_some(github_star_banner, |el, banner| el.child(banner))
-            .when_some(update_strip, |el, strip| el.child(strip))
-            .child(
-                div()
-                    .p(px(Theme::SPACE_SM))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .child(self.render_sidebar_footer_row(theme, cx)),
-            )
-            .into_any_element()
+        (filter_row.into_any_element(), sidebar_lists.into_any_element())
     }
 
     /// "Star on GitHub" banner, styled like the update strip. Clicking it

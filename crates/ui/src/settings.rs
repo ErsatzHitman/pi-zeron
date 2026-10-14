@@ -690,6 +690,16 @@ pub enum SidebarOrganization {
     InOneList,
 }
 
+/// The sidebar's two lists: the sessions the user opens, or the tree an
+/// orchestrator runs (`zeron_proto::orchestrator`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SidebarTab {
+    #[default]
+    Normal,
+    Orchestrator,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SidebarSort {
@@ -843,6 +853,9 @@ pub struct UiSettings {
     pub sidebar_show_pull_request: bool,
     /// The project filter row at the top of the sidebar.
     pub sidebar_show_project_filter: bool,
+    /// Which list the sidebar shows: the user's sessions or an
+    /// orchestrator's tree.
+    pub sidebar_tab: SidebarTab,
     /// The sidebar's "Star on GitHub" banner was dismissed (its close button
     /// or following the link). Device-local; never shown again once set.
     pub github_star_banner_dismissed: bool,
@@ -1029,6 +1042,7 @@ impl Default for UiSettings {
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
             sidebar_show_project_filter: true,
+            sidebar_tab: SidebarTab::Normal,
             github_star_banner_dismissed: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
@@ -1680,6 +1694,7 @@ impl UiSettings {
             sidebar_show_branch,
             sidebar_show_pull_request,
             sidebar_show_project_filter,
+            sidebar_tab,
             github_star_banner_dismissed,
             last_space_id,
             last_project_action_by_space_id,
@@ -2707,6 +2722,7 @@ mod tests {
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
             sidebar_show_project_filter: false,
+            sidebar_tab: SidebarTab::Orchestrator,
             github_star_banner_dismissed: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
