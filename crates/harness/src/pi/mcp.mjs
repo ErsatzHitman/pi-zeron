@@ -42,8 +42,7 @@ export default function (pi) {
         reject(new Error("Zeron MCP request cancelled"));
       };
       const timer = setTimeout(() => {
-        child?.stdin.write(JSON.stringify({jsonrpc: "2.0", method: "notifications/cancelled", params: {requestId: id}}) + "
-");
+        child?.stdin.write(JSON.stringify({jsonrpc: "2.0", method: "notifications/cancelled", params: {requestId: id}}) + "\n");
         cleanup();
         reject(new Error(`Zeron MCP ${method} timed out`));
       }, callTimeoutMs(method, params));
