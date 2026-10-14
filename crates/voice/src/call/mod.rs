@@ -6,6 +6,9 @@
 //! ([`Command::Say`], split and cleaned by [`Reader`]); each sentence is voiced
 //! (`providers::speak`) while the user is not talking. Talking over the voice
 //! ducks it, then silences it.
+//!
+//! With [`Config::realtime`] set, one real-time model does all of that over a
+//! single connection instead ([`realtime`]).
 use std::{
     sync::{
         Arc, Mutex,
@@ -19,12 +22,14 @@ mod audio;
 #[cfg(test)]
 mod live;
 mod providers;
+mod realtime;
 mod speech;
 mod turns;
 
 pub use providers::{
     Failure, OPENROUTER_KEY, SPEECH_MODELS, SpeechModel, Stt, SttProvider, speech_model,
 };
+pub use realtime::{Processing, Realtime, RealtimeModel, RealtimeProvider, Region, TurnTaking};
 pub use speech::{MORE_IN_CHAT, Reader};
 
 /// How often the loop reads the microphone and the meters.
@@ -48,6 +53,9 @@ pub struct Config {
     pub end_silence: Duration,
     /// Microphone id; `None` is the system default.
     pub input: Option<String>,
+    /// A real-time model runs the call; the fields above that name the
+    /// transcriber and the voice are then unused.
+    pub realtime: Option<Realtime>,
 }
 
 /// Something the host should know or do.
@@ -63,6 +71,12 @@ pub enum Event {
     Speaking { item: String, text: String },
     /// The user talked over the voice and it stopped.
     Interrupted,
+    /// What the user said, as a real-time model heard it: a caption only.
+    Heard { item: String, text: String },
+    /// More of what a real-time model is saying in answer `item`.
+    Reply { item: String, delta: String },
+    /// A real-time model hands this to the coding agent as a prompt.
+    Prompt { turn: u64, text: String },
     /// Microphone and speaker loudness, 0–1.
     Levels { microphone: f32, speaker: f32 },
     /// A failure the call survives, worded for the user.
@@ -190,6 +204,9 @@ pub async fn run(
     events: mpsc::Sender<Event>,
     stop: Stop,
 ) -> Result<(), CallError> {
+    if let Some(rt) = config.realtime.clone() {
+        return realtime::run(rt, config.input, config.barge_in, commands, events, stop).await;
+    }
     if config.openrouter_key.trim().is_empty() {
         return Err(CallError::Provider(
             "Add an OpenRouter API key in Settings → Voice.".into(),
@@ -533,6 +550,7 @@ mod tests {
             barge_in: true,
             end_silence: Duration::from_millis(800),
             input: None,
+            realtime: None,
         };
         let error = run(config.clone(), commands_rx, events.clone(), Stop::default())
             .await
@@ -551,5 +569,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Deepgram"));
+        // A real-time call needs only its provider's key.
+        let (_commands, commands_rx) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel(1);
+        let config = Config {
+            realtime: Some(Realtime {
+                provider: RealtimeProvider::Gemini,
+                api_key: " ".into(),
+                model: "gemini-3.1-flash-live-preview".into(),
+                voice: "Puck".into(),
+                region: Region::International,
+                turns: TurnTaking::Balanced,
+            }),
+            ..config
+        };
+        let error = run(config, commands_rx, events, Stop::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Gemini API key"), "{error}");
     }
 }

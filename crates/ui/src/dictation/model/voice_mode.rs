@@ -1,6 +1,9 @@
-//! Settings → Voice → Voice mode: who transcribes the user (OpenRouter,
-//! Deepgram or Mistral), which OpenRouter voice reads the agent's messages,
-//! when a pause ends a prompt, and whether talking over the voice stops it.
+//! Settings → Voice → Voice mode: how a call is processed, then that mode's
+//! choices. Real-time voice: the provider (OpenAI, Gemini or Qwen), its key,
+//! model, voice, region and how readily it answers. STT + LLM + TTS: who
+//! transcribes the user (OpenRouter, Deepgram or Mistral), which OpenRouter
+//! voice reads the agent's messages and when a pause ends a prompt. Both:
+//! whether talking over the voice stops it.
 use super::*;
 use zeron_voice::call;
 
@@ -14,6 +17,12 @@ const PAUSES: &[(u32, &str)] = &[
 
 #[derive(Default)]
 pub(super) struct Selects {
+    processing: widgets::SelectState,
+    rt_provider: widgets::SelectState,
+    rt_model: widgets::SelectState,
+    rt_voice: widgets::SelectState,
+    rt_region: widgets::SelectState,
+    rt_turns: widgets::SelectState,
     stt: widgets::SelectState,
     stt_model: widgets::SelectState,
     speech: widgets::SelectState,
@@ -31,6 +40,42 @@ pub(crate) fn call_config(cx: &App) -> Result<call::Config, String> {
         .read(cx)
         .keys;
     let key = |name: &str| keys.get(name).cloned().unwrap_or_default();
+    let barge_in = saved.voice_barge_in;
+    let end_silence = Duration::from_millis(u64::from(saved.voice_pause_ms.clamp(300, 3000)));
+    if saved.voice_processing == call::Processing::Realtime {
+        let provider = saved.voice_realtime_provider;
+        let api_key = key(provider.key_name());
+        if api_key.trim().is_empty() {
+            return Err(format!(
+                "Add a {} in Settings → Voice.",
+                provider.key_label()
+            ));
+        }
+        let model = provider.model(saved.voice_realtime_model.as_deref());
+        let voice = saved
+            .voice_realtime_voice
+            .as_deref()
+            .filter(|v| model.voices.contains(v))
+            .unwrap_or(model.voices[0])
+            .to_owned();
+        return Ok(call::Config {
+            stt: call::Stt::default(),
+            openrouter_key: String::new(),
+            speech_model: String::new(),
+            voice: voice.clone(),
+            barge_in,
+            end_silence,
+            input: saved.dictation_input.clone(),
+            realtime: Some(call::Realtime {
+                provider,
+                api_key,
+                model: model.id.to_owned(),
+                voice,
+                region: saved.voice_realtime_region,
+                turns: saved.voice_realtime_turns,
+            }),
+        });
+    }
     let openrouter_key = key(call::OPENROUTER_KEY);
     if openrouter_key.trim().is_empty() {
         return Err("Add an OpenRouter API key in Settings → Voice.".into());
@@ -60,9 +105,10 @@ pub(crate) fn call_config(cx: &App) -> Result<call::Config, String> {
         openrouter_key,
         speech_model: speech.id.to_owned(),
         voice,
-        barge_in: saved.voice_barge_in,
-        end_silence: Duration::from_millis(u64::from(saved.voice_pause_ms.clamp(300, 3000))),
+        barge_in,
+        end_silence,
         input: saved.dictation_input.clone(),
+        realtime: None,
     })
 }
 
@@ -72,6 +118,16 @@ impl VoiceCard {
         if !key.is_empty() {
             let input = self.openrouter_input.clone();
             self.store_key(call::OPENROUTER_KEY, Some(key), &input, cx);
+        }
+    }
+
+    /// The key of whichever provider runs real-time voice.
+    pub(super) fn save_realtime_key(&mut self, cx: &mut Context<Self>) {
+        let name = settings::current(cx).voice_realtime_provider.key_name();
+        let key = self.realtime_key_input.read(cx).text().trim().to_owned();
+        if !key.is_empty() {
+            let input = self.realtime_key_input.clone();
+            self.store_key(name, Some(key), &input, cx);
         }
     }
 
@@ -121,6 +177,257 @@ impl VoiceCard {
         saved: &settings::UiSettings,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let processing = saved.voice_processing;
+        let processing_control = widgets::select(
+            "voice-mode-processing",
+            "Processing",
+            theme,
+            |card: &mut Self| &mut card.voice.processing,
+        )
+        .options(
+            call::Processing::ALL
+                .iter()
+                .map(|p| widgets::SelectOption::new(p.label()).detail(p.detail())),
+            call::Processing::ALL
+                .iter()
+                .position(|p| *p == processing)
+                .unwrap_or(0),
+        )
+        .width(260.0)
+        .on_select(move |_, ix, _, cx| {
+            if let Some(chosen) = call::Processing::ALL.get(ix).copied() {
+                settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                    s.voice_processing = chosen
+                });
+                cx.refresh_windows();
+            }
+            cx.notify();
+        })
+        .render(&self.voice.processing, cx);
+        let processing_row = row(
+            theme,
+            true,
+            "Processing",
+            Some(processing.detail().into()),
+            processing_control,
+        );
+        let barge_in_row = self.barge_in_row(theme, saved, cx);
+        let card = widgets::section_card(theme).child(processing_row);
+        let card = if processing == call::Processing::Realtime {
+            self.realtime_rows(theme, saved, card, cx)
+        } else {
+            self.pipeline_rows(theme, saved, card, cx)
+        };
+        widgets::section(theme, "Voice mode", card.child(barge_in_row))
+    }
+
+    /// Real-time voice: provider, key, model, voice, region, turn-taking.
+    fn realtime_rows(
+        &mut self,
+        theme: &Theme,
+        saved: &settings::UiSettings,
+        card: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let provider = saved.voice_realtime_provider;
+        let provider_control = widgets::select(
+            "voice-mode-rt-provider",
+            "Provider",
+            theme,
+            |card: &mut Self| &mut card.voice.rt_provider,
+        )
+        .options(
+            call::RealtimeProvider::ALL
+                .iter()
+                .map(|p| widgets::SelectOption::new(p.label())),
+            call::RealtimeProvider::ALL
+                .iter()
+                .position(|p| *p == provider)
+                .unwrap_or(0),
+        )
+        .width(260.0)
+        .on_select(move |_, ix, _, cx| {
+            let Some(chosen) = call::RealtimeProvider::ALL.get(ix).copied() else {
+                return;
+            };
+            if chosen != provider {
+                settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                    s.voice_realtime_provider = chosen;
+                    s.voice_realtime_model = None;
+                    s.voice_realtime_voice = None;
+                });
+                cx.refresh_windows();
+            }
+            cx.notify();
+        })
+        .render(&self.voice.rt_provider, cx);
+
+        let name = provider.key_name();
+        let key_actions = self.key_actions(
+            theme,
+            ("voice-mode-rt-key-save", "voice-mode-rt-key-remove"),
+            name,
+            Self::save_realtime_key,
+            self.realtime_key_input.clone(),
+            cx,
+        );
+        let key_meta = match (self.keys.contains_key(name), provider) {
+            (true, call::RealtimeProvider::OpenAi) => {
+                "Saved on this device, and shared with OpenAI dictation."
+            }
+            (true, _) => "Saved on this device. Paste a new key to replace it.",
+            (false, _) => "Add a key to talk with this provider's model.",
+        };
+        let key_row = field_row(
+            theme,
+            false,
+            provider.key_label(),
+            key_meta.into_any_element(),
+            &self.realtime_key_input,
+            key_actions,
+        );
+
+        let model = provider.model(saved.voice_realtime_model.as_deref());
+        let models = provider.models();
+        let model_control =
+            widgets::select("voice-mode-rt-model", "Model", theme, |card: &mut Self| {
+                &mut card.voice.rt_model
+            })
+            .options(
+                models
+                    .iter()
+                    .map(|m| widgets::SelectOption::new(m.label).detail(m.id)),
+                models.iter().position(|m| m.id == model.id).unwrap_or(0),
+            )
+            .width(260.0)
+            .on_select(move |_, ix, _, cx| {
+                let Some(chosen) = models.get(ix) else {
+                    return;
+                };
+                settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                    if s.voice_realtime_model.as_deref() != Some(chosen.id) {
+                        s.voice_realtime_model = Some(chosen.id.to_owned());
+                        s.voice_realtime_voice = None;
+                    }
+                });
+                cx.notify();
+            })
+            .render(&self.voice.rt_model, cx);
+
+        let voices = model.voices;
+        let voice_control =
+            widgets::select("voice-mode-rt-voice", "Voice", theme, |card: &mut Self| {
+                &mut card.voice.rt_voice
+            })
+            .options(
+                voices.iter().map(|v| widgets::SelectOption::new(*v)),
+                saved
+                    .voice_realtime_voice
+                    .as_deref()
+                    .and_then(|v| voices.iter().position(|known| *known == v))
+                    .unwrap_or(0),
+            )
+            .width(260.0)
+            .on_select(move |_, ix, _, cx| {
+                let voice = voices.get(ix).map(|v| (*v).to_owned());
+                settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                    s.voice_realtime_voice = voice
+                });
+                cx.notify();
+            })
+            .render(&self.voice.rt_voice, cx);
+
+        let region_row = (provider == call::RealtimeProvider::Qwen).then(|| {
+            let region = saved.voice_realtime_region;
+            let control = widgets::select(
+                "voice-mode-rt-region",
+                "Region",
+                theme,
+                |card: &mut Self| &mut card.voice.rt_region,
+            )
+            .options(
+                call::Region::ALL
+                    .iter()
+                    .map(|r| widgets::SelectOption::new(r.label())),
+                call::Region::ALL
+                    .iter()
+                    .position(|r| *r == region)
+                    .unwrap_or(0),
+            )
+            .width(260.0)
+            .on_select(move |_, ix, _, cx| {
+                if let Some(chosen) = call::Region::ALL.get(ix).copied() {
+                    settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                        s.voice_realtime_region = chosen
+                    });
+                }
+                cx.notify();
+            })
+            .render(&self.voice.rt_region, cx);
+            row(
+                theme,
+                false,
+                "Region",
+                Some("Where your DashScope key was issued".into()),
+                control,
+            )
+        });
+
+        let turns = saved.voice_realtime_turns;
+        let turns_control = widgets::select(
+            "voice-mode-rt-turns",
+            "Turn-taking",
+            theme,
+            |card: &mut Self| &mut card.voice.rt_turns,
+        )
+        .options(
+            call::TurnTaking::ALL
+                .iter()
+                .map(|t| widgets::SelectOption::new(t.label())),
+            call::TurnTaking::ALL
+                .iter()
+                .position(|t| *t == turns)
+                .unwrap_or(1),
+        )
+        .width(200.0)
+        .on_select(move |_, ix, _, cx| {
+            if let Some(chosen) = call::TurnTaking::ALL.get(ix).copied() {
+                settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                    s.voice_realtime_turns = chosen
+                });
+            }
+            cx.notify();
+        })
+        .render(&self.voice.rt_turns, cx);
+
+        card.child(row(
+            theme,
+            false,
+            "Provider",
+            Some("Hears you, answers, and hands work to your agent".into()),
+            provider_control,
+        ))
+        .child(key_row)
+        .child(row(theme, false, "Model", None, model_control))
+        .child(row(theme, false, "Voice", None, voice_control))
+        .children(region_row)
+        .child(row(
+            theme,
+            false,
+            "Turn-taking",
+            Some("How long it waits after you pause before answering".into()),
+            turns_control,
+        ))
+    }
+
+    /// STT + LLM + TTS: transcriber, its key and model, voice, pause.
+    fn pipeline_rows(
+        &mut self,
+        theme: &Theme,
+        saved: &settings::UiSettings,
+        card: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let provider = saved.voice_stt_provider;
         let has_openrouter = self.keys.contains_key(call::OPENROUTER_KEY);
         let openrouter_actions = self.key_actions(
@@ -133,7 +440,7 @@ impl VoiceCard {
         );
         let openrouter_row = field_row(
             theme,
-            true,
+            false,
             "OpenRouter API key",
             if has_openrouter {
                 "Saved on this device. The voice uses it.".into_any_element()
@@ -305,6 +612,46 @@ impl VoiceCard {
         })
         .render(&self.voice.pause, cx);
 
+        card.child(openrouter_row)
+            .child(row(
+                theme,
+                false,
+                "Speech to text",
+                Some("Transcribes what you say and sends it to the agent".into()),
+                stt_control,
+            ))
+            .children(stt_key_row)
+            .child(row(
+                theme,
+                false,
+                "Transcription model",
+                None,
+                stt_model_control,
+            ))
+            .child(row(
+                theme,
+                false,
+                "Voice model",
+                Some("Reads the agent's messages aloud".into()),
+                speech_control,
+            ))
+            .child(row(theme, false, "Voice", None, voice_control))
+            .child(row(
+                theme,
+                false,
+                "Send after a pause",
+                Some("How long a silence ends what you are saying".into()),
+                pause_control,
+            ))
+    }
+
+    /// Both modes: whether talking over the voice stops it.
+    fn barge_in_row(
+        &mut self,
+        theme: &Theme,
+        saved: &settings::UiSettings,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let barge_in = saved.voice_barge_in;
         fn toggle_barge_in(cx: &mut App) {
             settings::update(settings::SavePolicy::Immediate, cx, |s| {
@@ -338,48 +685,12 @@ impl VoiceCard {
                 toggle_barge_in(cx);
             });
 
-        widgets::section(
+        row(
             theme,
-            "Voice mode",
-            widgets::section_card(theme)
-                .child(openrouter_row)
-                .child(row(
-                    theme,
-                    false,
-                    "Speech to text",
-                    Some("Transcribes what you say and sends it to the agent".into()),
-                    stt_control,
-                ))
-                .children(stt_key_row)
-                .child(row(
-                    theme,
-                    false,
-                    "Transcription model",
-                    None,
-                    stt_model_control,
-                ))
-                .child(row(
-                    theme,
-                    false,
-                    "Voice model",
-                    Some("Reads the agent's messages aloud".into()),
-                    speech_control,
-                ))
-                .child(row(theme, false, "Voice", None, voice_control))
-                .child(row(
-                    theme,
-                    false,
-                    "Send after a pause",
-                    Some("How long a silence ends what you are saying".into()),
-                    pause_control,
-                ))
-                .child(row(
-                    theme,
-                    false,
-                    "Interrupt by speaking",
-                    Some("Talk over the voice to stop it. Turn off if your speakers echo".into()),
-                    barge_in_switch,
-                )),
+            false,
+            "Interrupt by speaking",
+            Some("Talk over the voice to stop it. Turn off if your speakers echo".into()),
+            barge_in_switch,
         )
     }
 }
@@ -427,6 +738,26 @@ mod tests {
             // A voice the model lacks falls back to its first.
             assert_eq!(config.voice, "aura-2-thalia-en");
             assert_eq!(config.end_silence, Duration::from_millis(300));
+            assert!(config.realtime.is_none());
+            // Real-time voice needs only its provider's key.
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.voice_processing = call::Processing::Realtime;
+                s.voice_realtime_provider = call::RealtimeProvider::Gemini;
+                s.voice_realtime_voice = Some("marin".into());
+            });
+            assert!(call_config(cx).unwrap_err().contains("Gemini API key"));
+        });
+        card.update(cx, |card, cx| {
+            card.realtime_key_input
+                .update(cx, |input, cx| input.set_text("gm", cx));
+            card.save_realtime_key(cx);
+        });
+        cx.update(|cx| {
+            let realtime = call_config(cx).unwrap().realtime.unwrap();
+            assert_eq!(realtime.api_key, "gm");
+            assert_eq!(realtime.model, "gemini-3.1-flash-live-preview");
+            // A voice the model lacks falls back to its first.
+            assert_eq!(realtime.voice, "Puck");
         });
         let keys = load_keys(&dir.path().join(KEYS_FILE));
         assert_eq!(keys.get("openrouter").map(String::as_str), Some("sk-or"));

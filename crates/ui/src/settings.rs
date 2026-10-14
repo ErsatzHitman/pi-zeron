@@ -857,6 +857,21 @@ pub struct UiSettings {
     pub voice_barge_in: bool,
     /// The pause, in milliseconds, that ends what the user is saying.
     pub voice_pause_ms: u32,
+    /// Voice mode runs on one real-time model, or on speech to text, the
+    /// agent and a voice.
+    pub voice_processing: zeron_voice::call::Processing,
+    /// The real-time model's provider. Its key is kept in `stt-keys.json`.
+    pub voice_realtime_provider: zeron_voice::call::RealtimeProvider,
+    /// `None` is the provider's first model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_realtime_model: Option<String>,
+    /// One of the real-time model's voices; `None` is its first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_realtime_voice: Option<String>,
+    /// Where Qwen is served from.
+    pub voice_realtime_region: zeron_voice::call::Region,
+    /// How readily the real-time model answers once the user pauses.
+    pub voice_realtime_turns: zeron_voice::call::TurnTaking,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
@@ -1070,6 +1085,12 @@ impl Default for UiSettings {
             voice_name: None,
             voice_barge_in: true,
             voice_pause_ms: VOICE_PAUSE_DEFAULT_MS,
+            voice_processing: zeron_voice::call::Processing::default(),
+            voice_realtime_provider: zeron_voice::call::RealtimeProvider::default(),
+            voice_realtime_model: None,
+            voice_realtime_voice: None,
+            voice_realtime_region: zeron_voice::call::Region::default(),
+            voice_realtime_turns: zeron_voice::call::TurnTaking::default(),
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
@@ -1727,6 +1748,12 @@ impl UiSettings {
             voice_name,
             voice_barge_in,
             voice_pause_ms,
+            voice_processing,
+            voice_realtime_provider,
+            voice_realtime_model,
+            voice_realtime_voice,
+            voice_realtime_region,
+            voice_realtime_turns,
             window_geometry,
             composer_send_behavior,
             skills_in_slash_menu,
@@ -2765,6 +2792,12 @@ mod tests {
             voice_name: Some("aura-2-luna-en".into()),
             voice_barge_in: false,
             voice_pause_ms: 1200,
+            voice_processing: zeron_voice::call::Processing::Realtime,
+            voice_realtime_provider: zeron_voice::call::RealtimeProvider::Qwen,
+            voice_realtime_model: Some("qwen3.5-omni-flash-realtime".into()),
+            voice_realtime_voice: Some("Ethan".into()),
+            voice_realtime_region: zeron_voice::call::Region::China,
+            voice_realtime_turns: zeron_voice::call::TurnTaking::Patient,
             window_geometry: None,
             sidebar_width: 300.0,
             sidebar_collapsed: true,

@@ -13388,12 +13388,15 @@ name = "zeron-voice"
 version = "0.2.119"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "cpal 0.17.3",
+ "futures",
  "reqwest",
  "rubato",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

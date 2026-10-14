@@ -103,6 +103,8 @@ pub(crate) struct VoiceCard {
     /// Voice mode's OpenRouter key, and its Deepgram or Mistral key.
     openrouter_input: Entity<ComposerInput>,
     voice_key_input: Entity<ComposerInput>,
+    /// The real-time model's provider key.
+    realtime_key_input: Entity<ComposerInput>,
     /// Why the typed trigger phrase was not saved.
     phrase_problem: Option<&'static str>,
     error: Option<String>,
@@ -157,6 +159,7 @@ impl VoiceCard {
         };
         let openrouter_input = key_field(cx);
         let voice_key_input = key_field(cx);
+        let realtime_key_input = key_field(cx);
         let openrouter_sub = cx.subscribe(&openrouter_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.save_openrouter_key(cx);
@@ -167,6 +170,12 @@ impl VoiceCard {
                 this.save_voice_key(cx);
             }
         });
+        let realtime_key_sub =
+            cx.subscribe(&realtime_key_input, |this: &mut Self, _, event, cx| {
+                if matches!(event, ComposerInputEvent::Submitted) {
+                    this.save_realtime_key(cx);
+                }
+            });
         Self {
             scroll: widgets::PageScroll::default(),
             keys: load_keys(&keys_path),
@@ -175,6 +184,7 @@ impl VoiceCard {
             phrase_input,
             openrouter_input,
             voice_key_input,
+            realtime_key_input,
             phrase_problem: None,
             error: None,
             inputs: Inputs::default(),
@@ -184,7 +194,13 @@ impl VoiceCard {
             input_select: widgets::SelectState::default(),
             trigger_select: widgets::SelectState::default(),
             voice: voice_mode::Selects::default(),
-            _subscriptions: vec![key_sub, phrase_sub, openrouter_sub, voice_key_sub],
+            _subscriptions: vec![
+                key_sub,
+                phrase_sub,
+                openrouter_sub,
+                voice_key_sub,
+                realtime_key_sub,
+            ],
         }
     }
 

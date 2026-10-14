@@ -30,7 +30,14 @@ Pressing the orb starts a call and opens the full-window stage. The call keeps r
 
 ## Settings → Voice → Voice mode
 
-| Setting | Effect |
+**Processing** picks how a call runs:
+
+- **STT + LLM + TTS** (default): the pipeline above. What the user says is transcribed and sent to Pi, and Pi's messages are read aloud.
+- **Real-time voice**: one end-to-end audio model hears the user, answers aloud and hands work to Pi. See [Real-time voice](#real-time-voice).
+
+Rows for the other mode are hidden. **Interrupt by speaking** applies to both.
+
+| Setting (STT + LLM + TTS) | Effect |
 | --- | --- |
 | OpenRouter API key | Required. Used for the voice, and for speech to text when OpenRouter transcribes. |
 | Speech to text | OpenRouter (default), Deepgram or Mistral. Deepgram and Mistral each need their own key. |
@@ -38,6 +45,15 @@ Pressing the orb starts a call and opens the full-window stage. The call keeps r
 | Voice model / Voice | Kokoro 82M (`hexgrad/kokoro-82m`, default voice `af_heart`) or Deepgram Aura 2 (`deepgram/aura-2`). Changing the model resets the voice to that model's first voice. |
 | Send after a pause | 0.5, 0.8 (default), 1.2 or 2 seconds of silence ends what the user is saying. |
 | Interrupt by speaking | On by default. Talking over the voice stops it. Turn this off if speaker echo keeps stopping it; the microphone is then ignored while the voice speaks. |
+
+| Setting (Real-time voice) | Effect |
+| --- | --- |
+| Provider | OpenAI (default), Google Gemini, or Qwen (Alibaba Cloud). Changing it resets the model and the voice. |
+| API key | The provider's key: OpenAI (`openai`, shared with OpenAI dictation), Gemini (`gemini`) or DashScope (`dashscope`). |
+| Model | OpenAI: `gpt-realtime-2.1` (default), `gpt-realtime-2`, `gpt-realtime`, `gpt-realtime-mini`. Gemini: `gemini-3.1-flash-live-preview` (default), `gemini-2.5-flash-native-audio-preview-12-2025`. Qwen: `qwen3.8-omni-flash-realtime` (default), `qwen3.5-omni-plus-realtime`, `qwen3.5-omni-flash-realtime`. |
+| Voice | The model's voices (OpenAI `marin` by default, Gemini `Puck`, Qwen `Tina`). Changing the model resets the voice. |
+| Region | Qwen only: International (Singapore, `dashscope-intl.aliyuncs.com`) or China (Beijing, `dashscope.aliyuncs.com`), matching where the key was issued. |
+| Turn-taking | Patient, Balanced (default) or Quick: how long the model waits after a pause before answering. OpenAI: semantic VAD eagerness low, medium or high. Gemini and Qwen: 1.2, 0.8 or 0.5 seconds of silence. |
 
 The microphone is the one chosen for dictation. Keys are stored in `stt-keys.json` in Zeron's data directory, next to the dictation keys and never in `ui-settings.json`. Removing a key hides the orb.
 
@@ -111,6 +127,18 @@ Audio is held in memory only. Each finished turn goes to the chosen transcriber 
 
 A rejected key (401 or 403) or exhausted credit (402) ends the call and says why. Other provider failures are shown as a caption, and the call carries on.
 
+## Real-time voice
+
+One WebSocket per call goes straight to the provider: OpenAI Realtime, Gemini Live, or Qwen-Omni Realtime. The model detects turns, transcribes the user and speaks its answer, so replies start while the user is still on the line rather than after separate transcription and speech requests.
+
+Pi still does the work. The model is told that it is the voice of Zeron and that a coding agent works in the user's chat. It gets one tool, `send_to_agent(prompt)`. A call to that tool sends the prompt to the followed chat exactly like a spoken prompt in the pipeline mode. The model answers small talk itself and never does or invents coding work.
+
+Pi's messages reach the model as text, prefixed `[Coding agent]`. The narrator's sentences for one message are gathered until the message has been quiet for 1.2 seconds, then sent as one. The model tells the user what matters in a sentence or two. The captions show what the user said, as the provider transcribed it, and what the model is saying.
+
+Nothing cancels the speaker's echo, so this device keeps the model from hearing itself. While the model's voice plays, the microphone is sent as silence. The exception is when Interrupt by speaking is on and the local turn detector hears the user talking over the voice. Then playback stops, the provider's answer is cancelled, and the user's audio goes through. Stray noise does not start a turn: OpenAI uses far-field noise reduction and semantic VAD, and Gemini uses low start-of-speech sensitivity.
+
+Audio is PCM16. The microphone is sent at 24 kHz to OpenAI and 16 kHz to Gemini and Qwen. Every provider answers at 24 kHz.
+
 ## Implementation
 
 `zeron_voice::call` owns the audio side of a call:
@@ -120,6 +148,7 @@ A rejected key (401 or 403) or exhausted credit (402) ends the call and says why
 - `providers`: speech to text, the voice, and the model catalog.
 - `speech`: `Reader`, which turns a streamed Markdown message into speakable sentences, skipping code, tables and HTML.
 - `mod.rs`: the call loop. It transcribes finished turns in order and reports them as `Event::User`, and it voices `Command::Say` sentences while the user is quiet.
+- `realtime`: the real-time call. It keeps each provider's session setup, messages and event parsing together, reports `Event::Heard`, `Event::Reply` and `Event::Prompt`, and turns `Command::Say` into text for the model.
 
 `zeron-ui::voice` maps call events onto the existing voice view state, so the orb, the stage and the captions are unchanged. The UI side is split across:
 

@@ -381,6 +381,29 @@ impl VoiceController {
                 );
             }
             call::Event::Interrupted => {}
+            // A real-time model's call: what it heard is a caption only; it
+            // decides what reaches the agent.
+            call::Event::Heard { item, text } => {
+                let item = format!("heard-{item}");
+                self.reduce(
+                    VoiceEvent::Partial {
+                        generation: GENERATION,
+                        item_id: Some(item.clone()),
+                        text: text.clone(),
+                    },
+                    cx,
+                );
+                self.reduce(transcript(item, VoiceRole::User, text), cx);
+            }
+            call::Event::Reply { item, delta } => self.reduce(
+                VoiceEvent::Partial {
+                    generation: GENERATION,
+                    item_id: Some(format!("reply-{item}")),
+                    text: delta,
+                },
+                cx,
+            ),
+            call::Event::Prompt { text, .. } => self.send_prompt(text, cx),
             call::Event::Levels {
                 microphone,
                 speaker,
