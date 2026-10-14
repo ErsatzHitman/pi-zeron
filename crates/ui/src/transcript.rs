@@ -1143,6 +1143,28 @@ pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
     }
 }
 
+/// Webviews kept for reply pages at once.
+const MAX_INLINE_PAGES: usize = 8;
+/// A reply page's frame until the page reports its height.
+const INLINE_PAGE_HEIGHT: f32 = 320.0;
+
+/// A page published into a reply, embedded live (T3 Code's inline frame).
+struct InlinePage {
+    row_id: SharedString,
+    owner: String,
+    title: String,
+    browser: Option<Entity<crate::browser::BrowserSurface>>,
+    /// Set when the row paints; the shell's sweep shows or hides the page.
+    painted: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    /// Where the loopback server serves it, once fetched.
+    url: Option<String>,
+    height: f32,
+    loading: bool,
+    failed: bool,
+    used: u64,
+    _events: Option<Subscription>,
+}
+
 #[derive(Clone)]
 pub enum RowKind {
     GeneratedImage {
@@ -3476,10 +3498,11 @@ pub struct Transcript {
     /// In-flight ReadAttachmentChunk loads, keyed by device, path and validation
     /// policy; results land in the global attachment cache.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
-    /// Published pages (by path) being fetched to open, and those that could
-    /// not be.
-    opening_pages: HashSet<String>,
-    failed_pages: HashSet<String>,
+    /// Pages published into replies, by path (see [`InlinePage`]).
+    inline_pages: HashMap<String, InlinePage>,
+    /// Bumped per page row render; the least recently shown page gives up
+    /// its webview first.
+    inline_clock: u64,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
     /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
@@ -3908,8 +3931,8 @@ impl Transcript {
             image_menu_focus: cx.focus_handle(),
             image_copy: None,
             attachment_loads: HashMap::new(),
-            opening_pages: HashSet::new(),
-            failed_pages: HashSet::new(),
+            inline_pages: HashMap::new(),
+            inline_clock: 0,
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
@@ -6900,9 +6923,6 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
-        if mime_type == crate::visual_pages::PAGE_MIME {
-            return self.render_page_card(row_id, owner, path, name, cx);
-        }
         let devices = self.generated_attachment_device_ids(owner, cx);
         let state = self.attachment_state(&devices, path, Some(mime_type), cx);
         let theme = Theme::of(cx).clone();
@@ -6976,159 +6996,350 @@ impl Transcript {
         }
     }
 
-    /// A page the agent published with `html_render`: a card that opens it
-    /// in the right pane's browser.
-    fn render_page_card(
+    /// A page the agent published with `html_render`, live in the reply: a
+    /// native webview fitted to the page's reported height (up to
+    /// [`crate::visual_pages::MAX_HEIGHT`]), under a caption that opens it
+    /// beside the chat.
+    fn render_inline_page(
         &mut self,
         row_id: &SharedString,
         owner: &str,
         path: &str,
         title: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let detail = if self.opening_pages.contains(path) {
-            "Opening…"
-        } else if self.failed_pages.contains(path) {
-            "Page unavailable. Click to try again"
-        } else {
-            "Page · opens beside the chat"
+        self.inline_clock += 1;
+        if !self.inline_pages.contains_key(path) {
+            self.inline_pages.insert(
+                path.to_owned(),
+                InlinePage {
+                    row_id: row_id.clone(),
+                    owner: owner.to_owned(),
+                    title: title.to_owned(),
+                    browser: None,
+                    painted: None,
+                    url: None,
+                    height: INLINE_PAGE_HEIGHT,
+                    loading: false,
+                    failed: false,
+                    used: 0,
+                    _events: None,
+                },
+            );
+            self.load_inline_page(path.to_owned(), window, cx);
+        }
+        // A page whose webview was let go while off screen gets a new one,
+        // after this frame (a webview is not created mid-render).
+        if self
+            .inline_pages
+            .get(path)
+            .is_some_and(|page| page.url.is_some() && page.browser.is_none())
+        {
+            let path = path.to_owned();
+            cx.defer_in(window, move |this, window, cx| {
+                this.mount_inline_page(&path, window, cx)
+            });
+        }
+        let clock = self.inline_clock;
+        let Some(page) = self.inline_pages.get_mut(path) else {
+            return gpui::Empty.into_any_element();
         };
-        let devices = self.generated_attachment_device_ids(owner, cx);
-        let page_path = path.to_owned();
-        let page_title = title.to_owned();
-        let hover = theme.ink(0.06);
-        let accent = theme.accent;
-        div()
-            .id(SharedString::from(format!("{row_id}-page")))
-            .debug_selector(|| "transcript-page-card".into())
-            .w(px(360.0))
-            .max_w_full()
-            .flex()
-            .items_center()
-            .gap(px(10.0))
-            .p(px(8.0))
-            .rounded(px(10.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.ink(0.03))
-            .role(gpui::Role::Button)
-            .aria_label(SharedString::from(format!("Open page {title}")))
-            .tab_index(0)
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover))
-            .focus_visible(move |style| style.border_color(accent))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_page(
-                    page_path.clone(),
-                    page_title.clone(),
-                    devices.clone(),
-                    window,
-                    cx,
+        page.used = clock;
+        page.row_id = row_id.clone();
+        let frame = div()
+            .id(SharedString::from(format!("{row_id}-page-frame")))
+            .relative()
+            .w_full()
+            .overflow_hidden();
+        let frame = match (&page.browser, &page.painted) {
+            (Some(browser), Some(painted)) => {
+                let painted = painted.clone();
+                frame.h(px(page.height)).child(browser.clone()).child(
+                    // Tells the shell's sweep this page is on screen.
+                    gpui::canvas(|_, _, _| (), move |_, _, _, _| painted.set(true))
+                        .absolute()
+                        .inset_0(),
                 )
-            }))
-            .child(
-                div()
-                    .size(px(32.0))
-                    .flex_none()
+            }
+            _ if page.failed => {
+                let retry = path.to_owned();
+                frame
+                    .h(px(crate::visual_pages::MIN_HEIGHT))
+                    .rounded(px(8.0))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(7.0))
-                    .bg(theme.ink(0.06))
-                    .child(
-                        crate::icons::icon(crate::icons::GLOBE)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
+                    .gap(px(8.0))
+                    .bg(theme.ink(0.03))
+                    .text_size(px(13.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!("Unable to load {title}")))
                     .child(
                         div()
-                            .truncate()
-                            .text_size(px(13.0))
+                            .id(SharedString::from(format!("{row_id}-page-retry")))
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .cursor_pointer()
                             .text_color(theme.text)
-                            .child(SharedString::from(title.to_owned())),
+                            .hover(|style| style.bg(crate::theme::wash(0.10)))
+                            .role(gpui::Role::Button)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.load_inline_page(retry.clone(), window, cx)
+                            }))
+                            .child("Retry"),
+                    )
+            }
+            _ => frame
+                .h(px(page.height))
+                .rounded(px(8.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.ink(0.03))
+                .text_size(px(13.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!("Loading {title}…"))),
+        };
+        let open = page.url.clone().map(|url| {
+            let title = title.to_owned();
+            div()
+                .id(SharedString::from(format!("{row_id}-page-open")))
+                .size(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(crate::theme::wash(0.10)))
+                .role(gpui::Role::Button)
+                .aria_label("Open beside the chat")
+                .tooltip(crate::settings::widgets::text_tooltip(
+                    "Open beside the chat",
+                ))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let link = this.link_ui(cx);
+                    render::activate_link(
+                        render::LinkTarget::new(&title, &url),
+                        render::LinkAction::Internal,
+                        link.as_ref(),
+                        window,
+                        cx,
+                    );
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
+                        .size(px(12.0))
+                        .text_color(theme.text_muted),
+                )
+        });
+        div()
+            .id(SharedString::from(format!("{row_id}-page")))
+            .debug_selector(|| "transcript-page".into())
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(
+                        crate::icons::icon(crate::icons::GLOBE)
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.text_faint),
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(detail),
-                    ),
+                            .child(SharedString::from(title.to_owned())),
+                    )
+                    .children(open),
             )
+            .child(frame)
             .into_any_element()
     }
 
-    /// Fetch a published page from the device that holds it, serve it on
-    /// loopback with Zeron's theme, and open it in the right pane.
-    fn open_page(
-        &mut self,
-        path: String,
-        title: String,
-        devices: Vec<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.failed_pages.insert(path);
-            cx.notify();
+    /// Fetch a published page from the device that holds it and serve it on
+    /// loopback with Zeron's theme; the row mounts a webview on it.
+    fn load_inline_page(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(page) = self.inline_pages.get_mut(&path) else {
             return;
         };
-        if !self.opening_pages.insert(path.clone()) {
+        if page.loading {
             return;
         }
-        self.failed_pages.remove(&path);
-        cx.notify();
+        page.loading = true;
+        page.failed = false;
+        let (owner, title) = (page.owner.clone(), page.title.clone());
+        let devices = self.generated_attachment_device_ids(&owner, cx);
+        let engine = self.state.read(cx).engine().cloned();
         let local = self.state.read(cx).local_device_id.clone();
         let style = crate::visual_pages::theme_style(Theme::of(cx));
         cx.spawn_in(window, async move |this, cx| {
-            let mut page = None;
-            for device in &devices {
-                // The local device's files are served directly.
-                let target = (local.as_deref() != Some(device.as_str())).then_some(device.as_str());
-                if let Some(file) = crate::attachments::read_attachment_file(
-                    &engine,
-                    cx.background_executor(),
-                    target,
-                    &path,
-                )
-                .await
-                {
-                    page = Some(file.bytes().to_vec());
-                    break;
+            let mut bytes = None;
+            if let Some(engine) = engine {
+                for device in &devices {
+                    // The local device's files are served directly.
+                    let target =
+                        (local.as_deref() != Some(device.as_str())).then_some(device.as_str());
+                    if let Some(file) = crate::attachments::read_attachment_file(
+                        &engine,
+                        cx.background_executor(),
+                        target,
+                        &path,
+                    )
+                    .await
+                    {
+                        bytes = Some(file.bytes().to_vec());
+                        break;
+                    }
                 }
             }
-            let url = page
+            let url = bytes
                 .ok_or_else(|| "unavailable".to_owned())
-                .and_then(|page| crate::visual_pages::serve(&page, &style));
+                .and_then(|bytes| crate::visual_pages::serve(&bytes, &style, &title));
             this.update_in(cx, |this, window, cx| {
-                this.opening_pages.remove(&path);
+                let Some(page) = this.inline_pages.get_mut(&path) else {
+                    return;
+                };
+                page.loading = false;
                 match url {
                     Ok(url) => {
-                        let link = this.link_ui(cx);
-                        render::activate_link(
-                            render::LinkTarget::new(&title, &url),
-                            render::LinkAction::Internal,
-                            link.as_ref(),
-                            window,
-                            cx,
-                        );
+                        page.url = Some(url);
+                        this.mount_inline_page(&path, window, cx);
                     }
-                    Err(_) => {
-                        this.failed_pages.insert(path.clone());
-                    }
+                    Err(_) => page.failed = true,
+                }
+                if let Some(row) = this.inline_pages.get(&path).map(|page| page.row_id.clone()) {
+                    this.diagram_layout_changed(&[row], cx);
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Give a served page its webview, letting go of the least recently
+    /// shown one past [`MAX_INLINE_PAGES`].
+    fn mount_inline_page(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .inline_pages
+            .get(path)
+            .is_none_or(|page| page.browser.is_some())
+        {
+            return;
+        }
+        let live: Vec<(u64, String)> = self
+            .inline_pages
+            .iter()
+            .filter(|(key, page)| page.browser.is_some() && key.as_str() != path)
+            .map(|(key, page)| (page.used, key.clone()))
+            .collect();
+        if live.len() >= MAX_INLINE_PAGES
+            && let Some((_, oldest)) = live.iter().min()
+            && let Some(page) = self.inline_pages.get_mut(oldest)
+        {
+            page.browser = None;
+            page.painted = None;
+            page._events = None;
+        }
+        let Some(url) = self
+            .inline_pages
+            .get(path)
+            .and_then(|page| page.url.clone())
+        else {
+            return;
+        };
+        let browser = cx.new(|cx| {
+            crate::browser::BrowserSurface::new_inline(
+                crate::visual_pages::inline_context(),
+                window,
+                cx,
+            )
+        });
+        let painted = crate::visual_pages::register_inline(&browser);
+        let key = path.to_owned();
+        let events = cx.subscribe_in(&browser, window, move |this, browser, event, window, cx| {
+            this.on_inline_page_event(&key, browser, event, window, cx)
+        });
+        browser.update(cx, |browser, cx| browser.navigate(&url, window, cx));
+        if let Some(page) = self.inline_pages.get_mut(path) {
+            page.browser = Some(browser);
+            page.painted = Some(painted);
+            page._events = Some(events);
+        }
+    }
+
+    fn on_inline_page_event(
+        &mut self,
+        path: &str,
+        browser: &Entity<crate::browser::BrowserSurface>,
+        event: &crate::browser::BrowserEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let link_to = match event {
+            crate::browser::BrowserEvent::Changed => {
+                let (title, now) = {
+                    let browser = browser.read(cx);
+                    (browser.page.title.clone(), browser.page.url.clone())
+                };
+                let Some(page) = self.inline_pages.get_mut(path) else {
+                    return;
+                };
+                // A link that took the frame elsewhere opens outside the
+                // reply, which keeps its page.
+                if let Some(now) = now.filter(|now| {
+                    (now.starts_with("https://") || now.starts_with("http://"))
+                        && !crate::visual_pages::is_page_url(now)
+                }) && let Some(home) = page.url.clone()
+                {
+                    browser.update(cx, |browser, cx| browser.navigate(&home, window, cx));
+                    Some(now)
+                } else {
+                    if let Some(height) = crate::visual_pages::measured_height(&title) {
+                        let frame = height.clamp(
+                            crate::visual_pages::MIN_HEIGHT,
+                            crate::visual_pages::MAX_HEIGHT,
+                        );
+                        browser.update(cx, |browser, _| {
+                            browser.set_inline_scrolls(height > crate::visual_pages::MAX_HEIGHT)
+                        });
+                        if (frame - page.height).abs() >= 1.0 {
+                            page.height = frame;
+                            let row = page.row_id.clone();
+                            self.diagram_layout_changed(&[row], cx);
+                            cx.notify();
+                        }
+                    }
+                    None
+                }
+            }
+            crate::browser::BrowserEvent::NewTab(url) => url.clone(),
+            crate::browser::BrowserEvent::Close => None,
+        };
+        if let Some(url) = link_to {
+            let link = self.link_ui(cx);
+            render::activate_link(
+                render::LinkTarget::new(&url, &url),
+                render::LinkAction::Primary,
+                link.as_ref(),
+                window,
+                cx,
+            );
+        }
     }
 
     /// The right-aligned thumbnail strip above a user bubble.
@@ -7898,6 +8109,14 @@ impl Transcript {
             ),
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
+            }
+            RowKind::GeneratedImage {
+                owner,
+                path,
+                name,
+                mime_type,
+            } if mime_type == crate::visual_pages::PAGE_MIME => {
+                self.render_inline_page(&row.id, owner, path, name, window, cx)
             }
             RowKind::GeneratedImage {
                 owner,
@@ -12376,7 +12595,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_published_page_draws_a_card_that_says_when_it_cannot_open(cx: &mut gpui::TestAppContext) {
+    fn a_published_page_shows_in_the_reply_and_says_when_it_cannot_load(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
@@ -12387,14 +12608,14 @@ mod tests {
         let transcript = cx.new(|cx| Transcript::new(state, cx));
         struct PageFixture(Entity<Transcript>);
         impl Render for PageFixture {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 self.0.update(cx, |this, cx| {
-                    this.render_generated_image(
+                    this.render_inline_page(
                         &"page".into(),
                         "owner",
                         "/uploads/abcd1234-page.html",
                         "Build times",
-                        crate::visual_pages::PAGE_MIME,
+                        window,
                         cx,
                     )
                 })
@@ -12402,13 +12623,13 @@ mod tests {
         }
         let (_fixture, cx) = cx.add_window_view(|_, _| PageFixture(transcript.clone()));
         cx.run_until_parked();
-        assert!(cx.debug_bounds("transcript-page-card").is_some());
-        // No engine to fetch it from: the card says so instead of spinning.
-        cx.simulate_click(gpui::point(px(20.0), px(20.0)), gpui::Modifiers::default());
-        cx.run_until_parked();
+        assert!(cx.debug_bounds("transcript-page").is_some());
+        // No engine to fetch it from: the frame says so instead of spinning.
         transcript.read_with(cx, |this, _| {
-            assert!(this.failed_pages.contains("/uploads/abcd1234-page.html"));
-            assert!(this.opening_pages.is_empty());
+            let page = &this.inline_pages["/uploads/abcd1234-page.html"];
+            assert!(page.failed);
+            assert!(!page.loading);
+            assert!(page.browser.is_none());
         });
     }
 

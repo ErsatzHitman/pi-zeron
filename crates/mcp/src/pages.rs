@@ -1,7 +1,7 @@
 //! `html_render`: an agent publishes a self-contained HTML page into its own
 //! chat. The page is stored like an upload on this device. The harness turns
-//! the tool's result into a page part, and the transcript shows a card that
-//! opens the page in the right pane.
+//! the tool's result into a page part, and the transcript embeds the page
+//! live in the reply.
 
 use std::path::Path;
 
@@ -13,10 +13,10 @@ const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_PAGE_BYTES: usize = 25 * 1024 * 1024;
 
 /// What the agent reads back: the reader already sees the page.
-pub const PUBLISHED: &str = "The page is published in this chat, above your reply. Don't mention, announce or describe it; reply with only what it doesn't already say.";
+pub const PUBLISHED: &str = "The page is shown inline in this chat, above your reply. Don't mention, announce or describe it; reply with only what it doesn't already say.";
 
 /// The tool's description, shared with the prompt's wording.
-pub const DESCRIPTION: &str = "Show a finished HTML page (chart, table, diagram, image collage, mockup) in this chat, above your final reply; call it before writing that reply. The reader opens it from a card in the transcript, so the reply should not announce it, say where it is or restate it: add only what the page doesn't say. Write one self-contained document with inline <style> and <script>. Local images written as absolute paths (src=\"/abs/shot.png\", CSS url(/abs/bg.webp), or a JS string) are inlined automatically; remote https URLs, such as a CDN chart library, load as-is. The page cannot call back to any server (fetch and XHR are blocked). Zeron sets its theme as CSS variables on :root: --background, --foreground, --muted, --muted-foreground, --card, --border, --accent, --accent-foreground, --destructive, --warning, --success, --chart-1 to --chart-6, --radius, --font-sans and --font-mono. The base stylesheet sets the page's background, color and font from them; your own CSS overrides it. Use a fluid width and give charts fixed pixel heights.";
+pub const DESCRIPTION: &str = "Show a finished HTML page (chart, table, diagram, image collage, mockup) inline in this chat, above your final text reply; call it before writing that reply. The reader already sees the page, so the reply should not announce it, say where it is or restate it: add only what the page doesn't say. Preview with html_preview first. The frame is borderless on the chat's background, as wide as the reply column, and fits the page's height up to 2000px; anything taller scrolls inside it. Use a fluid width with no horizontal padding on the outermost element, and no outer card, border or banner title: the page is part of your reply. Write one self-contained document with inline <style> and <script>. Local images written as absolute paths (src=\"/abs/shot.png\", CSS url(/abs/bg.webp), or a JS string) are inlined automatically; remote https URLs, such as a CDN chart library, load as-is. The page cannot call back to any server (fetch and XHR are blocked). Zeron sets its theme as CSS variables on :root: --background, --foreground, --muted, --muted-foreground, --card, --border, --accent, --accent-foreground, --destructive, --warning, --success, --chart-1 to --chart-6, --radius, --font-sans and --font-mono. The base stylesheet sets the page's background, color and font from them, body margin to 0, and hides the page's scrollbar; your own CSS overrides it. Give charts fixed pixel heights rather than heights that scale with width.";
 
 /// The page with its local images inlined, and the paths that could not be.
 #[derive(Debug, PartialEq, Eq)]

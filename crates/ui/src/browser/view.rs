@@ -281,6 +281,20 @@ impl BrowserSurface {
     }
 
     fn empty_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.inline {
+            // A reply's page: blank while it loads, one line if it failed.
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_muted)
+                .when(self.page.error.is_some(), |el| {
+                    el.child("Unable to load this page")
+                })
+                .into_any_element();
+        }
         if self.page.url.is_none() && self.previews_task.is_some() {
             return self.preview_body(theme, cx);
         }
@@ -515,7 +529,7 @@ impl BrowserSurface {
             }),
         )
         .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-            if let Some(native) = &this.native {
+            if let Some(native) = this.native.as_ref().filter(|_| this.takes_wheel()) {
                 native.wheel(event.position, wheel_units(event.delta), event.modifiers);
                 cx.stop_propagation();
             }
@@ -732,7 +746,7 @@ impl Render for BrowserSurface {
                 .on_mouse_up(MouseButton::Middle,cx.listener(|this,event: &gpui::MouseUpEvent,_,cx| {this.linux_pointer("up",event.position,Some(event.button),event.modifiers);cx.stop_propagation();}))
                 .on_mouse_move(cx.listener(|this,event: &gpui::MouseMoveEvent,_,cx| {if !cx.has_active_drag(){this.linux_pointer("move",event.position,event.pressed_button,event.modifiers);}}))
                 .on_scroll_wheel(cx.listener(|this,event: &gpui::ScrollWheelEvent,_,cx| {
-                    if let Some(native)=&this.native {
+                    if let Some(native)=this.native.as_ref().filter(|_| this.takes_wheel()) {
                         let delta=event.delta.pixel_delta(px(16.));let p=event.position-native.bounds.origin;
                         native.command(serde_json::json!({"cmd":"scroll","x":f32::from(p.x),"y":f32::from(p.y),"dx":-f32::from(delta.x)/40.,"dy":-f32::from(delta.y)/40.,"mods":super::linux::modifiers_mask(event.modifiers)}));
                         cx.stop_propagation();
@@ -788,13 +802,13 @@ impl Render for BrowserSurface {
             // else; over the browser they are inert.
             .on_mouse_down(MouseButton::Navigate(gpui::NavigationDirection::Back), |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Navigate(gpui::NavigationDirection::Forward), |_, _, cx| cx.stop_propagation())
-            .child(toolbar)
-            .when_some(self.validation.clone(), |el, message| el.child(div().px(px(12.0)).py(px(8.0)).text_size(crate::typography::ui_rems(11.0)).text_color(theme.danger).child(message)))
-            .when(remote_loopback, |el| el.child(div().px(px(12.0)).py(px(8.0)).border_b_1().border_color(theme.border)
+            .when(!self.inline, |el| el.child(toolbar))
+            .when_some(self.validation.clone().filter(|_| !self.inline), |el, message| el.child(div().px(px(12.0)).py(px(8.0)).text_size(crate::typography::ui_rems(11.0)).text_color(theme.danger).child(message)))
+            .when(remote_loopback && !self.inline, |el| el.child(div().px(px(12.0)).py(px(8.0)).border_b_1().border_color(theme.border)
                 .text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_muted)
                 .child("Localhost opens on this device. Open a detected preview from a new tab to reach your other device.")))
             .child(body)
-            .when(external, |el| el.child(div().h(px(26.0)).px(px(10.0)).flex().items_center().gap(px(5.0)).border_t_1().border_color(theme.border)
+            .when(external && !self.inline, |el| el.child(div().h(px(26.0)).px(px(10.0)).flex().items_center().gap(px(5.0)).border_t_1().border_color(theme.border)
                 .text_size(crate::typography::ui_rems(10.0)).text_color(theme.text_faint)
                 .child(icons::icon(icons::ARROW_UP_RIGHT).size(px(11.0))).child("Opens in your default browser")))
     }

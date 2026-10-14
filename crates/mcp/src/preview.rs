@@ -78,7 +78,7 @@ fn theme_style(dark: bool) -> String {
     root.push_str("--radius:10px;--font-sans:system-ui,-apple-system,\"Segoe UI\",sans-serif;--font-mono:ui-monospace,Menlo,Consolas,monospace;");
     let scheme = if dark { "dark" } else { "light" };
     format!(
-        ":root{{{root}color-scheme:{scheme}}}html{{background:var(--background);color:var(--foreground);font-family:var(--font-sans)}}body{{margin:0;padding:20px 24px}}"
+        ":root{{{root}color-scheme:{scheme}}}html{{background:var(--background);color:var(--foreground);font-family:var(--font-sans)}}body{{margin:0}}html{{scrollbar-width:none}}html::-webkit-scrollbar{{display:none}}"
     )
 }
 

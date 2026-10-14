@@ -148,11 +148,22 @@ tells the agent not to describe the page in its reply.
 
 For Pi, the normalizer turns a successful `zeron_html_render` result into a
 `GeneratedImage` part with type `text/html`. The engine accepts that path only
-when it sits directly in the uploads folder. The transcript draws a page
-card; clicking it reads the page from its device (`ReadAttachmentChunk`),
-serves it from a loopback server in the app (`crates/ui/src/visual_pages.rs`)
-at an unguessable address, and opens it in a right-pane browser tab. The
-page is sent with `Content-Security-Policy: sandbox allow-scripts
+when it sits directly in the uploads folder.
+
+The transcript embeds the page live in the reply, as T3 Code's sandboxed
+iframe does, but with a native webview: the right pane's `BrowserSurface` in
+an inline mode with no toolbar. The row reads the page from its device
+(`ReadAttachmentChunk`) and serves it from a loopback server in the app
+(`crates/ui/src/visual_pages.rs`) at an unguessable address. An injected
+script reports the page's height through `document.title`, and the frame
+fits it between 80 and 2000px; a taller page scrolls inside, otherwise the
+wheel scrolls the chat. The webview is positioned and clipped by the frame
+that paints its row. A row that scrolled out paints nothing, so the shell
+sweeps every frame and hides the pages no row painted. At most 8 webviews
+live at once; the least recently shown gives its up and remounts when it
+shows again. A link that navigates the page opens outside the reply, as
+does a new-window link, and the caption's arrow opens the page in a
+right-pane browser tab. The page is sent with `Content-Security-Policy: sandbox allow-scripts
 allow-popups; connect-src 'none'; form-action 'none'`, so it runs in an
 opaque origin and cannot call out. Zeron's theme is injected first in
 `<head>` as CSS variables (`--background`, `--foreground`, `--accent`,

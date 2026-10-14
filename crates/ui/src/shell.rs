@@ -14313,6 +14313,18 @@ impl Render for Shell {
             )
         };
         let root = root
+            // After every transcript paints: show the reply pages a row
+            // painted this frame, hide the rest.
+            .child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    |_, _, window, cx| crate::visual_pages::sweep(window, cx),
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size(px(1.0)),
+            )
             .children(self.render_windows_caption_controls(window, cx))
             .children(self.render_linux_caption_controls(window, cx))
             // Last so the invisible CSD resize strips sit above every other
