@@ -19,6 +19,38 @@ use serde_json::Value;
 /// `status` is `active`, `waiting`, `paused`, `blocked` or `budget_limited`.
 pub const GOAL_CHANNEL: &str = "pi-goal:status";
 
+/// Zeron's own compaction status for a Pi chat ([`CompactStatus`]).
+/// Published by the harness, not an extension, and held beside the PIUI
+/// channels; absent when the chat's harness has no such notion or its
+/// process is not running.
+pub const COMPACT_CHANNEL: &str = "zeron:compact";
+
+/// The [`COMPACT_CHANNEL`] payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CompactStatus {
+    /// Pi's auto-compaction flag (`get_state.autoCompactionEnabled`).
+    pub enabled: bool,
+    /// Context size above which Pi starts compacting; `None` when unknown.
+    pub threshold_tokens: Option<u64>,
+    pub compacting: bool,
+    /// `manual`, `threshold` or `overflow`.
+    pub reason: Option<String>,
+    /// Host clock, unix ms, when the running compaction began.
+    pub started_at_ms: Option<u64>,
+    /// Context size the last successful compaction left; cleared by the
+    /// next reply.
+    pub tokens_after: Option<u64>,
+    /// The last compaction's error; cleared by the next compaction.
+    pub error: Option<String>,
+}
+
+impl CompactStatus {
+    pub fn of(ui: &ExtensionUiState) -> Option<Self> {
+        serde_json::from_value(ui.channels.get(COMPACT_CHANNEL)?.clone()).ok()
+    }
+}
+
 /// One chat's live extension UI, as of `revision`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -671,6 +703,30 @@ pub fn section_text(section: &PiUiSection) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_compact_status_travels_as_a_camel_case_channel() {
+        let status = CompactStatus {
+            enabled: true,
+            threshold_tokens: Some(134_464),
+            compacting: true,
+            reason: Some("threshold".into()),
+            started_at_ms: Some(5),
+            tokens_after: None,
+            error: None,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["thresholdTokens"], 134_464);
+        assert_eq!(value["startedAtMs"], 5);
+        let mut ui = ExtensionUiState::default();
+        assert_eq!(CompactStatus::of(&ui), None);
+        ui.channels.insert(COMPACT_CHANNEL.into(), value);
+        assert_eq!(CompactStatus::of(&ui), Some(status));
+        ui.channels.insert(COMPACT_CHANNEL.into(), json!({}));
+        assert_eq!(CompactStatus::of(&ui), Some(CompactStatus::default()));
+        ui.channels.insert(COMPACT_CHANNEL.into(), json!("nope"));
+        assert_eq!(CompactStatus::of(&ui), None);
+    }
 
     #[test]
     fn ask_user_sheet_parses_with_unknown_sections_and_fields_skipped() {

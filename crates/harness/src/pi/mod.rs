@@ -1,6 +1,7 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
 mod catalog;
 mod commands;
+mod compact;
 mod mcp;
 mod normalize;
 mod piui;
@@ -536,6 +537,9 @@ impl Harness for PiHarness {
                 extension_commands: HashSet::new(),
                 pi_commands: HashSet::new(),
                 auto_compaction: true,
+                model_key: None,
+                compaction: compact::Compaction::default(),
+                compact_threshold: None,
                 live_model: request.model.clone().filter(|model| model != "default"),
                 refresh_commands: false,
                 completions: Value::Null,
@@ -627,6 +631,11 @@ struct Runner {
     /// Each shadows Zeron's built-in mapping of the same name.
     pi_commands: HashSet<String>,
     auto_compaction: bool,
+    /// `provider/id` of the model Pi reported, for the settings lookups.
+    model_key: Option<String>,
+    compaction: compact::Compaction,
+    /// Where Pi compacts now; recomputed when get_state arrives.
+    compact_threshold: Option<u64>,
     /// The model Pi last answered with (`provider/id`), to tell when an
     /// extension switched it (a refusal's fallback, a model picker).
     live_model: Option<String>,
@@ -666,7 +675,36 @@ struct Runner {
 }
 /// The footer chip Zeron shows while Pi retries a failed request.
 const RETRY_STATUS: &str = "zeron:retry";
+/// `provider/id` of the model in a `get_state` reply.
+fn model_key(state: &Value) -> Option<String> {
+    let model = &state["model"];
+    Some(format!(
+        "{}/{}",
+        model["provider"].as_str()?,
+        model["id"].as_str()?
+    ))
+}
 impl Runner {
+    /// Work out where Pi compacts (the window less its reserve) and publish
+    /// the compaction status.
+    fn refresh_compact(&mut self) {
+        self.compact_threshold = self.norm.window.and_then(|window| {
+            let reserve = self
+                .store
+                .compaction_reserve(Path::new(&self.request.cwd), self.model_key.as_deref());
+            compact::threshold(window, reserve)
+        });
+        self.publish_compact();
+    }
+    fn publish_compact(&mut self) {
+        let status = self
+            .compaction
+            .status(self.auto_compaction, self.compact_threshold);
+        self.ui.host_channel(
+            zeron_proto::extension_ui::COMPACT_CHANNEL,
+            serde_json::to_value(status).ok(),
+        );
+    }
     /// Opt in to PIUI only while a UI that renders it is watching, and opt
     /// out when the last one leaves, so Pi falls back to dialogs a plain
     /// client (or an older Zeron) can answer. Sent as a raw command: it must
@@ -985,6 +1023,10 @@ impl Runner {
         }
         self.auto_compaction = state["autoCompactionEnabled"].as_bool().unwrap_or(true);
         self.norm.window = state["model"]["contextWindow"].as_u64();
+        self.model_key = model_key(&state);
+        self.compaction
+            .sync(state["isCompacting"].as_bool(), compact::unix_millis());
+        self.refresh_compact();
         self.started(state["model"]["id"].as_str().unwrap_or("default").into())
             .await?;
         if let Some(message) = self.lost_context.take() {
@@ -1195,6 +1237,10 @@ impl Runner {
             .as_bool()
             .unwrap_or(self.auto_compaction);
         self.norm.window = data["model"]["contextWindow"].as_u64().or(self.norm.window);
+        self.model_key = model_key(&data).or(self.model_key.take());
+        self.compaction
+            .sync(data["isCompacting"].as_bool(), compact::unix_millis());
+        self.refresh_compact();
         if data["isStreaming"] != false
             || data["isCompacting"] != false
             || self.pending.values().any(|p| {
@@ -1429,6 +1475,15 @@ impl Runner {
                 }
             }
             self.live_model = Some(full);
+        }
+        // Compaction, manual ones between turns too, feeds the session
+        // panel's Compaction section.
+        if matches!(
+            string(&frame, "type"),
+            "compaction_start" | "compaction_end" | "message_end"
+        ) && self.compaction.frame(&frame, compact::unix_millis())
+        {
+            self.publish_compact();
         }
         // Pi retrying a failed request shows as a footer chip until the
         // retry ends (or the run does).

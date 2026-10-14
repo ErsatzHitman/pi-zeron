@@ -73,6 +73,16 @@ impl Store {
             .iter()
             .any(|settings| json_file(settings).get("steeringMode").is_some())
     }
+    /// Tokens Pi keeps free before it compacts `model` (`provider/id`), in
+    /// the settings it loads for `cwd`.
+    pub fn compaction_reserve(&self, cwd: &Path, model: Option<&str>) -> u64 {
+        let files: Vec<Value> = self
+            .settings_files(cwd)
+            .iter()
+            .map(|file| json_file(file))
+            .collect();
+        reserve_from(&files, model)
+    }
     /// The settings files Pi actually loads for `cwd`: the global one, plus
     /// the project's only when the project is trusted (RPC mode never asks,
     /// so an undecided project stays untrusted).
@@ -228,6 +238,20 @@ impl Store {
         )))
     }
 }
+/// Pi's own reserve when no setting names one (`compaction.ts`).
+const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
+
+/// Settings merge global then project: a later file beats an earlier one,
+/// and a model's override beats the ordinary value.
+fn reserve_from(files: &[Value], model: Option<&str>) -> u64 {
+    let find = |value: &dyn Fn(&Value) -> Option<u64>| files.iter().rev().find_map(value);
+    model
+        .and_then(|model| {
+            find(&|file| file["compaction"]["modelOverrides"][model]["reserveTokens"].as_u64())
+        })
+        .or_else(|| find(&|file| file["compaction"]["reserveTokens"].as_u64()))
+        .unwrap_or(DEFAULT_RESERVE_TOKENS)
+}
 fn json_file(path: &Path) -> Value {
     std::fs::read(path)
         .ok()
@@ -251,6 +275,34 @@ fn matches_id(path: &Path, id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_compaction_reserve_follows_pi_settings() {
+        assert_eq!(reserve_from(&[], None), 16_384);
+        assert_eq!(reserve_from(&[Value::Null], Some("a/b")), 16_384);
+        let global = json!({"compaction":{"enabled":true,"reserveTokens":65536}});
+        assert_eq!(reserve_from(&[global.clone()], Some("a/b")), 65_536);
+        let project = json!({"compaction":{"reserveTokens":8000}});
+        assert_eq!(
+            reserve_from(&[global.clone(), project.clone()], None),
+            8_000
+        );
+        let overrides = json!({"compaction":{"modelOverrides":{"a/b":{"reserveTokens":1234}}}});
+        assert_eq!(
+            reserve_from(&[global.clone(), project, overrides.clone()], Some("a/b")),
+            1_234
+        );
+        assert_eq!(reserve_from(&[overrides, global], Some("x/y")), 65_536);
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::new(Some(dir.path().join("index")), None);
+        store.agent = dir.path().join("agent");
+        std::fs::create_dir_all(&store.agent).unwrap();
+        std::fs::write(
+            store.agent.join("settings.json"),
+            r#"{"compaction":{"reserveTokens":4000}}"#,
+        )
+        .unwrap();
+        assert_eq!(store.compaction_reserve(dir.path(), None), 4_000);
+    }
     #[test]
     fn only_proven_empty_local_sessions_can_be_recreated_and_submission_revokes_it() {
         let dir = tempfile::tempdir().unwrap();

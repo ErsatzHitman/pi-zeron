@@ -73,6 +73,9 @@ pub(super) struct ExtensionUi {
     seq: u64,
     /// Published after the PIUI elements; a PIUI `reset` never clears them.
     dialogs: Vec<HostDialog>,
+    /// Channels Zeron keeps itself (the compaction status). A PIUI `reset`
+    /// never touches them; `closed()` drops them with the process.
+    host: std::collections::BTreeMap<String, Value>,
     dialog_seq: u64,
     /// Long between-turn reports (`/lsp`, `/mcp` status), shown as closable
     /// screens: a toast is gone before it is read. `(key, element)`.
@@ -268,10 +271,26 @@ impl ExtensionUi {
         self.publish();
     }
 
+    /// A channel Zeron keeps itself; `None` takes it away.
+    pub fn host_channel(&mut self, name: &str, payload: Option<Value>) {
+        match payload {
+            Some(payload) if self.host.get(name) == Some(&payload) => return,
+            Some(payload) => {
+                self.host.insert(name.to_owned(), payload);
+            }
+            None if self.host.remove(name).is_some() => {}
+            None => return,
+        }
+        self.publish();
+    }
+
     fn publish(&mut self) {
         self.state.revision += 1;
         if let Some(sink) = &self.sink {
             let mut state = self.state.clone();
+            state
+                .channels
+                .extend(self.host.iter().map(|(name, value)| (name.clone(), value.clone())));
             state
                 .elements
                 .extend(self.dialogs.iter().map(|dialog| dialog.element.clone()));
@@ -573,6 +592,7 @@ impl ExtensionUi {
         self.keys.clear();
         self.chunks.clear();
         self.dialogs.clear();
+        self.host.clear();
         self.last_seq = 0;
         self.publish();
     }
@@ -765,6 +785,26 @@ impl ExtensionUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_channels_publish_beside_piui_and_go_with_the_process() {
+        let (tx, rx) = watch::channel(ExtensionUiState::default());
+        let mut ui = ExtensionUi::new(Some(tx));
+        ui.host_channel("zeron:compact", Some(json!({"enabled": true})));
+        let revision = rx.borrow().revision;
+        assert_eq!(rx.borrow().channels["zeron:compact"], json!({"enabled": true}));
+        // The same payload again is no change.
+        ui.host_channel("zeron:compact", Some(json!({"enabled": true})));
+        assert_eq!(rx.borrow().revision, revision);
+        // A PIUI reset keeps it.
+        ui.handle(&notify(json!({"v":1,"agentSeq":1,"instance":"a","op":"reset"})));
+        assert!(rx.borrow().channels.contains_key("zeron:compact"));
+        ui.host_channel("zeron:compact", None);
+        assert!(!rx.borrow().channels.contains_key("zeron:compact"));
+        ui.host_channel("zeron:compact", Some(json!({})));
+        ui.closed();
+        assert!(rx.borrow().channels.is_empty());
+    }
 
     fn notify(envelope: Value) -> Value {
         json!({"type":"extension_ui_request","id":"n","method":"notify",
