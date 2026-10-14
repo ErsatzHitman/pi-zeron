@@ -217,6 +217,30 @@ fn catalog() -> Vec<ToolDef> {
                 "required": ["html", "title"]
             }),
         },
+        ToolDef {
+            name: "html_preview",
+            description: crate::preview::DESCRIPTION,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "html": {
+                        "type": "string",
+                        "description": "A complete, self-contained HTML document.",
+                        "maxLength": crate::pages::MAX_HTML_CHARS
+                    },
+                    "width": {
+                        "type": "integer",
+                        "description": format!("Viewport width in CSS pixels, 240-1600. Defaults to {}; use about 390 to check phones.", crate::preview::DEFAULT_WIDTH)
+                    },
+                    "appearance": {
+                        "type": "string",
+                        "enum": ["dark", "light"],
+                        "description": "Theme to preview. Defaults to dark."
+                    }
+                },
+                "required": ["html"]
+            }),
+        },
     ];
     for (name, single, description) in [
         (
@@ -264,6 +288,45 @@ struct ChatArgs {
 struct HtmlRenderArgs {
     html: String,
     title: String,
+}
+
+#[derive(Deserialize)]
+struct HtmlPreviewArgs {
+    html: String,
+    width: Option<u32>,
+    appearance: Option<String>,
+}
+
+/// Render the page headless on this device. The screenshot rides as an image
+/// block (see [`crate::preview::IMAGE_KEY`]).
+async fn html_preview(args: HtmlPreviewArgs) -> anyhow::Result<Value> {
+    let (page, _) =
+        tokio::task::spawn_blocking(move || crate::pages::prepare(&args.html, "Preview"))
+            .await?
+            .map_err(anyhow::Error::msg)?;
+    let dark = args.appearance.as_deref() != Some("light");
+    let preview = crate::preview::render(&page.html, args.width, dark)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let console: Vec<Value> = preview
+        .console
+        .into_iter()
+        .map(|(level, text)| json!({ "level": level, "text": text }))
+        .collect();
+    let mut result = json!({
+        "width": preview.width,
+        "contentHeight": preview.content_height,
+        "capturedHeight": preview.captured_height,
+        "consoleMessages": console,
+    });
+    if !page.missing.is_empty() {
+        result["missingImages"] = json!(page.missing);
+    }
+    result[crate::preview::IMAGE_KEY] = json!({
+        "data": crate::pages::base64(&preview.png),
+        "mimeType": "image/png",
+    });
+    Ok(result)
 }
 
 #[derive(Deserialize)]
@@ -490,6 +553,7 @@ impl Tools {
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             "html_render" => self.html_render(parse(args)?).await,
+            "html_preview" => html_preview(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))

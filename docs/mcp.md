@@ -135,6 +135,7 @@ name (default: the local engine's device).
 | `respond_to_input` | `QueueCommand` RespondInput                               |
 | `archive_chat`     | `Mutate setChatArchived`                                  |
 | `html_render`      | `UploadChunk` + `UploadCommit` (see Pages below)          |
+| `html_preview`     | None: a headless browser on the device (see Pages below)  |
 
 ### Pages
 
@@ -157,6 +158,16 @@ opaque origin and cannot call out. Zeron's theme is injected first in
 `<head>` as CSS variables (`--background`, `--foreground`, `--accent`,
 `--chart-1`…`--chart-6`, `--font-sans`, …) the tool description lists.
 Pi's appended visuals prompt tells it when to reach for a page.
+
+`html_preview { html, width?, appearance? }` lets the agent check a page
+before publishing it. It runs a Chromium-family browser found on the device
+(Chrome, Edge or Chromium; `ZERON_PREVIEW_BROWSER` overrides) headless twice:
+once with `--dump-dom` to read the height the page needs and its console
+output from the browser's log, then with `--screenshot` at that height (up
+to 4000px). The PNG returns as an MCP image block; the JSON carries `width`,
+`contentHeight`, `capturedHeight` and `consoleMessages`. The page gets a
+fixed copy of Zeron's default dark or light theme variables. With no
+browser on the device, the tool says so and the agent publishes unchecked.
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

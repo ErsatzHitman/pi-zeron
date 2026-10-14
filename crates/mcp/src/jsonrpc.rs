@@ -174,14 +174,28 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             match tools.call(name, arguments).await {
-                Ok(value) => ok_response(
-                    id,
-                    json!({
-                        "content": [{ "type": "text", "text": pretty(&value) }],
-                        "structuredContent": wrap_structured(value),
-                        "isError": false,
-                    }),
-                ),
+                Ok(mut value) => {
+                    // A tool's picture is an image block, not part of the JSON.
+                    let image = value
+                        .as_object_mut()
+                        .and_then(|value| value.remove(crate::preview::IMAGE_KEY));
+                    let mut content = vec![json!({ "type": "text", "text": pretty(&value) })];
+                    if let Some(image) = image {
+                        content.push(json!({
+                            "type": "image",
+                            "data": image["data"],
+                            "mimeType": image["mimeType"],
+                        }));
+                    }
+                    ok_response(
+                        id,
+                        json!({
+                            "content": content,
+                            "structuredContent": wrap_structured(value),
+                            "isError": false,
+                        }),
+                    )
+                }
                 Err(message) => ok_response(
                     id,
                     json!({
