@@ -6473,7 +6473,7 @@ impl Composer {
             }
         });
         cx.observe_global::<crate::settings::SettingsStore>(|this, cx| {
-            if !crate::settings::current(cx).dictation_enabled {
+            if !crate::dictation::enabled(cx) {
                 this.input.update(cx, |input, _| input.cancel_dictation());
             }
             this.on_input_edited(cx);

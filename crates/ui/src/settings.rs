@@ -354,15 +354,16 @@ impl SettingsStore {
 
 pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
     let data_dir = data_dir.into();
-    crate::dictation::init(data_dir.clone(), cx);
     cx.set_global(SettingsStore {
         current: settings,
-        data_dir: data_dir.into(),
+        data_dir: data_dir.clone(),
         revision: 0,
         saved_revision: 0,
         code_fences_generation: 0,
         save_task: None,
     });
+    // After the store: the Voice page shows the saved trigger phrase.
+    crate::dictation::init(data_dir, cx);
 }
 
 /// Latest settings, including mutations still inside the debounce window.
@@ -819,11 +820,22 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
-    pub dictation_enabled: bool,
     /// Dictation microphone as a `zeron_voice::InputDevice` id; `None`
     /// follows the system default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dictation_input: Option<String>,
+    /// Dictation's speech-to-text provider. Its API key is kept in
+    /// `stt-keys.json`, never here.
+    pub stt_provider: zeron_voice::cloud::Provider,
+    /// `None` is the provider's default model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stt_model: Option<String>,
+    /// ISO-639-1 language hint; `None` detects the language.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stt_language: Option<String>,
+    pub stt_remove_fillers: bool,
+    /// Ending a dictation with it rewrites the text; empty turns it off.
+    pub stt_trigger_phrase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
@@ -1012,12 +1024,6 @@ pub struct UiSettings {
     pub reduce_motion: crate::motion::ReduceMotion,
     /// Also snap animations while the main window is not focused.
     pub pause_animations_in_background: bool,
-    /// Stable native Codex voice id only; devices and microphone state are never persisted.
-    #[serde(default)]
-    pub codex_voice: Option<String>,
-    /// Local preference: never transfers an active call or credentials.
-    #[serde(default)]
-    pub codex_voice_device: Option<String>,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -1027,8 +1033,12 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            dictation_enabled: false,
             dictation_input: None,
+            stt_provider: zeron_voice::cloud::Provider::default(),
+            stt_model: None,
+            stt_language: None,
+            stt_remove_fillers: true,
+            stt_trigger_phrase: zeron_voice::DEFAULT_TRIGGER_PHRASE.to_owned(),
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
@@ -1112,8 +1122,6 @@ impl Default for UiSettings {
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             reduce_motion: crate::motion::ReduceMotion::System,
             pause_animations_in_background: false,
-            codex_voice: None,
-            codex_voice_device: None,
             legacy_accent_color: None,
         }
     }
@@ -1675,8 +1683,12 @@ impl UiSettings {
             }};
         }
         merge!(
-            dictation_enabled,
             dictation_input,
+            stt_provider,
+            stt_model,
+            stt_language,
+            stt_remove_fillers,
+            stt_trigger_phrase,
             window_geometry,
             composer_send_behavior,
             skills_in_slash_menu,
@@ -1756,8 +1768,6 @@ impl UiSettings {
             new_thread_background_effect,
             reduce_motion,
             pause_animations_in_background,
-            codex_voice,
-            codex_voice_device,
             legacy_accent_color,
             pull_request_destination,
             last_pull_request_repository,
@@ -2098,7 +2108,6 @@ mod tests {
             height: 800.0,
         };
         let settings = UiSettings {
-            dictation_enabled: false,
             window_geometry: Some(geometry),
             ..Default::default()
         };
@@ -2705,11 +2714,13 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
-            dictation_enabled: false,
             dictation_input: Some("coreaudio:usb-mic".into()),
+            stt_provider: zeron_voice::cloud::Provider::Groq,
+            stt_model: Some("whisper-large-v3".into()),
+            stt_language: Some("hi".into()),
+            stt_remove_fillers: false,
+            stt_trigger_phrase: "make it shorter".into(),
             window_geometry: None,
-            codex_voice: Some("ember".into()),
-            codex_voice_device: Some("fedora".into()),
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,

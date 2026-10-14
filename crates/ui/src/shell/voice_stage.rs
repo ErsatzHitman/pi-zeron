@@ -54,15 +54,12 @@ impl Shell {
                 model_options: Default::default(),
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             });
-        let saved = settings::current(cx);
-        let device = saved.codex_voice_device.unwrap_or(device);
-        let voice = saved.codex_voice;
         let host_name = state
             .device_name(&device)
             .unwrap_or("This device")
             .to_owned();
         self.voice.update(cx, |controller, cx| {
-            controller.start(engine, device, config, voice, cx);
+            controller.start(engine, device, config, None, cx);
             controller.host_name = Some(host_name);
             controller.set_stage_open(true, cx);
         });

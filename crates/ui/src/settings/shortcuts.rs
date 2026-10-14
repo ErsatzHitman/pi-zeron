@@ -370,8 +370,8 @@ impl popover::ScrollRailHost for ShortcutsPage {
     }
 }
 
-/// One rebindable shortcut on the settings page of the feature it drives
-/// (Settings → Voice). Records and refuses combos exactly like a Shortcuts
+/// One rebindable shortcut on the settings page of the feature it drives.
+/// Records and refuses combos exactly like a Shortcuts
 /// row, then saves straight to the store and re-applies the keymap.
 pub struct ShortcutField {
     id: ShortcutId,
@@ -655,7 +655,7 @@ fn refusal(
     conflict_owner(keymap, id, combo).map(|owner| {
         // Name the page for shortcuts that live on their feature's page.
         let page = match group(owner) {
-            page @ ("Appshots" | "Voice") => format!(" in Settings → {page}"),
+            page @ "Appshots" => format!(" in Settings → {page}"),
             _ => String::new(),
         };
         format!(
@@ -977,8 +977,8 @@ impl Render for ShortcutsPage {
         // own top margin is zeroed.
         let mut groups: Vec<gpui::AnyElement> = Vec::new();
         for name in GROUP_ORDER {
-            // Feature pages own these: Settings → Appshots and → Voice.
-            if name == "Appshots" || name == "Voice" {
+            // Settings → Appshots owns its shortcut.
+            if name == "Appshots" {
                 continue;
             }
             let mut card = widgets::section_card(&theme).mt_0();
@@ -1150,7 +1150,7 @@ mod tests {
         cx.update(|window, _| window.remove_window());
         cx.run_until_parked();
         field.update(cx, |field, _| assert!(!field.recording));
-        // Elsewhere, a clash with a feature page's shortcut says where it lives.
+        // Elsewhere, a clash names the shortcut it would take.
         let notice = refusal(
             &KeymapConfig::default(),
             ComposerSendBehavior::Enter,
@@ -1159,7 +1159,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            notice.ends_with("Hold to dictate in Settings → Voice."),
+            notice.ends_with("already assigned to Hold to dictate."),
             "{notice}"
         );
         // Settings → Shortcuts, opened later with an older copy, adopts the

@@ -10,7 +10,8 @@ pub(crate) mod waveform;
 pub(crate) use meter::{Bar, FLOOR, Meter};
 pub(crate) use model::{card, enabled, init};
 
-pub(crate) const FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Covers the upload, transcription and an optional trigger-phrase rewrite.
+pub(crate) const FINALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(tag = "kind", content = "text", rename_all = "snake_case")]
@@ -68,7 +69,7 @@ fn origin_window() -> usize {
 struct Native {
     pending: Option<Event>,
     origin_window: usize,
-    dir: std::path::PathBuf,
+    config: zeron_voice::cloud::Config,
     device: Option<String>,
     session: Option<zeron_voice::Session>,
     finished: bool,
@@ -98,7 +99,7 @@ impl Transcriber for Native {
                     self.finished = true;
                     return Some(Event::Cancelled);
                 }
-                _ => match zeron_voice::Session::start(self.dir.clone(), self.device.clone()) {
+                _ => match zeron_voice::Session::start(self.config.clone(), self.device.clone()) {
                     Ok(s) => self.session = Some(s),
                     Err(e) => {
                         self.finished = true;
@@ -127,9 +128,7 @@ impl Transcriber for Native {
     }
 }
 pub(crate) fn start(cx: &gpui::App) -> Option<Box<dyn Transcriber>> {
-    if !enabled(cx) {
-        return None;
-    }
+    let config = model::config(cx)?;
     let origin_window = origin_window();
     #[cfg(target_os = "macos")]
     if permission() == 0 {
@@ -140,7 +139,7 @@ pub(crate) fn start(cx: &gpui::App) -> Option<Box<dyn Transcriber>> {
     Some(Box::new(Native {
         pending: None,
         origin_window,
-        dir: model::directory(cx),
+        config,
         device: crate::settings::current(cx).dictation_input.clone(),
         session: None,
         finished: false,
@@ -184,7 +183,7 @@ impl Phase {
             Self::Idle => return None,
             Self::Requesting => ("Getting ready…", "Wait for Listening before speaking."),
             Self::Listening => ("Listening", "Release when you’re done · Up to 1 minute"),
-            Self::Finalizing => ("Transcribing…", "Processing on this device."),
+            Self::Finalizing => ("Transcribing…", "Sending to your speech provider."),
             Self::NoSpeech => (
                 "No speech detected",
                 "Check your microphone, then try again.",
@@ -286,7 +285,7 @@ mod tests {
         let mut native = Native {
             pending: None,
             origin_window: 0,
-            dir: std::path::PathBuf::new(),
+            config: Default::default(),
             device: None,
             session: None,
             finished: false,

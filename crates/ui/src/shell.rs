@@ -5708,39 +5708,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Voice => {
-                let card = crate::dictation::card(cx);
-                let state = self.state.read(cx);
-                let mut hosts = vec![(None, "This device".to_owned(), true, "Local".to_owned())];
-                for device in &state.devices {
-                    if state.local_device_id.as_deref() == Some(&device.id) {
-                        continue;
-                    }
-                    let online = state.device_online(&device.id, chrono::Utc::now());
-                    let compatible = device.supports(zeron_proto::voice::remote::CAPABILITY);
-                    let detail = if !online {
-                        "Offline"
-                    } else if !compatible {
-                        "Update Zeron to use remote voice"
-                    } else {
-                        "Available"
-                    };
-                    hosts.push((
-                        Some(device.id.clone()),
-                        device.name.clone(),
-                        online && compatible,
-                        detail.into(),
-                    ));
-                }
-                let live = self.voice.read(cx).is_live();
-                let offered = self.voice.read(cx).offered();
-                card.update(cx, |card, cx| card.set_hosts(hosts, live, offered, cx));
-                if let Some(snapshot) = &self.voice.read(cx).snapshot {
-                    let voices = snapshot.voices.clone();
-                    card.update(cx, |card, cx| card.set_voices(&voices, cx));
-                }
-                card.into_any_element()
-            }
+            SettingsSection::Voice => crate::dictation::card(cx).into_any_element(),
             SettingsSection::Shortcuts | SettingsSection::General | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -16423,9 +16391,9 @@ mod exit_regressions {
                 // Voice, transcript and diff controls save straight to the
                 // store. None of them is known to the Shell.
                 settings::update(SavePolicy::Immediate, cx, |settings| {
-                    settings.dictation_enabled = true;
+                    settings.stt_remove_fillers = false;
                     settings.dictation_input = Some("coreaudio:usb".into());
-                    settings.codex_voice = Some("ember".into());
+                    settings.stt_model = Some("whisper-1".into());
                     settings.transcript_compact_mode = true;
                     settings.code_fences_fit_content = true;
                     settings.diff_split = true;
@@ -16436,9 +16404,9 @@ mod exit_regressions {
                 shell.settings.sidebar_width = 300.0;
                 shell.schedule_save(cx);
                 let saved = settings::current(cx);
-                assert!(saved.dictation_enabled);
+                assert!(!saved.stt_remove_fillers);
                 assert_eq!(saved.dictation_input.as_deref(), Some("coreaudio:usb"));
-                assert_eq!(saved.codex_voice.as_deref(), Some("ember"));
+                assert_eq!(saved.stt_model.as_deref(), Some("whisper-1"));
                 assert!(saved.transcript_compact_mode);
                 assert!(saved.code_fences_fit_content);
                 assert!(saved.diff_split);
@@ -16448,14 +16416,14 @@ mod exit_regressions {
                 // An outside change to a field the Shell also holds still wins
                 // once the Shell has nothing newer of its own.
                 settings::update(SavePolicy::Immediate, cx, |settings| {
-                    settings.dictation_enabled = false;
-                    settings.codex_voice = None;
+                    settings.stt_remove_fillers = true;
+                    settings.stt_model = None;
                     settings.sidebar_width = 320.0;
                 });
                 shell.schedule_save(cx);
                 let saved = settings::current(cx);
-                assert!(!saved.dictation_enabled);
-                assert_eq!(saved.codex_voice, None);
+                assert!(saved.stt_remove_fillers);
+                assert_eq!(saved.stt_model, None);
                 assert_eq!(saved.sidebar_width, 320.0);
                 assert_eq!(shell.settings.sidebar_width, 320.0);
             })

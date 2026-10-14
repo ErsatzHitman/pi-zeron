@@ -47,7 +47,7 @@ impl Fixture {
         let cancel = Arc::new(AtomicBool::new(false));
         let level = Arc::new(AtomicU32::new(0));
         let job = Job {
-            dir: Default::default(),
+            config: Default::default(),
             stop: stop.clone(),
             cancel: cancel.clone(),
             level: level.clone(),
@@ -238,7 +238,7 @@ fn cancelled_load_keeps_start_and_model_removal_guarded_until_native_work_return
 fn stop_before_capture_start_never_opens_the_microphone() {
     let (events, _) = mpsc::sync_channel(4);
     let job = Job {
-        dir: Default::default(),
+        config: Default::default(),
         stop: Arc::new(AtomicBool::new(true)),
         cancel: Arc::new(AtomicBool::new(false)),
         level: Arc::new(AtomicU32::new(0)),
