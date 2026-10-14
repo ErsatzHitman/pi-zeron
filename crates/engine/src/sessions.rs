@@ -1624,18 +1624,48 @@ impl Inner {
             return None;
         }
         let command = std::env::current_exe().ok()?.to_str()?.to_owned();
+        let mut env: std::collections::BTreeMap<String, String> = [
+            ("ZERON_IPC_PORT".to_owned(), port.to_string()),
+            ("ZERON_CHAT_ID".to_owned(), chat_id.to_owned()),
+            ("ZERON_DEVICE_ID".to_owned(), self.device_id.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let role = zeron_proto::orchestrator::Role::of(&self.lineage(chat_id), chat_id);
+        env.extend(
+            role.env()
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value)),
+        );
         Some(zeron_proto::McpServer {
             name: "zeron".into(),
             command,
             args: vec!["mcp".into()],
-            env: [
-                ("ZERON_IPC_PORT".to_owned(), port.to_string()),
-                ("ZERON_CHAT_ID".to_owned(), chat_id.to_owned()),
-                ("ZERON_DEVICE_ID".to_owned(), self.device_id.clone()),
-            ]
-            .into_iter()
-            .collect(),
+            env,
         })
+    }
+
+    /// `chat_id` and its ancestors, nearest first: enough to place a run in
+    /// an orchestrator tree without reading every chat.
+    fn lineage(&self, chat_id: &str) -> Vec<zeron_proto::Chat> {
+        let Some(workspace) = self.workspace() else {
+            return Vec::new();
+        };
+        let mut lineage: Vec<zeron_proto::Chat> = Vec::new();
+        let mut next = Some(chat_id.to_owned());
+        while let Some(id) = next.take() {
+            if lineage.len() > zeron_proto::orchestrator::MAX_DEPTH + 1
+                || lineage.iter().any(|chat| chat.id == id)
+            {
+                break;
+            }
+            let Ok(Some(chat)) = workspace.chat(&id) else {
+                break;
+            };
+            next = chat.parent_chat_id.clone();
+            lineage.push(chat);
+        }
+        lineage
     }
 
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {

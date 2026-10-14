@@ -12,29 +12,86 @@ pub const ROOT_CHAT_TITLE: &str = "Orchestrator";
 /// the sessions they start level 2, and so on.
 pub const MAX_DEPTH: usize = 4;
 
-/// Appended to the root agent's system prompt (Pi `--append-system-prompt`).
-pub const ROOT_PROMPT: &str = "\
-# Zeron orchestrator
+/// Process env naming a run's place in a tree: `orchestrator`, `member`,
+/// or unset for a plain chat. User extensions read it too.
+pub const ENV_ROLE: &str = "ZERON_ROLE";
+/// A member's level below its root.
+pub const ENV_TREE_DEPTH: &str = "ZERON_TREE_DEPTH";
 
-You are the orchestrator in Zeron. You do not edit files or run project \
-commands yourself: you hand every task to Pi sessions that work in the \
-right directory, follow them, and report back.
+/// The root agent's whole system prompt (Pi `--system-prompt`): it plans and
+/// delegates, and has no coding prompt to fall back on.
+pub const ROOT_SYSTEM_PROMPT: &str = include_str!("orchestrator_root.md");
+/// The root's tools (Pi `--tools`): Zeron's delegation tools, read-only
+/// files, and the planning extensions. No bash, edits or MCP servers.
+pub const ROOT_TOOLS: &str = "zeron_*,read,ls,find,grep,ask_user,todo,goal_*,\
+memory_search,memory_read,memory_status";
+const MEMBER_PROMPT: &str = include_str!("orchestrator_member.md");
 
-- Find the directory first. The user may name a project (zeron_list_projects \
-lists them with their paths) or a folder such as D:\\OpenTalk.
-- Start a session with zeron_create_chat: harness \"pi\", the project or cwd, \
-a short title naming the task, and a prompt that states the task completely \
-(the session sees nothing of this conversation). Use zeron_create_chats to \
-start independent tasks together. Several sessions may work in one directory; \
-give each its own task.
-- Follow up with zeron_send_message, wait with zeron_wait_for_turn, read \
-results with zeron_read_chat (include_tools false for a summary), and answer \
-a session's questions with zeron_respond_to_input or ask the user.
-- Sessions you start can start their own sub-sessions; they report to you \
-through their own replies.
-- Keep the user informed in a few lines: what you started, where, and what \
-came back.
-";
+/// Where a run sits relative to an orchestrator tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// A plain chat, outside any tree.
+    Chat,
+    /// An orchestrator's root.
+    Root,
+    /// A session in a tree, `depth` levels below its root.
+    Member { depth: usize },
+}
+
+impl Role {
+    /// The role of `chat_id`, given it and its ancestors (any order).
+    pub fn of(chats: &[Chat], chat_id: &str) -> Self {
+        if is_root_chat(chat_id) {
+            return Role::Root;
+        }
+        match depth(chats, chat_id) {
+            Some(depth) if depth > 0 => Role::Member { depth },
+            _ => Role::Chat,
+        }
+    }
+
+    /// The process env that carries this role.
+    pub fn env(self) -> Vec<(&'static str, String)> {
+        match self {
+            Role::Chat => Vec::new(),
+            Role::Root => vec![(ENV_ROLE, "orchestrator".into())],
+            Role::Member { depth } => vec![
+                (ENV_ROLE, "member".into()),
+                (ENV_TREE_DEPTH, depth.to_string()),
+            ],
+        }
+    }
+
+    /// The role an MCP server's env carries. Without `ZERON_ROLE` (an
+    /// older engine) a root is still known by its chat id.
+    pub fn from_env(env: &std::collections::BTreeMap<String, String>) -> Self {
+        match env.get(ENV_ROLE).map(String::as_str) {
+            Some("orchestrator") => Role::Root,
+            Some("member") => Role::Member {
+                depth: env
+                    .get(ENV_TREE_DEPTH)
+                    .and_then(|depth| depth.parse().ok())
+                    .unwrap_or(1),
+            },
+            _ if env.get("ZERON_CHAT_ID").is_some_and(|id| is_root_chat(id)) => Role::Root,
+            _ => Role::Chat,
+        }
+    }
+}
+
+/// Appended to a member's system prompt.
+pub fn member_prompt(depth: usize) -> String {
+    let sessions = if depth >= MAX_DEPTH {
+        "You cannot start sessions; do the work here."
+    } else {
+        "Start a sub-session with zeron_create_chat only for an independent task in a \
+         different folder, or when parallel work clearly pays."
+    };
+    MEMBER_PROMPT
+        .replace("{sessions}", sessions)
+        .replace("{depth}", &depth.to_string())
+        .replace("{max}", &MAX_DEPTH.to_string())
+}
 
 pub fn is_root_chat(chat_id: &str) -> bool {
     chat_id.starts_with(ROOT_CHAT_PREFIX)
@@ -122,5 +179,47 @@ mod tests {
         assert_eq!(depth(&chats, "side"), None, "a side chat of a plain chat");
         assert_eq!(depth(&chats, "missing"), None);
         assert_eq!(lineage(&chats, "loop-a").len(), 2, "a cycle ends the walk");
+    }
+
+    #[test]
+    fn a_run_knows_its_role_from_the_tree_and_from_its_env() {
+        let root = new_root_chat_id();
+        let chats = vec![
+            chat(&root, None),
+            chat("child", Some(&root)),
+            chat("grandchild", Some("child")),
+            chat("plain", None),
+            chat("side", Some("plain")),
+        ];
+        assert_eq!(Role::of(&chats, &root), Role::Root);
+        assert_eq!(Role::of(&[], &root), Role::Root, "known by its id alone");
+        assert_eq!(Role::of(&chats, "grandchild"), Role::Member { depth: 2 });
+        assert_eq!(Role::of(&chats, "plain"), Role::Chat);
+        assert_eq!(Role::of(&chats, "side"), Role::Chat);
+        for role in [Role::Chat, Role::Root, Role::Member { depth: 3 }] {
+            let env = role
+                .env()
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect();
+            assert_eq!(Role::from_env(&env), role);
+        }
+        // An older engine sends no role; the root's id still names it.
+        let env = [("ZERON_CHAT_ID".to_owned(), root.clone())].into();
+        assert_eq!(Role::from_env(&env), Role::Root);
+    }
+
+    #[test]
+    fn prompts_fill_in_the_tree_limits() {
+        let member = member_prompt(2);
+        assert!(member.contains("You are 2 levels below the root; the limit is 4."));
+        assert!(member.contains("zeron_create_chat only for an independent task"));
+        assert!(!member.contains('{'), "{member}");
+        assert!(member_prompt(MAX_DEPTH).contains("You cannot start sessions"));
+        assert!(ROOT_SYSTEM_PROMPT.starts_with("You are the orchestrator in Zeron"));
+        assert_eq!(
+            ROOT_TOOLS,
+            "zeron_*,read,ls,find,grep,ask_user,todo,goal_*,memory_search,memory_read,memory_status"
+        );
     }
 }

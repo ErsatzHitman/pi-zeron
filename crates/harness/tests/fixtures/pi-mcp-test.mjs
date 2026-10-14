@@ -17,7 +17,12 @@ if (process.argv[2] === 'server') {
   });
 } else {
   // A Windows path (D:\...) is not an ESM specifier; a file URL is.
-  const {default: extension} = await import(pathToFileURL(process.argv[2]).href);
+  const {default: extension, callTimeoutMs} = await import(pathToFileURL(process.argv[2]).href);
+  // A call outlives the longest wait it asks for, a batch's included.
+  assert.equal(callTimeoutMs('initialize', {}), 15_000);
+  assert.equal(callTimeoutMs('tools/call', {name: 'read_chat', arguments: {}}), 660_000);
+  assert.equal(callTimeoutMs('tools/call', {arguments: {timeout_secs: 3600}}), 3_630_000);
+  assert.equal(callTimeoutMs('tools/call', {arguments: {requests: [{timeout_secs: 60}, {timeout_secs: 1800}]}}), 1_830_000);
   for (const chat of ['first', 'second']) {
     process.env.ZERON_PI_MCP = JSON.stringify({name:'zeron',command:process.execPath,args:[process.argv[1],'server'],env:{ZERON_CHAT_ID:chat}});
     const handlers = {}, tools = {};

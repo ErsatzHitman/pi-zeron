@@ -157,10 +157,24 @@ Zeron's existing delegation uses a temporary MCP bridge loaded with
 `--extension`. Every Pi chat also gets `--append-system-prompt` with
 `crates/harness/src/pi/visuals.md`, which describes the charts, diagrams and
 tables Zeron draws ([chat visuals](reference/chat-visuals.md)). An
-orchestrator's root chat (the sidebar's Orchestrator tab) additionally gets
-`orchestrator::ROOT_PROMPT`: it hands
-each task to a Pi session in the right folder through `zeron_create_chat` and
-follows it with the other `zeron_*` tools. The user's pi-herdr-delegate
+orchestrator's root chat (the sidebar's Orchestrator tab) runs with its own
+profile instead of the coding one:
+
+- `--system-prompt` with `crates/proto/src/orchestrator_root.md` in place of
+  Pi's coding prompt: it hands each task to a Pi session in the right folder
+  through `zeron_create_chat` and follows it with the other `zeron_*` tools;
+- `--tools` limited to `orchestrator::ROOT_TOOLS` (the `zeron_*` tools,
+  read-only `read`/`ls`/`find`/`grep`, `ask_user`, `todo`, `goal_*` and the
+  memory reads): no bash, edits or extension delegation tools;
+- `--no-mcp`, `--no-skills`, `--no-prompt-templates` and
+  `--no-context-files`.
+
+A session in an orchestrator's tree keeps Pi's coding prompt and every tool,
+and also gets `crates/proto/src/orchestrator_member.md`: report in the final
+reply, and the tree's depth limit. The engine marks each run with
+`ZERON_ROLE` (`orchestrator` or `member`, unset for a plain chat) and, for a
+member, `ZERON_TREE_DEPTH`, in both the Zeron MCP server's env and Pi's own,
+so extensions can change their behaviour too. The user's pi-herdr-delegate
 extension sees `ZERON_PI_MCP` and starts its children the same way, so they
 join the tree. Image attachments are sent as native image blocks; image-only
 tool results do not yet render inline.

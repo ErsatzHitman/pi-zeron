@@ -2,6 +2,17 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
+// A tool call outlives the longest wait it asks for (wait_for_turn, or any
+// request of a batch), with 11 minutes as the floor.
+export function callTimeoutMs(method, params) {
+  if (method !== "tools/call") return 15_000;
+  const args = params?.arguments ?? {};
+  const requests = Array.isArray(args.requests) ? args.requests : [];
+  const secs = [args.timeout_secs, ...requests.map(r => r?.timeout_secs)]
+    .map(Number).filter(Number.isFinite);
+  return Math.max(660_000, (secs.length ? Math.max(...secs) : 0) * 1000 + 30_000);
+}
+
 export default function (pi) {
   const config = JSON.parse(process.env.ZERON_PI_MCP);
   let child, lines, nextId = 0;
@@ -30,11 +41,12 @@ export default function (pi) {
         cleanup();
         reject(new Error("Zeron MCP request cancelled"));
       };
-      // wait_for_turn can legitimately wait several minutes.
       const timer = setTimeout(() => {
+        child?.stdin.write(JSON.stringify({jsonrpc: "2.0", method: "notifications/cancelled", params: {requestId: id}}) + "
+");
         cleanup();
         reject(new Error(`Zeron MCP ${method} timed out`));
-      }, method === "tools/call" ? 660_000 : 15_000);
+      }, callTimeoutMs(method, params));
       pending.set(id, {
         resolve: value => { cleanup(); resolve(value); },
         reject: error => { cleanup(); reject(error); },
