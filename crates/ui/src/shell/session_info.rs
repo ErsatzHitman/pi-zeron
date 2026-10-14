@@ -1,8 +1,9 @@
 //! The session panel: where this chat runs and what is working under it, in
 //! one card at the transcript's right. Its essentials (machine, project,
 //! working directory, session, branch and changes) always show. The goal,
-//! the agent's todo list, the sub-agents and sub-sessions, and the commands
-//! Pi runs in the background each get a section only while active: a
+//! the agent's todo list, the sub-agents and sub-sessions, the commands Pi
+//! runs in the background, and Pi's auto-compaction once the context nears
+//! where it compacts each get a section only while active: a
 //! section grows in at the bottom when its work starts and folds away when
 //! it ends (see `sections.rs`). A section's header folds it.
 //!
@@ -21,14 +22,18 @@ use zeron_proto::extension_ui::{ExtensionUiAction, PiUiAction};
 use zeron_proto::{Chat, ChatIndicator, CheckoutDiff};
 
 mod agents;
+mod compact;
 mod sections;
 mod todos;
 
+use crate::settings::accounts;
 use crate::todo_panel::{self, FoldSide, TodoPanelState, TodoRow};
 use agents::{AgentKind, AgentList, AgentRow};
+use compact::{CompactMeter, Phase};
 use sections::{ActiveSections, Entry, SectionKey, stack_height};
 use todos::TodoList;
 use zeron_proto::TodoItem;
+use zeron_proto::extension_ui::CompactStatus;
 
 /// The card's width, its inset from the column's right edge, and the
 /// least gap the reading column keeps from it.
@@ -44,6 +49,10 @@ const GOAL: &str = "goal";
 const TODOS: &str = "todos";
 const AGENTS: &str = "agents";
 const BACKGROUND: &str = "background";
+const COMPACT: &str = "compact";
+/// The Compaction section's body: the bar line, a gap, the caption line and
+/// its bottom padding.
+const COMPACT_BODY_HEIGHT: f32 = 40.0;
 
 /// The panel's own state, held on the shell across chats.
 #[derive(Default)]
@@ -73,6 +82,8 @@ pub(super) struct SessionPanel {
     /// A side chat's title is being edited in its row: Sub-agents stays up
     /// even with nothing running.
     pub(super) rename_pin: bool,
+    /// The chat whose Compaction section is up, for its hysteresis.
+    compact_shown: (String, bool),
     /// The card's painted height, which the btw pane opens at.
     card_height: Rc<Cell<f32>>,
 }
@@ -84,6 +95,7 @@ enum SectionData {
     Todos(TodoList),
     Agents(AgentList),
     Background(Vec<AgentRow>),
+    Compact(CompactMeter),
 }
 
 /// One `WatchCheckoutDiffs` frame: every checkout, or one that changed.
@@ -652,6 +664,23 @@ impl Shell {
                 SectionData::Background(background),
             ));
         }
+        let (compact, usage) = {
+            let state = self.state.read(cx);
+            (
+                state.extension_ui.of(&chat.id).and_then(CompactStatus::of),
+                state.context_usage,
+            )
+        };
+        let shown = matches!(&self.session_panel.compact_shown, (id, true) if *id == chat.id);
+        let meter = CompactMeter::of(compact.as_ref(), usage, shown);
+        self.session_panel.compact_shown = (chat.id.clone(), meter.is_some());
+        if let Some(meter) = meter {
+            active.push((
+                SectionKey::Compact,
+                meter.since(),
+                SectionData::Compact(meter),
+            ));
+        }
         let frame_time = self.render_time.unwrap_or_else(|| self.motion_time());
         let pulse =
             self.session_panel
@@ -899,6 +928,10 @@ impl Shell {
             SectionData::Background(rows) => (
                 self.render_background(rows, theme, cx),
                 stack_height(rows.len()),
+            ),
+            SectionData::Compact(meter) => (
+                self.render_compact(meter, theme, cx),
+                stack_height(0) + popover::MENU_GAP + COMPACT_BODY_HEIGHT,
             ),
         };
         section_frame(entry.key.id(), t, estimate, entry.measured.clone(), rows)
@@ -1577,6 +1610,151 @@ impl Shell {
             out.push(self.render_agent_row(row, theme, cx));
         }
         out
+    }
+
+    /// Pi's auto-compaction near its limit, or running: a bar toward where
+    /// Pi compacts, and what happens next. Near and compacting share one
+    /// fixed-height body, so the switch moves nothing.
+    fn render_compact(
+        &mut self,
+        meter: &CompactMeter,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let compacting = meter.compacting();
+        let fraction = meter.fraction();
+        let (pill, tone) = if compacting {
+            ("Compacting", theme.accent)
+        } else if meter.error.is_some() {
+            ("Failed", theme.danger)
+        } else {
+            (
+                "Near limit",
+                accounts::usage_color(accounts::usage_level(fraction), theme),
+            )
+        };
+        let spinner = compacting.then(|| {
+            crate::loaders::mini_glyph_spinner(
+                "session-info-compacting",
+                2.0,
+                theme.glyph,
+                cx.entity_id(),
+                cx,
+            )
+            .into_any_element()
+        });
+        let action = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .children(spinner)
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(6.0))
+                    .rounded_full()
+                    .bg(tone.opacity(0.14))
+                    .text_size(crate::typography::ui_rems(10.5))
+                    .text_color(tone)
+                    .child(pill),
+            );
+        let mut rows = vec![
+            popover::picker_divider().into_any_element(),
+            self.render_section_header(
+                COMPACT,
+                "Compaction",
+                None,
+                Some(action.into_any_element()),
+                theme,
+                cx,
+            ),
+        ];
+        if !self.session_panel.is_open(COMPACT) {
+            return rows;
+        }
+        // Compacting, the bar is full: the context is past where Pi starts.
+        let filled = if compacting { 1.0 } else { fraction };
+        let percent = (!compacting).then(|| format!("{}%", (fraction * 100.0).round() as u32));
+        let elapsed = match &meter.phase {
+            Phase::Compacting {
+                since: Some(since), ..
+            } => Some(elapsed_label(
+                "session-info-compact-elapsed".into(),
+                // A remote host's clock may run ahead of this one.
+                (*since).min(Utc::now()),
+                theme.text_muted,
+            )),
+            _ => None,
+        };
+        let caption_color = if meter.error.is_some() && !compacting {
+            theme.danger
+        } else {
+            theme.text_muted
+        };
+        rows.push(
+            div()
+                .id("session-info-compact")
+                .debug_selector(|| "session-info-compact".into())
+                .h(px(COMPACT_BODY_HEIGHT))
+                .px(px(9.0))
+                .pb(px(4.0))
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .h(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(4.0))
+                                .rounded_full()
+                                .overflow_hidden()
+                                .bg(theme.wash(0.08))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui::relative(filled.max(0.015)))
+                                        .rounded_full()
+                                        .bg(tone.opacity(0.85)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(34.0))
+                                .flex_none()
+                                .text_right()
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_muted)
+                                .children(percent),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(caption_color)
+                                .child(meter.caption()),
+                        )
+                        .children(elapsed),
+                )
+                .into_any_element(),
+        );
+        rows
     }
 }
 

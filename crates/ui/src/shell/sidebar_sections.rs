@@ -757,6 +757,7 @@ mod tests {
             "session-info-todos-header",
             "session-info-agents-header",
             "session-info-background-header",
+            "session-info-compact-header",
         ] {
             assert!(cx.debug_bounds(header).is_none(), "{header}");
         }

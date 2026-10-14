@@ -23,8 +23,7 @@ pub(super) enum SectionKey {
     Todos,
     Agents,
     Background,
-    /// The auto-compact indicator.
-    #[allow(dead_code)]
+    /// Auto-compaction near its limit, or running.
     Compact,
 }
 

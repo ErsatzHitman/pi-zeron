@@ -22,9 +22,10 @@ A setting saved by an older build that hid the panel is ignored.
 | Goal | Only while pi-goal has an active goal: its status (Running, Waiting, Paused, Blocked, Budget reached), the objective and its progress line. It replaces the line that used to run beside the transcript and the goal chip in the composer footer |
 | Todo | Only while the agent has a checklist with work left: one row per item (done, in progress with a spinner while the turn runs, pending), and the header counts `done/total`. A list the agent has finished shows only until its turn ends. Lists over six items fold to the current item and its neighbours, with "N earlier" and "N later" rows. Read-only; it mirrors the composer's checklist tray |
 | Sub-agents | See below |
+| Compaction | Pi chats only, with auto-compaction on: shown once the context is within 10% of the model's window of where Pi compacts (the window less its reserve from Pi's settings), and while a compaction runs, manual ones too. A bar fills toward that point with its percent, and the caption says where it compacts, or that it is compacting with a live timer, or why the last one failed. Once shown it stays until the context is 12% away. The header's pill reads Near limit, Compacting or Failed |
 | Background | Only while one of Pi's background bash commands runs (the `bash-background` extension moves a command there after 20 seconds): one row per command with a live timer. Its Stop appears on hover; the first click asks, and the second sends Kill |
 
-The essentials, from Machine to Changes, always show. Goal, Todo, Sub-agents and Background appear only while active: nothing running means no sections. They have no fixed order. A section that becomes active grows in at the bottom, and one whose work ends folds away while the others close up; the card does not reorder what is already showing. Sections already active when a chat opens appear at once, ordered by when their work started. A section's header folds it, and a fold lasts for the app run.
+The essentials, from Machine to Changes, always show. Goal, Todo, Sub-agents, Background and Compaction appear only while active: nothing running means no sections. They have no fixed order. A section that becomes active grows in at the bottom, and one whose work ends folds away while the others close up; the card does not reorder what is already showing. Sections already active when a chat opens appear at once, ordered by when their work started. A section's header folds it, and a fold lasts for the app run.
 
 ## Sub-agents
 
@@ -63,6 +64,8 @@ Fork chat is gone. The Files panel no longer has Subagents or Chats sections; th
 `session_info/todos.rs` decides when the Todo section shows; the list, its folding and the status glyphs come from `todo_panel.rs`.
 
 `shell/btw_pane.rs` hosts the btw pane: one at a time, scoped to its conversation, backed by an ordinary side chat (`side_chats.rs`) attached to no right-pane tab.
+
+`session_info/compact.rs` decides when Compaction shows and what it says, from the Pi harness's `zeron:compact` host channel (`CompactStatus`: on or off, the threshold, a running compaction) and the chat's context usage.
 
 `session_info/agents.rs` builds the Sub-agents rows from `AppState`, and decides when Sub-agents and Background are active:
 
