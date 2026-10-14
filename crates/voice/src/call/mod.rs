@@ -565,7 +565,7 @@ mod tests {
             },
             ..config
         };
-        let error = run(config, commands_rx, events, Stop::default())
+        let error = run(config.clone(), commands_rx, events, Stop::default())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Deepgram"));

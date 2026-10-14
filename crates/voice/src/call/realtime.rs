@@ -992,7 +992,7 @@ mod tests {
     use super::*;
 
     fn config(provider: RealtimeProvider) -> Realtime {
-        let model = provider.models()[0];
+        let model = &provider.models()[0];
         Realtime {
             provider,
             api_key: "key".into(),
