@@ -64,6 +64,7 @@ use crate::theme::Theme;
 use crate::transcript::{self, Transcript, TranscriptEvent};
 
 mod actions_ui;
+mod btw_pane;
 mod chat_dropzone;
 #[cfg(test)]
 mod chat_dropzone_tests;
@@ -1339,6 +1340,15 @@ impl WidthTween {
         }
     }
 
+    /// [`Self::new`] at the quicker exit pace of [`motion::MENU_OUT`].
+    fn exit(from: f32, to: f32) -> Self {
+        Self {
+            duration: motion::MENU_OUT.total().mul_f32(motion::speed_scale()),
+            curve: motion::MENU_OUT.curve,
+            ..Self::new(from, to)
+        }
+    }
+
     /// A panel column moving from `from` to `to`. Longer moves take longer,
     /// so a wide pane travels at about the pace of the sidebar instead of
     /// covering twice the distance in the same time: 180ms up to the
@@ -2036,6 +2046,11 @@ pub struct Shell {
     closed_screens: Vec<u64>,
     side_chats: std::collections::HashMap<u64, SideChatTab>,
     side_chat_seq: u64,
+    /// btw: the side chat in the small pane beside the session panel, and
+    /// the pane's reveal.
+    btw: Option<btw_pane::BtwPane>,
+    btw_tween: Option<WidthTween>,
+    btw_shown: bool,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
@@ -2580,6 +2595,9 @@ impl Shell {
             closed_screens: Vec::new(),
             side_chats: std::collections::HashMap::new(),
             side_chat_seq: 0,
+            btw: None,
+            btw_tween: None,
+            btw_shown: false,
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -11320,15 +11338,13 @@ impl Shell {
             .relative()
             .left(px(-session_reserve / 2.0))
             .child(self.render_status_strip(composer_width, cx));
-        let session_card = self.render_session_info(
-            session_docked,
-            session_reveal,
-            self.viewport_height
-                - Theme::TITLEBAR_HEIGHT
-                - self.bottom_stack.get()
-                - 24.0,
-            cx,
-        );
+        let session_max_height =
+            self.viewport_height - Theme::TITLEBAR_HEIGHT - self.bottom_stack.get() - 24.0;
+        let session_card =
+            self.render_session_info(session_docked, session_reveal, session_max_height, cx);
+        let btw_pane = self.btw_frame(cx).and_then(|(id, reveal)| {
+            self.render_btw_pane(id, reveal, session_reveal, session_max_height, cx)
+        });
         self.chat_dropzone("chat-dropzone", self.composer.clone(), cx)
             .debug_selector(|| "chat-dropzone".into())
             .track_focus(&self.navigation_focus.main)
@@ -11393,6 +11409,7 @@ impl Shell {
                 },
             )
             .children(session_card)
+            .children(btw_pane)
             .when_some(harness_update_card, |column, chip| {
                 // Home notices stay anchored to the window bottom, behind the
                 // dock. Clip paint and hitboxes at the same measured terminal

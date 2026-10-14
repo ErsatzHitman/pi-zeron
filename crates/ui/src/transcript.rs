@@ -3386,6 +3386,11 @@ pub struct Transcript {
     /// Width held free at the column's right for a docked side card; the
     /// reading column centers in what remains.
     right_reserve: f32,
+    /// The rows' side padding: 48px, narrower in a small pane.
+    side_gutter: f32,
+    /// The chrome over the viewport's top that the first row clears: the
+    /// titlebar, or nothing in a pane below it.
+    top_inset: f32,
     /// Last global code-fence layout generation applied to this transcript.
     /// Each instance owns separate scroll handles and list measurements, so
     /// every one must reset itself after a global Fit-mode transition.
@@ -3884,6 +3889,8 @@ impl Transcript {
             typography_generation: crate::typography::generation(cx),
             content_width: crate::settings::transcript_width(cx),
             right_reserve: 0.0,
+            side_gutter: 48.0,
+            top_inset: Theme::TITLEBAR_HEIGHT,
             code_fences_generation: crate::settings::code_fences_generation(cx),
             compact_mode: crate::settings::transcript_compact_mode(cx),
             compact_live_entries: HashSet::new(),
@@ -3957,6 +3964,26 @@ impl Transcript {
             if self.pinned {
                 self.wake_spring();
             }
+            cx.notify();
+        }
+    }
+
+    /// Host-driven: the rows' side padding (see `side_gutter`).
+    pub fn set_side_gutter(&mut self, gutter: f32, cx: &mut Context<Self>) {
+        let gutter = gutter.max(0.0);
+        if (self.side_gutter - gutter).abs() > 0.25 {
+            self.side_gutter = gutter;
+            self.list.remeasure();
+            cx.notify();
+        }
+    }
+
+    /// Host-driven: the chrome over the viewport's top (see `top_inset`).
+    pub fn set_top_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
+        let inset = inset.max(0.0);
+        if (self.top_inset - inset).abs() > 0.25 {
+            self.top_inset = inset;
+            self.list.remeasure();
             cx.notify();
         }
     }
@@ -7856,7 +7883,7 @@ impl Transcript {
             if self.doc_override.is_some() {
                 Theme::SPACE_LG
             } else {
-                Theme::TITLEBAR_HEIGHT + Theme::SPACE_LG + 10.0
+                self.top_inset + Theme::SPACE_LG + 10.0
             }
         } else {
             top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
@@ -8243,8 +8270,8 @@ impl Transcript {
             .pb(px(bottom_pad))
             // Keep side gutters as the configurable column shrinks to fit;
             // a docked side card's room comes off the right.
-            .pl(px(48.0))
-            .pr(px(48.0 + self.right_reserve))
+            .pl(px(self.side_gutter))
+            .pr(px(self.side_gutter + self.right_reserve))
             .child(
                 div()
                     .w_full()

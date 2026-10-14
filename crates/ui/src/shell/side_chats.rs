@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) struct SideChatTab {
     pub state: Entity<AppState>,
-    transcript: Entity<Transcript>,
+    pub(super) transcript: Entity<Transcript>,
     pub(super) composer: Entity<Composer>,
     _events: Vec<Subscription>,
 }
@@ -25,7 +25,11 @@ impl Shell {
 
     /// Side-chat creation failed (nothing to fork yet, an engine or remote
     /// device error): say why in the conversation's composer.
-    fn show_side_chat_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub(super) fn show_side_chat_error(
+        &mut self,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         let message = message.into();
         self.composer
             .update(cx, |composer, cx| composer.show_error(message, cx));
@@ -48,19 +52,7 @@ impl Shell {
             return;
         };
         let key = self.panel_key(cx);
-        let mut chat = parent.clone();
-        chat.id = uuid::Uuid::new_v4().to_string();
-        chat.parent_chat_id = Some(parent.id.clone());
-        chat.title = None;
-        chat.archived = false;
-        chat.created_at = Utc::now();
-        chat.last_message_at = None;
-        chat.last_message_preview = None;
-        chat.last_seen_at = None;
-        chat.harness_session_id = None;
-        chat.harness_session_cwd = None;
-        chat.room_gen = Some(2);
-        self.open_side_chat_tab(chat, key, true, cx);
+        self.open_side_chat_tab(btw_pane::forked_child(&parent), key, true, cx);
     }
 
     /// Open an existing side chat (a footer row) in the right pane.
@@ -116,12 +108,12 @@ impl Shell {
         // closed (explorer-only pane, or hidden with its tabs kept): open it
         // beside the explorer first, for an existing tab too.
         self.open_surfaces_for(&key, cx);
-        if let Some((&id, _)) = self
-            .side_chats
-            .iter()
-            .find(|(_, tab)| tab.state.read(cx).selected_chat.as_deref() == Some(&chat.id))
-        {
-            // A closed tab kept for its draft is detached: re-attach it.
+        if let Some(id) = self.side_chat_tab_for(&chat.id, cx) {
+            // A closed tab kept for its draft is detached: re-attach it. One
+            // in the btw pane moves here: a chat shows in one place.
+            if self.btw_holds(id) {
+                self.drop_btw_pane();
+            }
             let tabs = self.right_tabs.entry(key.clone()).or_default();
             if !tabs.contains(&RightSurface::SideChat(id)) {
                 tabs.push(RightSurface::SideChat(id));
@@ -134,6 +126,35 @@ impl Shell {
             }
             cx.notify();
             return;
+        }
+        let id = self.build_side_chat_tab(chat, unsaved, cx);
+        self.right_tabs
+            .entry(key.clone())
+            .or_default()
+            .push(RightSurface::SideChat(id));
+        self.panels
+            .update(&key, |p| p.right_active = RightSurface::SideChat(id));
+        cx.notify();
+    }
+
+    /// The loaded side chat showing `chat_id`, attached anywhere or not.
+    pub(super) fn side_chat_tab_for(&self, chat_id: &str, cx: &App) -> Option<u64> {
+        self.side_chats
+            .iter()
+            .find(|(_, tab)| tab.state.read(cx).selected_chat.as_deref() == Some(chat_id))
+            .map(|(&id, _)| id)
+    }
+
+    /// Load `chat` as a side chat (its own state, transcript and composer),
+    /// attached to no host yet; its id. One already loaded is reused.
+    pub(super) fn build_side_chat_tab(
+        &mut self,
+        chat: zeron_proto::Chat,
+        unsaved: bool,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        if let Some(id) = self.side_chat_tab_for(&chat.id, cx) {
+            return id;
         }
         let chat_id = chat.id.clone();
         let parent = self.state.clone();
@@ -201,13 +222,7 @@ impl Shell {
                 _events: events,
             },
         );
-        self.right_tabs
-            .entry(key.clone())
-            .or_default()
-            .push(RightSurface::SideChat(id));
-        self.panels
-            .update(&key, |p| p.right_active = RightSurface::SideChat(id));
-        cx.notify();
+        id
     }
 
     fn remove_deleted_side_chats(&mut self, cx: &mut Context<Self>) {
@@ -255,6 +270,12 @@ impl Shell {
         };
         let transcript = tab.transcript.clone();
         let composer = tab.composer.clone();
+        // A chat handed over from the btw pane takes the pane's gutters back.
+        transcript.update(cx, |transcript, cx| {
+            transcript.set_side_gutter(48.0, cx);
+            transcript.set_top_inset(Theme::TITLEBAR_HEIGHT, cx);
+            transcript.set_rail_enabled(true, cx);
+        });
         // Share the main chat's docked width cap and responsive padding. Size
         // from the width the pane lays out at, not its mask, which an open or
         // close animates.
@@ -442,6 +463,50 @@ mod tests {
 
     /// "New side chat" writes nothing: the tab opens on a chat only its
     /// first send mints, and closing it before then leaves nothing behind.
+    #[gpui::test]
+    fn btw_opens_in_its_pane_and_hands_over_to_the_sidebar(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = shell_window(dir.path(), cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.active_chat = "main".into();
+                let main: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+                    "id": "main", "deviceId": "local",
+                    "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap();
+                shell.state.update(cx, |state, _| {
+                    state.chats = vec![main];
+                    state.selected_chat = Some("main".into());
+                });
+                let key = shell.panel_key(cx);
+                shell.open_btw_pane(cx);
+                let id = shell.side_chat_seq;
+                assert!(shell.btw_holds(id));
+                assert!(shell.side_chats[&id].state.read(cx).side_chat_unsaved());
+                // The right pane is left alone.
+                assert!(shell.right_tabs.get(&key).is_none_or(Vec::is_empty));
+                // A second + focuses the pane it has.
+                shell.open_btw_pane(cx);
+                assert_eq!(shell.side_chats.len(), 1);
+                // Open in sidebar: the same chat becomes a right-pane tab.
+                shell.btw_to_sidebar(cx);
+                assert!(!shell.btw_holds(id));
+                assert_eq!(shell.right_tabs[&key], vec![RightSurface::SideChat(id)]);
+
+                // Closed with nothing typed, an unsaved side chat goes once
+                // the pane's exit has played.
+                shell.open_btw_pane(cx);
+                let second = shell.side_chat_seq;
+                assert_ne!(second, id);
+                assert!(shell.close_btw_pane(cx));
+                assert_eq!(shell.btw_frame(cx), None);
+                assert!(!shell.side_chats.contains_key(&second));
+                assert!(shell.side_chats.contains_key(&id));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn new_side_chat_is_unsaved_until_its_first_send(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
