@@ -81,7 +81,7 @@ export const fromDocParts = (
   parts.map((p): SessionMessagePart => {
     switch (p.kind) {
       case "image":
-        return typeof p.path === "string" && p.path.length > 0 && typeof p.name === "string" && p.name.length > 0 && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(p.mimeType ?? "")
+        return typeof p.path === "string" && p.path.length > 0 && typeof p.name === "string" && p.name.length > 0 && ["image/png", "image/jpeg", "image/webp", "image/gif", "text/html"].includes(p.mimeType ?? "")
           ? { kind: "image", id: p.id, path: p.path, name: p.name, mimeType: p.mimeType! }
           : { kind: "error", id: p.id, message: "Generated image unavailable" };
       case "tool":

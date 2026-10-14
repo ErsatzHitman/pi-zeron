@@ -746,9 +746,7 @@ pub struct ImportedImage {
 
 const MAX_GENERATED_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
 
-/// The type an agent-published HTML page (`html_render`) carries as a
-/// generated asset.
-pub const PAGE_MIME: &str = "text/html";
+pub use zeron_proto::PAGE_MIME;
 const MAX_PAGE_BYTES: u64 = 25 * 1024 * 1024;
 
 fn raster_signature(bytes: &[u8]) -> Option<(&'static str, &'static str)> {

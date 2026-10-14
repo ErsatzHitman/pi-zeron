@@ -150,7 +150,10 @@ tells the agent not to describe the page in its reply.
 
 For Pi, the normalizer turns a successful `zeron_html_render` result into a
 `GeneratedImage` part with type `text/html`. The engine accepts that path only
-when it sits directly in the uploads folder.
+when it sits directly in the uploads folder. The session doc keeps that type
+on read: the transcript decoders (`doc/schema.rs` `image_part`, and
+`edge/src/session-doc/messages.ts`) accept `text/html` beside the raster
+types, and iOS shows the page as a chip.
 
 The transcript embeds the page live in the reply, as T3 Code's sandboxed
 iframe does, but with a native webview: the right pane's `BrowserSurface` in

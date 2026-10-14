@@ -392,6 +392,11 @@ impl RowBuilder {
                                 rows.push(Placed { core: core.clone(), gap });
                             }
                         }
+                        MessagePart::Image { id, name, mime_type, .. } if mime_type == zeron_proto::PAGE_MIME => {
+                            // A published HTML page: no inline web view here, so a chip names it.
+                            let gap = gap_for(&rows, false);
+                            rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "globe", ColorRole::TextTertiary, name)), gap });
+                        }
                         MessagePart::Image { id, path, .. } => {
                             let gap = gap_for(&rows, false);
                             let core = Arc::new(RowCore {

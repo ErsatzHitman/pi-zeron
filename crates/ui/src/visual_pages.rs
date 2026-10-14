@@ -26,7 +26,7 @@ use crate::browser::{BrowserContext, BrowserSurface, model::Presentation};
 use crate::theme::Theme;
 
 /// The type a published page's message part carries.
-pub const PAGE_MIME: &str = "text/html";
+pub use zeron_proto::PAGE_MIME;
 /// Pages kept addressable; the oldest goes first.
 const MAX_PAGES: usize = 32;
 const CSP: &str = "sandbox allow-scripts allow-popups; connect-src 'none'; form-action 'none'";

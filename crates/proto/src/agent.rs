@@ -573,6 +573,10 @@ pub enum DoneStatus {
     Errored,
 }
 
+/// The type an agent-published HTML page (`html_render`) carries as a
+/// generated asset, beside the raster image types.
+pub const PAGE_MIME: &str = "text/html";
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors zeron's `AgentEvent` tagged enum.
@@ -593,7 +597,8 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
-    /// A generated raster asset. The engine materializes this path before publication.
+    /// A generated asset: a raster image, or a published HTML page
+    /// (`PAGE_MIME`). The engine materializes this path before publication.
     #[serde(rename_all = "camelCase")]
     GeneratedImage {
         id: String,
