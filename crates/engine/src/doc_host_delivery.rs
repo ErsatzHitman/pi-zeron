@@ -232,23 +232,44 @@ mod tests {
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
-                    loop {
-                        let n = stream.read(&mut buf).await.unwrap();
+                    let head = loop {
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
                         if n == 0 {
                             return;
                         }
                         request.extend_from_slice(&buf[..n]);
-                        if request.windows(4).any(|s| s == b"\r\n\r\n") {
-                            break;
+                        if let Some(end) = request.windows(4).position(|s| s == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    // Read the whole body before answering: closing a socket
+                    // with unread bytes resets it on Windows, and the client
+                    // then sees an error instead of the status.
+                    let text = String::from_utf8_lossy(&request[..head]).to_ascii_lowercase();
+                    let length = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while request.len() < head + length {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
                         }
                     }
-                    assert!(
-                        String::from_utf8_lossy(&request).starts_with("POST /device/remote/nudge ")
-                    );
-                    count.fetch_add(1, Ordering::SeqCst);
-                    let response = format!(
-                        "HTTP/1.1 {} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    // Only the wake is under test; anything else the host
+                    // sends to the edge (outbox rows) is simply accepted.
+                    let nudge = text.starts_with("post /device/remote/nudge ");
+                    let status = if nudge {
+                        count.fetch_add(1, Ordering::SeqCst);
                         code.load(Ordering::SeqCst)
+                    } else {
+                        200
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                 });
@@ -299,9 +320,21 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        // Row delivery and wake delivery are independent: the rows drain
+        // while the wake keeps failing.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.has_pending_chat_updates("outgoing").unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("row delivery and wake delivery are independent");
         assert!(
-            !store.has_pending_chat_updates("outgoing").unwrap(),
-            "row delivery and wake delivery are independent"
+            store
+                .sync_job_version("outgoing", "remote-wake")
+                .unwrap()
+                .is_some(),
+            "the failed wake is still owed"
         );
         host.shutdown_workers().await;
         workspace.flush();
