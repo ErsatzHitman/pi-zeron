@@ -143,6 +143,8 @@ jobs:
           node-version: 24
       - name: Delete guard corpus
         run: node crates/harness/tests/fixtures/pi-delete-guard-test.mjs crates/harness/src/pi/guard.mjs
+      - name: Delete guard reaches child Pi processes
+        run: node crates/harness/tests/fixtures/pi-delete-guard-child-test.mjs crates/harness/src/pi/guard.mjs crates/harness/src/pi/guard-preload.mjs
       - name: Install preview fixture server
         run: npm ci --prefix edge
       - name: Project discovery, stable URLs and HMR in native WebKit

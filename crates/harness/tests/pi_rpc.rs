@@ -984,7 +984,10 @@ async fn chat_runs_load_the_delete_guard() {
     let installed = std::fs::read_dir(dir.path().join("pi-guard"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "mjs"))
+        .find(|path| {
+            path.extension().is_some_and(|ext| ext == "mjs")
+                && !path.to_string_lossy().contains("preload")
+        })
         .expect("the guard is installed");
     assert!(
         text.contains(&format!("ext={} ", installed.display())),

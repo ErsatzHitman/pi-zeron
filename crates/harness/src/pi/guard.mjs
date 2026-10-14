@@ -3,6 +3,7 @@
 // A guard against mistakes and model-driven deletes, not a sandbox.
 import { readFileSync, statSync } from "node:fs";
 import { basename, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 // ---- on/off: FORCE > live file > spawn snapshot > ON
 let seen = { file: "", mtimeMs: -1, size: -1, on: undefined };
@@ -381,8 +382,24 @@ export function decide(event, annotations, cwd) {
   return selfProtect(event) ?? classifyCall({ toolName: event.toolName, input: event.input ?? {}, annotations, cwd });
 }
 
+// ---- children: every Pi this one starts loads the guard too. Pi's child
+// launchers re-run this script with its loader flags (`process.execArgv`), so
+// the preload joins them; it hands each child Pi `--extension <guard>`. This
+// Pi's script is named so the preload touches no other node program.
+export function inheritIntoChildren(proc = process) {
+  const preload = proc.env.ZERON_DELETE_GUARD_PRELOAD;
+  if (!preload || !proc.env.ZERON_DELETE_GUARD_EXT) return false;
+  if (proc.argv[1]) proc.env.ZERON_DELETE_GUARD_PI = resolve(proc.argv[1]);
+  const url = pathToFileURL(preload).href;
+  const flags = proc.execArgv;
+  if (!flags.some((arg, i) => arg === `--import=${url}` || (arg === "--import" && flags[i + 1] === url)))
+    flags.push(`--import=${url}`);
+  return true;
+}
+
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
 export default function deleteGuard(pi) {
+  inheritIntoChildren();
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
     if (!guardOn()) return;
     let h;

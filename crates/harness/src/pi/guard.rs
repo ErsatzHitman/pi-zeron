@@ -1,6 +1,10 @@
 //! The delete guard: one bundled Pi extension (`guard.mjs`) loaded into every
-//! real Pi run, with or without the MCP bridge, and handed to the user's own
-//! child launchers through env. A guard against mistakes, not a sandbox.
+//! real Pi run, with or without the MCP bridge. Every Pi that run starts
+//! (fleet subagents, loop workers) gets it too: the extension adds a node
+//! preload (`guard-preload.mjs`) to the flags Pi's child launchers pass on,
+//! and the preload hands each child Pi the extension. Its path is also in
+//! env for launchers that pass extensions themselves. A guard against
+//! mistakes, not a sandbox.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::{HarnessError, process::Command};
 
 const SOURCE: &str = include_str!("guard.mjs");
+const PRELOAD: &str = include_str!("guard-preload.mjs");
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
 /// What a spawn tells the guard.
@@ -30,7 +35,9 @@ pub type DeleteGuardSetting = Arc<dyn Fn() -> DeleteGuard + Send + Sync>;
 pub(super) fn configure(cmd: &mut Command, guard: &DeleteGuard) -> Result<(), HarnessError> {
     // Fail closed: a run started without its guard is never covered, even
     // once the toggle turns on.
-    let path = install(&guard.dir).map_err(|error| {
+    let installed = install(&guard.dir)
+        .and_then(|path| install_preload(&guard.dir).map(|preload| (path, preload)));
+    let (path, preload) = installed.map_err(|error| {
         HarnessError::Protocol(format!(
             "the delete guard could not be installed in {}: {error}",
             guard.dir.display()
@@ -38,6 +45,7 @@ pub(super) fn configure(cmd: &mut Command, guard: &DeleteGuard) -> Result<(), Ha
     })?;
     cmd.arg("--extension").arg(&path);
     cmd.env("ZERON_DELETE_GUARD_EXT", &path)
+        .env("ZERON_DELETE_GUARD_PRELOAD", &preload)
         .env("ZERON_DELETE_GUARD", if guard.enabled { "1" } else { "0" });
     match &guard.state_file {
         Some(file) => cmd.env("ZERON_DELETE_GUARD_FILE", file),
@@ -60,32 +68,44 @@ fn fnv1a(text: &str) -> u64 {
 }
 
 fn current(path: &Path) -> bool {
-    std::fs::read(path).is_ok_and(|bytes| bytes == SOURCE.as_bytes())
+    holds(path, SOURCE)
+}
+
+fn holds(path: &Path, source: &str) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| bytes == source.as_bytes())
+}
+
+fn install(dir: &Path) -> std::io::Result<PathBuf> {
+    install_file(dir, "zeron-delete-guard", SOURCE)
+}
+
+fn install_preload(dir: &Path) -> std::io::Result<PathBuf> {
+    install_file(dir, "zeron-delete-guard-preload", PRELOAD)
 }
 
 /// Content-addressed and never pruned: a long-lived Pi from before an
 /// upgrade still hands the old path to its children.
-fn install(dir: &Path) -> std::io::Result<PathBuf> {
-    let path = dir.join(format!("zeron-delete-guard-{:016x}.mjs", fnv1a(SOURCE)));
-    if current(&path) {
+fn install_file(dir: &Path, stem: &str, source: &str) -> std::io::Result<PathBuf> {
+    let path = dir.join(format!("{stem}-{:016x}.mjs", fnv1a(source)));
+    if holds(&path, source) {
         return Ok(path);
     }
     std::fs::create_dir_all(dir)?;
     // A unique temporary per call: two spawns in one engine must not
     // truncate each other's file before it is renamed into place.
     let tmp = dir.join(format!(
-        ".zeron-delete-guard-{}-{}.tmp",
+        ".{stem}-{}-{}.tmp",
         std::process::id(),
         NEXT_TMP.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, SOURCE)?;
+    std::fs::write(&tmp, source)?;
     let renamed = std::fs::rename(&tmp, &path);
     let _ = std::fs::remove_file(&tmp);
     match renamed {
         Ok(()) => Ok(path),
         // A racing spawn won (a Windows rename-over fails while the file is
         // open).
-        Err(_) if current(&path) => Ok(path),
+        Err(_) if holds(&path, source) => Ok(path),
         Err(error) => Err(error),
     }
 }
@@ -129,6 +149,20 @@ mod tests {
         std::fs::write(&path, "// cut").unwrap();
         assert_eq!(install(dir.path()).unwrap(), path);
         assert!(current(&path));
+    }
+
+    #[test]
+    fn the_preload_installs_beside_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = install(dir.path()).unwrap();
+        let preload = install_preload(dir.path()).unwrap();
+        assert_ne!(guard, preload);
+        assert!(holds(&preload, PRELOAD));
+        let name = preload.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("zeron-delete-guard-preload-"));
+        assert_eq!(install_preload(dir.path()).unwrap(), preload);
+        assert!(SOURCE.contains("inheritIntoChildren();"));
+        assert!(PRELOAD.contains("ZERON_DELETE_GUARD_PI"));
     }
 
     #[test]
