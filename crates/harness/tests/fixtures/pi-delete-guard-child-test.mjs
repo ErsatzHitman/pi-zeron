@@ -3,7 +3,7 @@
 // extension. Run as `node <this> <guard.mjs> <guard-preload.mjs>`.
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
-import {mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
+import {mkdtempSync, readFileSync, realpathSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -99,6 +99,7 @@ const paneSeen = JSON.parse(pane.stdout);
 assert.deepEqual(paneSeen.argv, ['--extension', guardPath, '--mode', 'json']);
 assert.equal(paneSeen.ext, guardPath);
 assert.equal(paneSeen.file, join(dir, 'prefs.json'));
-assert.equal(resolve(paneSeen.preload), resolve(configured));
+// macOS temp is a symlink (/var -> /private/var).
+assert.equal(realpathSync(paneSeen.preload), realpathSync(configured));
 
 console.log('delete guard child coverage passed');
