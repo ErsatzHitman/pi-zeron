@@ -170,8 +170,17 @@ impl Normalizer {
                         input_tokens: input,
                         output_tokens: n("output"),
                     });
+                    // Pi's own footer (getAssistantUsage): an aborted or
+                    // failed reply, or one that reports no tokens (a retried
+                    // 429, a stop before the first token), says nothing
+                    // about the context. `None` keeps the last measurement.
+                    let tokens = Some(n("totalTokens"))
+                        .filter(|t| *t > 0)
+                        .unwrap_or(input + n("output"));
+                    let measured = tokens > 0
+                        && !matches!(message["stopReason"].as_str(), Some("aborted" | "error"));
                     events.push(AgentEvent::ContextUsage {
-                        tokens: Some(input + n("output")),
+                        tokens: measured.then_some(tokens),
                         window: self.window,
                     });
                 }
@@ -417,6 +426,37 @@ fn tool(name: &str, args: &Value) -> ToolCall {
 mod tests {
     use super::*;
     use serde_json::json;
+    fn context_tokens(events: &[AgentEvent]) -> Option<Option<u64>> {
+        events.iter().find_map(|event| match event {
+            AgentEvent::ContextUsage { tokens, .. } => Some(*tokens),
+            _ => None,
+        })
+    }
+    #[test]
+    fn only_a_reply_that_measured_the_context_moves_the_context_circle() {
+        let mut n = Normalizer::default();
+        let end = |stop: &str, usage: serde_json::Value| json!({"type":"message_end","message":{"role":"assistant","stopReason":stop,"content":[],"usage":usage}});
+        let real = json!({"input":1000,"output":200,"cacheRead":300,"cacheWrite":0});
+        let zero = json!({"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0});
+        // A tool-call reply carries real usage.
+        assert_eq!(
+            context_tokens(&n.map(&end("toolUse", real.clone()))),
+            Some(Some(1500))
+        );
+        // Pi's own total wins when it reports one.
+        let total = json!({"input":10,"output":5,"totalTokens":4321});
+        assert_eq!(
+            context_tokens(&n.map(&end("stop", total))),
+            Some(Some(4321))
+        );
+        // Aborted, failed and all-zero replies keep the last measurement.
+        assert_eq!(
+            context_tokens(&n.map(&end("aborted", zero.clone()))),
+            Some(None)
+        );
+        assert_eq!(context_tokens(&n.map(&end("error", real))), Some(None));
+        assert_eq!(context_tokens(&n.map(&end("stop", zero))), Some(None));
+    }
     #[test]
     fn final_message_reconciles_without_duplicate_text_and_retry_clears_error() {
         let mut n = Normalizer::default();
