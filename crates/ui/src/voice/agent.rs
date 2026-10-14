@@ -1,79 +1,20 @@
-//! The coding agent behind voice mode. The assistant cannot read or change
-//! code itself: it hands requests to the agent in the user's chat through
-//! the composer's own send path, answers questions about its progress, and
-//! passes on when the agent finishes or needs the user.
+//! The coding agent behind voice mode. What the user says goes to the agent
+//! in their chat through the composer's own send path, exactly as if typed;
+//! voice then follows that chat and reads the agent's messages aloud
+//! ([`super::narrator`]) while the agent keeps working.
 use super::*;
-use crate::{composer::Composer, state::AppState, transcript::Transcript};
+use crate::{composer::Composer, state::AppState};
 use gpui::{Entity, WeakEntity};
-use serde_json::{Value, json};
 use zeron_proto::view::Indicator;
 
-/// What the assistant drives: the app state, and the window's composer and
-/// transcript.
+/// How long a dropped watch waits before it subscribes again.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What voice drives: the app state and the window's composer.
 #[derive(Clone)]
 pub(crate) struct AgentBridge {
     pub state: Entity<AppState>,
     pub composer: WeakEntity<Composer>,
-    pub transcript: WeakEntity<Transcript>,
-}
-
-pub(super) const INSTRUCTIONS: &str = "You are the voice of Zeron, a desktop app where a coding \
-agent works in the user's projects. You cannot read files, run commands or change code yourself. \
-For any coding, repository, file, terminal or computer task, call ask_agent with one complete, \
-self-contained instruction in the user's own terms, then say in a few words that the agent is on \
-it. The agent works in the background; an automatic update arrives when it finishes or needs the \
-user, and you then tell the user what happened in a sentence or two. Use agent_status to answer \
-questions about its progress or what it said, summarizing rather than reading its reply out. \
-Call stop_agent only when the user asks to stop it.";
-
-/// The agent's reply, as much of it as the assistant reads.
-const REPLY_CHARS: usize = 1500;
-/// What an update quotes of the agent's reply.
-const NEWS_CHARS: usize = 600;
-
-pub(super) fn tools() -> Vec<call::Tool> {
-    let no_arguments = json!({ "type": "object", "properties": {} });
-    vec![
-        call::Tool {
-            name: "ask_agent".into(),
-            description: "Send an instruction or question to the coding agent in the user's \
-                          current chat. It works in the background; this returns at once."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "The complete instruction, as the user would type it.",
-                    },
-                },
-                "required": ["message"],
-            }),
-        },
-        call::Tool {
-            name: "agent_status".into(),
-            description: "Whether the coding agent is working, waiting for the user or done, \
-                          and its latest reply."
-                .into(),
-            parameters: no_arguments.clone(),
-        },
-        call::Tool {
-            name: "stop_agent".into(),
-            description: "Stop the coding agent's current run.".into(),
-            parameters: no_arguments,
-        },
-    ]
-}
-
-/// `text` cut to at most `max` characters, on a word.
-fn clip(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        return text.to_owned();
-    }
-    let cut: String = text.chars().take(max).collect();
-    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
-    format!("{cut}…")
 }
 
 impl VoiceController {
@@ -83,158 +24,121 @@ impl VoiceController {
         })
     }
 
-    /// The agent's newest reply in its chat, if it answered the latest prompt.
-    fn latest_reply(&self, agent: &AgentBridge, cx: &App) -> Option<String> {
-        let chat = self.agent_chat.as_deref()?;
-        let state = agent.state.read(cx);
-        if state.selected_chat.as_deref() == Some(chat)
-            && let Some(reply) = agent
-                .transcript
-                .upgrade()
-                .and_then(|t| t.read(cx).latest_reply())
-        {
-            return Some(reply);
-        }
-        state
-            .chats
-            .iter()
-            .find(|c| c.id == chat)?
-            .last_message_preview
-            .clone()
-    }
-
-    /// The app changed: tell the user when the agent finishes or needs them.
+    /// The app changed: the orb shows whether the agent is working or
+    /// waiting for the user.
     pub(super) fn agent_changed(&mut self, cx: &mut Context<Self>) {
         let Some(agent) = self.agent.clone() else {
             return;
         };
         let now = self.agent_indicator(&agent, cx);
-        let before = std::mem::replace(&mut self.agent_seen, now);
-        if before == now {
+        if std::mem::replace(&mut self.agent_seen, now) != now {
+            self.sync_work(cx);
+        }
+    }
+
+    /// Send what the user said to the agent as a prompt, then follow the
+    /// chat it went to.
+    pub(super) fn send_prompt(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(agent) = self.agent.clone() else {
             return;
-        }
-        self.sync_work(cx);
-        let reply = || {
-            self.latest_reply(&agent, cx)
-                .map(|r| format!(" Its reply: {}", clip(&r, NEWS_CHARS)))
-                .unwrap_or_default()
         };
-        let news = match (before, now) {
-            (Indicator::Working | Indicator::AwaitingInput, Indicator::None) => {
-                Some(format!("The coding agent finished.{}", reply()))
-            }
-            (_, Indicator::AwaitingInput) => Some(format!(
-                "The coding agent is waiting for the user's answer in the chat.{}",
-                reply()
-            )),
-            (_, Indicator::Errored) => Some("The coding agent stopped with an error.".to_owned()),
-            _ => None,
+        let sent = match agent.composer.upgrade() {
+            Some(composer) => composer.update(cx, |composer, cx| composer.send_spoken(text, cx)),
+            None => Err("The chat is not open.".to_owned()),
         };
-        if let Some(news) = news {
-            self.command(call::Command::Announce(news), cx);
-        }
-    }
-
-    pub(super) fn run_tool(&mut self, call: call::ToolCall, cx: &mut Context<Self>) {
-        let answer = match self.agent.clone() {
-            None => "No coding agent is connected.".to_owned(),
-            Some(agent) => match call.name.as_str() {
-                "ask_agent" => self.ask_agent(&agent, &call.arguments, cx),
-                "agent_status" => self.status(&agent, cx),
-                "stop_agent" => self.stop_agent(&agent, cx),
-                other => format!("There is no tool called {other}."),
-            },
-        };
-        let _ = call.reply.send(answer);
-    }
-
-    fn ask_agent(
-        &mut self,
-        agent: &AgentBridge,
-        arguments: &Value,
-        cx: &mut Context<Self>,
-    ) -> String {
-        let message = arguments
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        if message.is_empty() {
-            return "No instruction was given.".into();
-        }
-        let Some(composer) = agent.composer.upgrade() else {
-            return "The chat is not open.".into();
-        };
-        match composer.update(cx, |composer, cx| composer.send_spoken(message, cx)) {
-            Ok(chat) => {
-                self.agent_chat = Some(chat);
-                self.agent_seen = self.agent_indicator(agent, cx);
+        match sent {
+            Ok((chat, message)) => {
+                if self.agent_chat.as_deref() != Some(chat.as_str()) || self.narration.is_none() {
+                    self.follow(chat, Some(message), cx);
+                }
+                self.agent_seen = self.agent_indicator(&agent, cx);
                 self.sync_work(cx);
-                "Sent. The agent is working on it in the background; an update will follow \
-                 when it finishes."
-                    .into()
             }
-            Err(reason) => reason,
+            Err(reason) => self.notice(format!("That wasn't sent. {reason}"), true, cx),
         }
     }
 
-    fn status(&self, agent: &AgentBridge, cx: &App) -> String {
-        let Some(chat) = self.agent_chat.as_deref() else {
-            return "No chat is open and the agent has not been asked anything yet.".into();
-        };
-        let state = agent.state.read(cx);
-        let title = state
-            .chats
-            .iter()
-            .find(|c| c.id == chat)
-            .and_then(|c| c.title.clone())
-            .unwrap_or_else(|| "Untitled chat".into());
-        let doing = match state.indicator_for(chat, chrono::Utc::now()) {
-            Indicator::Working => "working",
-            Indicator::AwaitingInput => "waiting for the user's answer",
-            Indicator::Errored => "stopped with an error",
-            Indicator::None => "idle",
-        };
-        let reply = self
-            .latest_reply(agent, cx)
-            .map(|r| format!(" Latest reply: {}", clip(&r, REPLY_CHARS)))
-            .unwrap_or_default();
-        format!("Chat “{title}”: the agent is {doing}.{reply}")
-    }
-
-    fn stop_agent(&mut self, agent: &AgentBridge, cx: &mut Context<Self>) -> String {
-        let Some(chat) = self.agent_chat.clone() else {
-            return "There is no agent run to stop.".into();
-        };
-        if self.agent_indicator(agent, cx) == Indicator::None {
-            return "The agent is not running.".into();
+    /// Read `chat` aloud from now on: watch its transcript and say what the
+    /// agent writes. `anchor` is the prompt just sent there.
+    pub(super) fn follow(&mut self, chat: String, anchor: Option<String>, cx: &mut Context<Self>) {
+        self.agent_chat = Some(chat.clone());
+        if let Some(agent) = self.agent.clone() {
+            self.agent_seen = self.agent_indicator(&agent, cx);
         }
-        let Some(composer) = agent.composer.upgrade() else {
-            return "The chat is not open.".into();
+        let Some(engine) = self.engine.clone() else {
+            self.narration = None;
+            return;
         };
-        composer.update(cx, |composer, cx| composer.interrupt_chat(chat, cx));
-        "Asked the agent to stop.".into()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn replies_are_clipped_on_a_word() {
-        assert_eq!(clip("  short ", 10), "short");
-        assert_eq!(clip("one two three four", 9), "one two…");
-        assert_eq!(clip("supercalifragilistic", 5), "super…");
-    }
-
-    #[test]
-    fn tools_describe_their_arguments() {
-        let tools = tools();
-        let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["ask_agent", "agent_status", "stop_agent"]);
-        assert_eq!(tools[0].parameters["required"][0], "message");
-        assert_eq!(tools[1].parameters["type"], "object");
+        let epoch = self.epoch;
+        self.narration = Some(cx.spawn(async move |this, cx| {
+            // The chat's transcript copy and what has been read of it.
+            let mut state = (narrator::Narrator::new(anchor), Vec::new());
+            loop {
+                let params = serde_json::json!({ "chatId": chat });
+                let watch = engine
+                    .client()
+                    .subscribe_checked(zeron_rpc::methods::WATCH_DOC_MESSAGES, params)
+                    .await;
+                let mut frames = match watch {
+                    Ok(frames) => frames,
+                    Err(err) => {
+                        tracing::warn!(%chat, error = %err, "voice transcript watch failed");
+                        cx.background_executor().timer(RETRY).await;
+                        if this.update(cx, |_, _| {}).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                while let Some(value) = frames.recv().await {
+                    // Decoded and read off the UI thread: a chat's first copy
+                    // can be large.
+                    let (next, lines, applied) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let (mut narrator, mut entries) = state;
+                            let applied =
+                                serde_json::from_value::<zeron_doc::TranscriptUpdate>(value)
+                                    .ok()
+                                    .is_some_and(|update| {
+                                        zeron_doc::apply_transcript_frame(
+                                            &mut entries,
+                                            update.frame,
+                                        )
+                                        .is_ok()
+                                    });
+                            let lines = if applied {
+                                narrator.update(&entries)
+                            } else {
+                                Vec::new()
+                            };
+                            ((narrator, entries), lines, applied)
+                        })
+                        .await;
+                    state = next;
+                    let alive = this.update(cx, |voice, cx| {
+                        if voice.epoch != epoch {
+                            return;
+                        }
+                        for line in lines {
+                            let (item, text) = (line.item, line.text);
+                            voice.command(call::Command::Say { item, text }, cx);
+                        }
+                    });
+                    if alive.is_err() {
+                        return;
+                    }
+                    // A copy that no longer applies resubscribes for a fresh
+                    // one; the narrator remembers what it has read.
+                    if !applied {
+                        break;
+                    }
+                }
+                cx.background_executor().timer(RETRY).await;
+                if this.update(cx, |_, _| {}).is_err() {
+                    return;
+                }
+            }
+        }));
     }
 }

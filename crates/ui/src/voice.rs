@@ -1,9 +1,10 @@
-//! Window-owned voice mode. A call is a spoken conversation run on this
-//! device by `zeron_voice::call`: speech to text, an OpenRouter reply and an
-//! OpenRouter voice. The assistant hands real work to the coding agent in
-//! the user's chat ([`agent`]) and tells them when it finishes. A call
-//! survives navigation between threads; only an explicit end, losing the
-//! engine it reports to or a provider failure closes it.
+//! Window-owned voice mode, run on this device by `zeron_voice::call`. What
+//! the user says is transcribed and sent to the coding agent in their chat
+//! as a prompt ([`agent`]); the agent works exactly as it does for typed
+//! prompts, and its own messages are read aloud as it writes them
+//! ([`narrator`]). A call survives navigation between threads; only an
+//! explicit end, losing the engine it reports to or a provider failure
+//! closes it.
 use crate::orb::OrbState;
 use crate::state::EngineHandle;
 use gpui::{App, Context, Task};
@@ -11,6 +12,7 @@ use gpui_tokio::Tokio;
 use zeron_proto::voice::*;
 use zeron_voice::call;
 mod agent;
+mod narrator;
 mod permissions;
 
 pub(crate) use agent::AgentBridge;
@@ -41,13 +43,15 @@ pub struct VoiceController {
     epoch: u64,
     task: Option<Task<()>>,
     cancellation: tokio_util::sync::CancellationToken,
-    /// The assistant is working out a reply.
-    thinking: bool,
-    /// The coding agent the assistant talks to, and the chat it works in.
+    /// What the user said is being transcribed.
+    transcribing: bool,
+    /// The coding agent prompts go to, and the chat voice reads aloud.
     agent: Option<AgentBridge>,
     pub agent_chat: Option<String>,
     agent_seen: zeron_proto::view::Indicator,
     agent_watch: Option<gpui::Subscription>,
+    /// Watches `agent_chat` and passes the agent's messages to the voice.
+    narration: Option<Task<()>>,
     notices: u64,
     /// This call played its start sound and owes its end sound.
     cued: bool,
@@ -72,11 +76,12 @@ impl Default for VoiceController {
             epoch: 0,
             task: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
-            thinking: false,
+            transcribing: false,
             agent: None,
             agent_chat: None,
             agent_seen: zeron_proto::view::Indicator::None,
             agent_watch: None,
+            narration: None,
             notices: 0,
             cued: false,
         }
@@ -94,11 +99,11 @@ impl VoiceController {
         matches!(self.phase, VoicePhase::Checking) || self.phase.replaces_composer()
     }
 
-    /// Start a call. `agent` lets the assistant drive the coding agent;
+    /// Start a call. `agent` is where prompts go and what is read aloud;
     /// `engine` is the connection it reports to.
     pub(crate) fn start(
         &mut self,
-        mut config: call::Config,
+        config: call::Config,
         engine: Option<EngineHandle>,
         agent: Option<AgentBridge>,
         cx: &mut Context<Self>,
@@ -112,15 +117,18 @@ impl VoiceController {
         self.chat_id = None;
         self.reason = None;
         self.failure = None;
+        let chat = agent
+            .as_ref()
+            .and_then(|agent| agent.state.read(cx).selected_chat.clone());
         if let Some(agent) = &agent {
-            config.instructions = agent::INSTRUCTIONS.to_owned();
-            config.tools = agent::tools();
-            self.agent_chat = agent.state.read(cx).selected_chat.clone();
-            self.agent_seen = self.agent_indicator(agent, cx);
             self.agent_watch =
                 Some(cx.observe(&agent.state, |voice, _, cx| voice.agent_changed(cx)));
         }
         self.agent = agent;
+        // The open chat is read from the start: its history stays unread.
+        if let Some(chat) = chat {
+            self.follow(chat, None, cx);
+        }
         let epoch = self.epoch;
         self.reduce(
             VoiceEvent::Snapshot {
@@ -142,7 +150,7 @@ impl VoiceController {
         let cancellation = self.cancellation.clone();
         let (controls, control_rx) = tokio::sync::mpsc::channel(16);
         self.controls = Some(controls);
-        // Streamed reply deltas outnumber everything else; keep room for them.
+        // Meters outnumber everything else; keep room for them.
         let (events, mut event_rx) = tokio::sync::mpsc::channel(512);
         let query = Tokio::spawn(cx, async move {
             permissions::microphone().await.map_err(Failure::Rejected)?;
@@ -218,9 +226,10 @@ impl VoiceController {
         self.task = None;
         self.stage_open = false;
         self.active_since = None;
-        self.thinking = false;
+        self.transcribing = false;
         self.agent = None;
         self.agent_watch = None;
+        self.narration = None;
     }
 
     /// End the session (any phase). The provider stop runs in the background.
@@ -275,7 +284,7 @@ impl VoiceController {
         self.command(call::Command::Mute(!muted), cx);
     }
 
-    /// Stop the assistant mid-sentence.
+    /// Stop reading aloud, dropping what was left to say.
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
         self.command(call::Command::Interrupt, cx);
     }
@@ -336,26 +345,34 @@ impl VoiceController {
                     self.reduce(VoiceEvent::Snapshot { snapshot }, cx);
                 }
             }
-            call::Event::Thinking(thinking) => {
-                self.thinking = thinking;
+            call::Event::Transcribing(transcribing) => {
+                self.transcribing = transcribing;
                 self.sync_work(cx);
             }
-            call::Event::User { turn, text } => self.reduce(
-                transcript(format!("user-{turn}"), VoiceRole::User, text),
-                cx,
-            ),
-            call::Event::AssistantDelta { turn, text } => self.reduce(
-                VoiceEvent::Partial {
-                    generation: GENERATION,
-                    item_id: Some(format!("assistant-{turn}")),
-                    text,
-                },
-                cx,
-            ),
-            call::Event::AssistantDone { turn, text } => self.reduce(
-                transcript(format!("assistant-{turn}"), VoiceRole::Assistant, text),
-                cx,
-            ),
+            call::Event::User { turn, text } => {
+                self.reduce(
+                    transcript(format!("user-{turn}"), VoiceRole::User, text.clone()),
+                    cx,
+                );
+                self.send_prompt(text, cx);
+            }
+            // Each message read aloud builds one caption, a sentence at a time.
+            call::Event::Speaking { item, text } => {
+                let item = format!("agent-{item}");
+                let text = if self.caption_item() == Some(item.as_str()) {
+                    format!(" {text}")
+                } else {
+                    text
+                };
+                self.reduce(
+                    VoiceEvent::Partial {
+                        generation: GENERATION,
+                        item_id: Some(item),
+                        text,
+                    },
+                    cx,
+                );
+            }
             call::Event::Interrupted => {}
             call::Event::Levels {
                 microphone,
@@ -370,23 +387,48 @@ impl VoiceController {
                 },
                 cx,
             ),
-            call::Event::Tool(call) => self.run_tool(call, cx),
-            call::Event::Notice(text) => {
-                self.notices += 1;
-                let item = format!("notice-{}", self.notices);
-                self.reduce(transcript(item, VoiceRole::Assistant, text), cx);
-            }
+            call::Event::Notice(text) => self.notice(text, false, cx),
         }
     }
 
+    /// Caption a failure the call survives; `speak` also says it.
+    fn notice(&mut self, text: String, speak: bool, cx: &mut Context<Self>) {
+        self.notices += 1;
+        let item = format!("notice-{}", self.notices);
+        if speak {
+            self.command(
+                call::Command::Say {
+                    item: item.clone(),
+                    text: text.clone(),
+                },
+                cx,
+            );
+        }
+        let Some(session_id) = self.session_id() else {
+            return;
+        };
+        self.reduce(
+            VoiceEvent::Final {
+                transcript: VoiceTranscript {
+                    session_id,
+                    item_id: item,
+                    role: VoiceRole::Assistant,
+                    text,
+                    promoted_message_id: None,
+                },
+            },
+            cx,
+        );
+    }
+
     /// The orb's work state: the agent waiting on the user, or work underway
-    /// (the agent running or the assistant thinking).
+    /// (the agent running, or what the user said being transcribed).
     fn sync_work(&mut self, cx: &mut Context<Self>) {
         let agent = self.agent_seen;
         let work = match agent {
             zeron_proto::view::Indicator::AwaitingInput => VoiceWork::AwaitingInput,
             zeron_proto::view::Indicator::Working => VoiceWork::Working,
-            _ if self.thinking => VoiceWork::Working,
+            _ if self.transcribing => VoiceWork::Working,
             _ => VoiceWork::Idle,
         };
         if let Some(snapshot) = &mut self.snapshot
@@ -714,19 +756,24 @@ mod tests {
                 cx,
             );
             assert_eq!(voice.caption.text(), "Run the tests.");
-            voice.on_call(call::Event::Thinking(true), cx);
+            voice.on_call(call::Event::Transcribing(true), cx);
             assert_eq!(voice.orb_state(), OrbState::Working);
-            voice.on_call(call::Event::Thinking(false), cx);
-            for text in ["On it", ", I asked Pi."] {
+            voice.on_call(call::Event::Transcribing(false), cx);
+            // The agent's message is captioned as it is read, one sentence
+            // after another.
+            for text in ["I'm reading the tests.", "Running them now."] {
                 voice.on_call(
-                    call::Event::AssistantDelta {
-                        turn: 1,
+                    call::Event::Speaking {
+                        item: "a1/t1".into(),
                         text: text.into(),
                     },
                     cx,
                 );
             }
-            assert_eq!(voice.caption.text(), "On it, I asked Pi.");
+            assert_eq!(
+                voice.caption.text(),
+                "I'm reading the tests. Running them now."
+            );
             voice.on_call(
                 call::Event::Levels {
                     microphone: 0.0,
@@ -735,15 +782,7 @@ mod tests {
                 cx,
             );
             assert_eq!(voice.orb_state(), OrbState::Composing);
-            voice.on_call(
-                call::Event::AssistantDone {
-                    turn: 1,
-                    text: "On it, I asked Pi.".into(),
-                },
-                cx,
-            );
-            assert_eq!(voice.caption.role(), Some(VoiceRole::Assistant));
-            // A notice is its own caption once the reply has settled.
+            // A notice is its own caption.
             voice.on_call(call::Event::Notice("Deepgram is rate limiting.".into()), cx);
             assert_eq!(voice.caption.text(), "Deepgram is rate limiting.");
         });
