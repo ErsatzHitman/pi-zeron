@@ -58,7 +58,7 @@ The agent works in the background. When it finishes, needs an answer or fails, t
 
 ## Cost
 
-Each turn makes one transcription, one or more chat requests and one speech request per sentence. The table uses OpenRouter list prices from 14 October 2026, at about ₹95 to the US dollar (the September 2026 rate).
+Each turn makes one transcription, one or more chat requests and one speech request per sentence. The table uses OpenRouter list prices from 14 October 2026, at ₹95.32 to the US dollar (14 October 2026).
 
 | Stage | Model | Price | Per minute of conversation* |
 | --- | --- | --- | --- |
@@ -74,7 +74,7 @@ Each turn makes one transcription, one or more chat requests and one speech requ
 Calling Deepgram or Mistral directly costs the same as going through OpenRouter:
 
 - Deepgram lists Nova-3 pre-recorded audio at $0.0043 a minute ($0.0052 for multilingual) and Aura-2 at $0.030 per 1,000 characters.
-- Mistral's `voxtral-mini-latest` is reported at $0.003 a minute.
+- Mistral doesn't publish a per-minute price for `voxtral-mini-latest` on its own pages; OpenRouter lists it at $0.003 a minute.
 
 With the defaults, a call costs about ₹0.15 a minute, or ₹9 an hour. Aura 2 makes it about nine times dearer. Prices and exchange rates change, so check each provider's pricing page.
 
