@@ -1486,9 +1486,10 @@ pub fn rows_for_entry(
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
         let body = agent_message_display(&body);
-        // Chips stand in for their attachments: those leave the strip, and a
-        // chip carries its upload's path for its progress and, for an image,
-        // a click opening it.
+        // A file's chip stands in for it, so it leaves the strip; an image
+        // stays there, so the prompt shows the picture and not only its
+        // `Image N` chip. Each chip carries its upload's path for its
+        // progress and, for an image, a click opening it.
         let chips = zeron_proto::attachment_mentions::attachment_mentions(&body);
         let mut attachments = parsed.attachments;
         let (text, mut mentions) = match crate::composer::sent_mention_display(&body) {
@@ -1509,6 +1510,7 @@ pub fn rows_for_entry(
         }
         attachments.retain(|att| {
             att.appshot.is_some()
+                || crate::attachments::is_image_path(&att.path)
                 || !chips
                     .iter()
                     .any(|chip| crate::attachments::chip_names_attachment(chip, &att.path))
@@ -15851,7 +15853,14 @@ mod tests {
         else {
             panic!("expected a user row");
         };
-        assert!(attachments.is_empty());
+        // The image keeps its thumbnail; the files are their chips.
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|a| a.path.as_str())
+                .collect::<Vec<_>>(),
+            ["pending://att-1/Image 1.png"]
+        );
         let mentions = mentions.clone();
         transcript.update(cx, |transcript, cx| {
             let overlays = transcript.chip_overlays(&"u5".into(), &mentions, &Theme::dark(), cx);
@@ -15927,14 +15936,17 @@ mod tests {
             })
             .collect();
         assert_eq!(labels, ["Image 1", "notes.md", "composer.rs"]);
-        // Chips stand in for their attachments: only the unchipped image is
-        // left in the strip, and each attachment chip carries its upload.
+        // A file's chip stands in for it; every image stays in the strip,
+        // and each attachment chip carries its upload.
         assert_eq!(
             attachments
                 .iter()
                 .map(|a| a.path.as_str())
                 .collect::<Vec<_>>(),
-            ["/uploads/0a1b2c3d-Image_3.png"]
+            [
+                "/uploads/ab12cd34-Image_1.png",
+                "/uploads/0a1b2c3d-Image_3.png"
+            ]
         );
         assert_eq!(
             mentions
