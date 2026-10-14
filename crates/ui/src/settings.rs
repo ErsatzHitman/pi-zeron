@@ -38,6 +38,8 @@ pub mod widgets;
 pub const SIDEBAR_MIN: f32 = 242.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
+/// Voice mode answers after this much quiet.
+pub const VOICE_PAUSE_DEFAULT_MS: u32 = 800;
 
 /// Independent file explorer width preference and drag bounds (px).
 pub const FILES_PANEL_DEFAULT: f32 = 286.0;
@@ -836,6 +838,25 @@ pub struct UiSettings {
     pub stt_remove_fillers: bool,
     /// Ending a dictation with it rewrites the text; empty turns it off.
     pub stt_trigger_phrase: String,
+    /// Voice mode's speech-to-text provider. Its key, like OpenRouter's for
+    /// the reply and the voice, is kept in `stt-keys.json`.
+    pub voice_stt_provider: zeron_voice::call::SttProvider,
+    /// `None` is the provider's default model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_stt_model: Option<String>,
+    /// The OpenRouter chat model that answers; `None` is the first listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_reply_model: Option<String>,
+    /// The OpenRouter speech model; `None` is the first listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_speech_model: Option<String>,
+    /// One of the speech model's voices; `None` is its first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_name: Option<String>,
+    /// Talking over the assistant interrupts it.
+    pub voice_barge_in: bool,
+    /// The pause, in milliseconds, that ends what the user is saying.
+    pub voice_pause_ms: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
@@ -1039,6 +1060,13 @@ impl Default for UiSettings {
             stt_language: None,
             stt_remove_fillers: true,
             stt_trigger_phrase: zeron_voice::DEFAULT_TRIGGER_PHRASE.to_owned(),
+            voice_stt_provider: zeron_voice::call::SttProvider::default(),
+            voice_stt_model: None,
+            voice_reply_model: None,
+            voice_speech_model: None,
+            voice_name: None,
+            voice_barge_in: true,
+            voice_pause_ms: VOICE_PAUSE_DEFAULT_MS,
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
@@ -1689,6 +1717,13 @@ impl UiSettings {
             stt_language,
             stt_remove_fillers,
             stt_trigger_phrase,
+            voice_stt_provider,
+            voice_stt_model,
+            voice_reply_model,
+            voice_speech_model,
+            voice_name,
+            voice_barge_in,
+            voice_pause_ms,
             window_geometry,
             composer_send_behavior,
             skills_in_slash_menu,
@@ -2720,6 +2755,13 @@ mod tests {
             stt_language: Some("hi".into()),
             stt_remove_fillers: false,
             stt_trigger_phrase: "make it shorter".into(),
+            voice_stt_provider: zeron_voice::call::SttProvider::Deepgram,
+            voice_stt_model: Some("nova-2".into()),
+            voice_reply_model: Some("openai/gpt-4.1-nano".into()),
+            voice_speech_model: Some("deepgram/aura-2".into()),
+            voice_name: Some("aura-2-luna-en".into()),
+            voice_barge_in: false,
+            voice_pause_ms: 1200,
             window_geometry: None,
             sidebar_width: 300.0,
             sidebar_collapsed: true,

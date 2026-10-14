@@ -8,7 +8,7 @@ mod meter;
 mod model;
 pub(crate) mod waveform;
 pub(crate) use meter::{Bar, FLOOR, Meter};
-pub(crate) use model::{card, enabled, init};
+pub(crate) use model::{call_config, card, enabled, init};
 
 /// Covers the upload, transcription and an optional trigger-phrase rewrite.
 pub(crate) const FINALIZE_TIMEOUT: Duration = Duration::from_secs(60);

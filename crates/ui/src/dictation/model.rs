@@ -1,6 +1,7 @@
 //! Settings → Voice: the speech-to-text provider, its API key, model,
-//! language, microphone, filler-word cleanup and the trigger phrase. Keys live
-//! in `stt-keys.json` beside the settings file, never in `ui-settings.json`.
+//! language, microphone, filler-word cleanup and the trigger phrase, then
+//! voice mode's providers ([`voice_mode`]). Keys live in `stt-keys.json`
+//! beside the settings file, never in `ui-settings.json`.
 use crate::{
     composer::{ComposerInput, ComposerInputEvent},
     popover,
@@ -16,6 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 use zeron_voice::cloud::{Config, Provider};
+
+mod voice_mode;
+pub(crate) use voice_mode::call_config;
 
 const KEYS_FILE: &str = "stt-keys.json";
 /// Auto-detect, then fixed ISO-639-1 hints.
@@ -96,6 +100,9 @@ pub(crate) struct VoiceCard {
     keys: BTreeMap<String, String>,
     key_input: Entity<ComposerInput>,
     phrase_input: Entity<ComposerInput>,
+    /// Voice mode's OpenRouter key, and its Deepgram or Mistral key.
+    openrouter_input: Entity<ComposerInput>,
+    voice_key_input: Entity<ComposerInput>,
     /// Why the typed trigger phrase was not saved.
     phrase_problem: Option<&'static str>,
     error: Option<String>,
@@ -104,7 +111,8 @@ pub(crate) struct VoiceCard {
     model_select: widgets::SelectState,
     language_select: widgets::SelectState,
     input_select: widgets::SelectState,
-    _subscriptions: [Subscription; 2],
+    voice: voice_mode::Selects,
+    _subscriptions: Vec<Subscription>,
 }
 /// Microphones as last enumerated, refreshed off the UI thread while the page
 /// is visible so newly connected devices appear.
@@ -139,12 +147,33 @@ impl VoiceCard {
                 this.save_phrase(cx);
             }
         });
+        let key_field = |cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                ComposerInput::new("Paste an API key", cx)
+                    .with_single_line()
+                    .with_masked()
+            })
+        };
+        let openrouter_input = key_field(cx);
+        let voice_key_input = key_field(cx);
+        let openrouter_sub = cx.subscribe(&openrouter_input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.save_openrouter_key(cx);
+            }
+        });
+        let voice_key_sub = cx.subscribe(&voice_key_input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.save_voice_key(cx);
+            }
+        });
         Self {
             scroll: widgets::PageScroll::default(),
             keys: load_keys(&keys_path),
             keys_path,
             key_input,
             phrase_input,
+            openrouter_input,
+            voice_key_input,
             phrase_problem: None,
             error: None,
             inputs: Inputs::default(),
@@ -152,12 +181,25 @@ impl VoiceCard {
             model_select: widgets::SelectState::default(),
             language_select: widgets::SelectState::default(),
             input_select: widgets::SelectState::default(),
-            _subscriptions: [key_sub, phrase_sub],
+            voice: voice_mode::Selects::default(),
+            _subscriptions: vec![key_sub, phrase_sub, openrouter_sub, voice_key_sub],
         }
     }
 
     fn set_key(&mut self, key: Option<String>, cx: &mut Context<Self>) {
         let name = settings::current(cx).stt_provider.key_name();
+        let input = self.key_input.clone();
+        self.store_key(name, key, &input, cx);
+    }
+
+    /// Save or remove the key called `name`, clearing `input` once saved.
+    fn store_key(
+        &mut self,
+        name: &str,
+        key: Option<String>,
+        input: &Entity<ComposerInput>,
+        cx: &mut Context<Self>,
+    ) {
         let mut keys = self.keys.clone();
         match key {
             Some(key) => keys.insert(name.to_owned(), key),
@@ -166,15 +208,15 @@ impl VoiceCard {
         match save_keys(&self.keys_path, &keys) {
             Ok(()) => {
                 self.keys = keys;
-                self.key_input
-                    .update(cx, |input, cx| input.set_text("", cx));
+                input.update(cx, |input, cx| input.set_text("", cx));
             }
             Err(_) => {
                 self.error =
                     Some("Could not save the API key. Check folder permissions and retry.".into())
             }
         }
-        // The composer shows its microphone only while a key is saved.
+        // The composer shows its microphone and voice orb only while their
+        // keys are saved.
         cx.refresh_windows();
         cx.notify();
     }
@@ -533,6 +575,7 @@ impl Render for VoiceCard {
             vec![save_phrase],
         );
 
+        let voice_mode = self.render_voice_mode(&theme, &saved, cx);
         crate::toast::take_error(&mut self.error, cx);
         let scrollbar = popover::rail(self, "voice-page-scrollbar", &theme, cx);
         div()
@@ -593,7 +636,8 @@ impl Render for VoiceCard {
                                             fillers_switch,
                                         ))
                                         .child(phrase_row),
-                                ),
+                                )
+                                .child(voice_mode),
                         ),
                 )
                 .fade_overflow_y(&self.scroll.scroll),

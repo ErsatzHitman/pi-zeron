@@ -1960,7 +1960,6 @@ pub struct Shell {
     /// The chat selected when the stage opened; picking another closes it.
     voice_stage_selection: Option<String>,
     _voice_observation: gpui::Subscription,
-    _voice_catalog: gpui::Subscription,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under. Paint-time
     /// measurement schedules another frame whenever this value changes.
@@ -2388,11 +2387,8 @@ impl Shell {
                 .visible(false)
         });
         let voice_observation = cx.observe(&voice, |_: &mut Shell, _, cx| cx.notify());
-        // Settings → Agents installed or toggled Codex: voice follows.
-        let voice_catalog =
-            cx.observe_global::<crate::pickers::HarnessCatalogChanged>(|this: &mut Shell, cx| {
-                this.check_voice_codex(true, cx)
-            });
+        // The empty composer's send slot holds the voice orb.
+        composer.update(cx, |composer, cx| composer.attach_voice(voice.clone(), cx));
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
@@ -2442,6 +2438,13 @@ impl Shell {
                     transcript.update(cx, |t, cx| {
                         t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
                     });
+                }
+                ComposerEvent::Voice => {
+                    if this.voice.read(cx).is_live() {
+                        this.set_voice_stage_open(true, cx);
+                    } else {
+                        this.start_voice(cx);
+                    }
                 }
             }
         });
@@ -2535,7 +2538,6 @@ impl Shell {
             voice_stage_changed_at: None,
             voice_stage_selection: None,
             _voice_observation: voice_observation,
-            _voice_catalog: voice_catalog,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
@@ -2808,12 +2810,7 @@ impl Shell {
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         // Voice is an orchestrator over every thread: navigation keeps it,
         // only losing the engine that hosts it ends the session.
-        if self.voice.read(cx).chat_id.is_some()
-            && state
-                .read(cx)
-                .engine()
-                .is_none_or(|engine| !self.voice.read(cx).belongs_to(engine))
-        {
+        if self.voice.read(cx).engine_lost(state.read(cx).engine()) {
             self.voice.update(cx, |voice, cx| voice.cancel(cx));
         }
         self.prune_file_explorers(cx);
@@ -13599,9 +13596,6 @@ impl Render for Shell {
                         // Coming back to the app (often after sleep) checks
                         // at once when a check is due by the wall clock.
                         update.read(cx).poke();
-                    }
-                    if window.is_window_active() && !this.voice.read(cx).offered() {
-                        this.check_voice_codex(true, cx);
                     }
                     if !window.is_window_active() {
                         this.reset_command_palette_key_state();

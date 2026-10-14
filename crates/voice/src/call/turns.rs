@@ -227,9 +227,11 @@ mod tests {
         let mut turns = Turns::new(RATE, Duration::from_millis(600));
         turns.push(&tone(200, 0.0005), false);
         let events = turns.push(&tone(31_000, 0.2), false);
-        assert!(
-            matches!(events.last(), Some(TurnEvent::Ended(_))),
-            "{events:?}"
-        );
+        // The limit cuts the first turn; the speech that goes on starts the next.
+        let Some(TurnEvent::Ended(audio)) = events.get(2) else {
+            panic!("{events:?}")
+        };
+        assert_eq!(audio.len(), RATE as usize * MAX_TURN.as_secs() as usize);
+        assert_eq!(&events[3..], [TurnEvent::Started, TurnEvent::Confirmed]);
     }
 }

@@ -5486,6 +5486,9 @@ pub enum ComposerEvent {
         chat_id: String,
         message_id: String,
     },
+    /// The voice orb in the send slot was pressed: start voice mode, or
+    /// return to the call that is already live.
+    Voice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6333,7 +6336,24 @@ pub struct Composer {
     /// after the transcript lands instead of vanishing.
     voice_last: Option<VoiceFrame>,
     voice_tween: VoiceTween,
+    /// Voice mode's orb in the send slot, once the shell attaches its call.
+    voice_slot: Option<VoiceSlot>,
 }
+
+/// The send slot's voice orb. With nothing typed it stands where the send
+/// arrow goes; typing morphs it into the arrow (0 = orb, 1 = arrow).
+struct VoiceSlot {
+    voice: Entity<crate::voice::VoiceController>,
+    orb: Entity<crate::orb::Orb>,
+    /// `None` until the first frame, which starts settled.
+    tween: Option<VoiceTween>,
+    hovered: bool,
+    _voice: Subscription,
+}
+
+/// The slot orb's magnification of the inline preset: it fills the 28px
+/// slot the way the send circle does.
+const VOICE_SLOT_ORB_SCALE: f32 = 1.25;
 
 impl EventEmitter<ComposerEvent> for Composer {}
 
@@ -6588,6 +6608,7 @@ impl Composer {
             dictation_focus: cx.focus_handle(),
             voice_last: None,
             voice_tween: VoiceTween::default(),
+            voice_slot: None,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
@@ -9956,6 +9977,46 @@ impl Composer {
         }));
     }
 
+    /// Voice mode's hand-off: send `text` as a prompt to the selected chat
+    /// (or a new one, as Send would), queued behind a live run. Returns the
+    /// chat's id, or why nothing was sent. A draft the user is writing is
+    /// never taken.
+    pub(crate) fn send_spoken(
+        &mut self,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let draft = composer_has_content(
+            self.input.read(cx).text(),
+            self.staged().len() + self.staged_appshots().len(),
+            self.staged_comments(cx).len(),
+        );
+        if draft
+            || self.editing_queued.is_some()
+            || self.wizard.is_some()
+            || self.input.read(cx).dictation.phase.active()
+        {
+            return Err(
+                "The message box has an unsent draft. Ask the user to send or clear it first."
+                    .into(),
+            );
+        }
+        if self.send_blocked(cx) {
+            return Err("No agent can take a message here yet.".into());
+        }
+        let queue = self.run_live(cx);
+        self.failure = None;
+        self.send(text, queue, cx);
+        if let Some(failure) = &self.failure {
+            return Err(failure.to_string());
+        }
+        self.state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .ok_or_else(|| "The message was not sent.".to_owned())
+    }
+
     pub(crate) fn interrupt_selected(&mut self, cx: &mut Context<Self>) {
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
@@ -10934,12 +10995,112 @@ impl Composer {
             .into_any_element()
     }
 
+    /// Let the shell's voice call drive the send slot's orb.
+    pub(crate) fn attach_voice(
+        &mut self,
+        voice: Entity<crate::voice::VoiceController>,
+        cx: &mut Context<Self>,
+    ) {
+        let orb = cx.new(|_| {
+            crate::orb::Orb::new()
+                .size(crate::orb::OrbSize::Inline)
+                .state(crate::orb::OrbState::Breathing)
+                .state_transition(Duration::from_millis(300))
+                .scale(VOICE_SLOT_ORB_SCALE)
+                .pause_when_inactive(true)
+        });
+        let observation = cx.observe(&voice, |_, _, cx| cx.notify());
+        self.voice_slot = Some(VoiceSlot {
+            voice,
+            orb,
+            tween: None,
+            hovered: false,
+            _voice: observation,
+        });
+    }
+
+    /// Advance the send slot's orb ↔ arrow morph. `None` draws the plain
+    /// send circle (voice mode is not set up); otherwise the morph progress
+    /// (0 = orb, 1 = arrow) and whether the slot acts as the voice button.
+    /// The action follows the draft, never the animation.
+    fn update_voice_slot(
+        &mut self,
+        mode: SendButtonMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(f32, bool)> {
+        let slot = self.voice_slot.as_ref()?;
+        let voice = slot.voice.read(cx);
+        let offered = voice.offered(cx);
+        let live = voice.is_live();
+        let (state, microphone, speaker) = (
+            voice.orb_state(),
+            voice.microphone_level(),
+            voice.speaker_level(),
+        );
+        let has_content = self.input.read(cx).dictation.phase.active()
+            || composer_has_content(
+                self.input.read(cx).text(),
+                self.staged().len() + self.staged_appshots().len(),
+                self.staged_comments(cx).len(),
+            );
+        let orb = offered
+            && mode == SendButtonMode::Send
+            && !has_content
+            && self.editing_queued.is_none()
+            && self.wizard.is_none();
+        let now = Instant::now();
+        let reduced = motion::reduced_motion(cx);
+        let target = if orb { 0.0 } else { 1.0 };
+        let slot = self.voice_slot.as_mut()?;
+        let tween = slot.tween.get_or_insert(VoiceTween {
+            from: target,
+            to: target,
+            start: now,
+        });
+        tween.retarget(target, now, reduced);
+        let t = tween.value(now);
+        if !reduced && !tween.settled(now) {
+            window.request_animation_frame();
+        }
+        let hovered = slot.hovered;
+        slot.orb.update(cx, |o, cx| {
+            o.set_visible(t < 1.0, cx);
+            o.set_state(
+                if live {
+                    state
+                } else {
+                    crate::orb::OrbState::Breathing
+                },
+                cx,
+            );
+            if live {
+                o.set_audio_levels(microphone, speaker, cx);
+            } else {
+                o.set_audio_levels(0.0, 0.0, cx);
+            }
+            o.set_reduced_motion(reduced, cx);
+            // Idle, the orb holds still until pointed at: a composer must
+            // not animate forever. A live call always moves.
+            o.set_paused(!live && !hovered, cx);
+            // The outgoing glyph shrinks as the incoming one grows.
+            o.set_scale(VOICE_SLOT_ORB_SCALE * (1.0 - 0.75 * t), cx);
+        });
+        (offered || t < 1.0).then_some((t, orb))
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
+        if mode != SendButtonMode::Stop
+            && let Some((t, voice)) = self.update_voice_slot(mode, window, cx)
+        {
+            return self.render_voice_slot(mode, t, voice, &theme, cx);
+        }
         // Zeron composer-actions.tsx: a size-7 filled circle — up-arrow to
         // send/queue, a dark rounded square on the same light circle to stop.
         match mode {
@@ -10976,6 +11137,116 @@ impl Composer {
                     .into_any_element()
             }
         }
+    }
+}
+
+impl Composer {
+    /// The send slot while voice mode is set up: the orb with an empty
+    /// draft, the send arrow once there is something to send, crossfading
+    /// with a scale as one gives way to the other (the dictation morph).
+    fn render_voice_slot(
+        &mut self,
+        mode: SendButtonMode,
+        t: f32,
+        voice: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(slot) = self.voice_slot.as_ref() else {
+            return div().into_any_element();
+        };
+        let live = slot.voice.read(cx).is_live();
+        let orb = slot.orb.clone();
+        let blocked = !voice && self.send_blocked(cx);
+        let dim = if blocked { 0.35 } else { 1.0 };
+        let arrow_scale = 0.25 + 0.75 * t;
+        let arrow = div()
+            .absolute()
+            .inset_0()
+            .rounded_full()
+            .bg(theme.text.opacity(t * dim))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                crate::icons::icon(crate::icons::ARROW_UP)
+                    .size(px(14.0))
+                    .text_color(theme.bg.opacity(t))
+                    .with_transformation(gpui::Transformation::scale(gpui::size(
+                        arrow_scale,
+                        arrow_scale,
+                    ))),
+            );
+        let orb = (t < 1.0).then(|| {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(1.0 - t)
+                .child(orb)
+        });
+        let slot = div()
+            .relative()
+            .size(px(28.0))
+            .flex_none()
+            .rounded_full()
+            .child(arrow)
+            .children(orb);
+        let hover = cx.listener(|this: &mut Self, hovered: &bool, _, cx| {
+            if let Some(slot) = &mut this.voice_slot
+                && slot.hovered != *hovered
+            {
+                slot.hovered = *hovered;
+                cx.notify();
+            }
+        });
+        if voice {
+            let label = if live {
+                "Open voice"
+            } else {
+                "Start voice mode"
+            };
+            return slot
+                .id("composer-voice")
+                .debug_selector(|| "composer-voice".into())
+                .on_hover(hover)
+                .role(Role::Button)
+                .aria_label(label)
+                .tab_index(0)
+                .cursor_pointer()
+                .focus_visible(|style| style.border_1().border_color(theme.accent))
+                .tooltip(crate::settings::widgets::text_tooltip(if live {
+                    "Open voice"
+                } else {
+                    "Voice mode"
+                }))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Voice)))
+                .on_key_down(cx.listener(|_, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        cx.emit(ComposerEvent::Voice);
+                    }
+                }))
+                .into_any_element();
+        }
+        slot.id("composer-send")
+            .debug_selector(|| "composer-send".into())
+            .on_hover(hover)
+            .when(!blocked, |el| {
+                el.cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
+            })
+            .tooltip(crate::settings::widgets::text_tooltip(
+                if mode == SendButtonMode::Queue {
+                    "Queue message"
+                } else {
+                    "Send message"
+                },
+            ))
+            .into_any_element()
     }
 }
 
@@ -11567,7 +11838,7 @@ impl Render for Composer {
             }
         });
 
-        let send_button = self.render_send_button(mode, cx);
+        let send_button = self.render_send_button(mode, window, cx);
         let (voice_t, voice_frame) = self.update_voice(window, cx);
         let dictating = self.input.read(cx).dictation.phase.active();
         let microphone = self.render_dictation_button(voice_t, voice_frame.as_ref(), cx);
@@ -16949,3 +17220,113 @@ impl Composer {
 #[cfg(test)]
 #[path = "composer_dictation_tests.rs"]
 mod dictation_tests;
+
+#[cfg(test)]
+mod voice_slot_tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext, VisualTestContext};
+
+    struct SlotHost(Entity<Composer>);
+    impl Render for SlotHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.update(cx, |composer, cx| {
+                let mode = composer.button_mode(cx);
+                div()
+                    .size_full()
+                    .child(composer.render_send_button(mode, window, cx))
+            })
+        }
+    }
+
+    fn slot<'a>(
+        cx: &'a mut TestAppContext,
+        keys: &str,
+    ) -> (Entity<Composer>, &'a mut VisualTestContext) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join("stt-keys.json"), keys).unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::settings::init(crate::settings::UiSettings::default(), &dir, cx);
+            crate::dictation::init(dir.clone(), cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            SlotHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                let mut composer = Composer::new(state, cx);
+                let voice = cx.new(|_| crate::voice::VoiceController::default());
+                composer.attach_voice(voice, cx);
+                composer
+            }))
+        });
+        let composer = host.read_with(cx, |host, _| host.0.clone());
+        cx.update(|window, cx| window.draw(cx).clear());
+        (composer, cx)
+    }
+
+    #[gpui::test]
+    fn the_empty_send_slot_holds_the_voice_orb_until_typing(cx: &mut TestAppContext) {
+        let (composer, cx) = slot(cx, r#"{"openrouter":"sk-or"}"#);
+        let pressed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = pressed.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&composer, move |_, event: &ComposerEvent, _| {
+                if matches!(event, ComposerEvent::Voice) {
+                    counter.set(counter.get() + 1);
+                }
+            })
+        });
+        let orb = cx
+            .debug_bounds("composer-voice")
+            .expect("orb in the send slot");
+        assert!(cx.debug_bounds("composer-send").is_none());
+        cx.simulate_click(orb.center(), gpui::Modifiers::default());
+        assert_eq!(pressed.get(), 1, "the orb starts voice mode");
+
+        // Typing turns the slot into Send at once; the glyphs then morph.
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("run the tests", cx))
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("composer-send").is_some());
+        assert!(cx.debug_bounds("composer-voice").is_none());
+
+        // Clearing the draft brings the orb back.
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("", cx))
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("composer-voice").is_some());
+    }
+
+    #[gpui::test]
+    fn without_voice_keys_the_slot_is_the_plain_send_button(cx: &mut TestAppContext) {
+        let (_composer, cx) = slot(cx, "{}");
+        assert!(cx.debug_bounds("composer-voice").is_none());
+        assert!(cx.debug_bounds("composer-send").is_some());
+    }
+
+    #[gpui::test]
+    fn spoken_prompts_never_take_a_draft(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("half a thought", cx));
+            let refused = composer.send_spoken("run the tests".into(), cx);
+            assert!(refused.unwrap_err().contains("draft"));
+            assert_eq!(composer.input.read(cx).text(), "half a thought");
+            // With no engine the send fails and says why.
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("", cx));
+            assert!(composer.send_spoken("run the tests".into(), cx).is_err());
+        });
+    }
+}
