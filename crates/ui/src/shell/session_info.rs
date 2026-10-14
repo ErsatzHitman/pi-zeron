@@ -28,7 +28,8 @@ mod todos;
 
 use crate::settings::accounts;
 use crate::todo_panel::{self, FoldSide, TodoPanelState, TodoRow};
-use agents::{AgentKind, AgentList, AgentRow};
+use agents::AgentList;
+pub(super) use agents::{AgentKind, AgentRow};
 use compact::{CompactMeter, Phase};
 use sections::{ActiveSections, Entry, SectionKey, stack_height};
 use todos::TodoList;
@@ -255,6 +256,20 @@ fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// The selected chat's sub-agents at work (the Pi fleet's and a harness's),
+/// for the sidebar to nest under its row. Only the selected chat's roster
+/// and transcript are watched, so other rows keep their "● N" pill.
+pub(super) fn sidebar_agents(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<AgentRow> {
+    if state.selected_chat.as_deref() != Some(chat_id) {
+        return Vec::new();
+    }
+    state
+        .chats
+        .iter()
+        .find(|chat| chat.id == chat_id)
+        .map_or_else(Vec::new, |chat| agents::agent_list(state, chat, now).active)
+}
+
 /// A row's small trailing text.
 fn trailing_text(text: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div {
     div()
@@ -265,7 +280,7 @@ fn trailing_text(text: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div 
 }
 
 /// Running time since `started`, ticking while it shows.
-fn elapsed_label(id: String, started: DateTime<Utc>, color: gpui::Hsla) -> AnyElement {
+pub(super) fn elapsed_label(id: String, started: DateTime<Utc>, color: gpui::Hsla) -> AnyElement {
     div()
         .flex_none()
         .text_size(crate::typography::ui_rems(11.0))
@@ -489,7 +504,7 @@ impl Shell {
     }
 
     /// Send a Pi sub-agent's roster action (View, Kill).
-    fn send_fleet_action(
+    pub(super) fn send_fleet_action(
         &mut self,
         element: String,
         row: String,

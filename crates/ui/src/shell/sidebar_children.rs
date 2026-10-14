@@ -1,9 +1,12 @@
 //! Side chats nested under their parent in the sidebar's Sessions list
 //! (docs/reference/sidebar-side-chats.md). A listed session with live side
 //! chats wears a fold chip; open, its children hang below it on the
-//! Orchestrator tab's tree rail, in the order they started. Children never
-//! join the jump slots, cycling, pins or sections: the parent carries them.
+//! Orchestrator tab's tree rail, in the order they started. The selected
+//! session's sub-agents at work (Pi fleet, harness) hang there too, after its
+//! side chats. Children never join the jump slots, cycling, pins or
+//! sections: the parent carries them.
 
+use super::session_info::{AgentKind, AgentRow};
 use super::*;
 use std::collections::HashMap;
 use zeron_proto::view::attention_rank;
@@ -97,10 +100,11 @@ pub(super) fn needs_attention(status: ChatIndicator) -> bool {
     )
 }
 
-/// The folded parent's dot: its most urgent child's status.
-pub(super) fn rollup(kids: &[ChildEntry]) -> ChatIndicator {
+/// The folded parent's dot: its most urgent child's or sub-agent's status.
+pub(super) fn rollup(kids: &[ChildEntry], agents: &[AgentRow]) -> ChatIndicator {
     kids.iter()
         .map(|kid| kid.status)
+        .chain(agents.iter().map(|agent| agent.status))
         .min_by_key(|status| attention_rank(*status))
         .unwrap_or(ChatIndicator::Idle)
 }
@@ -160,6 +164,9 @@ pub(super) fn block_height(shown: usize, more_row: bool) -> f32 {
 /// A listed parent's children as this frame draws them.
 pub(super) struct SidebarFamily {
     pub kids: Vec<ChildEntry>,
+    /// Its sub-agents at work, listed after the side chats (the selected
+    /// session only).
+    pub agents: Vec<AgentRow>,
     pub more: usize,
     pub total: usize,
     pub open: bool,
@@ -241,22 +248,25 @@ impl Shell {
 
     /// Whether `parent`'s children show. A manual fold or unfold wins;
     /// otherwise a parent opens, and stays open, once a child runs, asks,
-    /// fails, is selected or is open beside.
+    /// fails, is selected or is open beside it, or a sub-agent works.
     fn sidebar_children_open(
         &mut self,
         parent: &str,
         kids: &[ChildEntry],
+        agents: bool,
         selected: Option<&str>,
         beside: Option<&str>,
     ) -> bool {
         if let Some(open) = self.sidebar_children_override.get(parent) {
             return *open;
         }
-        if kids.iter().any(|kid| {
-            needs_attention(kid.status)
-                || selected == Some(kid.id.as_str())
-                || beside == Some(kid.id.as_str())
-        }) {
+        if agents
+            || kids.iter().any(|kid| {
+                needs_attention(kid.status)
+                    || selected == Some(kid.id.as_str())
+                    || beside == Some(kid.id.as_str())
+            })
+        {
             self.sidebar_children_auto.insert(parent.to_owned());
         }
         self.sidebar_children_auto.contains(parent)
@@ -271,20 +281,36 @@ impl Shell {
         cx: &App,
     ) -> HashMap<String, SidebarFamily> {
         let index = ChildIndex::build(self.state.read(cx), now);
+        let working = selected
+            .map(|id| super::session_info::sidebar_agents(self.state.read(cx), id, now))
+            .unwrap_or_default();
+        let agent_parent = selected.filter(|_| !working.is_empty());
+        let listed = |parent: &str| index.has(parent) || agent_parent == Some(parent);
         self.sidebar_children_auto
-            .retain(|parent| index.has(parent));
+            .retain(|parent| listed(parent.as_str()));
         self.sidebar_children_override
-            .retain(|parent, _| index.has(parent));
+            .retain(|parent, _| listed(parent.as_str()));
         self.sidebar_children_all.retain(|parent| index.has(parent));
         let beside = self.beside_chat(cx);
         let dragging = self.dragged_sidebar_chat();
         let mut families = HashMap::new();
         for parent in parents {
             let kids = index.of(parent);
-            if kids.is_empty() {
+            let agents = if agent_parent == Some(parent) {
+                working.clone()
+            } else {
+                Vec::new()
+            };
+            if kids.is_empty() && agents.is_empty() {
                 continue;
             }
-            let open = self.sidebar_children_open(parent, kids, selected, beside.as_deref());
+            let open = self.sidebar_children_open(
+                parent,
+                kids,
+                !agents.is_empty(),
+                selected,
+                beside.as_deref(),
+            );
             let (shown, more) = if open {
                 visible_children(
                     kids,
@@ -298,14 +324,15 @@ impl Shell {
             let height = if !open || dragging.as_deref() == Some(parent) {
                 0.0
             } else {
-                block_height(shown.len(), more > 0)
+                block_height(shown.len() + agents.len(), more > 0)
             };
             families.insert(
                 parent.to_owned(),
                 SidebarFamily {
-                    total: kids.len(),
-                    rollup: rollup(kids),
+                    total: kids.len() + agents.len(),
+                    rollup: rollup(kids, &agents),
                     kids: shown,
+                    agents: if open { agents } else { Vec::new() },
                     more,
                     open,
                     height,
@@ -360,9 +387,9 @@ impl Shell {
             .hover(move |el| el.bg(hover))
             .role(gpui::Role::Button)
             .aria_label(if open {
-                "Hide side chats"
+                "Hide sub-sessions"
             } else {
-                "Show side chats"
+                "Show sub-sessions"
             })
             .child(self.sidebar_disclosure_chevron(&format!("kids:{parent}"), open, theme))
             .child(
@@ -405,13 +432,17 @@ impl Shell {
         let rail = theme.hairline(0.12);
         let selected = self.state.read(cx).selected_chat.clone();
         let beside = self.beside_chat(cx);
-        let count = family.kids.len() + usize::from(family.more > 0);
+        let count = family.kids.len() + family.agents.len() + usize::from(family.more > 0);
         let mut items = Vec::with_capacity(count);
-        for (ix, kid) in family.kids.iter().enumerate() {
+        for kid in &family.kids {
             let lit = selected.as_deref() == Some(kid.id.as_str())
                 || beside.as_deref() == Some(kid.id.as_str());
             let child = self.render_sidebar_child_row(&kid.id, kid.status, lit, now, theme, cx);
-            items.push(child_slot(child, ix + 1 == count, rail));
+            items.push(child_slot(child, items.len() + 1 == count, rail));
+        }
+        for agent in &family.agents {
+            let child = self.render_sidebar_agent_row(agent, theme, cx);
+            items.push(child_slot(child, items.len() + 1 == count, rail));
         }
         if family.more > 0 {
             let show_parent = parent.to_owned();
@@ -513,6 +544,127 @@ impl Shell {
             theme,
             cx,
         )
+    }
+
+    /// A sub-agent at work under the selected session, in the child rows'
+    /// compact shape: its state, a bot glyph, its name and running time.
+    /// A click opens it as the session panel's row does: a Pi sub-agent
+    /// through its roster View, a harness subagent in its transcript tab.
+    fn render_sidebar_agent_row(
+        &self,
+        agent: &AgentRow,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = format!("sidebar-agent-{}", agent.key());
+        let muted = theme.text_muted.opacity(0.5);
+        let glyph: AnyElement = if agent.status == ChatIndicator::AwaitingInput {
+            icon(icons::DANGER_TRIANGLE)
+                .size(px(11.0))
+                .text_color(spaces::status_dot_color(agent.status, theme))
+                .into_any_element()
+        } else {
+            loaders::mini_glyph_spinner(
+                format!("{id}-working"),
+                2.0,
+                theme.glyph,
+                self.sidebar_pane.entity_id(),
+                cx,
+            )
+            .into_any_element()
+        };
+        let clickable = matches!(
+            &agent.kind,
+            AgentKind::Fleet { view: Some(_), .. } | AgentKind::Subagent { .. }
+        );
+        let hover = theme.glass_hover();
+        let row = div()
+            .id(SharedString::from(id.clone()))
+            .debug_selector({
+                let id = id.clone();
+                move || id.clone()
+            })
+            .role(gpui::Role::Button)
+            .aria_label(agent.title.clone())
+            .h(px(CHILD_ROW_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(Theme::SPACE_SM))
+            .rounded(px(8.0))
+            .text_color(theme.text.opacity(0.8))
+            .child(
+                div()
+                    .size(px(13.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(glyph),
+            )
+            .child(
+                icon(icons::BOT)
+                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                    .flex_none()
+                    .text_color(muted),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .line_height(px(17.0))
+                    .child(agent.title.clone()),
+            )
+            .children(agent.started.map(|started| {
+                div()
+                    .flex_none()
+                    .min_w(px(30.0))
+                    .flex()
+                    .justify_end()
+                    .child(super::session_info::elapsed_label(
+                        format!("{id}-elapsed"),
+                        started,
+                        muted,
+                    ))
+            }))
+            .when_some(agent.detail.clone(), |el, detail| {
+                el.tooltip(crate::settings::widgets::text_tooltip(detail))
+            });
+        if !clickable {
+            return row.into_any_element();
+        }
+        let kind = agent.kind.clone();
+        let title = agent.title.to_string();
+        row.cursor_pointer()
+            .hover(move |el| el.bg(hover))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let selected = this.state.read(cx).selected_chat.clone();
+                if !matches!(this.route, Route::Chat)
+                    && let Some(chat) = selected
+                {
+                    this.open_chat(chat, cx);
+                }
+                match &kind {
+                    AgentKind::Fleet {
+                        element,
+                        row,
+                        view: Some(view),
+                        ..
+                    } => this.send_fleet_action(element.clone(), row.clone(), view, cx),
+                    AgentKind::Subagent { doc_id, frozen } => this.add_subagent_surface(
+                        this.active_chat.clone(),
+                        doc_id.clone(),
+                        title.clone(),
+                        *frozen,
+                        cx,
+                    ),
+                    _ => {}
+                }
+            }))
+            .into_any_element()
     }
 
     /// A child row's click: its parent becomes the open session (from any
@@ -632,14 +784,32 @@ mod tests {
 
     #[test]
     fn rollup_picks_the_most_urgent_child() {
-        assert_eq!(rollup(&[]), ChatIndicator::Idle);
+        assert_eq!(rollup(&[], &[]), ChatIndicator::Idle);
         let kids = [
             entry("a", 0, ChatIndicator::Completed),
             entry("b", 1, ChatIndicator::Working),
             entry("c", 2, ChatIndicator::AwaitingInput),
         ];
-        assert_eq!(rollup(&kids), ChatIndicator::AwaitingInput);
-        assert_eq!(rollup(&kids[..2]), ChatIndicator::Working);
+        assert_eq!(rollup(&kids, &[]), ChatIndicator::AwaitingInput);
+        assert_eq!(rollup(&kids[..2], &[]), ChatIndicator::Working);
+    }
+
+    #[test]
+    fn a_working_sub_agent_lights_a_family_of_settled_side_chats() {
+        let agent = AgentRow {
+            kind: AgentKind::Subagent {
+                doc_id: "doc".into(),
+                frozen: false,
+            },
+            title: "Explore".into(),
+            status: ChatIndicator::Working,
+            started: None,
+            trailing: None,
+            detail: None,
+        };
+        let kids = [entry("a", 0, ChatIndicator::Completed)];
+        assert_eq!(rollup(&kids, &[agent.clone()]), ChatIndicator::Working);
+        assert_eq!(rollup(&[], &[agent]), ChatIndicator::Working);
     }
 
     #[test]

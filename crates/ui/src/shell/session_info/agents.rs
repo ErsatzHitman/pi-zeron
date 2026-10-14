@@ -34,7 +34,7 @@ const BASH_CHANNEL: &str = "bash-bg:fleet";
 
 /// What a row opens or controls.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum AgentKind {
+pub(in crate::shell) enum AgentKind {
     /// A Pi sub-agent: the fleet element's key, the row's id, and the
     /// roster actions it offers.
     Fleet {
@@ -64,7 +64,7 @@ pub(super) enum AgentKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct AgentRow {
+pub(in crate::shell) struct AgentRow {
     pub kind: AgentKind,
     pub title: SharedString,
     pub status: ChatIndicator,
