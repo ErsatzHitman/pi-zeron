@@ -219,6 +219,14 @@ pub trait Harness: Send + Sync {
     fn stops_turn_in_place(&self) -> bool {
         false
     }
+    /// Whether a parked runtime lives as long as the app: the engine's idle
+    /// reaper spares it, a failed turn parks it instead of ending it, and the
+    /// user's Stop ends only the turn. Its process ends with the app, the
+    /// chat's deletion or a launch change. Drivers whose runtime is the
+    /// user's own agent session (Pi) opt in; the rest are reaped when idle.
+    fn keeps_runtime_alive(&self) -> bool {
+        false
+    }
     /// Whether a live runtime started for `live` can take `next` as its
     /// next prompt. Only a difference that changes how the runtime was
     /// launched needs a fresh one — replacing a runtime kills its background

@@ -286,6 +286,40 @@ async fn idle_mailbox_starts_another_turn_without_restarting_process() {
 }
 
 #[tokio::test]
+async fn a_refused_prompt_ends_its_turn_and_keeps_the_pi_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "reject"), c)
+        .await
+        .unwrap();
+    let mut sender = Some(tx);
+    let mut statuses = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::Done { status, .. } = event.unwrap() {
+                statuses.push(status);
+                // The same stream (and process) takes the next message.
+                if let Some(tx) = sender.take() {
+                    tx.send(SteerMessage {
+                        prompt: "hello".into(),
+                        message_id: None,
+                        attachments: Vec::new(),
+                        config: None,
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(statuses, vec![DoneStatus::Errored, DoneStatus::Completed]);
+}
+
+#[tokio::test]
 async fn steering_mode_is_selected_only_while_unconfigured() {
     for configured in [None, Some("one-at-a-time"), Some("all")] {
         let dir = tempfile::tempdir().unwrap();

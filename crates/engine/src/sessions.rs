@@ -154,6 +154,8 @@ struct RunHandle {
     /// stopping a turn when the driver [`Harness::stops_turn_in_place`].
     turn: TurnControl,
     stops_turn_in_place: bool,
+    /// [`Harness::keeps_runtime_alive`]: the user's Stop ends only the turn.
+    keeps_runtime_alive: bool,
     /// The harness stream is open. Before that there is no runtime to keep:
     /// a stop tears the pending start down instead.
     started: Arc<std::sync::atomic::AtomicBool>,
@@ -841,6 +843,9 @@ impl SessionsEngine {
                 steer_tx,
                 interrupt_token,
                 stops_turn_in_place: harness.supports_steering() && harness.stops_turn_in_place(),
+                keeps_runtime_alive: harness.supports_steering()
+                    && harness.stops_turn_in_place()
+                    && harness.keeps_runtime_alive(),
                 turn: turn.clone(),
                 started: started.clone(),
                 cancel: cancel_tx,
@@ -1057,7 +1062,17 @@ impl SessionsEngine {
     /// shells, everything the agent runs. The next message resumes the
     /// conversation in a fresh process. (Sending, steering and switching
     /// models never come here: they keep the runtime and its work.)
+    ///
+    /// A runtime that lives as long as the app ([`Harness::keeps_runtime_alive`],
+    /// Pi) is the exception: Stop ends its turn in place, and its process,
+    /// extensions and their background work stay up.
     pub async fn interrupt(&self, chat_id: &str) -> Result<bool, EngineError> {
+        let keeps_runtime = lock(&self.inner.runs)
+            .get(chat_id)
+            .is_some_and(|h| h.keeps_runtime_alive);
+        if keeps_runtime {
+            return self.stop_turn(chat_id).await;
+        }
         self.terminate(chat_id).await
     }
 
@@ -2452,6 +2467,9 @@ async fn drive_run(
     let mut held_for_background = false;
     let steerable = harness.supports_steering();
     let stops_turn_in_place = steerable && harness.stops_turn_in_place();
+    // The harness stream itself failed or ended: its Done is synthetic and
+    // nothing is left to park.
+    let mut stream_failed = false;
     // TURN-QUIESCE WATCHDOG (2026-08-12 stuck-Working incident): a harness
     // that loses a turn's Done — the adapter never settles `session/prompt`
     // even though the agent finished — strands Working forever: the live
@@ -2472,6 +2490,8 @@ async fn drive_run(
     // with an authoritative completion signal must still await that signal.
     // ACP retains the watchdog only for unowned self-continued activity.
     let deterministic_turn_end = harness.deterministic_turn_end();
+    // A runtime that lives as long as the app (Pi) is never reaped idle.
+    let keeps_runtime_alive = harness.keeps_runtime_alive();
     let authoritative_prompt_end = harness.authoritative_prompt_end();
     let quiesce_after: Option<std::time::Duration> = match std::env::var("ZERON_TURN_QUIESCE_MS")
         .ok()
@@ -2590,7 +2610,7 @@ async fn drive_run(
                             (base, deferred) => base.or(deferred).unwrap_or_else(tokio::time::Instant::now),
                         }
                     }
-                ), if idle_since.is_some() && !resume_state.voice_active.live() => {
+                ), if idle_since.is_some() && !keeps_runtime_alive && !resume_state.voice_active.live() => {
                     // A call that began after this wait was armed holds it off.
                     if resume_state.voice_active.live() {
                         continue;
@@ -2634,12 +2654,15 @@ async fn drive_run(
                         tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
                         break SessionStatus::Idle;
                     }
-                    Some(Err(err)) => AgentEvent::Done {
-                        status: DoneStatus::Errored,
-                        result: None,
-                        error: Some(err.to_string()),
-                        session_id: None,
-                    },
+                    Some(Err(err)) => {
+                        stream_failed = true;
+                        AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(err.to_string()),
+                            session_id: None,
+                        }
+                    }
                     None if interrupted => AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
@@ -2651,12 +2674,15 @@ async fn drive_run(
                     // was already finalized). Persistent adapters keep the
                     // stream open and never hit this.
                     None if idle_since.is_some() => break SessionStatus::Idle,
-                    None => AgentEvent::Done {
-                        status: DoneStatus::Errored,
-                        result: None,
-                        error: Some("harness stream ended without Done".into()),
-                        session_id: None,
-                    },
+                    None => {
+                        stream_failed = true;
+                        AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some("harness stream ended without Done".into()),
+                            session_id: None,
+                        }
+                    }
                 },
                 _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
                     #[cfg(test)]
@@ -3327,7 +3353,11 @@ async fn drive_run(
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
             // harness PARKS instead of ending — child + mailbox stay warm for
             // the next routed dispatch; per-turn state resets for it.
-            if (*status == DoneStatus::Completed || stopped_in_place)
+            // A runtime that lives as long as the app (Pi) also parks after a
+            // failed turn: the provider failed, not the process.
+            let failed_in_place =
+                *status == DoneStatus::Errored && keeps_runtime_alive && !stream_failed;
+            if (*status == DoneStatus::Completed || stopped_in_place || failed_in_place)
                 && steerable
                 && !interrupted
                 && !inner.registry.update_pending(harness_id)
@@ -3347,6 +3377,8 @@ async fn drive_run(
                     &chat_id,
                     if pending_steer {
                         SessionStatus::Working
+                    } else if failed_in_place {
+                        SessionStatus::Errored
                     } else {
                         SessionStatus::Idle
                     },

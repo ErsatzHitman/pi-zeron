@@ -332,6 +332,11 @@ impl Harness for PiHarness {
     fn stops_turn_in_place(&self) -> bool {
         true
     }
+    /// A Pi session is the user's own agent: its process, extensions and
+    /// their background work stay up for as long as Zeron runs.
+    fn keeps_runtime_alive(&self) -> bool {
+        true
+    }
     /// `set_model` and `set_thinking_level` change the live process. Clearing
     /// either back to the default cannot be expressed that way.
     fn reconfigures_in_place(&self, live: &RunRequest, next: &RunRequest) -> bool {
@@ -1057,6 +1062,34 @@ impl Runner {
             }
         }
     }
+    /// Pi refused a request (`success: false`). One that carried the turn
+    /// ends it with Pi's error, and the process, its extensions and their
+    /// background work stay up for the next message; a stale or background
+    /// request's refusal is only logged.
+    async fn refused(&mut self, pending: Pending, error: HarnessError) -> Result<(), HarnessError> {
+        let epoch = match &pending {
+            Pending::Prompt(epoch) | Pending::Barrier(epoch) | Pending::Command(epoch) => *epoch,
+            // The empty-session proof cannot go on without its answer.
+            Pending::EmptyEntries(..) | Pending::EmptyState(..) => return Err(error),
+            Pending::Commands => {
+                tracing::debug!(%error, "Pi refused the command list");
+                return Ok(());
+            }
+        };
+        if epoch != self.epoch || !self.active {
+            tracing::debug!(%error, "Pi refused a request of an earlier turn");
+            return Ok(());
+        }
+        if matches!(pending, Pending::Prompt(_) | Pending::Command(_)) {
+            self.initial_pending = false;
+            // The refused message was taken: it reads as sent, with the error.
+            if self.deliveries.front().is_some_and(|d| d.epoch == epoch) {
+                self.confirm_delivery().await?;
+            }
+        }
+        self.norm.error = Some(error.to_string());
+        self.finish().await
+    }
     async fn confirm_delivery(&mut self) -> Result<(), HarnessError> {
         if self.deliveries.pop_front().is_some() {
             let old = std::mem::replace(&mut self.assistant, uuid::Uuid::new_v4().to_string());
@@ -1260,7 +1293,10 @@ impl Runner {
             let Some(pending) = self.pending.remove(string(&frame, "id")) else {
                 return Ok(());
             };
-            let data = response_data(frame)?;
+            let data = match response_data(frame) {
+                Ok(data) => data,
+                Err(error) => return self.refused(pending, error).await,
+            };
             if let Pending::Command(epoch) = pending {
                 if epoch == self.epoch {
                     self.initial_pending = false;

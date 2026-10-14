@@ -1277,6 +1277,14 @@ impl EngineRpc {
                 self.voice.retire_chat(&chat_id);
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
+                // Its live runtime goes with it: one that lives as long as
+                // the app (Pi) is never reaped idle and would outlive it.
+                let sessions = self.sessions.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = sessions.terminate(&chat_id).await {
+                        tracing::debug!(chat = %chat_id, error = %err, "deleteChat teardown skipped");
+                    }
+                });
                 Ok(())
             }
             MutateParams::RenameDevice { device_id, name } => self
