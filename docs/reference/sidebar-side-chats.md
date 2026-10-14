@@ -21,7 +21,7 @@ The sidebar's Sessions list nests each session's side chats under it, on the Orc
 - A child is lit while it is selected or open beside its parent.
 - Click: its parent becomes the open session, from any page, and the child opens beside it in the right pane, its composer focused.
 - Cmd-click (macOS) or Ctrl-click (Windows, Linux): opens the child as the session itself.
-- Double-click renames it in place. Right-click opens the side-chat menu (Rename, Delete). Hovering the corner archives it.
+- Double-click renames it in place. Right-click opens the side-chat menu (Open as session, Rename, Delete). Hovering the corner archives it.
 
 ## Keyboard and drag
 

@@ -211,7 +211,8 @@ const CHAT_MENU_ROW_PIN: u8 = 1;
 const CHAT_MENU_ROW_ARCHIVE: u8 = 2;
 const CHAT_MENU_ROW_COPY: u8 = 3;
 const CHAT_MENU_ROW_DELETE: u8 = 4;
-const CHAT_MENU_ROW_TAB: u8 = 5;
+const CHAT_MENU_ROW_OPEN: u8 = 5;
+const CHAT_MENU_ROW_TAB: u8 = 6;
 
 #[derive(Clone, Copy)]
 enum TabCloseAction {
@@ -10805,6 +10806,7 @@ impl Shell {
             let pin_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            let open_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
                 .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -10824,6 +10826,26 @@ impl Shell {
             let menu = if chat_id.is_empty() {
                 menu
             } else {
+                // A side chat opens beside its parent; this opens it as the
+                // session itself (the sidebar's Cmd/Ctrl-click).
+                let menu = if is_side_chat {
+                    let open =
+                        popover::menu_row(&theme, false, format!("chat-menu-open-{chat_id}"))
+                            .id("chat-menu-open")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_chat_menu(cx);
+                                this.open_chat(open_id.clone(), cx);
+                            }))
+                            .child(
+                                icon(icons::ARROW_UP_RIGHT)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Open as session"));
+                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_OPEN, open, cx))
+                } else {
+                    menu
+                };
                 let rename = popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
                     .id("chat-menu-rename")
                     .on_click(cx.listener(move |this, _, window, cx| {
