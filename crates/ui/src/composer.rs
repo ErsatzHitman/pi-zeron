@@ -11095,12 +11095,13 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = Theme::of(cx);
         if mode != SendButtonMode::Stop
             && let Some((t, voice)) = self.update_voice_slot(mode, window, cx)
         {
+            let theme = Theme::of(cx).clone();
             return self.render_voice_slot(mode, t, voice, &theme, cx);
         }
+        let theme = Theme::of(cx);
         // Zeron composer-actions.tsx: a size-7 filled circle — up-arrow to
         // send/queue, a dark rounded square on the same light circle to stop.
         match mode {
