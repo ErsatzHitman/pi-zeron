@@ -15,6 +15,8 @@ use std::{
 use tokio::sync::{Notify, mpsc, oneshot};
 
 mod audio;
+#[cfg(test)]
+mod live;
 mod providers;
 mod speech;
 mod turns;

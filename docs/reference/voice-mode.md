@@ -58,7 +58,20 @@ The agent works in the background. When it finishes, needs an answer or fails, t
 
 ## Cost
 
-Each turn makes one transcription, one or more chat requests and one speech request per sentence. With the defaults (Whisper large v3 turbo, Gemini 2.5 Flash Lite, Kokoro), a conversation costs roughly ₹0.1 per minute at the time of writing. Larger reply models and Aura 2 cost more. Check each model's OpenRouter page for current prices.
+Each turn makes one transcription, one or more chat requests and one speech request per sentence. OpenRouter list prices on 14 October 2026, at ₹88 per US dollar:
+
+| Stage | Model | Price | Per minute of conversation* |
+| --- | --- | --- | --- |
+| Speech to text | `openai/whisper-large-v3-turbo` | $0.0002 per audio minute | ₹0.01 |
+| Speech to text | `deepgram/nova-3` | $0.0043 per audio minute | ₹0.19 |
+| Speech to text | `mistralai/voxtral-mini-transcribe` | $0.003 per audio minute | ₹0.13 |
+| Reply | `google/gemini-2.5-flash-lite` | $0.10 / $0.40 per million tokens in / out | ₹0.10 |
+| Voice | `hexgrad/kokoro-82m` | $0.62 per million characters | ₹0.02 |
+| Voice | `deepgram/aura-2` | $30 per million characters | ₹1.19 |
+
+\*Assumes the user talks for 30 seconds, four turns of about 2,500 prompt tokens each (instructions, tools and history), and 450 spoken characters a minute.
+
+The defaults come to about ₹0.13 a minute, or ₹8 an hour. Aura 2 makes a call roughly ten times dearer. Prices change: check each model's OpenRouter page.
 
 ## Privacy
 
@@ -77,6 +90,14 @@ Audio is held in memory only. Each finished turn goes to the chosen transcriber 
 `zeron-ui::voice` maps call events onto the existing voice view state, so the orb, the stage and the captions are unchanged. `zeron-ui::voice::agent` bridges the tools to the composer, the app state and the transcript. Settings live in `zeron-ui::dictation::model::voice_mode`.
 
 ## Verification
+
+The live suite (`crates/voice/src/call/live.rs`) makes real requests and runs in the **Voice mode live** workflow when the `OPENROUTER_API_KEY` repository secret is set (`DEEPGRAM_API_KEY` and `MISTRAL_API_KEY` add the direct providers). It checks that:
+
+- every voice model speaks;
+- every OpenRouter transcriber, plus Deepgram and Mistral directly, hears that speech;
+- every reply model streams and calls `ask_agent`;
+- the default model confirms aloud once the tool answers, using the same message format a call uses.
+
 
 `cargo test -p zeron-voice --lib` covers:
 
