@@ -10,6 +10,8 @@ use super::*;
 use std::cell::Cell;
 use std::rc::Rc;
 
+use zeron_proto::ChatIndicator;
+
 use super::session_info::{SESSION_CARD_INSET, SESSION_CARD_WIDTH};
 
 /// The room between the pane and the card, and between the pane and its bar.
@@ -260,14 +262,14 @@ impl Shell {
     }
 
     /// The pane and its prompt bar, placed from the main column's right edge
-    /// at the card's left; `card` is the card's reveal, so while the card is
+    /// at the card's left; `card_reveal` is the card's reveal, so while the card is
     /// away the pane takes its place. `max_height` is the room above the
     /// window's bottom chrome.
     pub(super) fn render_btw_pane(
         &mut self,
         id: u64,
         reveal: f32,
-        card: f32,
+        card_reveal: f32,
         max_height: f32,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -473,7 +475,8 @@ impl Shell {
                     .child(Self::mention_drop_overlay(&theme)),
             );
 
-        let right = SESSION_CARD_INSET + (SESSION_CARD_WIDTH + BTW_GAP) * card.clamp(0.0, 1.0);
+        let right =
+            SESSION_CARD_INSET + (SESSION_CARD_WIDTH + BTW_GAP) * card_reveal.clamp(0.0, 1.0);
         Some(
             div()
                 .absolute()
