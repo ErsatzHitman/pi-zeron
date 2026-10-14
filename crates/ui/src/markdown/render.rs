@@ -2066,7 +2066,13 @@ fn render_code_block(
                 );
             }
             DiagramView::Failed(reason) => {
-                let notice = code_notice(format!("{frame_id}-failure").into(), reason, theme);
+                let label = if kind == "mermaid" {
+                    "Unable to render diagram"
+                } else {
+                    "Unable to render chart"
+                };
+                let notice =
+                    code_notice(format!("{frame_id}-failure").into(), label, reason, theme);
                 return render_code_block_source_with_actions(
                     language,
                     code,
@@ -2151,14 +2157,25 @@ fn code_icon_action(
         .into_any_element()
 }
 
-/// A passive header marker whose tooltip explains why a fence stays source.
-fn code_notice(id: SharedString, message: SharedString, theme: &Theme) -> AnyElement {
+/// A passive header marker saying why a fence stays source: `label` in
+/// the header, the renderer's reason in its tooltip.
+fn code_notice(
+    id: SharedString,
+    label: &'static str,
+    message: SharedString,
+    theme: &Theme,
+) -> AnyElement {
+    let debug_id = id.clone();
     div()
         .id(id)
-        .size(px(CODE_ACTION_SIZE))
+        .debug_selector(move || debug_id.to_string())
+        .h(px(CODE_ACTION_SIZE))
+        .px(px(4.0))
         .flex()
         .items_center()
-        .justify_center()
+        .gap(px(4.0))
+        .text_size(crate::typography::ui_rems(11.0))
+        .text_color(theme.warning_muted)
         .tooltip(move |_, cx| {
             let message = message.clone();
             cx.new(move |_| CodeBlockTooltip(message)).into()
@@ -2168,6 +2185,7 @@ fn code_notice(id: SharedString, message: SharedString, theme: &Theme) -> AnyEle
                 .size(px(13.0))
                 .text_color(theme.warning_muted),
         )
+        .child(label)
         .into_any_element()
 }
 
