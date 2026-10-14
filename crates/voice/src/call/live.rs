@@ -76,6 +76,14 @@ fn ask_agent() -> Tool {
     }
 }
 
+fn status() -> Tool {
+    Tool {
+        name: "agent_status".into(),
+        description: "What the coding agent is doing.".into(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    }
+}
+
 #[tokio::test]
 #[ignore = "calls OpenRouter; run by the Voice mode live workflow"]
 async fn openrouter_speaks_hears_and_hands_work_to_the_agent() {
@@ -109,7 +117,7 @@ async fn openrouter_speaks_hears_and_hands_work_to_the_agent() {
         }),
         json!({ "role": "user", "content": heard }),
     ];
-    let tools = [ask_agent()];
+    let tools = [ask_agent(), status()];
     let mut streamed = String::new();
     let reply = providers::reply(&client, &key, REPLY_MODELS[0], &messages, &tools, |t| {
         streamed.push_str(t)
@@ -167,7 +175,9 @@ async fn every_reply_model_streams_and_calls_tools() {
     ];
     let mut failures = Vec::new();
     for model in REPLY_MODELS {
-        match providers::reply(&client, &key, model, &messages, &[ask_agent()], |_| {}).await {
+        // The call declares an argument-free tool too, as voice mode does.
+        let tools = [ask_agent(), status()];
+        match providers::reply(&client, &key, model, &messages, &tools, |_| {}).await {
             Ok(reply) if reply.tools.iter().any(|t| t.name == "ask_agent") => {
                 eprintln!("{model}: ok");
             }

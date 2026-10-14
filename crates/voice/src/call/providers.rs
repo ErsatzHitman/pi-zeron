@@ -313,19 +313,7 @@ pub(crate) async fn reply(
         "max_tokens": 600,
     });
     if !tools.is_empty() {
-        body["tools"] = tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                })
-            })
-            .collect();
+        body["tools"] = tools.iter().map(tool_json).collect();
     }
     let mut response = client
         .post(format!("{OPENROUTER}/chat/completions"))
@@ -351,6 +339,24 @@ pub(crate) async fn reply(
         }
     }
     Ok(stream.finish())
+}
+
+/// A tool as the chat API declares it. A tool without arguments leaves its
+/// schema out: Gemini rejects an object schema with no properties.
+fn tool_json(tool: &Tool) -> Value {
+    let mut function = json!({
+        "name": tool.name,
+        "description": tool.description,
+    });
+    let empty = tool
+        .parameters
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_none_or(|p| p.is_empty());
+    if !empty {
+        function["parameters"] = tool.parameters.clone();
+    }
+    json!({ "type": "function", "function": function })
 }
 
 /// Server-sent reply events, parsed as they arrive.
@@ -538,6 +544,26 @@ impl Pcm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_without_arguments_leave_their_schema_out() {
+        let tool = |parameters: Value| Tool {
+            name: "agent_status".into(),
+            description: "Status.".into(),
+            parameters,
+        };
+        let bare = tool_json(&tool(json!({ "type": "object", "properties": {} })));
+        assert_eq!(bare["type"], "function");
+        assert_eq!(bare["function"]["name"], "agent_status");
+        assert!(bare["function"].get("parameters").is_none());
+        let schema = json!({
+            "type": "object",
+            "properties": { "message": { "type": "string" } },
+            "required": ["message"],
+        });
+        let full = tool_json(&tool(schema.clone()));
+        assert_eq!(full["function"]["parameters"], schema);
+    }
 
     #[test]
     fn transcripts_are_read_from_each_provider() {
