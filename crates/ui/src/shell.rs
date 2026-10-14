@@ -3875,7 +3875,9 @@ impl Shell {
             return;
         }
         let key = self.panel_key(cx);
-        let remote = {
+        // A published page is served from this app, never the chat's device.
+        let page = url.as_deref().is_some_and(crate::visual_pages::is_page_url);
+        let remote = !page && {
             let state = self.state.read(cx);
             state.selected_chat_row().is_some_and(|chat| {
                 Some(chat.device_id.as_str()) != state.local_device_id.as_deref()

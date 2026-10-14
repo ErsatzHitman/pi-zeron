@@ -239,12 +239,27 @@ impl Normalizer {
                         call: ToolCall::Todo { items },
                     });
                 }
+                // A page the agent published with Zeron's `html_render`
+                // shows in the reply, like a generated image.
+                let page = info
+                    .as_ref()
+                    .filter(|(name, _)| name.ends_with("_html_render") && frame["isError"] != true)
+                    .and_then(|_| {
+                        let page = &result["details"]["page"];
+                        Some(AgentEvent::GeneratedImage {
+                            id: format!("{id}:page"),
+                            path: page["path"].as_str().filter(|p| !p.is_empty())?.into(),
+                            name: page["title"].as_str().unwrap_or("Page").into(),
+                            mime_type: "text/html".into(),
+                        })
+                    });
                 events.push(AgentEvent::ToolResult {
                     id,
                     is_error: frame["isError"].as_bool().unwrap_or(false),
                     output: output.map(|s| cap(&s, 16384)),
                     diff,
                 });
+                events.extend(page);
             }
             "compaction_end" => {
                 if let Some(tokens) = frame["result"]["estimatedTokensAfter"].as_u64() {
@@ -580,5 +595,34 @@ mod tests {
             tool("lsp_diagnostics", &json!({"paths":["a.rs"]})),
             ToolCall::Unknown { name, .. } if name == "LSP: diagnostics a.rs"
         ));
+    }
+
+    #[test]
+    fn a_published_page_follows_its_tool_result_as_a_page_part() {
+        let mut n = Normalizer::default();
+        n.map(
+            &json!({"type":"tool_execution_start","toolCallId":"h","toolName":"zeron_html_render",
+            "args":{"title":"Build times","html":"<p>x</p>"}}),
+        );
+        let events = n.map(
+            &json!({"type":"tool_execution_end","toolCallId":"h","isError":false,
+            "result":{"content":[{"type":"text","text":"{}"}],
+            "details":{"page":{"path":"/u/abcd1234-page.html","title":"Build times"}}}}),
+        );
+        assert!(
+            matches!(&events[0], AgentEvent::ToolResult { id, is_error: false, .. } if id == "h")
+        );
+        assert!(
+            matches!(&events[1], AgentEvent::GeneratedImage { id, path, name, mime_type }
+                if id == "h:page" && path == "/u/abcd1234-page.html" && name == "Build times" && mime_type == "text/html"),
+            "{events:?}"
+        );
+        // A failed call publishes nothing.
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"f","toolName":"zeron_html_render","args":{}}));
+        let events = n.map(
+            &json!({"type":"tool_execution_end","toolCallId":"f","isError":true,
+            "result":{"content":[{"type":"text","text":"title must not be empty"}],"details":{}}}),
+        );
+        assert_eq!(events.len(), 1);
     }
 }

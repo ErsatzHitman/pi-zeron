@@ -298,7 +298,7 @@ pub(crate) fn format_value(value: f64, unit: Option<&str>) -> String {
     }
 }
 
-fn color(theme: &Theme, ix: usize) -> Hsla {
+pub(crate) fn color(theme: &Theme, ix: usize) -> Hsla {
     if ix == 0 {
         theme.accent
     } else {

@@ -134,6 +134,29 @@ name (default: the local engine's device).
 | `interrupt_chat`   | `QueueCommand` Interrupt                                  |
 | `respond_to_input` | `QueueCommand` RespondInput                               |
 | `archive_chat`     | `Mutate setChatArchived`                                  |
+| `html_render`      | `UploadChunk` + `UploadCommit` (see Pages below)          |
+
+### Pages
+
+`html_render { html, title }` publishes a self-contained HTML page into the
+calling chat, the way T3 Code's visual replies do. The server inlines local
+images written as absolute paths (`src="/abs/shot.png"`, CSS `url(...)`, JS
+strings; 10 MiB each, 25 MiB per page), stores the page in the device's
+uploads folder, and returns `{page: {path, title}, message}`. The message
+tells the agent not to describe the page in its reply.
+
+For Pi, the normalizer turns a successful `zeron_html_render` result into a
+`GeneratedImage` part with type `text/html`. The engine accepts that path only
+when it sits directly in the uploads folder. The transcript draws a page
+card; clicking it reads the page from its device (`ReadAttachmentChunk`),
+serves it from a loopback server in the app (`crates/ui/src/visual_pages.rs`)
+at an unguessable address, and opens it in a right-pane browser tab. The
+page is sent with `Content-Security-Policy: sandbox allow-scripts
+allow-popups; connect-src 'none'; form-action 'none'`, so it runs in an
+opaque origin and cannot call out. Zeron's theme is injected first in
+`<head>` as CSS variables (`--background`, `--foreground`, `--accent`,
+`--chart-1`…`--chart-6`, `--font-sans`, …) the tool description lists.
+Pi's appended visuals prompt tells it when to reach for a page.
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

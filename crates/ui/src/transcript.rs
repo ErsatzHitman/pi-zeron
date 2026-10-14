@@ -3476,6 +3476,10 @@ pub struct Transcript {
     /// In-flight ReadAttachmentChunk loads, keyed by device, path and validation
     /// policy; results land in the global attachment cache.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
+    /// Published pages (by path) being fetched to open, and those that could
+    /// not be.
+    opening_pages: HashSet<String>,
+    failed_pages: HashSet<String>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
     /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
@@ -3904,6 +3908,8 @@ impl Transcript {
             image_menu_focus: cx.focus_handle(),
             image_copy: None,
             attachment_loads: HashMap::new(),
+            opening_pages: HashSet::new(),
+            failed_pages: HashSet::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
@@ -6894,6 +6900,9 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
+        if mime_type == crate::visual_pages::PAGE_MIME {
+            return self.render_page_card(row_id, owner, path, name, cx);
+        }
         let devices = self.generated_attachment_device_ids(owner, cx);
         let state = self.attachment_state(&devices, path, Some(mime_type), cx);
         let theme = Theme::of(cx).clone();
@@ -6965,6 +6974,161 @@ impl Transcript {
                 .child("Generated image unavailable")
                 .into_any_element(),
         }
+    }
+
+    /// A page the agent published with `html_render`: a card that opens it
+    /// in the right pane's browser.
+    fn render_page_card(
+        &mut self,
+        row_id: &SharedString,
+        owner: &str,
+        path: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let detail = if self.opening_pages.contains(path) {
+            "Opening…"
+        } else if self.failed_pages.contains(path) {
+            "Page unavailable. Click to try again"
+        } else {
+            "Page · opens beside the chat"
+        };
+        let devices = self.generated_attachment_device_ids(owner, cx);
+        let page_path = path.to_owned();
+        let page_title = title.to_owned();
+        let hover = theme.ink(0.06);
+        let accent = theme.accent;
+        div()
+            .id(SharedString::from(format!("{row_id}-page")))
+            .debug_selector(|| "transcript-page-card".into())
+            .w(px(360.0))
+            .max_w_full()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .p(px(8.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.ink(0.03))
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(format!("Open page {title}")))
+            .tab_index(0)
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .focus_visible(move |style| style.border_color(accent))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_page(
+                    page_path.clone(),
+                    page_title.clone(),
+                    devices.clone(),
+                    window,
+                    cx,
+                )
+            }))
+            .child(
+                div()
+                    .size(px(32.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.0))
+                    .bg(theme.ink(0.06))
+                    .child(
+                        crate::icons::icon(crate::icons::GLOBE)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from(title.to_owned())),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(detail),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Fetch a published page from the device that holds it, serve it on
+    /// loopback with Zeron's theme, and open it in the right pane.
+    fn open_page(
+        &mut self,
+        path: String,
+        title: String,
+        devices: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failed_pages.insert(path);
+            cx.notify();
+            return;
+        };
+        if !self.opening_pages.insert(path.clone()) {
+            return;
+        }
+        self.failed_pages.remove(&path);
+        cx.notify();
+        let local = self.state.read(cx).local_device_id.clone();
+        let style = crate::visual_pages::theme_style(Theme::of(cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let mut page = None;
+            for device in &devices {
+                // The local device's files are served directly.
+                let target = (local.as_deref() != Some(device.as_str())).then_some(device.as_str());
+                if let Some(file) = crate::attachments::read_attachment_file(
+                    &engine,
+                    cx.background_executor(),
+                    target,
+                    &path,
+                )
+                .await
+                {
+                    page = Some(file.bytes().to_vec());
+                    break;
+                }
+            }
+            let url = page
+                .ok_or_else(|| "unavailable".to_owned())
+                .and_then(|page| crate::visual_pages::serve(&page, &style));
+            this.update_in(cx, |this, window, cx| {
+                this.opening_pages.remove(&path);
+                match url {
+                    Ok(url) => {
+                        let link = this.link_ui(cx);
+                        render::activate_link(
+                            render::LinkTarget::new(&title, &url),
+                            render::LinkAction::Internal,
+                            link.as_ref(),
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(_) => {
+                        this.failed_pages.insert(path.clone());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The right-aligned thumbnail strip above a user bubble.
@@ -12209,6 +12373,43 @@ mod tests {
         cx.simulate_keystrokes("escape");
         transcript.read_with(cx, |this, _| assert!(this.attachment_preview.is_none()));
         cx.update(|window, _| assert!(return_focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn a_published_page_draws_a_card_that_says_when_it_cannot_open(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        let transcript = cx.new(|cx| Transcript::new(state, cx));
+        struct PageFixture(Entity<Transcript>);
+        impl Render for PageFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |this, cx| {
+                    this.render_generated_image(
+                        &"page".into(),
+                        "owner",
+                        "/uploads/abcd1234-page.html",
+                        "Build times",
+                        crate::visual_pages::PAGE_MIME,
+                        cx,
+                    )
+                })
+            }
+        }
+        let (_fixture, cx) = cx.add_window_view(|_, _| PageFixture(transcript.clone()));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("transcript-page-card").is_some());
+        // No engine to fetch it from: the card says so instead of spinning.
+        cx.simulate_click(gpui::point(px(20.0), px(20.0)), gpui::Modifiers::default());
+        cx.run_until_parked();
+        transcript.read_with(cx, |this, _| {
+            assert!(this.failed_pages.contains("/uploads/abcd1234-page.html"));
+            assert!(this.opening_pages.is_empty());
+        });
     }
 
     #[gpui::test]

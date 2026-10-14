@@ -197,6 +197,26 @@ fn catalog() -> Vec<ToolDef> {
                 "archived": { "type": "boolean", "default": true }
             })),
         },
+        ToolDef {
+            name: "html_render",
+            description: crate::pages::DESCRIPTION,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "html": {
+                        "type": "string",
+                        "description": "A complete, self-contained HTML document.",
+                        "maxLength": crate::pages::MAX_HTML_CHARS
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Short name for the page, shown on its card.",
+                        "maxLength": crate::pages::MAX_TITLE_CHARS
+                    }
+                },
+                "required": ["html", "title"]
+            }),
+        },
     ];
     for (name, single, description) in [
         (
@@ -238,6 +258,12 @@ struct BatchArgs {
 #[derive(Deserialize)]
 struct ChatArgs {
     chat: String,
+}
+
+#[derive(Deserialize)]
+struct HtmlRenderArgs {
+    html: String,
+    title: String,
 }
 
 #[derive(Deserialize)]
@@ -463,6 +489,7 @@ impl Tools {
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
+            "html_render" => self.html_render(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
@@ -1002,6 +1029,27 @@ impl Tools {
             .mutate(json!({ "op": "setChatArchived", "chatId": chat.id, "archived": archived }))
             .await?;
         Ok(json!({ "chatId": chat.id, "title": chat.title, "archived": archived }))
+    }
+
+    /// Store the page on this device; the harness shows it in the chat from
+    /// the result's `page`.
+    async fn html_render(&self, args: HtmlRenderArgs) -> anyhow::Result<Value> {
+        let (page, title) =
+            tokio::task::spawn_blocking(move || crate::pages::prepare(&args.html, &args.title))
+                .await?
+                .map_err(anyhow::Error::msg)?;
+        let path = self
+            .zeron
+            .store_upload("page.html", page.html.as_bytes())
+            .await?;
+        let mut result = json!({
+            "page": { "path": path, "title": title },
+            "message": crate::pages::PUBLISHED,
+        });
+        if !page.missing.is_empty() {
+            result["missingImages"] = json!(page.missing);
+        }
+        Ok(result)
     }
 
     async fn interrupt_chat(&self, args: ChatArgs) -> anyhow::Result<Value> {

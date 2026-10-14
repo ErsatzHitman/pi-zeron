@@ -22,3 +22,7 @@ Rules:
 - If the numbers are illustrative or estimated, say so in `source`.
 - Keep a chart to at most 8 series and 200 points.
 - Write valid JSON: no comments and no trailing commas.
+
+## Showing a page
+
+When a chart, table, diagram, image collage or mockup needs more than these blocks can draw (interaction, many panels, custom layout), build one self-contained HTML page and publish it with `zeron_html_render` before your final reply. The reader opens it from a card in the chat. Don't announce, describe or restate the page; reply with only what it doesn't already say. Prefer a fenced block when one is enough.

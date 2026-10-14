@@ -1371,7 +1371,13 @@ impl Inner {
             parents.push(parent_tool_use_id);
             leaf = *event;
         }
-        let events = if let AgentEvent::GeneratedImage { id, path, .. } = leaf {
+        let events = if let AgentEvent::GeneratedImage {
+            id,
+            path,
+            name,
+            mime_type,
+        } = leaf
+        {
             let key = std::iter::once(chat_id)
                 .chain(parents.iter().map(String::as_str))
                 .chain(std::iter::once(id.as_str()))
@@ -1385,7 +1391,14 @@ impl Inner {
                 let root = allowed_root.clone();
                 let stable_key = key.clone();
                 tokio::task::spawn_blocking(move || {
-                    uploads.import_generated_image(std::path::Path::new(&path), &root, &stable_key)
+                    let path = std::path::Path::new(&path);
+                    // A page `html_render` already stored in the uploads
+                    // folder stays where it is, under the agent's title.
+                    if mime_type == crate::uploads::PAGE_MIME {
+                        uploads.accept_page(path, &name)
+                    } else {
+                        uploads.import_generated_image(path, &root, &stable_key)
+                    }
                 })
                 .await
                 .unwrap_or_else(|err| Err(EngineError::Other(err.to_string())))
@@ -1408,7 +1421,11 @@ impl Inner {
                     tracing::warn!(chat = %chat_id, error = %err, "generated image import failed");
                     vec![
                         AgentEvent::ToolResult {
-                            id: id.strip_suffix(":image").unwrap_or(&id).into(),
+                            id: id
+                                .strip_suffix(":image")
+                                .or_else(|| id.strip_suffix(":page"))
+                                .unwrap_or(&id)
+                                .into(),
                             is_error: true,
                             output: None,
                             diff: None,
