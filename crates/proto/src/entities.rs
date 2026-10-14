@@ -235,8 +235,8 @@ pub struct Chat {
     pub room_gen: Option<u32>,
     /// The chat this one hangs off: the conversation a side chat was forked
     /// from, or the chat whose agent spawned this one through the Zeron MCP
-    /// server. Children stay out of the main sidebar and list under their
-    /// parent instead. Absent for top-level chats; a dangling id (parent
+    /// server. Children stay out of the main session lists and nest under
+    /// their parent in the sidebar instead. Absent for top-level chats; a dangling id (parent
     /// deleted) is tolerated rather than cascaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,

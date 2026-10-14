@@ -184,7 +184,12 @@ impl Shell {
         // The same list `render_active_rows` draws and the jump shortcuts
         // count — one function, so neither can drift from the screen.
         let order = self.sidebar_visible_order(cx);
-        let selected = self.state.read(cx).selected_chat.clone();
+        let selected = self.state.read(cx).selected_chat.clone().map(|id| {
+            // A selected side chat steps from the session it nests under.
+            self.sidebar_child_parent(&id, cx)
+                .filter(|parent| order.contains(parent))
+                .unwrap_or(id)
+        });
         if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
             self.open_chat(target, cx);
         }

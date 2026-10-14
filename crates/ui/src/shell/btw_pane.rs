@@ -1,7 +1,7 @@
 //! btw: a side chat in a small pane beside the session panel, the card's
 //! width, with its own prompt bar under it. The Session row's `+` opens it.
 //! It floats at the card's left (in the card's place while the card is
-//! away) and never opens the right pane; "Open in sidebar" hands the chat to
+//! away) and never opens the right pane; "Open as tab" hands the chat to
 //! one. The history button lists the conversation's side chats, so settled
 //! ones stay one click away.
 
@@ -378,7 +378,7 @@ impl Shell {
                 header_button(
                     "session-btw-sidebar",
                     icons::EXPAND_ARROWS,
-                    "Open in sidebar",
+                    "Open as tab",
                     false,
                     &theme,
                 )

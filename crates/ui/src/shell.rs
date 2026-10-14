@@ -85,6 +85,7 @@ mod panel_interaction_tests;
 pub(crate) mod project_icon;
 mod session_info;
 mod side_chats;
+mod sidebar_children;
 mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
@@ -1475,6 +1476,16 @@ enum ChatRenameSurface {
     Session,
 }
 
+/// Where a sidebar row sits in its family (`shell/sidebar_children.rs`).
+pub(super) enum SidebarRowRole {
+    /// A row without listed children.
+    Plain,
+    /// A session with live side chats: the row wears their fold chip.
+    Parent(AnyElement),
+    /// A side chat nested under its parent: compact, opens beside it.
+    Child,
+}
+
 /// A chat title edited in place on its row (double-click, or Rename in the
 /// chat menu). Enter or blur commits, Escape cancels.
 struct ChatRename {
@@ -1991,6 +2002,13 @@ pub struct Shell {
     pub(super) archived_shown: usize,
     /// Ephemeral collapsed project/device sections, keyed by organization + id.
     pub(super) sidebar_collapsed_groups: std::collections::HashSet<String>,
+    /// Side chat families folded or unfolded by hand, by parent id; wins
+    /// over the automatic rule.
+    pub(super) sidebar_children_override: std::collections::HashMap<String, bool>,
+    /// Parents opened because a child ran, asked, failed or was opened.
+    pub(super) sidebar_children_auto: std::collections::HashSet<String>,
+    /// Parents whose "Show N more" was clicked.
+    pub(super) sidebar_children_all: std::collections::HashSet<String>,
     /// In-flight disclosure tweens, shared by device groups, Pinned and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -2570,6 +2588,9 @@ impl Shell {
             sessions_open: true,
             archived_shown: 0,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
+            sidebar_children_override: std::collections::HashMap::new(),
+            sidebar_children_auto: std::collections::HashSet::new(),
+            sidebar_children_all: std::collections::HashSet::new(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
@@ -5836,6 +5857,17 @@ impl Shell {
     /// Start editing `chat_id`'s title in place on its row: the sidebar's
     /// session row, or — for a side chat — its row under the file tree.
     fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.open_rename_chat_on(chat_id, None, cx);
+    }
+
+    /// [`Self::open_rename_chat`] on a given surface: a side chat nested in
+    /// the sidebar renames on its sidebar row. `None` picks by parentage.
+    fn open_rename_chat_on(
+        &mut self,
+        chat_id: String,
+        surface: Option<ChatRenameSurface>,
+        cx: &mut Context<Self>,
+    ) {
         self.close_chat_menu(cx);
         if self.chat_rename.is_some() {
             self.finish_rename_chat(true, cx);
@@ -5859,11 +5891,11 @@ impl Shell {
         // The sidebar lists only top-level chats; side chats live in the
         // session panel's Sub-agents section. Either way the row must be on
         // screen first: a field on a hidden row would take keystrokes unseen.
-        let surface = if parent.is_some() {
+        let surface = surface.unwrap_or(if parent.is_some() {
             ChatRenameSurface::Session
         } else {
             ChatRenameSurface::Sidebar
-        };
+        });
         let revealed = match surface {
             ChatRenameSurface::Sidebar => self.reveal_sidebar_chat(&chat_id, cx),
             // The panel lists the open chat's live side chats, with its
@@ -8058,10 +8090,16 @@ impl Shell {
         // Whether the row wears its project icon. Rows inside a project
         // group leave it to the group header.
         project_icon: bool,
+        role: SidebarRowRole,
         search_query: Option<&str>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let (child_row, children_chip) = match role {
+            SidebarRowRole::Plain => (false, None),
+            SidebarRowRole::Parent(chip) => (false, Some(chip)),
+            SidebarRowRole::Child => (true, None),
+        };
         // Activity, not position (t3code Sidebar): status is a small colored
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
@@ -8082,7 +8120,7 @@ impl Shell {
             .iter()
             .find(|chat| chat.id == id)
             .map(|chat| chat.device_id.clone());
-        let compact = search_query.is_none() && self.settings.sidebar_compact;
+        let compact = child_row || (search_query.is_none() && self.settings.sidebar_compact);
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
         let remote = self
             .state
@@ -8460,9 +8498,24 @@ impl Shell {
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                     // The palette's copy of the row only opens; the sidebar's
-                    // double-click edits the title in place.
+                    // double-click edits the title in place. A side chat row
+                    // opens beside its parent (Cmd/Ctrl: as the session).
                     if event.click_count() >= 2 && search_query_none {
-                        this.open_rename_chat(select_id.clone(), cx);
+                        if child_row {
+                            this.open_rename_chat_on(
+                                select_id.clone(),
+                                Some(ChatRenameSurface::Sidebar),
+                                cx,
+                            );
+                        } else {
+                            this.open_rename_chat(select_id.clone(), cx);
+                        }
+                    } else if child_row {
+                        this.open_sidebar_child(
+                            select_id.clone(),
+                            event.modifiers().secondary(),
+                            cx,
+                        );
                     } else {
                         this.open_chat(select_id.clone(), cx);
                     }
@@ -8612,6 +8665,7 @@ impl Shell {
                         )
                         .into_any_element(),
                     })
+                    .children(children_chip)
                     .when(!compact && !show_label && remote, |el| {
                         el.child(
                             icon(icons::REMOTE_SERVER)

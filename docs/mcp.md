@@ -65,11 +65,12 @@ For children, `parent` (id, prefix, or title) overrides the origin (`ZERON_CHAT_
 `list_chats { parent }` returns children, and chat summaries carry `parentChatId`.
 Rows from older engines read as parentless; a dangling parent id is tolerated.
 
-The left sidebar hides chats that have a parent: `AppState::visible_chats`
-(the Sessions list, project tabs, jump slots) and the Archived section both
-require `parent_chat_id == None`. Children remain addressable by id, deep
-link, and every MCP tool; `list_chats { parent }` is how an orchestrator
-finds them.
+The sidebar's Sessions list holds top-level chats only (`AppState::visible_chats`);
+children nest under their listed parent instead
+([sidebar side chats](reference/sidebar-side-chats.md)). Jump slots, cycling and
+the Archived section stay top-level, and Orchestrator members show only in the
+Orchestrator tab. Children remain addressable by id, deep link, and every MCP
+tool; `list_chats { parent }` is how an orchestrator finds them.
 
 ### Injection
 

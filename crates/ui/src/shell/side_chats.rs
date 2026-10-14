@@ -489,7 +489,7 @@ mod tests {
                 // A second + focuses the pane it has.
                 shell.open_btw_pane(cx);
                 assert_eq!(shell.side_chats.len(), 1);
-                // Open in sidebar: the same chat becomes a right-pane tab.
+                // Open as tab: the same chat becomes a right-pane tab.
                 shell.btw_to_sidebar(cx);
                 assert!(!shell.btw_holds(id));
                 assert_eq!(shell.right_tabs[&key], vec![RightSurface::SideChat(id)]);

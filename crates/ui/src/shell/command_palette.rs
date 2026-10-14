@@ -1114,6 +1114,7 @@ impl Shell {
                     None,
                     None,
                     false,
+                    SidebarRowRole::Plain,
                     Some(query),
                     theme,
                     cx,

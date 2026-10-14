@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use zeron_proto::{Chat, Space, orchestrator};
 
 /// Indent of each nesting level; its rail runs down the middle of it.
-const TREE_INDENT: f32 = 14.0;
+pub(super) const TREE_INDENT: f32 = 14.0;
 
 /// One folder's sessions under a root: its top sessions in start order, each
 /// followed by the sessions it started, `level` deep.
@@ -498,6 +498,7 @@ impl Shell {
             None,
             None,
             false,
+            SidebarRowRole::Plain,
             None,
             theme,
             cx,

@@ -4884,6 +4884,30 @@ impl Shell {
     /// clear), or a synced section could not be expanded. Either way the
     /// sidebar notice says why.
     pub(super) fn reveal_sidebar_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
+        // A side chat draws under its listed parent: reveal that, unfolded
+        // far enough to include it.
+        if let Some(parent) = self.sidebar_child_parent(chat_id, cx) {
+            let listed = self
+                .state
+                .read(cx)
+                .sidebar_chats(Utc::now(), self.settings.space_filter.as_deref())
+                .iter()
+                .any(|(_, chat)| chat.id == parent);
+            if !listed || !self.reveal_sidebar_chat(&parent, cx) {
+                if !listed {
+                    self.show_notice(
+                        crate::toast::ToastKind::Error,
+                        "Show this side chat's session in the sidebar to rename it",
+                        cx,
+                    );
+                }
+                return false;
+            }
+            self.sidebar_children_override.insert(parent.clone(), true);
+            self.sidebar_children_all.insert(parent);
+            cx.notify();
+            return true;
+        }
         let (active, archived) = {
             let state = self.state.read(cx);
             let active = state
@@ -5071,6 +5095,13 @@ impl Shell {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
+        let selected = self.state.read(cx).selected_chat.clone();
+        let mut families = self.sidebar_families(
+            base_ids.iter().map(String::as_str),
+            selected.as_deref(),
+            now,
+            cx,
+        );
         let active: HashSet<&str> = base_ids.iter().map(String::as_str).collect();
         let pinned_count = pinned_order
             .iter()
@@ -5087,7 +5118,9 @@ impl Shell {
                     self.settings.sidebar_show_project_label,
                     row.branch.is_some(),
                     row.change_request.is_some(),
-                )
+                ) + families
+                    .get(&row.chat.id)
+                    .map_or(0.0, |family| family.height)
             })
             .collect();
         let visible_pinned_ids = std::sync::Arc::new(
@@ -5243,7 +5276,6 @@ impl Shell {
             }
         }
 
-        let selected = self.state.read(cx).selected_chat.clone();
         // Re-checked at render so the chips drop the FRAME a popover opens,
         // not on the next modifier event — the jumps are suppressed under it.
         let jump_hints = self.jump_hints && !self.overlay_owns_keyboard(cx);
@@ -5345,7 +5377,16 @@ impl Shell {
                     })
                     .filter(|drag| drag.payload.chat_id == chat.id)
                     .map_or(0.0, |drag| drag.collapsed_height);
-                let slot_height = height - removed;
+                // A parent's slot carries its open side chats.
+                let family = families.remove(&chat.id);
+                let family_height = family.as_ref().map_or(0.0, |family| family.height);
+                let slot_height = height + family_height - removed;
+                let role = match &family {
+                    Some(family) => SidebarRowRole::Parent(
+                        self.render_children_chip(&chat.id, family, theme, cx),
+                    ),
+                    None => SidebarRowRole::Plain,
+                };
                 let element = self.render_chat_row(
                     chat.id.clone(),
                     transcript::single_line(
@@ -5364,6 +5405,7 @@ impl Shell {
                     if is_moving { None } else { drag },
                     jump_label,
                     self.settings.sidebar_show_project_icon && !project_group,
+                    role,
                     None,
                     theme,
                     cx,
@@ -5381,6 +5423,12 @@ impl Shell {
                         })
                         .into_any_element()
                 } else {
+                    let element = match &family {
+                        Some(family) => {
+                            self.with_sidebar_children(element, &chat.id, family, now, theme, cx)
+                        }
+                        None => element,
+                    };
                     self.render_sidebar_gap_row(element, &chat.id, &drag_group, group_index)
                 };
                 // The hit region stays at the natural slot while its content slides;
@@ -5408,7 +5456,10 @@ impl Shell {
                             let Some(drag) = this.sidebar_session_transfer.as_mut() else {
                                 return;
                             };
-                            let after = event.event.position.y >= event.bounds.center().y;
+                            // Split on the session row itself, not on the
+                            // side chats hanging under it.
+                            let after =
+                                event.event.position.y >= event.bounds.top() + px(height / 2.0);
                             let index = group_index + usize::from(after);
                             let mut top = f32::from(
                                 if after {
@@ -5883,6 +5934,7 @@ impl Shell {
                         None,
                         None,
                         self.settings.sidebar_show_project_icon,
+                        SidebarRowRole::Plain,
                         None,
                         theme,
                         cx,
