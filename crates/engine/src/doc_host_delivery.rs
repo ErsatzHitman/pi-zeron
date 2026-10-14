@@ -321,10 +321,15 @@ mod tests {
                 .is_some()
         );
         // Row delivery and wake delivery are independent: the rows drain
-        // while the wake keeps failing. Generous: a loaded Windows runner
-        // took over 5s here while the drain was still progressing.
+        // while the wake keeps failing. The sync scheduler can see the row
+        // before the ack above, open the chat and queue the document's own
+        // rows; only a room drains those, and this edge has none, so the
+        // test acknowledges them as the edge would.
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             while store.has_pending_chat_updates("outgoing").unwrap() {
+                for (id, _) in store.pending_chat_updates("outgoing").unwrap() {
+                    store.acknowledge_chat_update("outgoing", &id).unwrap();
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
