@@ -30,9 +30,9 @@ pub(super) fn stage_reveal(open: bool, elapsed_ms: f32, reduced: bool) -> f32 {
 }
 
 impl Shell {
-    /// Start voice mode with the providers from Settings → Voice. The
-    /// assistant hands work to the agent in the selected chat (or a new one,
-    /// as the composer would) through the composer.
+    /// Start voice mode with the providers from Settings → Voice. What the
+    /// user says goes to the agent in the selected chat (or a new one, as the
+    /// composer would) through the composer.
     pub(super) fn start_voice(&mut self, cx: &mut Context<Self>) {
         let config = match crate::dictation::call_config(cx) {
             Ok(config) => config,
@@ -52,7 +52,6 @@ impl Shell {
         let agent = crate::voice::AgentBridge {
             state: self.state.clone(),
             composer: self.composer.downgrade(),
-            transcript: self.transcript.downgrade(),
         };
         self.voice.update(cx, |controller, cx| {
             controller.start(config, engine, Some(agent), cx);

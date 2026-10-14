@@ -1,7 +1,6 @@
 //! Settings → Voice → Voice mode: who transcribes the user (OpenRouter,
-//! Deepgram or Mistral), which OpenRouter model answers and which OpenRouter
-//! voice speaks, when a pause ends a turn, and whether talking over the
-//! assistant interrupts it.
+//! Deepgram or Mistral), which OpenRouter voice reads the agent's messages,
+//! when a pause ends a prompt, and whether talking over the voice stops it.
 use super::*;
 use zeron_voice::call;
 
@@ -17,7 +16,6 @@ const PAUSES: &[(u32, &str)] = &[
 pub(super) struct Selects {
     stt: widgets::SelectState,
     stt_model: widgets::SelectState,
-    reply: widgets::SelectState,
     speech: widgets::SelectState,
     voice: widgets::SelectState,
     pause: widgets::SelectState,
@@ -52,12 +50,6 @@ pub(crate) fn call_config(cx: &App) -> Result<call::Config, String> {
         .filter(|v| speech.voices.contains(v))
         .unwrap_or(speech.voices[0])
         .to_owned();
-    let reply_model = saved
-        .voice_reply_model
-        .as_deref()
-        .filter(|m| call::REPLY_MODELS.contains(m))
-        .unwrap_or(call::REPLY_MODELS[0])
-        .to_owned();
     Ok(call::Config {
         stt: call::Stt {
             provider,
@@ -66,14 +58,11 @@ pub(crate) fn call_config(cx: &App) -> Result<call::Config, String> {
             language: saved.stt_language.clone(),
         },
         openrouter_key,
-        reply_model,
         speech_model: speech.id.to_owned(),
         voice,
         barge_in: saved.voice_barge_in,
         end_silence: Duration::from_millis(u64::from(saved.voice_pause_ms.clamp(300, 3000))),
         input: saved.dictation_input.clone(),
-        instructions: String::new(),
-        tools: Vec::new(),
     })
 }
 
@@ -147,7 +136,7 @@ impl VoiceCard {
             true,
             "OpenRouter API key",
             if has_openrouter {
-                "Saved on this device. Replies and the voice use it.".into_any_element()
+                "Saved on this device. The voice uses it.".into_any_element()
             } else {
                 "Add an OpenRouter key to turn on voice mode.".into_any_element()
             },
@@ -236,32 +225,6 @@ impl VoiceCard {
         })
         .render(&self.voice.stt_model, cx);
 
-        let reply_control = widgets::select(
-            "voice-mode-reply",
-            "Reply model",
-            theme,
-            |card: &mut Self| &mut card.voice.reply,
-        )
-        .options(
-            call::REPLY_MODELS
-                .iter()
-                .map(|m| widgets::SelectOption::new(*m)),
-            saved
-                .voice_reply_model
-                .as_deref()
-                .and_then(|m| call::REPLY_MODELS.iter().position(|known| *known == m))
-                .unwrap_or(0),
-        )
-        .width(260.0)
-        .on_select(move |_, ix, _, cx| {
-            let model = call::REPLY_MODELS.get(ix).map(|m| (*m).to_owned());
-            settings::update(settings::SavePolicy::Immediate, cx, |s| {
-                s.voice_reply_model = model
-            });
-            cx.notify();
-        })
-        .render(&self.voice.reply, cx);
-
         let speech = call::speech_model(saved.voice_speech_model.as_deref());
         let speech_control = widgets::select(
             "voice-mode-speech",
@@ -318,7 +281,7 @@ impl VoiceCard {
 
         let pause_control = widgets::select(
             "voice-mode-pause",
-            "Reply after a pause",
+            "Send after a pause",
             theme,
             |card: &mut Self| &mut card.voice.pause,
         )
@@ -384,7 +347,7 @@ impl VoiceCard {
                     theme,
                     false,
                     "Speech to text",
-                    Some("Transcribes what you say once you pause".into()),
+                    Some("Transcribes what you say and sends it to the agent".into()),
                     stt_control,
                 ))
                 .children(stt_key_row)
@@ -398,16 +361,15 @@ impl VoiceCard {
                 .child(row(
                     theme,
                     false,
-                    "Reply model",
-                    Some("An OpenRouter chat model; it can hand work to Pi".into()),
-                    reply_control,
+                    "Voice model",
+                    Some("Reads the agent's messages aloud".into()),
+                    speech_control,
                 ))
-                .child(row(theme, false, "Voice model", None, speech_control))
                 .child(row(theme, false, "Voice", None, voice_control))
                 .child(row(
                     theme,
                     false,
-                    "Reply after a pause",
+                    "Send after a pause",
                     Some("How long a silence ends what you are saying".into()),
                     pause_control,
                 ))
@@ -415,9 +377,7 @@ impl VoiceCard {
                     theme,
                     false,
                     "Interrupt by speaking",
-                    Some(
-                        "Talk over the assistant to stop it. Turn off if your speakers echo".into(),
-                    ),
+                    Some("Talk over the voice to stop it. Turn off if your speakers echo".into()),
                     barge_in_switch,
                 )),
         )
@@ -444,7 +404,6 @@ mod tests {
             let config = call_config(cx).unwrap();
             assert_eq!(config.openrouter_key, "sk-or");
             assert_eq!(config.stt.api_key, "sk-or");
-            assert_eq!(config.reply_model, call::REPLY_MODELS[0]);
             assert_eq!(config.speech_model, "hexgrad/kokoro-82m");
             assert_eq!(config.voice, "af_heart");
             assert!(config.barge_in);

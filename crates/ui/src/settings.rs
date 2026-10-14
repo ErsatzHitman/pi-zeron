@@ -844,9 +844,6 @@ pub struct UiSettings {
     /// `None` is the provider's default model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice_stt_model: Option<String>,
-    /// The OpenRouter chat model that answers; `None` is the first listed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub voice_reply_model: Option<String>,
     /// The OpenRouter speech model; `None` is the first listed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice_speech_model: Option<String>,
@@ -1062,7 +1059,6 @@ impl Default for UiSettings {
             stt_trigger_phrase: zeron_voice::DEFAULT_TRIGGER_PHRASE.to_owned(),
             voice_stt_provider: zeron_voice::call::SttProvider::default(),
             voice_stt_model: None,
-            voice_reply_model: None,
             voice_speech_model: None,
             voice_name: None,
             voice_barge_in: true,
@@ -1719,7 +1715,6 @@ impl UiSettings {
             stt_trigger_phrase,
             voice_stt_provider,
             voice_stt_model,
-            voice_reply_model,
             voice_speech_model,
             voice_name,
             voice_barge_in,
@@ -2757,7 +2752,6 @@ mod tests {
             stt_trigger_phrase: "make it shorter".into(),
             voice_stt_provider: zeron_voice::call::SttProvider::Deepgram,
             voice_stt_model: Some("nova-2".into()),
-            voice_reply_model: Some("openai/gpt-4.1-nano".into()),
             voice_speech_model: Some("deepgram/aura-2".into()),
             voice_name: Some("aura-2-luna-en".into()),
             voice_barge_in: false,

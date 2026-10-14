@@ -6230,6 +6230,8 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    /// The id of the message [`Self::send`] last sent.
+    last_sent: Option<String>,
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
@@ -6553,6 +6555,7 @@ impl Composer {
             send_task: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
+            last_sent: None,
             editing_queued: None,
             key_warned: None,
             queue_edit_lease_id: None,
@@ -9293,6 +9296,7 @@ impl Composer {
         let text = crate::comments::with_comments(&text, &comments);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
+        self.last_sent = Some(message_id.clone());
         let created_at = chrono::Utc::now().timestamp_millis();
         // Existing busy chats always queue; compatibility was checked before
         // taking the draft, attachments, or review comments.
@@ -9981,11 +9985,13 @@ impl Composer {
     /// (or a new one, as Send would), queued behind a live run. Returns the
     /// chat's id, or why nothing was sent. A draft the user is writing is
     /// never taken.
+    /// Send what voice mode heard as a prompt, through the normal send path.
+    /// Returns the chat it went to and the message's id.
     pub(crate) fn send_spoken(
         &mut self,
         text: String,
         cx: &mut Context<Self>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, String), String> {
         let draft = composer_has_content(
             self.input.read(cx).text(),
             self.staged().len() + self.staged_appshots().len(),
@@ -9996,24 +10002,20 @@ impl Composer {
             || self.wizard.is_some()
             || self.input.read(cx).dictation.phase.active()
         {
-            return Err(
-                "The message box has an unsent draft. Ask the user to send or clear it first."
-                    .into(),
-            );
+            return Err("The message box has an unsent draft. Send or clear it first.".into());
         }
         if self.send_blocked(cx) {
             return Err("No agent can take a message here yet.".into());
         }
         let queue = self.run_live(cx);
         self.failure = None;
+        self.last_sent = None;
         self.send(text, queue, cx);
         if let Some(failure) = &self.failure {
             return Err(failure.to_string());
         }
-        self.state
-            .read(cx)
-            .selected_chat
-            .clone()
+        let chat = self.state.read(cx).selected_chat.clone();
+        chat.zip(self.last_sent.clone())
             .ok_or_else(|| "The message was not sent.".to_owned())
     }
 
