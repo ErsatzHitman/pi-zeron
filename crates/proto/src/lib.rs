@@ -12,6 +12,7 @@ pub mod extension_ui;
 pub mod file_mentions;
 pub mod invocation;
 pub mod motion;
+pub mod orchestrator;
 pub mod preview;
 pub mod projectless;
 pub mod sidebar_pins;

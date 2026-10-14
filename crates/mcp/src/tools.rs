@@ -119,7 +119,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
+            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -133,7 +133,7 @@ fn catalog() -> Vec<ToolDef> {
                     "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write" },
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
                     "branch": { "type": "string", "description": "Branch label to record on the chat." },
-                    "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to the project folder." },
+                    "cwd": { "type": "string", "description": "Working directory (an existing folder or worktree path). Defaults to the project folder; without a project, a cwd that is a project's folder joins that project." },
                     "prompt": { "type": "string", "description": "First message to send right away." },
                     "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
@@ -655,12 +655,17 @@ impl Tools {
     }
 
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+        // An orchestrator's tree may grow sessions below sessions; elsewhere
+        // only a top-level chat starts side chats.
+        let chats = self.zeron.chats().await?;
         if let Some(origin) = self.zeron.origin().chat_id.as_deref() {
             let chat = self.zeron.resolve_chat(origin).await?;
             anyhow::ensure!(
-                chat.parent_chat_id.is_none(),
+                chat.parent_chat_id.is_none()
+                    || zeron_proto::orchestrator::depth(&chats, &chat.id).is_some(),
                 "Side chats cannot create chats. Ask your parent chat to create another side chat."
             );
+            ensure_room_below(&chats, &chat)?;
         }
         // Parent: the explicit `parent` argument, else the chat this server
         // speaks for. Resolved so a prefix/title works and a typo fails loud.
@@ -693,18 +698,38 @@ impl Tools {
             ChatKind::Chat
         };
 
+        // Sessions of an orchestrator's tree default to their parent's harness.
+        let mut inherited_harness = None;
         if let Some(parent) = parent_chat_id.as_deref() {
             let chat = self.zeron.resolve_chat(parent).await?;
+            let orchestrated = zeron_proto::orchestrator::depth(&chats, &chat.id).is_some();
             anyhow::ensure!(
-                chat.parent_chat_id.is_none(),
+                chat.parent_chat_id.is_none() || orchestrated,
                 "Cannot create a child of a side chat. Choose a top-level parent chat."
             );
+            ensure_room_below(&chats, &chat)?;
+            if orchestrated {
+                inherited_harness = chat.config.as_ref().map(|c| c.harness);
+            }
         }
-        let (space, device_id) = self
+        let (mut space, device_id) = self
             .zeron
             .resolve_target(args.project.as_deref(), args.device.as_deref())
             .await?;
+        // A cwd that is a project's folder joins that project.
+        if space.is_none()
+            && let Some(cwd) = args.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty())
+        {
+            space = self
+                .zeron
+                .spaces()
+                .await?
+                .into_iter()
+                .find(|s| s.device_id == device_id && same_folder(&s.path, cwd));
+        }
         let harnesses = self.zeron.harnesses_on(Some(&device_id)).await?;
+        let inherited_harness =
+            inherited_harness.filter(|id| harnesses.iter().any(|h| h.id == *id && h.available()));
         let harness = match args.harness.as_deref() {
             Some(raw) => {
                 let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
@@ -714,7 +739,12 @@ impl Tools {
                 );
                 id
             }
-            None => default_harness(&harnesses).with_context(|| format!("device {device_id}"))?,
+            None => match inherited_harness {
+                Some(id) => id,
+                None => {
+                    default_harness(&harnesses).with_context(|| format!("device {device_id}"))?
+                }
+            },
         };
         if let Some(model) = args.model.as_deref() {
             let models = self.zeron.models_on(harness, Some(&device_id)).await?;
@@ -1242,6 +1272,33 @@ impl Tools {
 }
 
 /// claude-code when it is offered here, else the first available harness.
+/// An orchestrator's tree stops growing [`MAX_DEPTH`] levels below its root.
+///
+/// [`MAX_DEPTH`]: zeron_proto::orchestrator::MAX_DEPTH
+fn ensure_room_below(chats: &[Chat], parent: &Chat) -> anyhow::Result<()> {
+    let max = zeron_proto::orchestrator::MAX_DEPTH;
+    anyhow::ensure!(
+        zeron_proto::orchestrator::depth(chats, &parent.id).is_none_or(|depth| depth < max),
+        "This session is {max} levels below its orchestrator, the deepest a session may start more sessions from. Do the work here or report back."
+    );
+    Ok(())
+}
+
+/// The same folder, spelled with either separator, a trailing separator,
+/// or (Windows paths) another case.
+fn same_folder(a: &str, b: &str) -> bool {
+    let norm = |p: &str| {
+        let p = p.trim().replace('\\', "/");
+        let p = p.trim_end_matches('/').to_owned();
+        if p.as_bytes().get(1) == Some(&b':') {
+            p.to_lowercase()
+        } else {
+            p
+        }
+    };
+    norm(a) == norm(b)
+}
+
 fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
     harnesses
         .iter()
@@ -1795,6 +1852,61 @@ mod tests {
                 .contains("child of a side chat")
         );
         assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_orchestrators_sessions_start_sessions_until_the_depth_limit() {
+        let root = "orchestrator-root";
+        let mut extra_chats = vec![json!({
+            "id": root, "deviceId": "dev-local", "title": "Orchestrator",
+            "archived": false, "createdAt": "2026-09-03T00:00:00Z",
+            "config": { "harness": "claude-code", "model": null, "reasoning": null, "sandbox": "workspace-write" },
+        })];
+        let mut parent = root.to_owned();
+        for level in 1..=zeron_proto::orchestrator::MAX_DEPTH {
+            let id = format!("orchestrated-{level}");
+            extra_chats.push(json!({
+                "id": id, "deviceId": "dev-local", "title": format!("Level {level}"),
+                "archived": false, "createdAt": "2026-09-03T00:00:00Z",
+                "parentChatId": parent,
+                "config": { "harness": "claude-code", "model": null, "reasoning": null, "sandbox": "workspace-write" },
+            }));
+            parent = id;
+        }
+        let world = Arc::new(World {
+            extra_chats,
+            ..Default::default()
+        });
+        let from = |chat: &str| {
+            tools(
+                world.clone(),
+                Origin {
+                    chat_id: Some(chat.into()),
+                    device_id: None,
+                },
+            )
+        };
+        let created = from("orchestrated-1")
+            .call(
+                "create_chat",
+                json!({"cwd": "/repo/comet/", "title": "Sub"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["parentChatId"], "orchestrated-1");
+        assert_eq!(created["harness"], "claude-code", "the parent's harness");
+        assert_eq!(created["project"]["id"], "space-1", "the cwd's project");
+        let deepest = format!("orchestrated-{}", zeron_proto::orchestrator::MAX_DEPTH);
+        let refused = from(&deepest)
+            .call("create_chat", json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("levels below its orchestrator"),
+            "{refused}"
+        );
+        assert!(same_folder("D:\\OpenTalk\\", "d:/opentalk"));
+        assert!(!same_folder("/repo/Comet", "/repo/comet"));
     }
 
     #[tokio::test]
