@@ -2183,6 +2183,11 @@ pub struct Shell {
     /// lifecycle ([`crate::app_update`]) moves. `None` when the app runs
     /// without a desktop checker (tests).
     _app_update_observation: Option<Subscription>,
+    /// The release the update toast already asked about this session.
+    update_toast: Option<String>,
+    /// The toast's "Update" was pressed before the download was staged:
+    /// restart as soon as it is.
+    restart_when_ready: bool,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -2668,8 +2673,14 @@ impl Shell {
             harness_update_scroll: settings::widgets::PageScroll::default(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
-            _app_update_observation: crate::app_update::AppUpdate::global(cx)
-                .map(|update| cx.observe(&update, |_, _, cx| cx.notify())),
+            _app_update_observation: crate::app_update::AppUpdate::global(cx).map(|update| {
+                cx.observe(&update, |this, update, cx| {
+                    this.on_app_update(&update, cx);
+                    cx.notify();
+                })
+            }),
+            update_toast: None,
+            restart_when_ready: false,
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -9529,6 +9540,75 @@ impl Shell {
                 update.update(cx, |update, cx| update.dismiss_advisory(cx));
             }
         }
+    }
+
+    /// Ask once per release, in a toast, whether to update now; after
+    /// "Update", restart as soon as the download is staged.
+    fn on_app_update(
+        &mut self,
+        update: &Entity<crate::app_update::AppUpdate>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::app_update::Flow;
+        let (latest, flow) = {
+            let update = update.read(cx);
+            if !update.self_updating() {
+                return;
+            }
+            (update.available().map(str::to_owned), update.flow().clone())
+        };
+        if self.restart_when_ready {
+            match &flow {
+                Flow::Ready { staged, .. } => {
+                    self.restart_when_ready = false;
+                    self.apply_staged_update(staged.clone(), cx);
+                    return;
+                }
+                Flow::Failed { message, .. } => {
+                    self.restart_when_ready = false;
+                    crate::toast::error(cx, format!("Couldn't download the update: {message}"));
+                }
+                _ => {}
+            }
+        }
+        let Some(latest) = latest else {
+            return;
+        };
+        if self.update_toast.as_deref() == Some(latest.as_str()) {
+            return;
+        }
+        let Some((message, label)) = crate::app_update::toast_for(&flow, &latest) else {
+            return;
+        };
+        self.update_toast = Some(latest);
+        let shell = cx.weak_entity();
+        crate::toast::ask(
+            cx,
+            crate::toast::ToastKind::Info,
+            message,
+            vec![
+                crate::toast::ToastAction::new(label, move |cx| {
+                    shell.update(cx, |shell, cx| shell.update_now(cx)).ok();
+                })
+                .primary(),
+                crate::toast::ToastAction::new("Later", |_| {}),
+            ],
+        );
+    }
+
+    /// The update toast's button: restart onto a staged release now, or
+    /// download it and restart once it is staged.
+    fn update_now(&mut self, cx: &mut Context<Self>) {
+        let Some(update) = crate::app_update::AppUpdate::global(cx) else {
+            return;
+        };
+        if let Some(staged) = update.read(cx).staged() {
+            self.apply_staged_update(staged, cx);
+            return;
+        }
+        self.restart_when_ready = true;
+        update.update(cx, |update, cx| update.start_download(cx));
+        crate::toast::info(cx, "Downloading the update. Zeron restarts when ready.");
     }
 
     /// Swap the staged update over the installed one, arm the detached

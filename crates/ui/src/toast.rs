@@ -11,13 +11,16 @@
 //! - A toast is dismissed by swiping it off to the right.
 //!
 //! Push from anywhere with [`error`], [`success`] or [`info`]; the shell
-//! mounts [`render_toaster`] once per window.
+//! mounts [`render_toaster`] once per window. [`ask`] adds a toast with
+//! buttons that stays until it is answered or swiped away.
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Global, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, point, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, point,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::motion::CubicBezier;
@@ -89,10 +92,36 @@ impl Glide {
     }
 }
 
+/// A button on a toast. Pressing it runs `run`, then closes the toast.
+#[derive(Clone)]
+pub struct ToastAction {
+    pub label: SharedString,
+    /// The suggested answer, drawn filled.
+    pub primary: bool,
+    pub run: Rc<dyn Fn(&mut App)>,
+}
+
+impl ToastAction {
+    pub fn new(label: impl Into<SharedString>, run: impl Fn(&mut App) + 'static) -> Self {
+        Self {
+            label: label.into(),
+            primary: false,
+            run: Rc::new(run),
+        }
+    }
+
+    pub fn primary(mut self) -> Self {
+        self.primary = true;
+        self
+    }
+}
+
 struct Toast {
     id: u64,
     kind: ToastKind,
     message: SharedString,
+    /// Buttons under the message; a toast with any stays until answered.
+    actions: Vec<ToastAction>,
     created: Instant,
     /// Countdown left, and when it last resumed (`None` while paused).
     remaining: Duration,
@@ -107,9 +136,16 @@ struct Toast {
 }
 
 impl Toast {
+    /// A question waits for its answer instead of timing out.
+    fn sticky(&self) -> bool {
+        !self.actions.is_empty()
+    }
+
     fn expired(&self, now: Instant) -> bool {
-        self.resumed
-            .is_some_and(|since| now.saturating_duration_since(since) >= self.remaining)
+        !self.sticky()
+            && self
+                .resumed
+                .is_some_and(|since| now.saturating_duration_since(since) >= self.remaining)
     }
 
     fn pause(&mut self, now: Instant) {
@@ -129,6 +165,7 @@ impl Toast {
     fn deadline(&self) -> Option<Instant> {
         match (self.closing, self.resumed) {
             (Some(at), _) => Some(at + EXIT),
+            (None, _) if self.sticky() => None,
             (None, Some(since)) => Some(since + self.remaining),
             (None, None) => None,
         }
@@ -147,15 +184,20 @@ struct ToastStore {
 
 impl Global for ToastStore {}
 
-fn push(cx: &mut App, kind: ToastKind, message: SharedString) {
+fn push(
+    cx: &mut App,
+    kind: ToastKind,
+    message: SharedString,
+    actions: Vec<ToastAction>,
+) -> Option<u64> {
     let message: SharedString = message.trim().to_owned().into();
     if message.is_empty() {
-        return;
+        return None;
     }
     let now = Instant::now();
     let store = cx.default_global::<ToastStore>();
     // A repeat of the live front toast restarts it instead of stacking.
-    if let Some(front) = store
+    let id = if let Some(front) = store
         .toasts
         .iter_mut()
         .rev()
@@ -165,6 +207,8 @@ fn push(cx: &mut App, kind: ToastKind, message: SharedString) {
     {
         front.remaining = DURATION;
         front.resumed = (!store.hovered).then_some(now);
+        front.actions = actions;
+        front.id
     } else {
         store.next_id += 1;
         let id = store.next_id;
@@ -173,6 +217,7 @@ fn push(cx: &mut App, kind: ToastKind, message: SharedString) {
             id,
             kind,
             message,
+            actions,
             created: now,
             remaining: DURATION,
             resumed: (!hovered).then_some(now),
@@ -183,28 +228,62 @@ fn push(cx: &mut App, kind: ToastKind, message: SharedString) {
             swipe: 0.0,
             swipe_from: None,
         });
-    }
+        id
+    };
     cx.refresh_windows();
+    Some(id)
 }
 
 /// A toast of `kind`.
 pub fn show(cx: &mut App, kind: ToastKind, message: impl Into<SharedString>) {
-    push(cx, kind, message.into());
+    push(cx, kind, message.into(), Vec::new());
 }
 
 /// A failure toast.
 pub fn error(cx: &mut App, message: impl Into<SharedString>) {
-    push(cx, ToastKind::Error, message.into());
+    push(cx, ToastKind::Error, message.into(), Vec::new());
 }
 
 /// A confirmation toast ("Link copied").
 pub fn success(cx: &mut App, message: impl Into<SharedString>) {
-    push(cx, ToastKind::Success, message.into());
+    push(cx, ToastKind::Success, message.into(), Vec::new());
 }
 
 /// A neutral notice.
 pub fn info(cx: &mut App, message: impl Into<SharedString>) {
-    push(cx, ToastKind::Info, message.into());
+    push(cx, ToastKind::Info, message.into(), Vec::new());
+}
+
+/// A question: a toast with `actions` that stays until one is pressed or it
+/// is swiped away. Returns its id for [`close`].
+pub fn ask(
+    cx: &mut App,
+    kind: ToastKind,
+    message: impl Into<SharedString>,
+    actions: Vec<ToastAction>,
+) -> Option<u64> {
+    push(cx, kind, message.into(), actions)
+}
+
+/// Close toast `id` (a question that no longer applies).
+pub fn close(id: u64, cx: &mut App) {
+    dismiss(id, cx);
+}
+
+/// Press button `index` of toast `id`: close the toast, then run the action.
+fn answer(id: u64, index: usize, cx: &mut App) {
+    let action = cx.try_global::<ToastStore>().and_then(|store| {
+        store
+            .toasts
+            .iter()
+            .find(|toast| toast.id == id && toast.closing.is_none())
+            .and_then(|toast| toast.actions.get(index).cloned())
+    });
+    let Some(action) = action else {
+        return;
+    };
+    dismiss(id, cx);
+    (action.run)(cx);
 }
 
 /// Surface a view's pending error as a toast, once: takes it out of `slot`.
@@ -461,19 +540,61 @@ pub fn render_toaster(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
         }
         let kind = toast.kind;
         let message = toast.message.clone();
+        let buttons: Vec<AnyElement> = toast
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let tone = if action.primary {
+                    crate::settings::widgets::ActionTone::Outlined
+                } else {
+                    crate::settings::widgets::ActionTone::Quiet
+                };
+                crate::settings::widgets::text_action(&theme, tone, action.label.clone())
+                    .id(("toast-action", (id as usize) * 8 + index))
+                    .debug_selector(move || format!("toast-action-{index}"))
+                    .role(gpui::Role::Button)
+                    .aria_label(action.label.clone())
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        answer(id, index, cx);
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        let body = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(message.clone())
+            .when(!buttons.is_empty(), |body| {
+                body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .children(buttons),
+                )
+            });
         let content = div()
             .id(("toast-content", id as usize))
             .w_full()
             .flex()
             .flex_row()
-            .items_center()
+            .items_start()
             .gap(px(10.0))
             .px(px(14.0))
             .py(px(13.0))
             .text_size(crate::typography::ui_rems(13.0))
             .text_color(theme.text)
             .child(kind_icon(kind, &theme))
-            .child(div().flex_1().min_w_0().child(message.clone()))
+            .child(body)
             .child(
                 // Measure the natural height for the stack's layout.
                 gpui::canvas(
@@ -635,6 +756,7 @@ mod tests {
             id: store.next_id,
             kind: ToastKind::Error,
             message: message.to_owned().into(),
+            actions: Vec::new(),
             created: now,
             remaining: DURATION,
             resumed: Some(now),
@@ -698,6 +820,46 @@ mod tests {
         let id = cx.update(|_, cx| cx.global::<ToastStore>().toasts[1].id);
         cx.update(|_, cx| dismiss(id, cx));
         cx.update(|_, cx| assert_eq!(messages(cx), ["Couldn't save"]));
+    }
+
+    #[gpui::test]
+    fn questions_wait_for_an_answer_and_run_it(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let (_, cx) = cx.add_window_view(|_, _| Host);
+        let answered = Rc::new(std::cell::Cell::new(0));
+        let id = cx.update(|_, cx| {
+            let pressed = answered.clone();
+            ask(
+                cx,
+                ToastKind::Info,
+                "Zeron v9.9.9 is available.",
+                vec![
+                    ToastAction::new("Update now", move |_| pressed.set(pressed.get() + 1))
+                        .primary(),
+                    ToastAction::new("Later", |_| {}),
+                ],
+            )
+            .unwrap()
+        });
+        cx.run_until_parked();
+        // Long past a plain toast's four seconds, the question is still up.
+        cx.update(|_, cx| {
+            let store = cx.global_mut::<ToastStore>();
+            tick(store, true, Instant::now() + Duration::from_secs(60));
+            assert_eq!(messages(cx), ["Zeron v9.9.9 is available."]);
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let button = cx
+            .debug_bounds("toast-action-0")
+            .expect("the primary answer is drawn");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        assert_eq!(answered.get(), 1, "the answer ran");
+        cx.update(|_, cx| assert!(messages(cx).is_empty(), "answering closes it"));
+        // Pressing a closed question does nothing.
+        cx.update(|_, cx| answer(id, 0, cx));
+        assert_eq!(answered.get(), 1);
     }
 
     #[test]

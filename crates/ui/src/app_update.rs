@@ -428,6 +428,19 @@ pub fn strip_for(
     }
 }
 
+/// The toast that asks, once per release, whether to update now: its message
+/// and the label of its update button. `None` once the swap is underway.
+pub fn toast_for(flow: &Flow, latest: &str) -> Option<(SharedString, &'static str)> {
+    match flow {
+        Flow::Installed => None,
+        Flow::Ready { version, .. } if version == latest => Some((
+            format!("Zeron v{latest} is ready to install.").into(),
+            "Restart to update",
+        )),
+        _ => Some((format!("Zeron v{latest} is available.").into(), "Update")),
+    }
+}
+
 /// "Check for Updates…" from a menu: surface the main window, then check.
 pub fn check_for_updates(cx: &mut App) {
     crate::activate_main_window(cx);
@@ -493,6 +506,32 @@ mod tests {
             strip_for(&mac_app, true, &Flow::Idle, "0.2.86").1,
             StripAction::Explain
         );
+    }
+
+    #[test]
+    fn the_update_toast_offers_a_restart_once_staged() {
+        assert_eq!(
+            toast_for(&Flow::Idle, "0.2.118"),
+            Some((SharedString::from("Zeron v0.2.118 is available."), "Update"))
+        );
+        let downloading = Flow::Downloading {
+            version: "0.2.118".into(),
+        };
+        assert_eq!(toast_for(&downloading, "0.2.118").unwrap().1, "Update");
+        let ready = |version: &str| Flow::Ready {
+            version: version.into(),
+            staged: PathBuf::from("/tmp/Zeron.app"),
+        };
+        assert_eq!(
+            toast_for(&ready("0.2.118"), "0.2.118"),
+            Some((
+                SharedString::from("Zeron v0.2.118 is ready to install."),
+                "Restart to update"
+            ))
+        );
+        // An older staged release still asks to update to the newest.
+        assert_eq!(toast_for(&ready("0.2.117"), "0.2.118").unwrap().1, "Update");
+        assert_eq!(toast_for(&Flow::Installed, "0.2.118"), None);
     }
 
     #[test]
