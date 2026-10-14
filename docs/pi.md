@@ -63,7 +63,12 @@ is guarded too, with no change to the user's Pi config: the extension adds
 launchers (fleet subagents, loop workers, the advisor: `piInvocation`)
 pass to each child, and the preload adds `--extension <guard>` to that
 child's arguments when it runs the same Pi script; grandchildren inherit
-the flag. A missing guard file stops the child. A compiled Pi binary takes
+the flag. The installed preload has the guard's paths (extension, prefs
+file, force flag) written in, so a child that gets the node flags but not
+the env, such as a Pi typed into a herdr pane or opened in a new terminal
+tab by herdr-delegate, is guarded too: there the preload matches Pi's
+`cli` entry script and restores the env for the child's own children. A
+missing guard file stops the child. A compiled Pi binary takes
 no node flags, so its children rely on launchers passing
 `-e $ZERON_DELETE_GUARD_EXT`. A nested `pi --no-extensions`
 and non-interactive agent CLIs (`claude -p`, `codex exec`) run from bash are

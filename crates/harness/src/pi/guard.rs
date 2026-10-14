@@ -35,8 +35,9 @@ pub type DeleteGuardSetting = Arc<dyn Fn() -> DeleteGuard + Send + Sync>;
 pub(super) fn configure(cmd: &mut Command, guard: &DeleteGuard) -> Result<(), HarnessError> {
     // Fail closed: a run started without its guard is never covered, even
     // once the toggle turns on.
-    let installed = install(&guard.dir)
-        .and_then(|path| install_preload(&guard.dir).map(|preload| (path, preload)));
+    let installed = install(&guard.dir).and_then(|path| {
+        install_preload(&guard.dir, &preload_source(guard, &path)).map(|preload| (path, preload))
+    });
     let (path, preload) = installed.map_err(|error| {
         HarnessError::Protocol(format!(
             "the delete guard could not be installed in {}: {error}",
@@ -79,8 +80,24 @@ fn install(dir: &Path) -> std::io::Result<PathBuf> {
     install_file(dir, "zeron-delete-guard", SOURCE)
 }
 
-fn install_preload(dir: &Path) -> std::io::Result<PathBuf> {
-    install_file(dir, "zeron-delete-guard-preload", PRELOAD)
+fn install_preload(dir: &Path, source: &str) -> std::io::Result<PathBuf> {
+    install_file(dir, "zeron-delete-guard-preload", source)
+}
+
+/// The preload with this guard's paths written in, so a child Pi started
+/// without the parent's env (a herdr pane, a new terminal tab) still finds
+/// the extension and the live toggle.
+fn preload_source(guard: &DeleteGuard, ext: &Path) -> String {
+    let config = serde_json::json!({
+        "ext": ext.to_string_lossy(),
+        "file": guard.state_file.as_ref().map(|file| file.to_string_lossy()),
+        "force": guard.forced,
+    });
+    PRELOAD.replacen(
+        "{}; // zeron:guard-config",
+        &format!("{config}; // zeron:guard-config"),
+        1,
+    )
 }
 
 /// Content-addressed and never pruned: a long-lived Pi from before an
@@ -152,17 +169,32 @@ mod tests {
     }
 
     #[test]
-    fn the_preload_installs_beside_the_guard() {
+    fn the_preload_installs_beside_the_guard_with_its_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = install(dir.path()).unwrap();
-        let preload = install_preload(dir.path()).unwrap();
-        assert_ne!(guard, preload);
-        assert!(holds(&preload, PRELOAD));
+        let ext = install(dir.path()).unwrap();
+        let guard = DeleteGuard {
+            enabled: true,
+            forced: true,
+            state_file: Some(dir.path().join("harness-prefs.json")),
+            dir: dir.path().to_path_buf(),
+        };
+        let source = preload_source(&guard, &ext);
+        assert!(source.contains(&format!(
+            "export const CONFIG = {}; // zeron:guard-config",
+            serde_json::json!({
+                "ext": ext.to_string_lossy(),
+                "file": dir.path().join("harness-prefs.json").to_string_lossy(),
+                "force": true,
+            })
+        )));
+        let preload = install_preload(dir.path(), &source).unwrap();
+        assert_ne!(ext, preload);
+        assert!(holds(&preload, &source));
         let name = preload.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("zeron-delete-guard-preload-"));
-        assert_eq!(install_preload(dir.path()).unwrap(), preload);
+        assert_eq!(install_preload(dir.path(), &source).unwrap(), preload);
         assert!(SOURCE.contains("inheritIntoChildren();"));
-        assert!(PRELOAD.contains("ZERON_DELETE_GUARD_PI"));
+        assert!(PRELOAD.contains("export const CONFIG = {}; // zeron:guard-config"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 // extension. Run as `node <this> <guard.mjs> <guard-preload.mjs>`.
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
-import {mkdtempSync, writeFileSync} from 'node:fs';
+import {mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -24,8 +24,23 @@ assert.equal(argv.length, 6);
 argv = ['node', '/pi/cli.js', '-e', guardPath];
 assert.equal(addGuard(argv, env, () => true), 'present');
 assert.equal(addGuard(['node', '/other/tool.js'], env, () => true), 'skip');
-assert.equal(addGuard(['node', '/pi/cli.js'], {ZERON_DELETE_GUARD_EXT: guardPath}, () => true), 'skip');
+assert.equal(addGuard(['node', '/pi/cli.js'], {}, () => true, {}), 'skip');
+assert.equal(addGuard(['node', '/pi/cli.js'], {ZERON_DELETE_GUARD_EXT: guardPath}, () => true, {}), 'added');
+assert.equal(addGuard(['node', '/pi/other.js'], {ZERON_DELETE_GUARD_EXT: guardPath}, () => true, {}), 'skip');
 assert.equal(addGuard(['node', '/pi/cli.js'], env, () => false), 'missing');
+// No env (a herdr pane, a new terminal tab): the written-in config stands in
+// and is restored for the child's own children.
+const bare = {};
+const config = {ext: guardPath, file: '/p/harness-prefs.json', force: true};
+argv = ['node', '/src/cli.ts', '--mode', 'rpc'];
+assert.equal(addGuard(argv, bare, () => true, config, '/d/preload.mjs'), 'added');
+assert.deepEqual(argv.slice(2, 4), ['--extension', guardPath]);
+assert.deepEqual(bare, {
+  ZERON_DELETE_GUARD_EXT: guardPath,
+  ZERON_DELETE_GUARD_FILE: '/p/harness-prefs.json',
+  ZERON_DELETE_GUARD_FORCE: '1',
+  ZERON_DELETE_GUARD_PRELOAD: '/d/preload.mjs',
+});
 
 // inheritIntoChildren: the preload joins the node flags once, and names this
 // Pi's script for its children.
@@ -68,5 +83,22 @@ assert.deepEqual(JSON.parse(untouched.stdout).argv, ['--mode', 'json']);
 const missing = run(fakePi, {ZERON_DELETE_GUARD_EXT: join(dir, 'gone.mjs')});
 assert.equal(missing.status, 1);
 assert.match(missing.stderr, /delete guard extension is missing/);
+
+// A Pi typed into a herdr pane: the parent's node flags, none of its env.
+const configured = join(dir, 'configured-preload.mjs');
+const marker = 'export const CONFIG = {}; // zeron:guard-config';
+const source = readFileSync(preloadPath, 'utf8');
+assert.ok(source.includes(marker));
+writeFileSync(configured, source.replace(marker, `export const CONFIG = ${JSON.stringify({ext: guardPath, file: join(dir, 'prefs.json'), force: false})}; // zeron:guard-config`));
+const cli = join(dir, 'cli.mjs');
+writeFileSync(cli, 'console.log(JSON.stringify({argv: process.argv.slice(2), ext: process.env.ZERON_DELETE_GUARD_EXT, file: process.env.ZERON_DELETE_GUARD_FILE, preload: process.env.ZERON_DELETE_GUARD_PRELOAD}));\n');
+const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ZERON_')));
+const pane = spawnSync(process.execPath, [`--import=${pathToFileURL(configured).href}`, cli, '--mode', 'json'], {env: cleanEnv, encoding: 'utf8'});
+assert.equal(pane.status, 0, pane.stderr);
+const paneSeen = JSON.parse(pane.stdout);
+assert.deepEqual(paneSeen.argv, ['--extension', guardPath, '--mode', 'json']);
+assert.equal(paneSeen.ext, guardPath);
+assert.equal(paneSeen.file, join(dir, 'prefs.json'));
+assert.equal(resolve(paneSeen.preload), resolve(configured));
 
 console.log('delete guard child coverage passed');
