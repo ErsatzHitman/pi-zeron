@@ -58,20 +58,25 @@ The agent works in the background. When it finishes, needs an answer or fails, t
 
 ## Cost
 
-Each turn makes one transcription, one or more chat requests and one speech request per sentence. OpenRouter list prices on 14 October 2026, at ₹88 per US dollar:
+Each turn makes one transcription, one or more chat requests and one speech request per sentence. The table uses OpenRouter list prices from 14 October 2026, at about ₹95 to the US dollar (the September 2026 rate).
 
 | Stage | Model | Price | Per minute of conversation* |
 | --- | --- | --- | --- |
 | Speech to text | `openai/whisper-large-v3-turbo` | $0.0002 per audio minute | ₹0.01 |
-| Speech to text | `deepgram/nova-3` | $0.0043 per audio minute | ₹0.19 |
-| Speech to text | `mistralai/voxtral-mini-transcribe` | $0.003 per audio minute | ₹0.13 |
-| Reply | `google/gemini-2.5-flash-lite` | $0.10 / $0.40 per million tokens in / out | ₹0.10 |
-| Voice | `hexgrad/kokoro-82m` | $0.62 per million characters | ₹0.02 |
-| Voice | `deepgram/aura-2` | $30 per million characters | ₹1.19 |
+| Speech to text | `deepgram/nova-3` | $0.0043 per audio minute | ₹0.20 |
+| Speech to text | `mistralai/voxtral-mini-transcribe` | $0.003 per audio minute | ₹0.14 |
+| Reply | `google/gemini-2.5-flash-lite` | $0.10 / $0.40 per million tokens in / out | ₹0.11 |
+| Voice | `hexgrad/kokoro-82m` | $0.62 per million characters | ₹0.03 |
+| Voice | `deepgram/aura-2` | $30 per million characters | ₹1.28 |
 
 \*Assumes the user talks for 30 seconds, four turns of about 2,500 prompt tokens each (instructions, tools and history), and 450 spoken characters a minute.
 
-The defaults come to about ₹0.13 a minute, or ₹8 an hour. Aura 2 makes a call roughly ten times dearer. Prices change: check each model's OpenRouter page.
+Calling Deepgram or Mistral directly costs the same as going through OpenRouter:
+
+- Deepgram lists Nova-3 pre-recorded audio at $0.0043 a minute ($0.0052 for multilingual) and Aura-2 at $0.030 per 1,000 characters.
+- Mistral's `voxtral-mini-latest` is reported at $0.003 a minute.
+
+With the defaults, a call costs about ₹0.15 a minute, or ₹9 an hour. Aura 2 makes it about nine times dearer. Prices and exchange rates change, so check each provider's pricing page.
 
 ## Privacy
 
