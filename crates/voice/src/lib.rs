@@ -1,5 +1,6 @@
 //! Desktop dictation: capture on this device, transcription in the cloud
-//! ([`cloud`]). No engine, document, RPC or audio persistence.
+//! ([`cloud`]). No engine, document, RPC or audio persistence. Voice mode,
+//! a spoken conversation, is [`call`].
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{
@@ -7,6 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
+pub mod call;
 mod cleanup;
 pub mod cloud;
 mod resample;
