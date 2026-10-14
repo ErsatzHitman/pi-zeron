@@ -117,6 +117,11 @@ struct SetPiSettingsParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct SetDeleteGuardParams {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetHarnessEnabledParams {
     harness: HarnessId,
@@ -1457,6 +1462,7 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_TITLE_SETTINGS
             | methods::GET_PI_SETTINGS
             | methods::SET_PI_SETTINGS
+            | methods::SET_DELETE_GUARD
             // Live extension UI is held by the chat's host engine.
             | methods::WATCH_EXTENSION_UI
             | methods::EXTENSION_UI_ACTION
@@ -1891,8 +1897,13 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
-            methods::GET_PI_SETTINGS | methods::SET_PI_SETTINGS => {
-                if method == methods::SET_PI_SETTINGS {
+            methods::GET_PI_SETTINGS | methods::SET_PI_SETTINGS | methods::SET_DELETE_GUARD => {
+                if method == methods::SET_DELETE_GUARD {
+                    let p: SetDeleteGuardParams = parse_params(params)?;
+                    self.registry
+                        .set_block_deletes(p.enabled)
+                        .map_err(RpcError::Failed)?;
+                } else if method == methods::SET_PI_SETTINGS {
                     let p: SetPiSettingsParams = parse_params(params)?;
                     self.registry.set_pi_executable(
                         p.executable

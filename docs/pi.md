@@ -23,6 +23,51 @@ authenticate Pi through its own CLI. `PI_CODING_AGENT_DIR` continues to control
 Pi settings, credentials and extensions. `PI_ACP_EXECUTABLE` and
 `PI_ACP_PI_COMMAND` are no longer used.
 
+## Delete guard
+
+Settings → General → Pi → Block deletes (on by default, `blockDeletes` in
+`harness-prefs.json`) blocks tool calls that delete: `rm`, `del`,
+`Remove-Item`, `find -delete`, `git clean`/`rm`/`branch -D`/ref-deleting
+pushes, `rsync --delete`, package uninstalls, docker/kubectl/terraform
+deletes, SQL drops, HTTP `DELETE`, embedded `os.remove`/`fs.rmSync`/`unlink`
+in `python -c`/`node -e` and heredocs, and MCP or extension tools named or
+marked as deleting (`application_delete`, `trash_message`,
+`destructiveHint`). Wrappers (`sudo`, `xargs`, `ssh`, `docker exec`,
+`rtk`), `sh -c`, `cmd /c`, `powershell -Command`/`-EncodedCommand`, `$(…)`,
+backticks and pipes into a shell are looked through. An empty `write` over a
+non-empty file counts as a delete. The blocked call returns a reason that
+tells the agent not to retry another way and to tell the user what it wanted
+removed. The user's own `!command` is never blocked.
+
+It is the Pi extension `crates/harness/src/pi/guard.mjs`, installed
+content-addressed in `<data dir>/pi-guard/` and passed as `--extension` to
+every chat, sub-chat, orchestrator root and member run (not to model probes
+or title runs, which run no tools). It loads with or without the MCP bridge
+and while the toggle is off, so switching it on reaches running chats: the
+extension re-reads `harness-prefs.json` on each tool call (missing, corrupt
+or unreadable means on). Env for the run and its children:
+
+| Variable | Meaning |
+|---|---|
+| `ZERON_DELETE_GUARD_EXT` | The installed extension, for child launchers to pass on with `-e` |
+| `ZERON_DELETE_GUARD` | The toggle at spawn (`1`/`0`), used when there is no prefs file |
+| `ZERON_DELETE_GUARD_FILE` | The live `harness-prefs.json` |
+| `ZERON_DELETE_GUARD_FORCE` | `1` holds the guard on whatever the file says |
+
+`ZERON_BLOCK_DELETES=1` on the engine (headless engines: `~/.zeron/env`)
+sets the force flag and greys the switch out. Children inherit the env, and
+a Pi child that loads the extension from `ZERON_DELETE_GUARD_EXT` is covered
+too; Pi subagent, loop and herdr launchers in the user's own Pi config need
+to pass it on (`-e $ZERON_DELETE_GUARD_EXT`). A nested `pi --no-extensions`
+and non-interactive agent CLIs (`claude -p`, `codex exec`) run from bash are
+blocked, since they would run unguarded.
+
+This is a guard against mistakes and model-driven deletes, not a sandbox:
+code written to a file and run later, an unrecognised tool name, or a path
+assembled at run time can still delete. Other harnesses are not covered.
+The corpus in `crates/harness/tests/fixtures/pi-delete-guard-test.mjs` is
+its acceptance test, run on Linux, macOS and Windows CI.
+
 ## Updates
 
 Zeron for Pi updates itself from this fork's GitHub releases

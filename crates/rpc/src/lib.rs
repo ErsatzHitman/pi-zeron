@@ -53,6 +53,9 @@ pub mod methods {
     pub const GET_PI_SETTINGS: &str = "GetPiSettings";
     /// Save the Pi executable (`{executable: string|null}`); replies like `GetPiSettings`.
     pub const SET_PI_SETTINGS: &str = "SetPiSettings";
+    /// Turn the delete guard on or off (`{enabled: bool}`); replies like
+    /// `GetPiSettings`.
+    pub const SET_DELETE_GUARD: &str = "SetDeleteGuard";
     /// A chat's live extension UI (`ExtensionUiState` frames) on its host
     /// device; while any watcher is connected, Pi's extensions render rich
     /// elements instead of dialogs. Gated by `EXTENSION_UI_V1`.

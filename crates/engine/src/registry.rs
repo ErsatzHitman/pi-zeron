@@ -97,6 +97,10 @@ struct HarnessPrefsFile {
     /// falls back to `PI_EXECUTABLE`; Zeron never searches PATH for Pi.
     #[serde(skip_serializing_if = "Option::is_none")]
     pi_executable: Option<PathBuf>,
+    /// Settings → General → Pi → Block deletes; `None` (never touched) is
+    /// on. Running Pis read it live through the delete guard (`guard.mjs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_deletes: Option<bool>,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
     #[serde(skip_serializing)]
@@ -104,8 +108,10 @@ struct HarnessPrefsFile {
 }
 
 /// Settings → General → Pi: the device's configured executable and what it
-/// resolves to right now. Only `executable` is written back by the UI.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// resolves to right now, and whether deletes are blocked. The UI writes
+/// `executable` back with `SetPiSettings` and `block_deletes` with
+/// `SetDeleteGuard`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PiSettings {
     /// The saved path; `None` uses `PI_EXECUTABLE`.
@@ -117,6 +123,33 @@ pub struct PiSettings {
     pub version: Option<String>,
     /// Why Pi cannot start (missing, unreadable, older than 1.1.0).
     pub error: Option<String>,
+    /// Every Pi chat, sub-chat and subagent has delete tool calls blocked.
+    pub block_deletes: bool,
+    /// `ZERON_BLOCK_DELETES=1` on this engine holds `block_deletes` on.
+    pub delete_guard_forced: bool,
+}
+
+impl Default for PiSettings {
+    fn default() -> Self {
+        Self {
+            executable: None,
+            env_executable: None,
+            resolved: None,
+            version: None,
+            error: None,
+            block_deletes: true,
+            delete_guard_forced: false,
+        }
+    }
+}
+
+/// `ZERON_BLOCK_DELETES` holds the delete guard on, for headless engines.
+fn forced_by(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1" | "true"))
+}
+
+fn delete_guard_forced() -> bool {
+    forced_by(std::env::var("ZERON_BLOCK_DELETES").ok().as_deref())
 }
 
 impl HarnessRegistry {
@@ -141,6 +174,8 @@ impl HarnessRegistry {
             resolved,
             version,
             error,
+            block_deletes: self.block_deletes(),
+            delete_guard_forced: delete_guard_forced(),
         }
     }
 }
@@ -186,6 +221,8 @@ pub struct HarnessRegistry {
     update_generation: tokio::sync::watch::Sender<u64>,
     /// Live copy of `prefs.pi_executable`, shared with the Pi harness.
     pi_executable: Arc<Mutex<Option<PathBuf>>>,
+    /// What the Pi harness hands its delete guard on each run.
+    delete_guard: Arc<Mutex<zeron_harness::pi::DeleteGuard>>,
 }
 
 impl Default for HarnessRegistry {
@@ -269,7 +306,43 @@ impl HarnessRegistry {
             pending_updates: Mutex::new(std::collections::HashSet::new()),
             update_generation,
             pi_executable: Arc::new(Mutex::new(None)),
+            delete_guard: Arc::new(Mutex::new(zeron_harness::pi::DeleteGuard {
+                enabled: true,
+                forced: delete_guard_forced(),
+                state_file: None,
+                dir: std::env::temp_dir().join("zeron-pi-guard"),
+            })),
         }
+    }
+
+    /// The shared delete guard, read by the Pi harness on every run.
+    pub fn delete_guard_setting(&self) -> zeron_harness::pi::DeleteGuardSetting {
+        let state = self.delete_guard.clone();
+        Arc::new(move || state.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+
+    pub fn block_deletes(&self) -> bool {
+        delete_guard_forced() || self.prefs().block_deletes.unwrap_or(true)
+    }
+
+    /// Turn the delete guard on or off. Running Pis follow the saved file,
+    /// so a failed save is an error: the switch would show a state they do
+    /// not follow.
+    pub fn set_block_deletes(&self, on: bool) -> Result<(), String> {
+        self.prefs().block_deletes = Some(on);
+        self.refresh_delete_guard();
+        self.try_persist_prefs()
+            .map_err(|error| format!("Could not save Block deletes: {error}"))
+    }
+
+    fn refresh_delete_guard(&self) {
+        let enabled = self.block_deletes();
+        let mut guard = self
+            .delete_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.enabled = enabled;
+        guard.forced = delete_guard_forced();
     }
 
     /// The shared Pi executable setting, read by the Pi harness on every
@@ -395,6 +468,15 @@ impl HarnessRegistry {
         *self.pi_executable.lock().unwrap_or_else(PoisonError::into_inner) =
             loaded.pi_executable.clone();
         *self.prefs() = loaded;
+        {
+            let mut guard = self
+                .delete_guard
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard.state_file = Some(path.clone());
+            guard.dir = data_dir.join("pi-guard");
+        }
+        self.refresh_delete_guard();
         *self
             .prefs_path
             .lock()
@@ -479,25 +561,25 @@ impl HarnessRegistry {
 
     /// Best-effort atomic write (temp + rename, the ui-settings pattern).
     fn persist_prefs(&self) {
+        if let Err(err) = self.try_persist_prefs() {
+            tracing::warn!(error = %err, "harness-prefs save failed");
+        }
+    }
+
+    /// The atomic write; nothing to do without a path (tests, bare
+    /// registries).
+    fn try_persist_prefs(&self) -> std::io::Result<()> {
         let Some(path) = self
             .prefs_path
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
         else {
-            return;
+            return Ok(());
         };
-        let json = match serde_json::to_string_pretty(&*self.prefs()) {
-            Ok(json) => json,
-            Err(err) => {
-                tracing::warn!(error = %err, "harness-prefs serialize failed");
-                return;
-            }
-        };
+        let json = serde_json::to_string_pretty(&*self.prefs())?;
         let tmp = path.with_extension("json.tmp");
-        if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
-            tracing::warn!(error = %err, "harness-prefs save failed");
-        }
+        std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path))
     }
 
     pub fn title_settings(&self) -> TitleSettings {
@@ -680,9 +762,12 @@ pub fn default_registry() -> HarnessRegistry {
         },
         {
             let setting = registry.pi_executable_setting();
+            let guard = registry.delete_guard_setting();
             Box::new(move || {
                 Ok(Arc::new(
-                    zeron_harness::PiHarness::new().with_executable_setting(setting.clone()),
+                    zeron_harness::PiHarness::new()
+                        .with_executable_setting(setting.clone())
+                        .with_delete_guard(guard.clone()),
                 ) as Arc<dyn Harness>)
             })
         },
@@ -1076,6 +1161,63 @@ mod tests {
         // A missing executable is reported, never silently replaced by PATH.
         let status = reloaded.pi_settings_blocking();
         assert!(status.resolved.is_none() || std::env::var_os("PI_EXECUTABLE").is_some());
+    }
+
+    /// Block deletes is on until switched off, survives a reload, reaches
+    /// the harness's guard, and an engine flag or a corrupt file holds it on.
+    #[test]
+    fn block_deletes_persists_and_reaches_the_guard() {
+        assert!(PiSettings::default().block_deletes);
+        assert!(forced_by(Some("1")) && forced_by(Some(" true ")));
+        assert!(!forced_by(None) && !forced_by(Some("0")) && !forced_by(Some("")));
+        let forced = delete_guard_forced();
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        assert!(registry.block_deletes());
+        registry.load_prefs(dir.path());
+        let guard = registry.delete_guard_setting();
+        assert!(guard().enabled);
+        assert_eq!(
+            guard().state_file,
+            Some(dir.path().join("harness-prefs.json"))
+        );
+        assert_eq!(guard().dir, dir.path().join("pi-guard"));
+
+        registry.set_block_deletes(false).unwrap();
+        assert_eq!(guard().enabled, forced);
+        let text = std::fs::read_to_string(dir.path().join("harness-prefs.json")).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["blockDeletes"], false);
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(reloaded.block_deletes(), forced);
+        assert_eq!(reloaded.pi_settings_blocking().block_deletes, forced);
+        // Switching on again, and leaving the executable alone.
+        reloaded.set_pi_executable(Some(dir.path().join("pi-dev.cmd")));
+        reloaded.set_block_deletes(true).unwrap();
+        assert!(reloaded.block_deletes());
+        assert_eq!(
+            reloaded.pi_executable(),
+            Some(dir.path().join("pi-dev.cmd"))
+        );
+
+        // A file never written by this version, or a corrupt one, is on.
+        std::fs::write(dir.path().join("harness-prefs.json"), "{not json").unwrap();
+        let corrupt = HarnessRegistry::new();
+        corrupt.load_prefs(dir.path());
+        assert!(corrupt.block_deletes());
+    }
+
+    #[test]
+    fn a_failed_block_deletes_save_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        // The prefs path is a directory: the rename over it fails.
+        let blocked = dir.path().join("data");
+        std::fs::create_dir_all(blocked.join("harness-prefs.json")).unwrap();
+        registry.load_prefs(&blocked);
+        assert!(registry.set_block_deletes(false).is_err());
     }
 
     /// A registry slot for the tests below: installed probe fixed, factory
