@@ -1,117 +1,27 @@
-//! Desktop-local Parakeet v3. No engine, document, RPC or audio persistence.
+//! Desktop dictation: capture on this device, transcription in the cloud
+//! ([`cloud`]). No engine, document, RPC or audio persistence.
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use parakeet_rs::{ParakeetTDT, Transcriber};
-use sha2::{Digest, Sha256};
-use std::{
-    io::Write,
-    path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
+mod cleanup;
+pub mod cloud;
 mod resample;
+mod trigger;
+
+pub use trigger::{DEFAULT_PHRASE as DEFAULT_TRIGGER_PHRASE, MAX_PHRASE_CHARS};
 
 pub const MAX_SECONDS: usize = 60;
-#[derive(serde::Deserialize)]
-pub struct Artifact {
-    pub name: String,
-    pub size: u64,
-    pub sha256: String,
-}
-#[derive(serde::Deserialize)]
-pub struct Manifest {
-    pub repository: String,
-    pub revision: String,
-    pub files: Vec<Artifact>,
-}
-pub fn manifest() -> Manifest {
-    serde_json::from_str(include_str!("../model.json")).expect("pinned model manifest")
-}
-pub fn download_size() -> u64 {
-    manifest().files.iter().map(|f| f.size).sum()
-}
-pub fn installed(dir: &Path) -> bool {
-    manifest()
-        .files
-        .iter()
-        .all(|f| std::fs::metadata(dir.join(&f.name)).is_ok_and(|m| m.len() == f.size))
-        && std::fs::read_to_string(dir.join("verified")).is_ok_and(|r| r == manifest().revision)
-}
 
-/// Called only on a worker. Temporary files never establish readiness.
-pub fn download(dir: &Path, cancel: &AtomicBool, mut progress: impl FnMut(u64)) -> Result<()> {
-    tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
-        std::fs::create_dir_all(dir)?;
-        let client = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20)).build()?;
-        let m=manifest(); let mut total=0;
-        for file in m.files {
-            if cancel.load(Ordering::Acquire) { bail!("Download cancelled") }
-            let staging=dir.join(format!("{}.part",file.name));
-            let result=async {
-                let mut response=tokio::select! {
-                    _=cancelled(cancel)=>bail!("Download cancelled"),
-                    response=tokio::time::timeout(std::time::Duration::from_secs(30),client.get(format!("https://huggingface.co/{}/resolve/{}/{}",m.repository,m.revision,file.name)).send())=>response??.error_for_status()?,
-                };
-                let mut out=std::fs::File::create(&staging)?;let mut hash=Sha256::new();let mut size=0;
-                loop {
-                    let chunk=tokio::select! {
-                        _=cancelled(cancel)=>bail!("Download cancelled"),
-                        chunk=tokio::time::timeout(std::time::Duration::from_secs(30),response.chunk())=>chunk??,
-                    };
-                    let Some(chunk)=chunk else {break};
-                    size+=chunk.len() as u64;if size>file.size {bail!("Unexpected model size")}
-                    hash.update(&chunk);out.write_all(&chunk)?;total+=chunk.len() as u64;progress(total);
-                }
-                if size!=file.size || format!("{:x}",hash.finalize())!=file.sha256 {bail!("Model checksum verification failed")}
-                out.sync_all()?;std::fs::rename(&staging,dir.join(&file.name))?;Ok::<_,anyhow::Error>(())
-            }.await;
-            if result.is_err() {let _=std::fs::remove_file(staging);} result?;
-        }
-        if cancel.load(Ordering::Acquire) {bail!("Download cancelled")}
-        std::fs::write(dir.join("verified"),manifest().revision)?;Ok(())
-    })
-}
-async fn cancelled(cancel: &AtomicBool) {
-    while !cancel.load(Ordering::Acquire) {
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+/// Why a trigger phrase cannot be used, or `None` when it can (empty is off).
+pub fn trigger_problem(phrase: &str) -> Option<&'static str> {
+    if phrase.trim().is_empty() {
+        return None;
     }
-}
-
-pub struct Recognizer(ParakeetTDT);
-impl Recognizer {
-    pub fn load(dir: &Path) -> Result<Self> {
-        // Verify before handing bytes to the native runtime, including after restart.
-        for f in manifest().files {
-            let mut input = std::fs::File::open(dir.join(&f.name))?;
-            let mut hash = Sha256::new();
-            std::io::copy(&mut input, &mut hash)?;
-            if format!("{:x}", hash.finalize()) != f.sha256 {
-                bail!("Model is damaged. Remove it in Settings and download again.")
-            }
-        }
-        Ok(Self(ParakeetTDT::from_pretrained(dir, None).map_err(
-            |_| anyhow::anyhow!("Could not load Parakeet v3"),
-        )?))
-    }
-    pub fn transcribe(&mut self, samples: Vec<f32>, rate: u32) -> Result<String> {
-        if !(8_000..=192_000).contains(&rate) {
-            bail!("Unsupported microphone sample rate")
-        }
-        if samples.len() > rate as usize * MAX_SECONDS {
-            bail!("Recording exceeds one minute")
-        }
-        if samples.len() < rate as usize / 5 || samples.iter().all(|s| s.abs() < 0.0001) {
-            return Ok(String::new());
-        }
-        let samples = resample::for_model(samples, rate)?;
-        self.0
-            .transcribe_samples(samples, resample::MODEL_RATE, 1, None)
-            .map(|r| r.text)
-            .map_err(|_| anyhow::anyhow!("Could not transcribe this recording"))
-    }
+    trigger::Trigger::check(phrase, |p| cleanup::clean(p, true)).err()
 }
 
 struct Audio {
@@ -284,15 +194,15 @@ pub enum Event {
     Failed(String),
 }
 struct Job {
-    dir: std::path::PathBuf,
+    config: cloud::Config,
     stop: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     level: Arc<AtomicU32>,
     device: Option<String>,
     events: std::sync::mpsc::SyncSender<Event>,
 }
-// Capture owns its stream on a separate thread. Model loading and inference
-// remain serialized on WORKER, including after the user cancels native work.
+// Capture owns its stream on a separate thread. Requests remain serialized on
+// WORKER, including after the user cancels.
 trait Recording {
     fn ended(&self) -> bool;
     fn finish(self) -> Result<(Vec<f32>, u32)>;
@@ -332,7 +242,7 @@ fn record<C: Recording>(
     if job.cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
-    let audio = capture.finish()?; // Close the microphone before waiting for the model.
+    let audio = capture.finish()?; // Close the microphone before the upload.
     let _ = job.events.try_send(Event::Finalizing);
     Ok(Some(audio))
 }
@@ -403,11 +313,7 @@ impl Drop for BusyGuard {
         BUSY.store(false, Ordering::Release);
     }
 }
-enum Command {
-    Transcribe(Job, BusyGuard),
-    Unload,
-}
-static WORKER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Command>> =
+static WORKER: std::sync::OnceLock<std::sync::mpsc::SyncSender<(Job, BusyGuard)>> =
     std::sync::OnceLock::new();
 pub struct Session {
     stop: Arc<AtomicBool>,
@@ -418,52 +324,31 @@ pub struct Session {
 impl Session {
     /// `device` is an [`InputDevice::id`]; `None` or a disconnected device
     /// records from the system default.
-    pub fn start(dir: std::path::PathBuf, device: Option<String>) -> Result<Self> {
+    pub fn start(config: cloud::Config, device: Option<String>) -> Result<Self> {
         let admission = BusyGuard::acquire()?;
         let sender = WORKER.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Command>(1);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(Job, BusyGuard)>(1);
             std::thread::spawn(move || {
-                let mut cached: Option<(std::path::PathBuf, Recognizer)> = None;
-                loop {
-                    let (job, _admission) = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-                        Ok(Command::Transcribe(j, admission)) => (j, admission),
-                        Ok(Command::Unload) => {
-                            cached = None;
-                            continue;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            cached = None;
-                            continue;
-                        }
-                        Err(_) => break,
-                    };
-                    // A native panic must not take down the worker, and with
-                        // it every later session, until the app restarts.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(
-                        &job,
-                        || Capture::start(job.device.as_deref(), job.level.clone()),
-                        || {
-                            if cached.as_ref().is_none_or(|(path, _)| *path != job.dir) {
-                                let model = Recognizer::load(&job.dir).context(
-                                    "Could not load the model. Remove it in Settings and download again.",
-                                )?;
-                                cached = Some((job.dir.clone(), model));
-                            }
-                            let model = &mut cached.as_mut().unwrap().1;
-                            Ok(move |samples, rate| model.transcribe(samples, rate))
-                        },
-                    )))
+                while let Ok((job, _admission)) = rx.recv() {
+                    // A panic must not take down the worker, and with it every
+                    // later session, until the app restarts.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_job(
+                            &job,
+                            || Capture::start(job.device.as_deref(), job.level.clone()),
+                            || Ok(|samples, rate| cloud::transcribe(&job.config, samples, rate)),
+                        )
+                    }))
                     .unwrap_or_else(|_| {
-                        cached = None;
-                        Err(anyhow::anyhow!("Dictation stopped unexpectedly. Your draft is safe."))
+                        Err(anyhow::anyhow!(
+                            "Dictation stopped unexpectedly. Your draft is safe."
+                        ))
                     });
                     match result {
                         Ok(Some(text)) => {
                             let _ = job.events.try_send(Event::Final(text));
                         }
                         Ok(None) => {}
-                        // Keep loaded weights: a microphone or recording error says
-                        // nothing about the model, and reloading takes seconds.
                         Err(e) => {
                             let _ = job.events.try_send(Event::Failed(e.to_string()));
                         }
@@ -477,9 +362,9 @@ impl Session {
         let level = Arc::new(AtomicU32::new(0));
         let (tx, events) = std::sync::mpsc::sync_channel(4);
         if sender
-            .try_send(Command::Transcribe(
+            .try_send((
                 Job {
-                    dir,
+                    config,
                     stop: stop.clone(),
                     cancel: cancel.clone(),
                     level: level.clone(),
@@ -516,15 +401,9 @@ impl Drop for Session {
         self.cancel.store(true, Ordering::Release);
     }
 }
-pub fn busy() -> bool {
+#[cfg(test)]
+fn busy() -> bool {
     BUSY.load(Ordering::Acquire)
-}
-
-/// Retire cached weights on the worker, never on the UI thread.
-pub fn unload() {
-    if let Some(worker) = WORKER.get() {
-        let _ = worker.try_send(Command::Unload);
-    }
 }
 
 #[cfg(test)]
@@ -565,36 +444,10 @@ mod tests {
         check::<f64>();
     }
     #[test]
-    fn manifest_pins_only_v3_artifacts_and_exact_size() {
-        let m = manifest();
-        assert_eq!(m.revision.len(), 40);
-        assert_eq!(m.files.len(), 3);
-        assert_eq!(download_size(), 670479942);
-        assert!(
-            m.files
-                .iter()
-                .all(|f| f.sha256.len() == 64 && !f.name.contains('/'))
-        );
-    }
-    #[test]
-    fn cancelled_download_never_establishes_readiness() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            download(dir.path(), &AtomicBool::new(true), |_| panic!(
-                "no progress after cancellation"
-            ))
-            .is_err()
-        );
-        assert!(!installed(dir.path()));
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-    #[test]
-    fn partial_or_corrupt_model_cannot_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = &manifest().files[0];
-        std::fs::write(dir.path().join(&f.name), b"corrupt").unwrap();
-        assert!(!installed(dir.path()));
-        assert!(Recognizer::load(dir.path()).is_err());
+    fn trigger_phrases_are_checked_after_cleanup() {
+        assert_eq!(trigger_problem(""), None);
+        assert_eq!(trigger_problem(DEFAULT_TRIGGER_PHRASE), None);
+        assert!(trigger_problem("um go").is_some());
     }
 }
 

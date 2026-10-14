@@ -36,7 +36,6 @@ if [[ -n "${CODEX_EXECUTABLE:-}" ]]; then
 fi
 
 mkdir -p "$CONTENTS/Resources/licenses"
-cp "$ROOT/crates/voice/NOTICE.md" "$CONTENTS/Resources/licenses"/parakeet-v3.txt
 
 if [[ ! -f "$CONTENTS/Resources/zeron.icns" ]]; then
   ICONSET="$DEV_ROOT/zeron-dev.iconset"

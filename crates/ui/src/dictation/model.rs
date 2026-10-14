@@ -1,56 +1,66 @@
+//! Settings → Voice: the speech-to-text provider, its API key, model,
+//! language, microphone, filler-word cleanup and the trigger phrase. Keys live
+//! in `stt-keys.json` beside the settings file, never in `ui-settings.json`.
 use crate::{
+    composer::{ComposerInput, ComposerInputEvent},
     popover,
     settings::{self, widgets},
     theme::Theme,
 };
-use gpui::{App, Context, Entity, Global, Task, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, App, Context, Entity, Global, Subscription, Task, Window, div, prelude::*, px,
+};
 use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    collections::BTreeMap,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use zeron_voice::cloud::{Config, Provider};
+
+const KEYS_FILE: &str = "stt-keys.json";
+/// Auto-detect, then fixed ISO-639-1 hints.
+const LANGUAGES: &[(Option<&str>, &str)] = &[
+    (None, "Auto-detect"),
+    (Some("en"), "English"),
+    (Some("hi"), "Hindi"),
+    (Some("es"), "Spanish"),
+    (Some("fr"), "French"),
+    (Some("de"), "German"),
+    (Some("pt"), "Portuguese"),
+    (Some("ja"), "Japanese"),
+    (Some("zh"), "Chinese"),
+];
+
 struct VoiceGlobal {
     card: Entity<VoiceCard>,
-    directory: PathBuf,
 }
 impl Global for VoiceGlobal {}
 pub(crate) fn init(root: PathBuf, cx: &mut App) {
-    let directory = root.join("models/parakeet-tdt-0.6b-v3-int8");
-    let card = cx.new(|_| VoiceCard {
-        scroll: widgets::PageScroll::default(),
-        ready: zeron_voice::installed(&directory),
-        cache_present: directory.exists(),
-        directory: directory.clone(),
-        cancel: None,
-        task: None,
-        progress: 0,
-        error: None,
-        inputs: Inputs::default(),
-        input_select: widgets::SelectState::default(),
-        voice_select: widgets::SelectState::default(),
-        host_select: widgets::SelectState::default(),
-        hosts: Vec::new(),
-        call_live: false,
-        codex_offered: false,
-        voices: zeron_proto::voice::DEFAULT_VOICES
-            .iter()
-            .map(|voice| (*voice).to_owned())
-            .collect(),
-        shortcut: None,
-    });
-    cx.set_global(VoiceGlobal { card, directory });
+    let card = cx.new(|cx| VoiceCard::new(root.join(KEYS_FILE), cx));
+    cx.set_global(VoiceGlobal { card });
 }
-pub(crate) fn directory(cx: &App) -> PathBuf {
-    cx.global::<VoiceGlobal>().directory.clone()
-}
+/// Dictation is on once the selected provider has a key.
 pub(crate) fn enabled(cx: &App) -> bool {
-    settings::current(cx).dictation_enabled
-        && cx
-            .try_global::<VoiceGlobal>()
-            .is_some_and(|g| g.card.read(cx).ready)
+    config(cx).is_some()
+}
+/// What the dictation worker needs, or `None` without a key.
+pub(crate) fn config(cx: &App) -> Option<Config> {
+    let saved = settings::current(cx);
+    let api_key = cx
+        .try_global::<VoiceGlobal>()?
+        .card
+        .read(cx)
+        .keys
+        .get(saved.stt_provider.key_name())?
+        .clone();
+    Some(Config {
+        provider: saved.stt_provider,
+        api_key,
+        model: saved.stt_model.clone(),
+        language: saved.stt_language.clone(),
+        remove_fillers: saved.stt_remove_fillers,
+        trigger_phrase: saved.stt_trigger_phrase.clone(),
+    })
 }
 pub(crate) fn card(cx: &mut App) -> Entity<VoiceCard> {
     if !cx.has_global::<VoiceGlobal>() {
@@ -58,28 +68,43 @@ pub(crate) fn card(cx: &mut App) -> Entity<VoiceCard> {
     }
     cx.global::<VoiceGlobal>().card.clone()
 }
+
+fn load_keys(path: &Path) -> BTreeMap<String, String> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BTreeMap<String, String>>(&bytes).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, key)| !key.trim().is_empty())
+        .collect()
+}
+fn save_keys(path: &Path, keys: &BTreeMap<String, String>) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let bytes = serde_json::to_vec_pretty(keys)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    std::io::Write::write_all(&mut options.open(path)?, &bytes)
+}
+
 pub(crate) struct VoiceCard {
     scroll: widgets::PageScroll,
-    directory: PathBuf,
-    ready: bool,
-    cache_present: bool,
-    cancel: Option<Arc<AtomicBool>>,
-    task: Option<Task<()>>,
-    progress: u64,
+    keys_path: PathBuf,
+    keys: BTreeMap<String, String>,
+    key_input: Entity<ComposerInput>,
+    phrase_input: Entity<ComposerInput>,
+    /// Why the typed trigger phrase was not saved.
+    phrase_problem: Option<&'static str>,
     error: Option<String>,
     inputs: Inputs,
+    provider_select: widgets::SelectState,
+    model_select: widgets::SelectState,
+    language_select: widgets::SelectState,
     input_select: widgets::SelectState,
-    voice_select: widgets::SelectState,
-    host_select: widgets::SelectState,
-    hosts: Vec<(Option<String>, String, bool, String)>,
-    call_live: bool,
-    /// Codex voice rows show only where Codex voice can run (never on a
-    /// Pi-only engine); dictation is independent of it.
-    codex_offered: bool,
-    /// Native voice styles, refreshed with the live session's reported catalog.
-    voices: Vec<String>,
-    /// Created on first render (it needs this card's context).
-    shortcut: Option<Entity<settings::shortcuts::ShortcutField>>,
+    _subscriptions: [Subscription; 2],
 }
 /// Microphones as last enumerated, refreshed off the UI thread while the page
 /// is visible so newly connected devices appear.
@@ -92,134 +117,80 @@ struct Inputs {
 }
 const INPUT_REFRESH: Duration = Duration::from_secs(3);
 impl VoiceCard {
-    pub(crate) fn set_hosts(
-        &mut self,
-        hosts: Vec<(Option<String>, String, bool, String)>,
-        live: bool,
-        codex_offered: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if self.hosts != hosts || self.call_live != live || self.codex_offered != codex_offered {
-            self.hosts = hosts;
-            self.call_live = live;
-            self.codex_offered = codex_offered;
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn set_voices(&mut self, voices: &[String], cx: &mut Context<Self>) {
-        if !voices.is_empty() && self.voices != voices {
-            self.voices = voices.to_vec();
-            cx.notify();
-        }
-    }
-
-    fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        settings::update(settings::SavePolicy::Immediate, cx, |s| {
-            s.dictation_enabled = enabled
+    fn new(keys_path: PathBuf, cx: &mut Context<Self>) -> Self {
+        let key_input = cx.new(|cx| {
+            ComposerInput::new("Paste an API key", cx)
+                .with_single_line()
+                .with_masked()
         });
-        cx.refresh_windows();
-        cx.notify();
-    }
-    fn primary(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancel) = &self.cancel {
-            cancel.store(true, Ordering::Release);
-        } else if self.ready {
-            self.set_enabled(!settings::current(cx).dictation_enabled, cx);
-        } else {
-            self.download(cx);
-        }
-        cx.notify();
-    }
-    fn download(&mut self, cx: &mut Context<Self>) {
-        if self.cancel.is_some() {
-            return;
-        }
-        self.error = None;
-        self.progress = 0;
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cancel = Some(cancel.clone());
-        let progress = Arc::new(AtomicU64::new(0));
-        let counter = progress.clone();
-        let dir = self.directory.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let r = zeron_voice::download(&dir, &cancel, |n| counter.store(n, Ordering::Relaxed))
-                .map_err(|_| {
-                if cancel.load(Ordering::Acquire) { "Download cancelled.".to_owned() }
-                else { "Couldn’t download or verify the model. Check your connection and free storage, then retry.".to_owned() }
-            });
-            let _ = tx.send(r);
+        let phrase = settings::current(cx).stt_trigger_phrase;
+        let phrase_input = cx.new(|cx| {
+            let mut input = ComposerInput::new("Off", cx).with_single_line();
+            input.set_text(phrase, cx);
+            input
         });
-        self.task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                let result = rx.try_recv();
-                let done = !matches!(result, Err(std::sync::mpsc::TryRecvError::Empty));
-                if this
-                    .update(cx, |this, cx| {
-                        this.progress = progress.load(Ordering::Relaxed);
-                        if done {
-                            this.cache_present = this.directory.exists();
-                        }
-                        match result {
-                            Ok(Ok(())) => {
-                                this.ready = true;
-                                let cancelled = this
-                                    .cancel
-                                    .as_ref()
-                                    .is_some_and(|c| c.load(Ordering::Acquire));
-                                this.cancel = None;
-                                this.set_enabled(!cancelled, cx);
-                            }
-                            Ok(Err(e)) => {
-                                this.cancel = None;
-                                this.error = Some(e);
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                this.cancel = None;
-                                this.error = Some("Download interrupted. Try again.".into());
-                            }
-                            _ => {}
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                    || done
-                {
-                    break;
-                }
+        let key_sub = cx.subscribe(&key_input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.save_key(cx);
             }
-        }));
-        cx.notify();
-    }
-    fn remove(&mut self, cx: &mut Context<Self>) {
-        if zeron_voice::busy() {
-            self.error = Some("Stop dictation before removing the model.".into());
-            cx.notify();
-            return;
+        });
+        let phrase_sub = cx.subscribe(&phrase_input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.save_phrase(cx);
+            }
+        });
+        Self {
+            scroll: widgets::PageScroll::default(),
+            keys: load_keys(&keys_path),
+            keys_path,
+            key_input,
+            phrase_input,
+            phrase_problem: None,
+            error: None,
+            inputs: Inputs::default(),
+            provider_select: widgets::SelectState::default(),
+            model_select: widgets::SelectState::default(),
+            language_select: widgets::SelectState::default(),
+            input_select: widgets::SelectState::default(),
+            _subscriptions: [key_sub, phrase_sub],
         }
-        self.set_enabled(false, cx);
-        zeron_voice::unload();
-        match std::fs::remove_dir_all(&self.directory) {
+    }
+
+    fn set_key(&mut self, key: Option<String>, cx: &mut Context<Self>) {
+        let name = settings::current(cx).stt_provider.key_name();
+        let mut keys = self.keys.clone();
+        match key {
+            Some(key) => keys.insert(name.to_owned(), key),
+            None => keys.remove(name),
+        };
+        match save_keys(&self.keys_path, &keys) {
             Ok(()) => {
-                self.cache_present = false;
-                self.ready = false;
-                self.progress = 0;
-                self.error = None
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.cache_present = false;
-                self.ready = false;
-                self.progress = 0;
-                self.error = None;
+                self.keys = keys;
+                self.key_input
+                    .update(cx, |input, cx| input.set_text("", cx));
             }
             Err(_) => {
                 self.error =
-                    Some("Could not remove the model. Check folder permissions and retry.".into())
+                    Some("Could not save the API key. Check folder permissions and retry.".into())
             }
+        }
+        // The composer shows its microphone only while a key is saved.
+        cx.refresh_windows();
+        cx.notify();
+    }
+    fn save_key(&mut self, cx: &mut Context<Self>) {
+        let key = self.key_input.read(cx).text().trim().to_owned();
+        if !key.is_empty() {
+            self.set_key(Some(key), cx);
+        }
+    }
+    fn save_phrase(&mut self, cx: &mut Context<Self>) {
+        let phrase = self.phrase_input.read(cx).text().trim().to_owned();
+        self.phrase_problem = zeron_voice::trigger_problem(&phrase);
+        if self.phrase_problem.is_none() {
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.stt_trigger_phrase = phrase
+            });
         }
         cx.notify();
     }
@@ -307,303 +278,266 @@ impl VoiceCard {
         (options, selected)
     }
 }
+
+/// A title, an optional detail line, and the control on the right.
+fn row(
+    theme: &Theme,
+    first: bool,
+    title: &str,
+    meta: Option<String>,
+    control: impl IntoElement,
+) -> gpui::Div {
+    widgets::card_row(theme, first)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(160.0))
+                .flex()
+                .flex_col()
+                .child(widgets::row_title(theme, title.to_owned()))
+                .children(
+                    meta.map(|meta| widgets::meta_line(theme, vec![meta.into_any_element()])),
+                ),
+        )
+        .child(control)
+}
+
+/// A title and detail line above a text field and its action.
+fn field_row(
+    theme: &Theme,
+    first: bool,
+    title: &str,
+    meta: AnyElement,
+    input: &Entity<ComposerInput>,
+    actions: Vec<AnyElement>,
+) -> gpui::Div {
+    widgets::card_row(theme, first)
+        .flex_col()
+        .items_start()
+        .gap(px(8.0))
+        .child(
+            div()
+                .w_full()
+                .child(widgets::row_title(theme, title.to_owned()))
+                .child(widgets::meta_line(theme, vec![meta])),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(popover::dialog_field(input.clone().into_any_element()).flex_1())
+                .children(actions),
+        )
+}
+
 impl Render for VoiceCard {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
-        let saved_voice = settings::current(cx).codex_voice;
-        let mut voice_ids: Vec<Option<String>> = std::iter::once(None)
-            .chain(self.voices.iter().cloned().map(Some))
-            .collect();
-        if saved_voice.is_some() && !voice_ids.contains(&saved_voice) {
-            voice_ids.push(saved_voice.clone());
-        }
-        let selected_voice = voice_ids
-            .iter()
-            .position(|v| *v == saved_voice)
-            .unwrap_or(0);
-        let voice_options: Vec<_> = voice_ids
-            .iter()
-            .map(|voice| {
-                let label = voice.as_deref().map_or_else(
-                    || "Codex default".to_owned(),
-                    |voice| {
-                        let mut chars = voice.chars();
-                        chars
-                            .next()
-                            .map(|first| first.to_uppercase().chain(chars).collect::<String>())
-                            .unwrap_or_default()
-                    },
-                );
-                widgets::SelectOption::new(label)
+        let saved = settings::current(cx);
+        let provider = saved.stt_provider;
+
+        let provider_control =
+            widgets::select("voice-provider", "Provider", &theme, |card: &mut Self| {
+                &mut card.provider_select
             })
-            .collect();
-        let voice_control = widgets::select(
-            "voice-style",
-            "Codex voice style",
-            &theme,
-            |card: &mut Self| &mut card.voice_select,
-        )
-        .options(voice_options, selected_voice)
-        .width(200.0)
-        .on_select(move |_, ix, _, cx| {
-            let voice = voice_ids.get(ix).cloned().flatten();
-            settings::update(settings::SavePolicy::Immediate, cx, |s| {
-                s.codex_voice = voice
-            });
-            cx.refresh_windows();
-            cx.notify();
-        })
-        .render(&self.voice_select, cx);
-        let host_row = {
-            let selected = settings::current(cx).codex_voice_device;
-            let mut hosts = self.hosts.clone();
-            if selected.is_some() && !hosts.iter().any(|h| h.0 == selected) {
-                hosts.push((
-                    selected.clone(),
-                    "Unavailable device".into(),
-                    false,
-                    "Choose another device".into(),
-                ));
-            }
-            let index = hosts.iter().position(|h| h.0 == selected).unwrap_or(0);
-            let options = hosts
-                .iter()
-                .map(|h| widgets::SelectOption::new(h.1.clone()).detail(h.3.clone()))
-                .collect::<Vec<_>>();
-            let control = widgets::select(
-                "codex-voice-device",
-                "Codex voice device",
-                &theme,
-                |card: &mut Self| &mut card.host_select,
+            .options(
+                Provider::ALL
+                    .iter()
+                    .map(|p| widgets::SelectOption::new(p.label()))
+                    .collect(),
+                Provider::ALL
+                    .iter()
+                    .position(|p| *p == provider)
+                    .unwrap_or(0),
             )
-            .options(options, index)
             .width(200.0)
-            .on_select(move |card, ix, _, cx| {
-                if card.call_live {
+            .on_select(move |_, ix, _, cx| {
+                let Some(chosen) = Provider::ALL.get(ix).copied() else {
                     return;
-                }
-                if let Some((id, _, true, _)) = hosts.get(ix) {
-                    let id = id.clone();
+                };
+                if chosen != provider {
                     settings::update(settings::SavePolicy::Immediate, cx, |s| {
-                        s.codex_voice_device = id
+                        s.stt_provider = chosen;
+                        s.stt_model = None;
                     });
                     cx.refresh_windows();
-                    cx.notify();
                 }
+                cx.notify();
             })
-            .render(&self.host_select, cx);
-            widgets::card_row(&theme, true)
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .child(widgets::row_title(&theme, "Codex voice device"))
-                        .child(widgets::meta_line(
-                            &theme,
-                            vec![
-                                if self.call_live {
-                                    "End the call to change devices"
-                                } else {
-                                    "Runs Codex; audio stays on this device"
-                                }
-                                .into_any_element(),
-                            ],
-                        )),
-                )
-                .child(control)
-        };
-        let conversation_card = widgets::section_card(&theme).child(host_row).child(
-            widgets::card_row(&theme, true)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(160.0))
-                        .flex()
-                        .flex_col()
-                        .child(widgets::row_title(&theme, "Codex voice style"))
-                        .child(widgets::meta_line(
-                            &theme,
-                            vec!["Applies to your next voice session".into_any_element()],
-                        )),
-                )
-                .child(voice_control),
+            .render(&self.provider_select, cx);
+
+        let has_key = self.keys.contains_key(provider.key_name());
+        let save_key = widgets::text_action(&theme, widgets::ActionTone::Outlined, "Save")
+            .id("voice-key-save")
+            .tab_index(0)
+            .role(gpui::Role::Button)
+            .aria_label("Save the API key")
+            .focus_visible(|s| s.border_2().border_color(theme.accent))
+            .on_click(cx.listener(|card, _, _, cx| card.save_key(cx)))
+            .into_any_element();
+        let remove_key = has_key.then(|| {
+            widgets::text_action(&theme, widgets::ActionTone::Quiet, "Remove")
+                .id("voice-key-remove")
+                .tab_index(0)
+                .role(gpui::Role::Button)
+                .aria_label("Remove the API key")
+                .focus_visible(|s| s.border_2().border_color(theme.accent))
+                .on_click(cx.listener(|card, _, _, cx| card.set_key(None, cx)))
+                .into_any_element()
+        });
+        let key_row = field_row(
+            &theme,
+            false,
+            "API key",
+            if has_key {
+                "Saved on this device. Paste a new key to replace it.".into_any_element()
+            } else {
+                format!("Add a {} key to turn on dictation.", provider.label()).into_any_element()
+            },
+            &self.key_input,
+            std::iter::once(save_key).chain(remove_key).collect(),
         );
-        let enabled = settings::current(cx).dictation_enabled;
-        let downloading = self.cancel.is_some();
-        let on = downloading || (enabled && self.ready);
-        let size_mb = zeron_voice::download_size() as f64 / 1e6;
-        let meta = if downloading {
-            Some(format!(
-                "Downloading · {:.0} of {size_mb:.0} MB",
-                self.progress as f64 / 1e6
-            ))
-        } else if !self.ready {
-            Some(format!("{size_mb:.0} MB download"))
-        } else {
-            None
-        };
-        let weak = cx.entity().downgrade();
-        let switch = widgets::toggle_switch(&theme, on, "voice-dictation")
-            .id("voice-enable")
+
+        let models = provider.models();
+        let model_control = widgets::select("voice-model", "Model", &theme, |card: &mut Self| {
+            &mut card.model_select
+        })
+        .options(
+            models
+                .iter()
+                .map(|m| widgets::SelectOption::new(*m))
+                .collect(),
+            saved
+                .stt_model
+                .as_deref()
+                .and_then(|m| models.iter().position(|known| *known == m))
+                .unwrap_or(0),
+        )
+        .width(200.0)
+        .on_select(move |_, ix, _, cx| {
+            let model = models.get(ix).map(|m| (*m).to_owned());
+            settings::update(settings::SavePolicy::Immediate, cx, |s| s.stt_model = model);
+            cx.notify();
+        })
+        .render(&self.model_select, cx);
+
+        let language_control =
+            widgets::select("voice-language", "Language", &theme, |card: &mut Self| {
+                &mut card.language_select
+            })
+            .options(
+                LANGUAGES
+                    .iter()
+                    .map(|(_, name)| widgets::SelectOption::new(*name))
+                    .collect(),
+                LANGUAGES
+                    .iter()
+                    .position(|(code, _)| *code == saved.stt_language.as_deref())
+                    .unwrap_or(0),
+            )
+            .width(200.0)
+            .on_select(move |_, ix, _, cx| {
+                let language = LANGUAGES
+                    .get(ix)
+                    .and_then(|(code, _)| code.map(str::to_owned));
+                settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                    s.stt_language = language
+                });
+                cx.notify();
+            })
+            .render(&self.language_select, cx);
+
+        self.refresh_inputs(cx);
+        let (input_options, input_selected) = self.input_options(saved.dictation_input.as_deref());
+        let ids: Vec<Option<String>> = std::iter::once(None)
+            .chain(self.inputs.devices.iter().map(|d| Some(d.id.clone())))
+            .chain(std::iter::once(saved.dictation_input.clone()))
+            .collect();
+        let microphone_control = widgets::select(
+            "voice-microphone",
+            "Microphone",
+            &theme,
+            |card: &mut Self| &mut card.input_select,
+        )
+        .options(input_options, input_selected)
+        .width(200.0)
+        .on_select(move |_, ix, _, cx| {
+            let input = ids.get(ix).cloned().flatten();
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.dictation_input = input
+            });
+            cx.notify();
+        })
+        .render(&self.input_select, cx);
+
+        let fillers = saved.stt_remove_fillers;
+        fn toggle_fillers(cx: &mut App) {
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.stt_remove_fillers = !s.stt_remove_fillers
+            });
+        }
+        let fillers_switch = widgets::toggle_switch(&theme, fillers, "voice-fillers")
+            .id("voice-fillers")
             .cursor_pointer()
             .tab_index(0)
             .role(gpui::Role::Switch)
-            .aria_label("Dictation")
-            .aria_toggled(if on {
+            .aria_label("Remove filler words")
+            .aria_toggled(if fillers {
                 gpui::Toggled::True
             } else {
                 gpui::Toggled::False
             })
             .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-            .on_click(cx.listener(|this, _, _, cx| this.primary(cx)))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_click(cx.listener(move |_, _, _, cx| {
+                toggle_fillers(cx);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(move |_, event: &gpui::KeyDownEvent, _, cx| {
                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                     cx.stop_propagation();
-                    this.primary(cx);
+                    toggle_fillers(cx);
+                    cx.notify();
                 }
             }))
             .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
-                weak.update(cx, |this, cx| this.primary(cx)).ok();
+                toggle_fillers(cx);
             });
-        let progress = downloading.then(|| {
-            div()
-                .mt(px(8.0))
-                .w_full()
-                .h(px(3.0))
-                .rounded_full()
-                .bg(theme.border)
-                .child(
-                    div()
-                        .h_full()
-                        .rounded_full()
-                        .w(gpui::relative(
-                            (self.progress as f32 / zeron_voice::download_size() as f32)
-                                .clamp(0.0, 1.0),
-                        ))
-                        .bg(theme.accent),
-                )
-        });
-        let dictation_row = widgets::card_row(&theme, true)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(160.0))
-                    .flex()
-                    .flex_col()
-                    .child(widgets::row_title(&theme, "Dictation"))
-                    .children(meta.map(|meta| {
-                        div()
-                            .id("voice-status")
-                            .role(gpui::Role::Status)
-                            .aria_label(meta.clone())
-                            .child(widgets::meta_line(&theme, vec![meta.into_any_element()]))
-                    }))
-                    .children(progress),
+
+        let save_phrase = widgets::text_action(&theme, widgets::ActionTone::Outlined, "Save")
+            .id("voice-phrase-save")
+            .tab_index(0)
+            .role(gpui::Role::Button)
+            .aria_label("Save the trigger phrase")
+            .focus_visible(|s| s.border_2().border_color(theme.accent))
+            .on_click(cx.listener(|card, _, _, cx| card.save_phrase(cx)))
+            .into_any_element();
+        let phrase_meta = match self.phrase_problem {
+            Some(problem) => div()
+                .text_color(theme.danger)
+                .child(problem)
+                .into_any_element(),
+            None if saved.stt_trigger_phrase.trim().is_empty() => {
+                "Off. Type a phrase to rewrite dictations that end with it.".into_any_element()
+            }
+            None => format!(
+                "End a dictation with “{}” to have {} rewrite it",
+                saved.stt_trigger_phrase.trim(),
+                provider.label()
             )
-            .child(switch);
-        let microphone_row = (enabled && self.ready).then(|| {
-            self.refresh_inputs(cx);
-            let saved = settings::current(cx).dictation_input.clone();
-            let (options, selected) = self.input_options(saved.as_deref());
-            let ids: Vec<Option<String>> = std::iter::once(None)
-                .chain(self.inputs.devices.iter().map(|d| Some(d.id.clone())))
-                .chain(std::iter::once(saved))
-                .collect();
-            let control = widgets::select(
-                "voice-microphone",
-                "Microphone",
-                &theme,
-                |card: &mut Self| &mut card.input_select,
-            )
-            .options(options, selected)
-            .width(200.0)
-            .on_select(move |_, ix, _, cx| {
-                let input = ids.get(ix).cloned().flatten();
-                settings::update(settings::SavePolicy::Immediate, cx, |s| {
-                    s.dictation_input = input
-                });
-                cx.notify();
-            })
-            .render(&self.input_select, cx);
-            widgets::card_row(&theme, false)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(160.0))
-                        .child(widgets::row_title(&theme, "Microphone")),
-                )
-                .child(control)
-        });
-        // Always visible, so ⌘D can be rebound (and freed) before the model
-        // is downloaded.
-        let shortcut_row = {
-            let field = self
-                .shortcut
-                .get_or_insert_with(|| {
-                    cx.new(|cx| {
-                        settings::shortcuts::ShortcutField::new(
-                            settings::ShortcutId::ToggleDictation,
-                            cx,
-                        )
-                    })
-                })
-                .clone();
-            widgets::card_row(&theme, false)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(160.0))
-                        .flex()
-                        .flex_col()
-                        .child(widgets::row_title(&theme, "Shortcut"))
-                        .child(widgets::meta_line(
-                            &theme,
-                            vec!["Hold to talk, release to transcribe".into_any_element()],
-                        )),
-                )
-                .child(field)
+            .into_any_element(),
         };
-        let model_card = (self.cache_present && !downloading).then(|| {
-            let remove_weak = cx.entity().downgrade();
-            widgets::section_card(&theme).child(
-                widgets::card_row(&theme, true)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.0))
-                            .flex()
-                            .flex_col()
-                            .child(widgets::row_title(&theme, "Speech model"))
-                            .child(widgets::meta_line(
-                                &theme,
-                                vec![
-                                    "Parakeet v3".into_any_element(),
-                                    format!("{size_mb:.0} MB").into_any_element(),
-                                ],
-                            )),
-                    )
-                    .child(
-                        widgets::action_button(&theme, widgets::ActionTone::Quiet)
-                            .id("voice-remove")
-                            .role(gpui::Role::Button)
-                            .aria_label("Remove speech model")
-                            .tab_index(0)
-                            .child("Remove")
-                            .focus_visible(|s| s.border_2().border_color(theme.accent))
-                            .on_click(cx.listener(|this, _, _, cx| this.remove(cx)))
-                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                    cx.stop_propagation();
-                                    this.remove(cx);
-                                }
-                            }))
-                            .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
-                                remove_weak.update(cx, |this, cx| this.remove(cx)).ok();
-                            }),
-                    ),
-            )
-        });
+        let phrase_row = field_row(
+            &theme,
+            false,
+            "Trigger phrase",
+            phrase_meta,
+            &self.phrase_input,
+            vec![save_phrase],
+        );
+
         crate::toast::take_error(&mut self.error, cx);
         let scrollbar = popover::rail(self, "voice-page-scrollbar", &theme, cx);
         div()
@@ -628,16 +562,43 @@ impl Render for VoiceCard {
                         .child(
                             widgets::page_column()
                                 .child(widgets::page_header(&theme, "Voice", None))
-                                .when(self.codex_offered, |column| {
-                                    column.child(conversation_card)
-                                })
                                 .child(
                                     widgets::section_card(&theme)
-                                        .child(dictation_row)
-                                        .children(microphone_row)
-                                        .child(shortcut_row),
+                                        .child(row(
+                                            &theme,
+                                            true,
+                                            "Provider",
+                                            Some("Transcribes each recording in the cloud".into()),
+                                            provider_control,
+                                        ))
+                                        .child(key_row)
+                                        .child(row(&theme, false, "Model", None, model_control))
+                                        .child(row(
+                                            &theme,
+                                            false,
+                                            "Language",
+                                            None,
+                                            language_control,
+                                        ))
+                                        .child(row(
+                                            &theme,
+                                            false,
+                                            "Microphone",
+                                            None,
+                                            microphone_control,
+                                        )),
                                 )
-                                .children(model_card),
+                                .child(
+                                    widgets::section_card(&theme)
+                                        .child(row(
+                                            &theme,
+                                            true,
+                                            "Remove filler words",
+                                            Some("Drops “um”, “uh” and repeated words".into()),
+                                            fillers_switch,
+                                        ))
+                                        .child(phrase_row),
+                                ),
                         ),
                 )
                 .fade_overflow_y(&self.scroll.scroll),
@@ -649,24 +610,6 @@ impl Render for VoiceCard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[gpui::test]
-    fn dictation_partial_cache_is_removable_after_restart(cx: &mut gpui::TestAppContext) {
-        let root = tempfile::tempdir().unwrap();
-        let cache = root.path().join("models/parakeet-tdt-0.6b-v3-int8");
-        std::fs::create_dir_all(&cache).unwrap();
-        std::fs::write(cache.join("encoder-model.int8.onnx.part"), b"partial").unwrap();
-        cx.update(|cx| settings::init(settings::UiSettings::default(), root.path(), cx));
-        let card = cx.update(card);
-        card.update(cx, |card, cx| {
-            assert!(!card.ready);
-            assert_eq!(card.progress, 0);
-            assert!(card.cache_present);
-            card.remove(cx);
-            assert!(!card.cache_present);
-            assert!(!card.ready);
-        });
-        assert!(!cache.exists());
-    }
     #[gpui::test]
     fn microphone_choice_survives_disconnection(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -691,21 +634,66 @@ mod tests {
         });
     }
     #[gpui::test]
-    fn dictation_is_opt_in_and_disabling_preserves_download(cx: &mut gpui::TestAppContext) {
+    fn dictation_turns_on_with_a_key_for_the_selected_provider(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| settings::init(settings::UiSettings::default(), dir.path(), cx));
         cx.update(|cx| assert!(!enabled(cx)));
         let card = cx.update(card);
         card.update(cx, |card, cx| {
-            card.ready = true;
-            assert!(!settings::current(cx).dictation_enabled);
-            card.primary(cx);
+            card.key_input
+                .update(cx, |input, cx| input.set_text(" sk-test ", cx));
+            card.save_key(cx);
         });
-        cx.update(|cx| assert!(enabled(cx)));
-        card.update(cx, |card, cx| {
-            card.primary(cx);
-            assert!(card.ready);
+        cx.update(|cx| {
+            let config = config(cx).unwrap();
+            assert_eq!(config.api_key, "sk-test");
+            assert_eq!(config.provider, Provider::OpenAi);
+            assert!(config.remove_fillers);
+            assert_eq!(config.trigger_phrase, zeron_voice::DEFAULT_TRIGGER_PHRASE);
         });
+        let keys = dir.path().join(KEYS_FILE);
+        assert_eq!(
+            load_keys(&keys).get("openai").map(String::as_str),
+            Some("sk-test")
+        );
+        // Another provider needs its own key; the first one is kept.
+        cx.update(|cx| {
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.stt_provider = Provider::Groq
+            });
+            assert!(!enabled(cx));
+        });
+        card.update(cx, |card, cx| card.set_key(None, cx));
+        assert_eq!(load_keys(&keys).len(), 1);
+        cx.update(|cx| {
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.stt_provider = Provider::OpenAi
+            });
+            assert!(enabled(cx));
+        });
+        card.update(cx, |card, cx| card.set_key(None, cx));
         cx.update(|cx| assert!(!enabled(cx)));
+        assert!(load_keys(&keys).is_empty());
+    }
+    #[gpui::test]
+    fn an_unusable_trigger_phrase_is_not_saved(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| settings::init(settings::UiSettings::default(), dir.path(), cx));
+        let card = cx.update(card);
+        card.update(cx, |card, cx| {
+            card.phrase_input
+                .update(cx, |input, cx| input.set_text("go", cx));
+            card.save_phrase(cx);
+            assert!(card.phrase_problem.is_some());
+            assert_eq!(
+                settings::current(cx).stt_trigger_phrase,
+                zeron_voice::DEFAULT_TRIGGER_PHRASE
+            );
+            card.phrase_input
+                .update(cx, |input, cx| input.set_text("", cx));
+            card.save_phrase(cx);
+            assert!(card.phrase_problem.is_none());
+            assert_eq!(settings::current(cx).stt_trigger_phrase, "");
+        });
     }
 }
