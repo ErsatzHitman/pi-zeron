@@ -201,6 +201,8 @@ pub(super) struct MarkdownPreview {
     diagram_task: Option<Task<()>>,
     diagram_style: u32,
     source_visible: HashSet<String>,
+    /// ` ```chart ` series and source toggles.
+    charts: Rc<std::cell::RefCell<crate::markdown::chart::ChartState>>,
     preview_image: Option<crate::attachments::PreviewImage>,
     zoom_source: Option<crate::image_media::MediaImage>,
     zoom_render: Option<crate::image_media::MediaImage>,
@@ -431,6 +433,7 @@ impl MarkdownPreview {
             diagram_task: None,
             diagram_style: 0,
             source_visible: HashSet::new(),
+            charts: Rc::default(),
             preview_image: None,
             zoom_source: None,
             zoom_render: None,
@@ -472,6 +475,7 @@ impl MarkdownPreview {
         self.diagram_task = None;
         self.close_media_preview(cx);
         self.source_visible.clear();
+        self.charts = Rc::default();
         self.copied_clear = None;
         self.copied_code = None;
         let epoch = self.epoch;
@@ -1116,7 +1120,24 @@ impl MarkdownPreview {
                 let source_visible = self.source_visible.clone();
                 let image_allowed = self.image_allowed.clone();
                 let diagram_allowed = self.diagram_allowed.clone();
+                let charts = self.charts.clone();
+                let chart_owner = cx.weak_entity();
                 opts.media = Some(render::MediaUi {
+                    chart: Some(Rc::new(move |code, id, theme| {
+                        let owner = chart_owner.clone();
+                        crate::markdown::chart::view(
+                            code,
+                            id,
+                            theme,
+                            &charts,
+                            Rc::new(move |_: &str, cx: &mut gpui::App| {
+                                let _ = owner.update(cx, |view, cx| {
+                                    view.list.remeasure_items(0..view.tree.len());
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    })),
                     diagram: Some(Rc::new(move |code, id, theme| {
                         let state = diagrams.get(code);
                         let allowed = diagram_allowed.contains(code);
