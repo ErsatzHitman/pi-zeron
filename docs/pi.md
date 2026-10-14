@@ -110,6 +110,7 @@ live state; it never enters the synced chat document.
 | `status`, `setStatus`, footer channel, plan mode | chips in the composer footer (a `setStatus` line repeating an element chip shows once) |
 | goal channel (`pi-goal:status`) | the session panel's Goal section: status, objective and progress line. The goal's own status line is not repeated as a chip |
 | subagent fleet (`subagents:fleet`) | also listed in the session panel's Sub-agents section, with a live timer per running job; a row runs View, and its Stop sends Kill after a second click |
+| background bash (`bash:jobs`, `bash-bg:fleet`) | also listed in the session panel's Background section, with a live timer per running command; its Stop sends Kill after a second click |
 | `notify` (plain) | during a turn, a `pi · notice` row in the transcript; between turns, a toast. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
 | `setTitle` | renames the chat |
 | `set_editor_text` | fills the composer |

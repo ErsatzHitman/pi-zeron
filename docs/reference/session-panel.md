@@ -21,13 +21,13 @@ A setting saved by an older build that hid the panel is ignored.
 | Changes | The working tree's `+added −removed` line totals ("None" when clean). Clicking it opens the chat's diff tab, or a new one if none is open |
 | Goal | Only while pi-goal has an active goal: its status (Running, Waiting, Paused, Blocked, Budget reached), the objective and its progress line. It replaces the line that used to run beside the transcript and the goal chip in the composer footer |
 | Sub-agents | See below |
-| Actions | The project's run actions, unchanged |
+| Background | Only while Pi has bash commands in the background (the `bash-background` extension moves a command there after 20 seconds): one row per command with a live timer. Its Stop appears on hover; the first click asks, and the second sends Kill |
 
-The essentials, from Machine to Changes, always show. Goal, Sub-agents and Actions are sections whose headers fold them. A fold lasts for the app run.
+The essentials, from Machine to Changes, always show. Goal, Sub-agents and Background are sections whose headers fold them. A fold lasts for the app run.
 
 ## Sub-agents
 
-The header counts what is running and has a `+` button that starts a new side chat. Rows, in order:
+The header counts what is running and has a `+` button, "btw", that starts a new side chat. An untitled side chat is called "btw" until its first turn names it. Rows, in order:
 
 1. **Sub-sessions:**
    - the chat this one hangs off, marked "Parent", which opens it;

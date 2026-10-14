@@ -10,11 +10,17 @@
 //!   (forks, and chats an agent started through the Zeron MCP server).
 //!
 //! Running work leads; whatever has settled folds into Previous agents.
+//!
+//! The Background section is built here too: the bash commands Pi moved to
+//! the background (the `bash-background` extension's `bash:jobs` roster,
+//! with each job's start time from the `bash-bg:fleet` channel).
 
 use chrono::{DateTime, Utc};
 use gpui::SharedString;
 use zeron_doc::{MessagePart, SubagentStatus};
-use zeron_proto::extension_ui::{PiUiAction, PiUiElement, PiUiKind, PiUiRowState};
+use zeron_proto::extension_ui::{
+    ExtensionUiState, PiUiAction, PiUiElement, PiUiKind, PiUiRowState,
+};
 use zeron_proto::{Chat, ChatIndicator};
 
 use crate::state::AppState;
@@ -22,6 +28,9 @@ use crate::state::AppState;
 /// The Pi extension that publishes the fleet roster, and its live channel.
 const FLEET_NS: &str = "subagents";
 const FLEET_CHANNEL: &str = "subagents:fleet";
+/// The extension that publishes background bash commands, and its channel.
+const BASH_NS: &str = "bash";
+const BASH_CHANNEL: &str = "bash-bg:fleet";
 
 /// What a row opens or controls.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +41,14 @@ pub(super) enum AgentKind {
         element: String,
         row: String,
         view: Option<PiUiAction>,
+        stop: Option<PiUiAction>,
+    },
+    /// A bash command Pi moved to the background: the roster element's
+    /// key, the row's id and its Kill. Its output is not published, so the
+    /// row opens nothing.
+    Background {
+        element: String,
+        row: String,
         stop: Option<PiUiAction>,
     },
     /// A harness subagent's transcript doc.
@@ -64,6 +81,7 @@ impl AgentRow {
     pub fn key(&self) -> String {
         match &self.kind {
             AgentKind::Fleet { row, .. } => format!("fleet-{row}"),
+            AgentKind::Background { row, .. } => format!("bash-{row}"),
             AgentKind::Subagent { doc_id, .. } => format!("subagent-{doc_id}"),
             AgentKind::SideChat { chat_id, .. } => format!("chat-{chat_id}"),
             AgentKind::Parent { chat_id } => format!("parent-{chat_id}"),
@@ -85,6 +103,9 @@ pub(super) struct AgentList {
     pub sessions: Vec<AgentRow>,
     pub active: Vec<AgentRow>,
     pub previous: Vec<AgentRow>,
+    /// Background commands, for their own section: not counted as
+    /// sub-agents.
+    pub background: Vec<AgentRow>,
 }
 
 impl AgentList {
@@ -109,7 +130,7 @@ pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> A
             kind: AgentKind::Parent {
                 chat_id: parent.id.clone(),
             },
-            title: child_chat_title(parent).into(),
+            title: child_chat_title(parent, "Untitled chat").into(),
             status: state.display_status_for(parent, now),
             started: None,
             trailing: Some("Parent".into()),
@@ -117,12 +138,16 @@ pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> A
         });
     }
     list.sessions.extend(child_chat_rows(state, &chat.id, now));
-    for row in fleet_rows(state, &chat.id) {
-        if row.running() {
-            list.active.push(row);
-        } else {
-            list.previous.push(row);
+    if let Some(ui) = state.extension_ui.of(&chat.id) {
+        let elements = ui.typed_elements();
+        for row in roster_agent_rows(ui, &elements, FLEET_NS, FLEET_CHANNEL, false) {
+            if row.running() {
+                list.active.push(row);
+            } else {
+                list.previous.push(row);
+            }
         }
+        list.background = roster_agent_rows(ui, &elements, BASH_NS, BASH_CHANNEL, true);
     }
     for row in subagent_rows(state, &chat.id) {
         let running = row.status == Some(SubagentStatus::Running);
@@ -151,22 +176,25 @@ pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> A
     list
 }
 
-/// The Pi fleet's rows, in the roster's own tree order. A job's start time
-/// comes from the fleet channel; the roster only carries its state.
-fn fleet_rows(state: &AppState, chat_id: &str) -> Vec<AgentRow> {
-    let Some(ui) = state.extension_ui.of(chat_id) else {
-        return Vec::new();
-    };
-    let Some(element) = ui
-        .typed_elements()
-        .into_iter()
-        .find(|e| e.ns == FLEET_NS && e.kind == PiUiKind::Roster)
+/// A roster's rows (the Pi fleet's, or the background commands'), in the
+/// roster's own tree order. A job's start time comes from the extension's
+/// channel; the roster only carries its state.
+fn roster_agent_rows(
+    ui: &ExtensionUiState,
+    elements: &[PiUiElement],
+    ns: &str,
+    channel: &str,
+    background: bool,
+) -> Vec<AgentRow> {
+    let Some(element) = elements
+        .iter()
+        .find(|e| e.ns == ns && e.kind == PiUiKind::Roster)
     else {
         return Vec::new();
     };
     let entries = ui
         .channels
-        .get(FLEET_CHANNEL)
+        .get(channel)
         .and_then(|fleet| fleet["entries"].as_array().cloned())
         .unwrap_or_default();
     let started = |key: &str| {
@@ -176,12 +204,13 @@ fn fleet_rows(state: &AppState, chat_id: &str) -> Vec<AgentRow> {
             .and_then(|entry| entry["startedAt"].as_i64())
             .and_then(DateTime::<Utc>::from_timestamp_millis)
     };
-    fleet_roster_rows(&element, started)
+    roster_rows(element, started, background)
 }
 
-fn fleet_roster_rows(
+fn roster_rows(
     element: &PiUiElement,
     started: impl Fn(&str) -> Option<DateTime<Utc>>,
+    background: bool,
 ) -> Vec<AgentRow> {
     let key = element.key();
     element
@@ -205,13 +234,22 @@ fn fleet_roster_rows(
                 status,
                 ChatIndicator::Working | ChatIndicator::AwaitingInput
             );
-            AgentRow {
-                kind: AgentKind::Fleet {
+            let kind = if background {
+                AgentKind::Background {
+                    element: key.clone(),
+                    row: row.id.clone(),
+                    stop: action("kill"),
+                }
+            } else {
+                AgentKind::Fleet {
                     element: key.clone(),
                     row: row.id.clone(),
                     view: action("view"),
                     stop: action("kill"),
-                },
+                }
+            };
+            AgentRow {
+                kind,
                 title: row.label.clone().into(),
                 status,
                 started: running.then(|| started(&row.id)).flatten(),
@@ -314,7 +352,7 @@ fn child_chat_rows(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<A
                     device_id: chat.device_id.clone(),
                     change_request: state.change_request_for_chat(chat).cloned(),
                 },
-                title: child_chat_title(chat).into(),
+                title: child_chat_title(chat, "btw").into(),
                 status: state.display_status_for(chat, now),
                 started: None,
                 trailing: Some(zeron_proto::view::format_time_ago(activity, now).into()),
@@ -327,13 +365,13 @@ fn child_chat_rows(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<A
     rows.into_iter().map(|(_, row)| row).collect()
 }
 
-/// A side chat titles itself on its first turn; until then the preview or a
+/// A chat titles itself on its first turn; until then the preview or a
 /// placeholder stands in.
-pub(super) fn child_chat_title(chat: &Chat) -> String {
+pub(super) fn child_chat_title(chat: &Chat, placeholder: &str) -> String {
     chat.title
         .clone()
         .or_else(|| chat.last_message_preview.clone())
-        .unwrap_or_else(|| "New side chat".into())
+        .unwrap_or_else(|| placeholder.into())
 }
 
 #[cfg(test)]
@@ -499,7 +537,7 @@ mod tests {
             ["parent-root", "chat-a", "chat-b"]
         );
         assert_eq!(list.sessions[0].title.as_ref(), "Release prep");
-        assert_eq!(list.sessions[1].title.as_ref(), "New side chat");
+        assert_eq!(list.sessions[1].title.as_ref(), "btw");
         assert_eq!(list.sessions[2].title.as_ref(), "Investigate caching");
         assert_eq!(list.running(), 0);
         assert!(list.active.is_empty() && list.previous.is_empty());
@@ -568,5 +606,63 @@ mod tests {
         let mut other = main.clone();
         other.id = "other".into();
         assert!(agent_list(&state, &other, Utc::now()).is_empty());
+    }
+
+    #[test]
+    fn background_commands_list_apart_from_sub_agents_with_their_kill() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("main", None, 10)]);
+        state.selected_chat = Some("main".into());
+        state.extension_ui.chat = Some("main".into());
+        let started = Utc::now() - chrono::Duration::seconds(41);
+        state.extension_ui.state.elements = vec![serde_json::json!({
+            "id": "jobs", "ns": "bash", "kind": "roster", "placement": "pinned",
+            "title": "Background bash · 1 running",
+            "rows": [
+                {"id": "bg-1", "label": "npm run dev", "state": "running",
+                 "detail": "41s · ready",
+                 "actions": [{"id": "kill", "label": "Kill", "variant": "danger",
+                              "confirm": "Kill this job?"}]},
+                {"id": "bg-2", "label": "cargo check", "state": "done", "actions": []}
+            ]
+        })];
+        state.extension_ui.state.channels.insert(
+            "bash-bg:fleet".into(),
+            serde_json::json!({"entries": [
+                {"key": "bg-1", "startedAt": started.timestamp_millis()}
+            ], "active": false, "selected": ""}),
+        );
+        let main = state.chats[0].clone();
+        let list = agent_list(&state, &main, Utc::now());
+        // Commands are not sub-agents: the Sub-agents section stays empty.
+        assert!(list.is_empty());
+        assert_eq!(list.running(), 0);
+        let [dev, check] = list.background.as_slice() else {
+            panic!("two background rows");
+        };
+        assert_eq!(dev.title.as_ref(), "npm run dev");
+        assert_eq!(dev.key(), "bash-bg-1");
+        assert_eq!(dev.status, ChatIndicator::Working);
+        assert_eq!(
+            dev.started.map(|t| t.timestamp_millis()),
+            Some(started.timestamp_millis())
+        );
+        let AgentKind::Background { element, row, stop } = &dev.kind else {
+            panic!("a background row");
+        };
+        assert_eq!((element.as_str(), row.as_str()), ("bash:jobs", "bg-1"));
+        assert_eq!(
+            stop.as_ref().and_then(|s| s.confirm.as_deref()),
+            Some("Kill this job?")
+        );
+        // A settled command has no timer and nothing to stop.
+        assert_eq!(check.started, None);
+        assert!(matches!(
+            &check.kind,
+            AgentKind::Background { stop: None, .. }
+        ));
+        let mut other = main.clone();
+        other.id = "other".into();
+        assert!(agent_list(&state, &other, Utc::now()).background.is_empty());
     }
 }

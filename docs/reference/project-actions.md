@@ -1,6 +1,6 @@
 # Project Actions
 
-Project Actions are named shell commands attached to a project. They can be run from the selected chat's title bar, and one saved Action can optionally run when Zeron creates a new worktree.
+Project Actions are named shell commands attached to a project. One saved Action can optionally run when Zeron creates a new worktree. The session panel no longer lists Actions, so the app has no place to run, add or edit one yet; saved Actions and the worktree setup Action keep working.
 
 ## Trust and storage
 

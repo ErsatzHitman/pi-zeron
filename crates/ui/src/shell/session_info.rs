@@ -1,8 +1,8 @@
 //! The session panel: where this chat runs and what is working under it, in
 //! one card at the transcript's right. Its essentials (machine, project,
 //! working directory, session, branch and changes) always show; the goal,
-//! the sub-agents and sub-sessions, and the project's run actions sit in
-//! sections that fold.
+//! the sub-agents and sub-sessions, and the commands Pi runs in the
+//! background sit in sections that fold.
 //!
 //! While the column has room the panel stays docked at its right, the
 //! transcript and composer shifting left as needed to clear it. Once
@@ -15,8 +15,6 @@ use std::collections::HashSet;
 use gpui::Animation;
 use zeron_proto::extension_ui::{ExtensionUiAction, PiUiAction};
 use zeron_proto::{Chat, ChatIndicator, CheckoutDiff};
-
-use crate::project_actions::{ProjectActionsStatus, action_icon};
 
 mod agents;
 
@@ -34,7 +32,7 @@ const AGENT_ROW_HEIGHT: f32 = 28.0;
 /// Sections that fold, by key.
 const GOAL: &str = "goal";
 const AGENTS: &str = "agents";
-const ACTIONS: &str = "actions";
+const BACKGROUND: &str = "background";
 
 /// The panel's own state, held on the shell across chats.
 #[derive(Default)]
@@ -503,8 +501,8 @@ impl Shell {
 
         // ── Sections that fold.
         let goal = goal.map(|goal| self.render_goal(&goal, &theme, cx));
+        let background = self.render_background(&agents.background, &theme, cx);
         let agents = self.render_agents(&agents, &theme, cx);
-        let actions = self.render_session_info_actions(&theme, cx);
 
         let body = div()
             .id("session-info-body")
@@ -527,7 +525,7 @@ impl Shell {
             })
             .children(goal.into_iter().flatten())
             .children(agents)
-            .children(actions);
+            .children(background);
 
         let card = div()
             .w(px(SESSION_CARD_WIDTH))
@@ -826,7 +824,7 @@ impl Shell {
             .id("session-info-new-side-chat")
             .debug_selector(|| "session-info-new-side-chat".into())
             .role(gpui::Role::Button)
-            .aria_label("New side chat")
+            .aria_label("btw")
             .size(px(20.0))
             .flex_none()
             .flex()
@@ -834,7 +832,7 @@ impl Shell {
             .justify_center()
             .rounded(px(5.0))
             .hover(|style| style.bg(crate::theme::ink(0.08)))
-            .tooltip(crate::settings::widgets::text_tooltip("New side chat"))
+            .tooltip(crate::settings::widgets::text_tooltip("btw (by the way)"))
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.close_session_info_overlay(cx);
@@ -931,6 +929,7 @@ impl Shell {
         let group = SharedString::from(format!("session-info-agent-group-{key}"));
         let kind_icon = match &row.kind {
             AgentKind::Fleet { .. } | AgentKind::Subagent { .. } => icons::BOT,
+            AgentKind::Background { .. } => icons::TERMINAL,
             AgentKind::SideChat { .. } => icons::CHAT_ROUND_LINE,
             AgentKind::Parent { .. } => icons::ARROW_UP,
         };
@@ -1002,10 +1001,18 @@ impl Shell {
                 row: row_id,
                 stop: Some(stop),
                 ..
+            }
+            | AgentKind::Background {
+                element,
+                row: row_id,
+                stop: Some(stop),
             } => Some(self.render_fleet_stop(element, row_id, stop, &group, theme, cx)),
             _ => None,
         };
-        let clickable = !matches!(&row.kind, AgentKind::Fleet { view: None, .. });
+        let clickable = !matches!(
+            &row.kind,
+            AgentKind::Fleet { view: None, .. } | AgentKind::Background { .. }
+        );
         let mut element = div()
             .id(id.clone())
             .debug_selector({
@@ -1057,7 +1064,7 @@ impl Shell {
                     this.close_session_info_overlay(cx);
                     this.send_fleet_action(element.clone(), row.clone(), view, cx);
                 }
-                AgentKind::Fleet { .. } => {}
+                AgentKind::Fleet { .. } | AgentKind::Background { .. } => {}
                 AgentKind::Subagent { doc_id, frozen } => {
                     this.close_session_info_overlay(cx);
                     this.add_subagent_surface(
@@ -1102,8 +1109,8 @@ impl Shell {
         element.into_any_element()
     }
 
-    /// A running Pi sub-agent's Stop: shown on hover; a first click asks,
-    /// the second stops it.
+    /// A running Pi sub-agent's or background command's Stop: shown on
+    /// hover; a first click asks, the second stops it.
     fn render_fleet_stop(
         &self,
         element: &str,
@@ -1116,11 +1123,13 @@ impl Shell {
         let armed_key = format!("{element}/{row}");
         let armed = self.session_panel.armed_stop.as_deref() == Some(armed_key.as_str());
         let label = if armed { "Stop?" } else { "Stop" };
-        let tip = stop
-            .confirm
-            .clone()
-            .filter(|_| armed)
-            .unwrap_or_else(|| "Stop this sub-agent".into());
+        let tip = stop.confirm.clone().filter(|_| armed).unwrap_or_else(|| {
+            if element.starts_with("bash:") {
+                "Stop this command".into()
+            } else {
+                "Stop this sub-agent".into()
+            }
+        });
         let (element, row, stop) = (element.to_owned(), row.to_owned(), stop.clone());
         div()
             .id(SharedString::from(format!("session-info-stop-{armed_key}")))
@@ -1165,160 +1174,36 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The Actions section: a row per project action (click runs it; the
-    /// gear edits it), imports from zeron.json, and Add action.
-    fn render_session_info_actions(
+    /// Bash commands Pi moved to the background, each with a live timer
+    /// and a Stop on hover. Hidden while there are none.
+    fn render_background(
         &mut self,
+        rows: &[AgentRow],
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        self.ensure_project_actions(cx);
-        let (Some(status), Some(snapshot), Some(key)) = (
-            self.project_actions.active_status().cloned(),
-            self.project_actions.visible_snapshot(),
-            self.project_actions.active.clone(),
-        ) else {
+        if rows.is_empty() {
             return Vec::new();
-        };
-        let mut rows: Vec<AnyElement> = vec![
+        }
+        let running = rows.iter().filter(|row| row.running()).count();
+        let mut out = vec![
             popover::picker_divider().into_any_element(),
-            self.render_section_header(ACTIONS, "Actions", None, None, theme, cx),
+            self.render_section_header(
+                BACKGROUND,
+                "Background",
+                (running > 0).then(|| format!("· {running} running").into()),
+                None,
+                theme,
+                cx,
+            ),
         ];
-        if !self.session_panel.is_open(ACTIONS) {
-            return rows;
+        if !self.session_panel.is_open(BACKGROUND) {
+            return out;
         }
-        let note = |text: SharedString, color| {
-            div()
-                .px(px(9.0))
-                .py(px(5.0))
-                .text_size(crate::typography::ui_rems(12.0))
-                .text_color(color)
-                .child(text)
-                .into_any_element()
-        };
-        match &status {
-            ProjectActionsStatus::Idle | ProjectActionsStatus::Loading => {
-                rows.push(note("Loading actions…".into(), theme.text_muted));
-                return rows;
-            }
-            ProjectActionsStatus::Unavailable { message, .. } => {
-                rows.push(note(message.clone().into(), theme.text_muted));
-                rows.push(
-                    popover::picker_row(theme, false, false, "session-info-actions-retry")
-                        .id("session-info-actions-retry")
-                        .on_click(cx.listener(|this, _, _, cx| this.retry_project_actions(cx)))
-                        .child(popover::picker_icon_slot(row_glyph(icons::REFRESH, theme)))
-                        .child("Retry")
-                        .into_any_element(),
-                );
-            }
-            _ => {}
+        for row in rows {
+            out.push(self.render_agent_row(row, theme, cx));
         }
-        let can_run = status.can_run();
-        for action in snapshot.actions.clone() {
-            let row_id = SharedString::from(format!("session-info-action-{}", action.id));
-            let group = SharedString::from(format!("session-info-action-group-{}", action.id));
-            let key = key.clone();
-            let run = action.clone();
-            let edit = action.clone();
-            let label: SharedString = if action.run_on_worktree_create {
-                format!("{} (setup)", action.name).into()
-            } else {
-                action.name.clone().into()
-            };
-            rows.push(
-                popover::picker_row(theme, false, false, row_id.clone())
-                    .id(row_id)
-                    .group(group.clone())
-                    .when(!can_run, |row| row.opacity(0.5).cursor_default())
-                    .when(can_run, |row| {
-                        row.on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_session_info_overlay(cx);
-                            this.run_project_action(&key, run.clone(), cx)
-                        }))
-                    })
-                    .child(popover::picker_icon_slot(row_glyph(
-                        action_icon(action.icon),
-                        theme,
-                    )))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "session-info-edit-action-{}",
-                                edit.id
-                            )))
-                            .size(px(22.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(5.0))
-                            .invisible()
-                            .group_hover(group, |style| style.visible())
-                            .hover(|style| style.bg(crate::theme::ink(0.08)))
-                            .tooltip(crate::settings::widgets::text_tooltip("Edit action"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_session_info_overlay(cx);
-                                this.open_project_action_editor(Some(edit.clone()), None, cx)
-                            }))
-                            .child(
-                                icon(icons::SETTINGS_MINIMALISTIC)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-        }
-        for draft in snapshot.importable_actions.clone() {
-            let row_id = SharedString::from(format!("session-info-import-{}", draft.name));
-            let import = draft.clone();
-            rows.push(
-                popover::picker_row(theme, false, false, row_id.clone())
-                    .id(row_id)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_session_info_overlay(cx);
-                        this.open_project_action_editor(None, Some(import.clone()), cx)
-                    }))
-                    .child(popover::picker_icon_slot(row_glyph(
-                        action_icon(draft.icon),
-                        theme,
-                    )))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(draft.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .text_color(theme.text_muted)
-                            .child("Import"),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if let Some(issue) = snapshot.project_file_issue.clone() {
-            rows.push(note(issue.into(), theme.text_muted));
-        }
-        rows.push(
-            popover::picker_row(theme, false, false, "session-info-add-action")
-                .id("session-info-add-action")
-                .debug_selector(|| "session-info-add-action".into())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_session_info_overlay(cx);
-                    this.open_project_action_editor(None, None, cx)
-                }))
-                .child(popover::picker_icon_slot(row_glyph(icons::PLUS, theme)))
-                .child("Add action")
-                .into_any_element(),
-        );
-        rows
+        out
     }
 }
 

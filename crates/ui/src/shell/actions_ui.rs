@@ -17,6 +17,9 @@ struct ProjectActionContext {
 }
 
 
+// The session panel no longer lists project actions, so nothing opens the
+// runner or the editor; they stay for when actions find a new home.
+#[allow(dead_code)]
 impl Shell {
     pub(super) fn attach_worktree_setup(
         &mut self,
