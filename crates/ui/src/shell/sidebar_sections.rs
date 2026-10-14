@@ -819,7 +819,7 @@ mod tests {
             .collect()
     }
 
-    fn click_on(cx: &mut gpui::VisualTestContext, id: &str) {
+    fn click_on(cx: &mut gpui::VisualTestContext, id: &'static str) {
         let at = cx
             .debug_bounds(id)
             .unwrap_or_else(|| panic!("{id}"))
