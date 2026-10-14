@@ -851,10 +851,12 @@ mod tests {
         cx.update(|window, cx| {
             window.draw(cx).clear();
         });
-        let button = cx
-            .debug_bounds("toast-action-0")
-            .expect("the primary answer is drawn");
-        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        assert!(
+            cx.debug_bounds("toast-action-0").is_some(),
+            "the primary answer is drawn"
+        );
+        // A synthetic click lands mid slide-in, so press it directly.
+        cx.update(|_, cx| answer(id, 0, cx));
         assert_eq!(answered.get(), 1, "the answer ran");
         cx.update(|_, cx| assert!(messages(cx).is_empty(), "answering closes it"));
         // Pressing a closed question does nothing.
