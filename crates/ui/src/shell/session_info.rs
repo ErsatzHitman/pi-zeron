@@ -1,8 +1,10 @@
 //! The session panel: where this chat runs and what is working under it, in
 //! one card at the transcript's right. Its essentials (machine, project,
-//! working directory, session, branch and changes) always show; the goal,
+//! working directory, session, branch and changes) always show. The goal,
 //! the agent's todo list, the sub-agents and sub-sessions, and the commands
-//! Pi runs in the background sit in sections that fold.
+//! Pi runs in the background each get a section only while active: a
+//! section grows in at the bottom when its work starts and folds away when
+//! it ends (see `sections.rs`). A section's header folds it.
 //!
 //! While the column has room the panel stays docked at its right, the
 //! transcript and composer shifting left as needed to clear it. Once
@@ -10,17 +12,21 @@
 //! titlebar's toggle floats it over the transcript instead.
 use super::*;
 
+use std::cell::Cell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use gpui::Animation;
 use zeron_proto::extension_ui::{ExtensionUiAction, PiUiAction};
 use zeron_proto::{Chat, ChatIndicator, CheckoutDiff};
 
 mod agents;
+mod sections;
 mod todos;
 
 use crate::todo_panel::{self, FoldSide, TodoPanelState, TodoRow};
 use agents::{AgentKind, AgentList, AgentRow};
+use sections::{ActiveSections, Entry, SectionKey, stack_height};
 use todos::TodoList;
 use zeron_proto::TodoItem;
 
@@ -58,6 +64,24 @@ pub(super) struct SessionPanel {
     todo_cache: todo_panel::TodoCache,
     /// Per chat: whether the folded-away todo items are revealed.
     todo_folds: std::collections::HashMap<String, TodoPanelState>,
+    /// The sections up now, in the order they became active.
+    sections: ActiveSections<SectionData>,
+    body_scroll: gpui::ScrollHandle,
+    /// While a newcomer grows in, the body keeps scrolled to the bottom so
+    /// it is seen.
+    follow_until: Option<std::time::Instant>,
+    /// A side chat's title is being edited in its row: Sub-agents stays up
+    /// even with nothing running.
+    pub(super) rename_pin: bool,
+}
+
+/// What a section draws from: moved in each frame, kept by a section
+/// folding away.
+enum SectionData {
+    Goal(serde_json::Value),
+    Todos(TodoList),
+    Agents(AgentList),
+    Background(Vec<AgentRow>),
 }
 
 /// One `WatchCheckoutDiffs` frame: every checkout, or one that changed.
@@ -88,8 +112,10 @@ impl SessionPanel {
         !self.folded.contains(section)
     }
 
-    /// Unfold Sub-agents, so a side chat's row can take an inline rename.
+    /// Show and unfold Sub-agents, so a side chat's row can take an inline
+    /// rename.
     pub(super) fn reveal_agents(&mut self) -> bool {
+        self.rename_pin = true;
         self.folded.remove(AGENTS);
         true
     }
@@ -129,6 +155,50 @@ pub(super) fn session_card_reserve(main: f32, transcript: f32) -> Option<f32> {
     // (main - reserve) / 2 + transcript / 2; keep it at `card_left - gap`.
     let reserve = (main + transcript - 2.0 * (card_left - SESSION_CARD_GAP)).max(0.0);
     (main - reserve - 2.0 * TRANSCRIPT_GUTTER >= transcript - 0.5).then_some(reserve)
+}
+
+/// A section clipped to `t` of its height and faded with it. A probe records
+/// the content's painted height; until the first one, `estimate` stands in.
+fn section_frame(
+    id: &'static str,
+    t: f32,
+    estimate: f32,
+    measured: Rc<Cell<f32>>,
+    rows: Vec<AnyElement>,
+) -> AnyElement {
+    let natural = match measured.get() {
+        height if height > 0.0 => height,
+        _ => estimate,
+    };
+    let probe = gpui::canvas(
+        move |bounds, _, _| measured.set(f32::from(bounds.size.height)),
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .inset_0();
+    // It re-pads by the card's inset: dividers bleed through it, and a frame
+    // clipping at the content's width would cut them.
+    let content = div()
+        .relative()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(popover::MENU_GAP))
+        .pt(px(popover::MENU_GAP))
+        .px(px(popover::CARD_INSET))
+        .child(probe)
+        .children(rows);
+    let frame = div()
+        .id(SharedString::from(format!("session-info-section-{id}")))
+        .debug_selector(move || format!("session-info-section-{id}"))
+        .w_full()
+        .flex_none()
+        .overflow_hidden()
+        .child(content);
+    if t >= 0.999 {
+        return frame.into_any_element();
+    }
+    frame.h(px(natural * t)).opacity(t).into_any_element()
 }
 
 /// A non-interactive card row: icon slot, label, optional trailing detail.
@@ -404,6 +474,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if reveal <= 0.001 {
+            self.session_panel.sections.reset();
             return None;
         }
         let theme = Theme::of(cx).for_popup();
@@ -523,14 +594,62 @@ impl Shell {
         let changes_row = crate::changes::resolve_diff(&self.session_panel.diffs, &chat)
             .map(|diff| self.render_changes_row(diff, &theme, cx));
 
-        // ── Sections that fold.
-        let goal = goal.map(|goal| self.render_goal(&goal, &theme, cx));
-        let todos = self.render_todos(todos.as_ref(), &chat.id, &theme, cx);
-        let background = self.render_background(&agents.background, &theme, cx);
-        let agents = self.render_agents(&agents, &theme, cx);
+        // ── Sections: only what is active, in the order it became so.
+        let mut agents = agents;
+        let background = std::mem::take(&mut agents.background);
+        let mut active = Vec::new();
+        if let Some(goal) = goal {
+            let since = goal["startedAt"]
+                .as_i64()
+                .filter(|ms| *ms > 0)
+                .and_then(DateTime::<Utc>::from_timestamp_millis);
+            active.push((SectionKey::Goal, since, SectionData::Goal(goal)));
+        }
+        if let Some(todos) = todos {
+            active.push((SectionKey::Todos, None, SectionData::Todos(todos)));
+        }
+        // A rename keeps the row it edits up; its chat gone, the pin ends.
+        let pinned = self.session_panel.rename_pin && !agents.sessions.is_empty();
+        if agents.is_active() || pinned {
+            let since = agents.since();
+            active.push((SectionKey::Agents, since, SectionData::Agents(agents)));
+        }
+        if agents::background_active(&background) {
+            let since = agents::background_since(&background);
+            active.push((
+                SectionKey::Background,
+                since,
+                SectionData::Background(background),
+            ));
+        }
+        let frame_time = self.render_time.unwrap_or_else(|| self.motion_time());
+        let pulse =
+            self.session_panel
+                .sections
+                .observe(&chat.id, active, frame_time, self.reduced_motion);
+        if pulse.animating {
+            self.motion_active.set(true);
+        }
+        if pulse.entered {
+            self.session_panel.follow_until = Some(frame_time + crate::motion::COLLAPSE.total());
+        }
+        let entries = self.session_panel.sections.take();
+        let sections: Vec<AnyElement> = entries
+            .iter()
+            .map(|entry| self.render_section(entry, &chat.id, frame_time, &theme, cx))
+            .collect();
+        self.session_panel.sections.restore(entries);
+        if self
+            .session_panel
+            .follow_until
+            .is_some_and(|until| frame_time < until)
+        {
+            self.session_panel.body_scroll.scroll_to_bottom();
+        }
 
         let body = div()
             .id("session-info-body")
+            .track_scroll(&self.session_panel.body_scroll)
             .max_h(px(max_height.max(120.0)))
             .overflow_y_scroll()
             // The card's inset lives inside the scroller, so dividers can
@@ -548,10 +667,20 @@ impl Shell {
                     .children(branch_row)
                     .children(changes_row)
             })
-            .children(goal.into_iter().flatten())
-            .children(todos)
-            .children(agents)
-            .children(background);
+            .when(!sections.is_empty(), |body| {
+                // The body's gap already spaces the column and each section
+                // carries its own top gap, so cancel one. The column bleeds
+                // through the body's inset so dividers still reach the
+                // card's edges.
+                body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .mx(px(-popover::CARD_INSET))
+                        .mt(px(-popover::MENU_GAP))
+                        .children(sections),
+                )
+            });
 
         let card = div()
             .w(px(SESSION_CARD_WIDTH))
@@ -668,7 +797,71 @@ impl Shell {
             })
             .children(spinner)
             .child(trailing)
+            .child(self.render_btw_button(theme, cx))
             .into_any_element()
+    }
+
+    /// btw: a side chat off this one, from the Session row.
+    fn render_btw_button(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("session-info-new-side-chat")
+            .debug_selector(|| "session-info-new-side-chat".into())
+            .role(gpui::Role::Button)
+            .aria_label("btw")
+            .size(px(20.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.08)))
+            .tooltip(crate::settings::widgets::text_tooltip("btw (by the way)"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.close_session_info_overlay(cx);
+                this.create_child_chat(None, cx)
+            }))
+            .child(
+                icon(icons::PLUS)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted),
+            )
+            .into_any_element()
+    }
+
+    /// One active section, clipped to how far it has appeared.
+    fn render_section(
+        &mut self,
+        entry: &Entry<SectionData>,
+        chat_id: &str,
+        now: std::time::Instant,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = entry.reveal.value(now, self.reduced_motion);
+        let (rows, estimate) = match &entry.data {
+            SectionData::Goal(goal) => {
+                let chars = goal["text"].as_str().unwrap_or_default().chars().count();
+                (
+                    self.render_goal(goal, theme, cx),
+                    stack_height(0) + (chars / 30 + 1) as f32 * 18.0 + 4.0,
+                )
+            }
+            SectionData::Todos(todos) => (
+                self.render_todos(todos, chat_id, theme, cx),
+                stack_height(todos.items.len().min(8)),
+            ),
+            SectionData::Agents(list) => (
+                self.render_agents(list, theme, cx),
+                stack_height(list.sessions.len() + list.active.len()),
+            ),
+            SectionData::Background(rows) => (
+                self.render_background(rows, theme, cx),
+                stack_height(rows.len()),
+            ),
+        };
+        section_frame(entry.key.id(), t, estimate, entry.measured.clone(), rows)
     }
 
     /// Changes: the working tree's line totals; it opens the diff.
@@ -837,20 +1030,15 @@ impl Shell {
         rows
     }
 
-    /// Sub-agents: the sub-sessions this chat hangs off and owns, the
-    /// sub-agents at work, and the settled ones under Previous agents.
     /// The agent's checklist: what is done, what it is on and what is left.
-    /// Absent while there is no list in play (see [`TodoList::of`]).
+    /// Active while there is a list in play (see [`TodoList::of`]).
     fn render_todos(
         &mut self,
-        todos: Option<&TodoList>,
+        todos: &TodoList,
         chat_id: &str,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let Some(todos) = todos else {
-            return Vec::new();
-        };
         let mut out = vec![
             popover::picker_divider().into_any_element(),
             self.render_section_header(TODOS, "Todo", Some(todos.count_label()), None, theme, cx),
@@ -994,6 +1182,8 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Sub-agents: the sub-sessions this chat hangs off and owns, the
+    /// sub-agents at work, and the settled ones under Previous agents.
     fn render_agents(
         &mut self,
         list: &AgentList,
@@ -1001,53 +1191,18 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let running = list.running();
-        let new_side_chat = div()
-            .id("session-info-new-side-chat")
-            .debug_selector(|| "session-info-new-side-chat".into())
-            .role(gpui::Role::Button)
-            .aria_label("btw")
-            .size(px(20.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(5.0))
-            .hover(|style| style.bg(crate::theme::ink(0.08)))
-            .tooltip(crate::settings::widgets::text_tooltip("btw (by the way)"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.close_session_info_overlay(cx);
-                this.create_child_chat(None, cx)
-            }))
-            .child(
-                icon(icons::PLUS)
-                    .size(px(13.0))
-                    .text_color(theme.text_muted),
-            );
         let mut rows = vec![
             popover::picker_divider().into_any_element(),
             self.render_section_header(
                 AGENTS,
                 "Sub-agents",
                 (running > 0).then(|| format!("· {running} running").into()),
-                Some(new_side_chat.into_any_element()),
+                None,
                 theme,
                 cx,
             ),
         ];
         if !self.session_panel.is_open(AGENTS) {
-            return rows;
-        }
-        if list.is_empty() {
-            rows.push(
-                div()
-                    .px(px(9.0))
-                    .py(px(5.0))
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .text_color(theme.text_muted)
-                    .child("No sub-agents or side chats yet")
-                    .into_any_element(),
-            );
             return rows;
         }
         for row in list.sessions.iter().chain(&list.active) {
@@ -1356,16 +1511,13 @@ impl Shell {
     }
 
     /// Bash commands Pi moved to the background, each with a live timer
-    /// and a Stop on hover. Hidden while there are none.
+    /// and a Stop on hover. Active while one runs.
     fn render_background(
         &mut self,
         rows: &[AgentRow],
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        if rows.is_empty() {
-            return Vec::new();
-        }
         let running = rows.iter().filter(|row| row.running()).count();
         let mut out = vec![
             popover::picker_divider().into_any_element(),

@@ -16,19 +16,19 @@ A setting saved by an older build that hid the panel is ignored.
 | Machine | The device the chat runs on, with a warning mark while it is offline |
 | Project | The project's icon and name; hover for its path |
 | Directory | The working directory, shortened to its last two folders; hover for the full path. A worktree says so |
-| Session | The agent's mark and the chat's title. While the agent works it shows a spinner and a live timer; "Needs you" while it waits on the user; "Error" after a failure; otherwise the model |
+| Session | The agent's mark and the chat's title. While the agent works it shows a spinner and a live timer; "Needs you" while it waits on the user; "Error" after a failure; otherwise the model. Its `+` button, "btw", starts a side chat |
 | Branch | The conversation's branch |
 | Changes | The working tree's `+added −removed` line totals ("None" when clean). Clicking it opens the chat's diff tab, or a new one if none is open |
 | Goal | Only while pi-goal has an active goal: its status (Running, Waiting, Paused, Blocked, Budget reached), the objective and its progress line. It replaces the line that used to run beside the transcript and the goal chip in the composer footer |
 | Todo | Only while the agent has a checklist with work left: one row per item (done, in progress with a spinner while the turn runs, pending), and the header counts `done/total`. A list the agent has finished shows only until its turn ends. Lists over six items fold to the current item and its neighbours, with "N earlier" and "N later" rows. Read-only; it mirrors the composer's checklist tray |
 | Sub-agents | See below |
-| Background | Only while Pi has bash commands in the background (the `bash-background` extension moves a command there after 20 seconds): one row per command with a live timer. Its Stop appears on hover; the first click asks, and the second sends Kill |
+| Background | Only while one of Pi's background bash commands runs (the `bash-background` extension moves a command there after 20 seconds): one row per command with a live timer. Its Stop appears on hover; the first click asks, and the second sends Kill |
 
-The essentials, from Machine to Changes, always show. Goal, Todo, Sub-agents and Background are sections whose headers fold them. A fold lasts for the app run.
+The essentials, from Machine to Changes, always show. Goal, Todo, Sub-agents and Background appear only while active: nothing running means no sections. They have no fixed order. A section that becomes active grows in at the bottom, and one whose work ends folds away while the others close up; the card does not reorder what is already showing. Sections already active when a chat opens appear at once, ordered by when their work started. A section's header folds it, and a fold lasts for the app run.
 
 ## Sub-agents
 
-The header counts what is running and has a `+` button, "btw", that starts a new side chat. An untitled side chat is called "btw" until its first turn names it. Rows, in order:
+Shown while a sub-agent or side chat runs, or when the chat has a parent (the Parent row is its way back). Renaming a side chat from its tab menu shows it too. The header counts what is running. An untitled side chat is called "btw" until its first turn names it. Rows, in order:
 
 1. **Sub-sessions:**
    - the chat this one hangs off, marked "Parent", which opens it;
@@ -45,13 +45,14 @@ Fork chat is gone. The Files panel no longer has Subagents or Chats sections; th
 
 `crates/ui/src/shell/session_info.rs` renders the panel and holds its state (`SessionPanel`):
 
+- the active sections (`session_info/sections.rs`, pure): which are up, in activation order, and how far each has appeared. A section enters over `motion::COLLAPSE` and leaves over `motion::MENU_OUT`, keeping its seat and last data while it folds; reduced motion snaps;
 - the folds;
 - the armed Stop;
 - the change totals, from its own `WatchCheckoutDiffs` subscription. Frames are decoded off the UI thread, and their patches are dropped.
 
 `session_info/todos.rs` decides when the Todo section shows; the list, its folding and the status glyphs come from `todo_panel.rs`.
 
-`session_info/agents.rs` builds the Sub-agents rows from `AppState`:
+`session_info/agents.rs` builds the Sub-agents rows from `AppState`, and decides when Sub-agents and Background are active:
 
 - the transcript's spawn chips;
 - the chat list;

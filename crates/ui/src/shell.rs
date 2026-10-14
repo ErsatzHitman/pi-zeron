@@ -5920,6 +5920,7 @@ impl Shell {
     /// Close the inline rename, saving a changed, non-empty title when
     /// `commit` (Enter or blur) and dropping it otherwise (Escape).
     fn finish_rename_chat(&mut self, commit: bool, cx: &mut Context<Self>) {
+        self.session_panel.rename_pin = false;
         let Some(rename) = self.chat_rename.take() else {
             return;
         };

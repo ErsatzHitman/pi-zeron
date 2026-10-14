@@ -748,6 +748,18 @@ mod tests {
         }
         let actions = cx.debug_bounds("session-info-new-side-chat").unwrap();
         assert!(card.contains(&actions.center()));
+        // btw sits on the Session row.
+        let session = cx.debug_bounds("session-info-session").unwrap();
+        assert!(session.contains(&actions.center()));
+        // Nothing runs under the chat: no sections at all.
+        for header in [
+            "session-info-goal-header",
+            "session-info-todos-header",
+            "session-info-agents-header",
+            "session-info-background-header",
+        ] {
+            assert!(cx.debug_bounds(header).is_none(), "{header}");
+        }
         // Docked, it cannot be hidden.
         window
             .update(&mut cx, |shell, _, cx| shell.toggle_session_info(cx))

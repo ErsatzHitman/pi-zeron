@@ -109,14 +109,49 @@ pub(super) struct AgentList {
 }
 
 impl AgentList {
-    /// Work underway: running sub-agents and side chats.
+    /// Work underway: running sub-agents and side chats. The parent link is
+    /// a way back, not work under this chat.
     pub fn running(&self) -> usize {
-        self.active.len() + self.sessions.iter().filter(|row| row.running()).count()
+        self.active.len()
+            + self
+                .sessions
+                .iter()
+                .filter(|row| row.running() && !matches!(row.kind, AgentKind::Parent { .. }))
+                .count()
     }
 
+    /// Whether Sub-agents earns its section: work underway, or the chat's
+    /// way back to the one it hangs off.
+    pub fn is_active(&self) -> bool {
+        self.running() > 0
+            || self
+                .sessions
+                .iter()
+                .any(|row| matches!(row.kind, AgentKind::Parent { .. }))
+    }
+
+    /// When the longest-running work started, for the section's seat.
+    pub fn since(&self) -> Option<DateTime<Utc>> {
+        self.active.iter().filter_map(|row| row.started).min()
+    }
+
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty() && self.active.is_empty() && self.previous.is_empty()
     }
+}
+
+/// Whether Background earns its section: a command still running.
+pub(super) fn background_active(rows: &[AgentRow]) -> bool {
+    rows.iter().any(AgentRow::running)
+}
+
+/// When the longest-running background command started.
+pub(super) fn background_since(rows: &[AgentRow]) -> Option<DateTime<Utc>> {
+    rows.iter()
+        .filter(|row| row.running())
+        .filter_map(|row| row.started)
+        .min()
 }
 
 pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> AgentList {
@@ -541,6 +576,53 @@ mod tests {
         assert_eq!(list.sessions[2].title.as_ref(), "Investigate caching");
         assert_eq!(list.running(), 0);
         assert!(list.active.is_empty() && list.previous.is_empty());
+    }
+
+    #[test]
+    fn a_parent_link_keeps_sub_agents_up_without_running_work() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("root", None, 90), chat("main", Some("root"), 60)]);
+        let main = state.chats.iter().find(|c| c.id == "main").unwrap().clone();
+        let list = agent_list(&state, &main, Utc::now());
+        assert_eq!(list.running(), 0);
+        assert!(list.is_active());
+    }
+
+    #[test]
+    fn a_top_level_chat_with_only_settled_side_chats_is_not_active() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("main", None, 60), chat("a", Some("main"), 5)]);
+        let main = state.chats.iter().find(|c| c.id == "main").unwrap().clone();
+        let list = agent_list(&state, &main, Utc::now());
+        assert_eq!(list.sessions.len(), 1);
+        assert!(!list.is_active());
+        assert_eq!(list.since(), None);
+    }
+
+    #[test]
+    fn only_running_background_commands_are_active() {
+        let row = |status, started| AgentRow {
+            kind: AgentKind::Background {
+                element: "bash:jobs".into(),
+                row: "r".into(),
+                stop: None,
+            },
+            title: "cmd".into(),
+            status,
+            started,
+            trailing: None,
+            detail: None,
+        };
+        let early = DateTime::<Utc>::from_timestamp(10, 0);
+        let late = DateTime::<Utc>::from_timestamp(20, 0);
+        assert!(!background_active(&[row(ChatIndicator::Completed, None)]));
+        let rows = [
+            row(ChatIndicator::Completed, None),
+            row(ChatIndicator::Working, late),
+            row(ChatIndicator::Working, early),
+        ];
+        assert!(background_active(&rows));
+        assert_eq!(background_since(&rows), early);
     }
 
     #[test]
