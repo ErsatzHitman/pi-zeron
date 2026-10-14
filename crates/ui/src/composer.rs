@@ -11557,6 +11557,9 @@ impl Render for Composer {
                 (text, offline)
             })
         };
+        // A notice above or below the pill changes where the hero composer
+        // sits, so the Recent card stays away while one shows.
+        let has_notice = failure.is_some() || queue_notice.is_some();
         // The shell owns the width and its route animation. A route-dependent
         // cap here would cut a wide composer before its return glide finishes.
         let container = div()
@@ -12227,6 +12230,25 @@ impl Render for Composer {
                 })
             })
             .flatten();
+        // Recent folders hang above the target chips on the new-session
+        // screen until the user starts typing. The hero composer's top
+        // (as composer_dock parks it: the container is the pill, its footer
+        // slot and padding) sets how many rows fit.
+        let new_thread_recents = (new_thread_chrome_opacity > 0.0
+            && self.dock_frame.is_some()
+            && !self.side_chat
+            && !has_notice
+            && !self.input.read(cx).dictation.phase.active()
+            && !self.has_draft(cx))
+        .then(|| {
+            let viewport = f32::from(window.viewport_size().height);
+            let composer_top = (viewport - (pill_height + 40.0)) * 0.5 + 8.0;
+            let rows = crate::pickers::recent_rows_that_fit(composer_top);
+            self.pickers.update(cx, |pickers, cx| {
+                pickers.render_new_thread_recents(rows, cx)
+            })
+        })
+        .flatten();
         let has_new_thread_git_selectors = self
             .state
             .read(cx)
@@ -12263,20 +12285,38 @@ impl Render for Composer {
         // row collapses so the pill never jumps at the route boundary.
         let container = if self.dock_frame.is_some() {
             // Floating selectors share the surface's origin and never change its height.
-            container.relative().child(
-                div()
-                    .id("dock-target-selectors")
-                    .absolute()
-                    .top(px(-28.0))
-                    .left(px(Theme::SPACE_LG + 10.0))
-                    .right(px(Theme::SPACE_LG + 10.0))
-                    .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT))
-                    .flex()
-                    .items_start()
-                    .justify_end()
-                    .opacity(new_thread_chrome_opacity)
-                    .children(new_thread_target_selectors),
-            )
+            container
+                .relative()
+                .children(new_thread_recents.map(|card| {
+                    // Bottom-aligned in a fixed box, rising in with the chips.
+                    div()
+                        .absolute()
+                        .top(px(-(crate::pickers::RECENT_GAP
+                            + crate::pickers::RECENT_BOX_HEIGHT)
+                            + 8.0 * (1.0 - new_thread_chrome_opacity)))
+                        .left(px(Theme::SPACE_LG))
+                        .right(px(Theme::SPACE_LG))
+                        .h(px(crate::pickers::RECENT_BOX_HEIGHT))
+                        .flex()
+                        .flex_col()
+                        .justify_end()
+                        .opacity(new_thread_chrome_opacity)
+                        .child(card)
+                }))
+                .child(
+                    div()
+                        .id("dock-target-selectors")
+                        .absolute()
+                        .top(px(-28.0))
+                        .left(px(Theme::SPACE_LG + 10.0))
+                        .right(px(Theme::SPACE_LG + 10.0))
+                        .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT))
+                        .flex()
+                        .items_start()
+                        .justify_end()
+                        .opacity(new_thread_chrome_opacity)
+                        .children(new_thread_target_selectors),
+                )
         } else if new_thread_chrome > 0.0 {
             container.child(
                 div()

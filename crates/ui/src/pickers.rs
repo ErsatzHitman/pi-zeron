@@ -36,6 +36,37 @@ const MAX_REF_ROWS: usize = 300;
 
 pub(crate) const FOOTER_CHIP_RADIUS: f32 = 6.0;
 
+/// The new-session screen's Recent card: at most this many projects.
+pub(crate) const RECENT_MAX_ROWS: usize = 5;
+const RECENT_HEADING_HEIGHT: f32 = 24.0;
+/// The card hangs this far above the composer: the target chips' offset (28)
+/// and a gap (6).
+pub(crate) const RECENT_GAP: f32 = 34.0;
+/// The gap plus room to breathe under the titlebar.
+const RECENT_CLEARANCE: f32 = RECENT_GAP + 12.0;
+/// The box the card bottom-aligns in; fits [`RECENT_MAX_ROWS`] rows.
+pub(crate) const RECENT_BOX_HEIGHT: f32 = 212.0;
+
+/// The Recent card's height for `rows` rows: heading, rows and the card's
+/// gaps, inset and border.
+fn recent_card_height(rows: usize) -> f32 {
+    let rows = rows as f32;
+    RECENT_HEADING_HEIGHT
+        + rows * (popover::PICKER_ROW_HEIGHT + popover::MENU_GAP)
+        + 2.0 * popover::CARD_INSET
+        + 2.0
+}
+
+/// How many Recent rows fit between the titlebar and a composer whose top
+/// is at `composer_top`.
+pub(crate) fn recent_rows_that_fit(composer_top: f32) -> usize {
+    let room = composer_top - Theme::TITLEBAR_HEIGHT - RECENT_CLEARANCE;
+    (1..=RECENT_MAX_ROWS)
+        .rev()
+        .find(|rows| recent_card_height(*rows) <= room)
+        .unwrap_or(0)
+}
+
 /// Both sides of the composer handoff share one leading-aligned workspace
 /// cluster. Available width belongs after the pair, never between its labels.
 fn workspace_footer_row() -> gpui::Div {
@@ -3710,6 +3741,120 @@ impl Pickers {
             .into_any_element()
     }
 
+    /// The new-session screen's Recent card: the projects last worked in, one
+    /// click from being the new session's folder, the picked one checked.
+    /// `None` with fewer than two projects, no room, or while any picker is
+    /// open (its popover opens up through this space).
+    pub(crate) fn render_new_thread_recents(
+        &mut self,
+        max_rows: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if max_rows == 0 || self.mounted_kind().is_some() {
+            return None;
+        }
+        let (rows, selected, spaces, profile) = {
+            let state = self.state.read(cx);
+            let rows = state.recent_projects(max_rows);
+            let spaces: Vec<Option<zeron_proto::Space>> = rows
+                .iter()
+                .map(|row| {
+                    state
+                        .spaces
+                        .iter()
+                        .find(|space| zeron_proto::view::project_key(space) == row.key)
+                        .cloned()
+                })
+                .collect();
+            let profile = match &state.auth {
+                Some(zeron_proto::AuthState::SignedIn { user, org_id }) => {
+                    Some(format!("{}:{org_id:?}", user.id))
+                }
+                _ => None,
+            };
+            (
+                rows,
+                state
+                    .selected_space_row()
+                    .map(zeron_proto::view::project_key),
+                spaces,
+                profile,
+            )
+        };
+        if rows.len() < 2 {
+            return None;
+        }
+        let theme = Theme::of(cx).for_popup();
+        let icons: Vec<AnyElement> = rows
+            .iter()
+            .zip(&spaces)
+            .map(|(row, space)| {
+                self.project_icons.render(
+                    &self.state,
+                    space.as_ref(),
+                    profile.clone(),
+                    selected.as_deref() == Some(row.key.as_str()),
+                    cx,
+                )
+            })
+            .collect();
+        let list: Vec<AnyElement> = rows
+            .into_iter()
+            .zip(icons)
+            .enumerate()
+            .map(|(ix, (row, art))| {
+                let is_selected = selected.as_deref() == Some(row.key.as_str());
+                let key = row.key;
+                popover::picker_row(&theme, is_selected, false, format!("recent-row-{ix}"))
+                    .id(("recent-row", ix))
+                    .debug_selector(move || format!("recent-row-{ix}"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pick_recent(key.clone(), cx);
+                    }))
+                    .child(popover::picker_icon_slot(art))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(row.name)),
+                    )
+                    .when(is_selected, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .debug_selector(move || format!("recent-row-{ix}-check"))
+                                .child(
+                                    crate::icons::icon(crate::icons::CHECK)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            popover::popover_card(&theme)
+                .id("home-recents")
+                .debug_selector(|| "home-recents".into())
+                .occlude()
+                .flex()
+                .flex_col()
+                .child(popover::menu_heading(&theme, "Recent").h(px(RECENT_HEADING_HEIGHT)))
+                .children(list)
+                .into_any_element(),
+        )
+    }
+
+    /// A Recent row: the project picker's pick, then focus back to the
+    /// composer so typing continues (`close` only returns it from an open
+    /// popover).
+    fn pick_recent(&mut self, key: String, cx: &mut Context<Self>) {
+        self.pick_project(key, cx);
+        cx.emit(ReturnComposerFocus);
+    }
+
     /// New-session Git controls. Checkout mode and branch form the original
     /// chip-only cluster floating below the composer's leading edge.
     pub fn render_new_thread_git_selectors(
@@ -6467,6 +6612,18 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn the_recent_card_shows_as_many_rows_as_fit_under_the_titlebar() {
+        assert_eq!(recent_card_height(3), 136.0);
+        assert_eq!(recent_card_height(RECENT_MAX_ROWS), 204.0);
+        assert!(recent_card_height(RECENT_MAX_ROWS) <= RECENT_BOX_HEIGHT);
+        let floor = Theme::TITLEBAR_HEIGHT + RECENT_CLEARANCE;
+        assert_eq!(recent_rows_that_fit(floor + 34.0), 0);
+        assert_eq!(recent_rows_that_fit(floor + 136.0), 3);
+        assert_eq!(recent_rows_that_fit(floor + 204.0), 5);
+        assert_eq!(recent_rows_that_fit(2000.0), RECENT_MAX_ROWS);
+    }
 
     struct ModelShortcutHost {
         focus_sub: Option<gpui::Subscription>,

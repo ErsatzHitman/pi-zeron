@@ -10,6 +10,8 @@
 //! Everything in this module is pure. `chat_indicator` (the status derivation
 //! these gate on) is in [`crate::entities`].
 
+use std::collections::{HashMap, HashSet};
+
 use chrono::{DateTime, Utc};
 
 use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope};
@@ -168,6 +170,90 @@ pub fn sort_chats(chats: &mut [Chat]) {
     });
 }
 
+/// One of the new-session screen's recent folders: a project and when it was
+/// last used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentProject {
+    pub key: String,
+    pub name: String,
+    pub last_active: DateTime<Utc>,
+}
+
+/// Projects by their newest top-level chat (archived ones count); a project
+/// with no chats ranks by its newest checkout. Chats on unknown spaces are
+/// ignored. `pinned`, the current pick, is kept: when recency would cut it,
+/// it takes the last slot. Ties break by lowercase name, then key. Pure.
+pub fn recent_projects(
+    spaces: &[Space],
+    chats: &[Chat],
+    pinned: Option<&str>,
+    limit: usize,
+) -> Vec<RecentProject> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let keys: Vec<String> = spaces.iter().map(project_key).collect();
+    let by_id: HashMap<&str, usize> = spaces
+        .iter()
+        .enumerate()
+        .map(|(ix, space)| (space.id.as_str(), ix))
+        .collect();
+    let newest = |map: &mut HashMap<String, DateTime<Utc>>, key: &str, at: DateTime<Utc>| {
+        let seen = map.entry(key.to_owned()).or_insert(at);
+        *seen = (*seen).max(at);
+    };
+    let mut active = HashMap::new();
+    for chat in chats.iter().filter(|chat| chat.is_top_level()) {
+        let Some(&ix) = chat.space_id.as_deref().and_then(|id| by_id.get(id)) else {
+            continue;
+        };
+        newest(
+            &mut active,
+            &keys[ix],
+            chat.last_message_at.unwrap_or(chat.created_at),
+        );
+    }
+    let mut checkouts = HashMap::new();
+    for (space, key) in spaces.iter().zip(&keys) {
+        newest(&mut checkouts, key, space.created_at);
+    }
+    let mut seen = HashSet::new();
+    let mut rows: Vec<RecentProject> = spaces
+        .iter()
+        .zip(&keys)
+        .filter(|(_, key)| seen.insert(key.as_str()))
+        .map(|(space, key)| RecentProject {
+            key: key.clone(),
+            name: representative_space(spaces, space)
+                .display_name()
+                .to_owned(),
+            last_active: active
+                .get(key)
+                .or_else(|| checkouts.get(key))
+                .copied()
+                .unwrap_or(space.created_at),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.last_active
+            .cmp(&a.last_active)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    match pinned
+        .and_then(|key| rows.iter().position(|row| row.key == key))
+        .filter(|at| *at >= limit)
+    {
+        Some(at) => {
+            let row = rows.remove(at);
+            rows.truncate(limit - 1);
+            rows.push(row);
+        }
+        None => rows.truncate(limit),
+    }
+    rows
+}
+
 // ---------------------------------------------------------------------------
 // Boot gate
 // ---------------------------------------------------------------------------
@@ -240,6 +326,86 @@ mod project_tests {
         assert_eq!(representative_space(&spaces, &spaces[0]).id, "server");
         assert_eq!(representative_space(&spaces, &spaces[1]).id, "server");
         assert_eq!(representative_space(&spaces, &spaces[2]).id, "notes");
+    }
+
+    fn chat(id: &str, space: Option<&str>, minutes: i64) -> Chat {
+        let at = DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::minutes(minutes);
+        serde_json::from_value(serde_json::json!({
+            "id": id, "deviceId": "mac", "title": null, "archived": false,
+            "cwd": null, "branch": null, "checkoutId": null, "config": null,
+            "lastMessagePreview": null, "lastMessageAt": at,
+            "createdAt": "1970-01-01T00:00:00Z", "spaceId": space,
+        }))
+        .unwrap()
+    }
+
+    fn keys(rows: &[RecentProject]) -> Vec<&str> {
+        rows.iter().map(|row| row.key.as_str()).collect()
+    }
+
+    #[test]
+    fn recent_projects_follow_their_newest_chat() {
+        let spaces = vec![
+            space("laptop", "mac", Some("o/r"), 5),
+            space("server", "vps", Some("o/r"), 1),
+            space("notes", "mac", None, 0),
+            space("idle", "mac", None, 30),
+            space("old", "mac", None, 2),
+        ];
+        let mut archived = chat("a", Some("notes"), 20);
+        archived.archived = true;
+        let mut child = chat("c", Some("old"), 99);
+        child.parent_chat_id = Some("a".into());
+        let chats = vec![
+            chat("x", Some("laptop"), 10),
+            chat("y", Some("server"), 15),
+            archived,
+            child,
+            chat("lost", Some("gone"), 98),
+            chat("none", None, 97),
+        ];
+        let rows = recent_projects(&spaces, &chats, None, 10);
+        // `idle` has no chats: its checkout's age ranks it, here first.
+        assert_eq!(keys(&rows), ["idle", "notes", "repo:o/r", "old"]);
+        // Clones are one row, named for the oldest member, and the newest
+        // chat on any of them counts.
+        assert_eq!(rows[2].name, "server");
+        assert_eq!(
+            rows[2].last_active,
+            DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::minutes(15)
+        );
+        assert_eq!(
+            keys(&recent_projects(&spaces, &chats, None, 2)),
+            ["idle", "notes"]
+        );
+        assert!(recent_projects(&spaces, &chats, None, 0).is_empty());
+    }
+
+    #[test]
+    fn the_pinned_project_keeps_the_last_slot() {
+        let spaces = vec![
+            space("b", "mac", None, 3),
+            space("a", "mac", None, 3),
+            space("c", "mac", None, 1),
+        ];
+        // Equal ages break by name.
+        assert_eq!(
+            keys(&recent_projects(&spaces, &[], None, 3)),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            keys(&recent_projects(&spaces, &[], Some("c"), 2)),
+            ["a", "c"]
+        );
+        assert_eq!(
+            keys(&recent_projects(&spaces, &[], Some("a"), 2)),
+            ["a", "b"]
+        );
+        assert_eq!(
+            keys(&recent_projects(&spaces, &[], Some("zz"), 2)),
+            ["a", "b"]
+        );
+        assert_eq!(keys(&recent_projects(&spaces, &[], Some("c"), 1)), ["c"]);
     }
 }
 
