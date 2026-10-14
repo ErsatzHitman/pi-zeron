@@ -50,6 +50,15 @@ row (`Mutate createChat { parentChatId? }`). Chats with a parent cannot create
 chats through MCP, including standalone and batch creation or an explicit parent
 override. A side chat cannot be selected as a parent; only one level is supported.
 
+The exception is an orchestrator's tree (`zeron_proto::orchestrator`): a root
+chat whose id starts with `orchestrator-`, and every chat below it. There a
+session may start sessions, and be a parent, until it is `MAX_DEPTH` (4)
+levels below the root; deeper, `create_chat` refuses with "...levels below its
+orchestrator...". Their children default to the parent's harness, and a `cwd`
+that is a project's folder (any separator or trailing slash, any case on a
+Windows drive) joins that project. The sidebar's Orchestrator tab lists these
+trees; the root never shows in Sessions.
+
 For children, `parent` (id, prefix, or title) overrides the origin (`ZERON_CHAT_ID`).
 `list_chats { parent }` returns children, and chat summaries carry `parentChatId`.
 Rows from older engines read as parentless; a dangling parent id is tolerated.

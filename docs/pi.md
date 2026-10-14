@@ -151,7 +151,12 @@ with their details and text. Hidden messages, and ones arriving between turns,
 stay out of the transcript (they are in Pi's history for the next turn).
 
 Zeron's existing delegation uses a temporary MCP bridge loaded with
-`--extension`. Image attachments are sent as native image blocks; image-only
+`--extension`. An orchestrator's root chat (the sidebar's Orchestrator tab)
+also gets `--append-system-prompt` with `orchestrator::ROOT_PROMPT`: it hands
+each task to a Pi session in the right folder through `zeron_create_chat` and
+follows it with the other `zeron_*` tools. The user's pi-herdr-delegate
+extension sees `ZERON_PI_MCP` and starts its children the same way, so they
+join the tree. Image attachments are sent as native image blocks; image-only
 tool results do not yet render inline.
 
 ## Pi on another machine

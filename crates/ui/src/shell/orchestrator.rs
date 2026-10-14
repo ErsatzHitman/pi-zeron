@@ -684,7 +684,7 @@ impl Shell {
             let mut el = div()
                 .id(group.clone())
                 .group(group.clone())
-                .flex_shrink()
+                .flex_shrink(1.0)
                 .min_w_0()
                 .h(px(24.0))
                 .px(px(6.0))
