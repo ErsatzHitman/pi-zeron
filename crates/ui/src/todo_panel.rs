@@ -6,6 +6,9 @@
 //! as the message queue (`queue.rs`), one step narrower, so the two read as one
 //! object emerging from behind the composer.
 //!
+//! The session panel's Todo section (`shell/session_info/todos.rs`) mirrors
+//! the same list and reuses the pure half and [`status_glyph`].
+//!
 //! The first half of this file is pure — which list is current, what the header
 //! says, which rows a long list folds to — so it is unit-tested without a
 //! window. The second half is the gpui rendering on [`Composer`].
@@ -218,6 +221,12 @@ impl TodoPanelState {
             FoldSide::Earlier => self.show_earlier = !self.show_earlier,
             FoldSide::Later => self.show_later = !self.show_later,
         }
+    }
+
+    /// Whether the folded-away items above and below the focus window are
+    /// currently revealed.
+    pub fn folds(&self) -> (bool, bool) {
+        (self.show_earlier, self.show_later)
     }
 
     pub fn dismiss(&mut self, items: &[TodoItem]) {
@@ -625,7 +634,15 @@ fn todo_item_row(
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(status_glyph(ix, status, live, theme, view, cx)),
+                .child(status_glyph(
+                    format!("todo-active-{ix}"),
+                    2.5,
+                    status,
+                    live,
+                    theme,
+                    view,
+                    cx,
+                )),
         )
         .child(
             div()
@@ -643,8 +660,9 @@ fn todo_item_row(
 /// check / active / pending. An in-progress item only animates while the turn
 /// is live; on an idle chat it is a still ring (the agent is not working on
 /// it), so a stopped run does not look busy forever.
-fn status_glyph(
-    ix: usize,
+pub(crate) fn status_glyph(
+    key: String,
+    cell_px: f32,
     status: TodoStatus,
     live: bool,
     theme: &Theme,
@@ -656,14 +674,10 @@ fn status_glyph(
             .size(px(12.0))
             .text_color(theme.success)
             .into_any_element(),
-        TodoStatus::InProgress if live => crate::loaders::mini_glyph_spinner(
-            format!("todo-active-{ix}"),
-            2.5,
-            theme.glyph,
-            view,
-            cx,
-        )
-        .into_any_element(),
+        TodoStatus::InProgress if live => {
+            crate::loaders::mini_glyph_spinner(key, cell_px, theme.glyph, view, cx)
+                .into_any_element()
+        }
         TodoStatus::InProgress => div()
             .size(px(10.0))
             .rounded_full()
@@ -683,9 +697,46 @@ fn status_glyph(
     }
 }
 
+/// An assistant entry whose only part writes `list`, for tests.
+#[cfg(test)]
+pub(crate) fn assistant_with_todo(list: Vec<TodoItem>) -> SessionMessageEntry {
+    SessionMessageEntry {
+        id: "m".into(),
+        role: MessageRole::Assistant,
+        parts: vec![MessagePart::Tool {
+            id: "t".into(),
+            call: ToolCall::Todo { items: list },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }],
+        created_at: 0,
+        device_id: "d".into(),
+        status: None,
+        continuation_of: None,
+        duration_ms: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folds_report_what_the_user_revealed() {
+        let mut state = TodoPanelState::default();
+        assert_eq!(state.folds(), (false, false));
+        state.toggle_fold(FoldSide::Later);
+        assert_eq!(state.folds(), (false, true));
+    }
 
     fn items(spec: &str) -> Vec<TodoItem> {
         // x = completed, > = in progress, . = pending
@@ -969,33 +1020,6 @@ mod tests {
 mod composer_tests {
     use super::*;
     use crate::state::AppState;
-
-    fn assistant_with_todo(list: Vec<TodoItem>) -> SessionMessageEntry {
-        SessionMessageEntry {
-            id: "m".into(),
-            role: MessageRole::Assistant,
-            parts: vec![MessagePart::Tool {
-                id: "t".into(),
-                call: ToolCall::Todo { items: list },
-                is_error: false,
-                resolved: true,
-                output: None,
-                diff: None,
-                output_ref: None,
-                output_bytes: None,
-                diff_ref: None,
-                diff_stats: None,
-                subagent_ref: None,
-                subagent_status: None,
-                subagent_tail: None,
-            }],
-            created_at: 0,
-            device_id: "d".into(),
-            status: None,
-            continuation_of: None,
-            duration_ms: None,
-        }
-    }
 
     fn items(done: usize, total: usize) -> Vec<TodoItem> {
         (0..total)

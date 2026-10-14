@@ -20,10 +20,11 @@ A setting saved by an older build that hid the panel is ignored.
 | Branch | The conversation's branch |
 | Changes | The working tree's `+added −removed` line totals ("None" when clean). Clicking it opens the chat's diff tab, or a new one if none is open |
 | Goal | Only while pi-goal has an active goal: its status (Running, Waiting, Paused, Blocked, Budget reached), the objective and its progress line. It replaces the line that used to run beside the transcript and the goal chip in the composer footer |
+| Todo | Only while the agent has a checklist with work left: one row per item (done, in progress with a spinner while the turn runs, pending), and the header counts `done/total`. A list the agent has finished shows only until its turn ends. Lists over six items fold to the current item and its neighbours, with "N earlier" and "N later" rows. Read-only; it mirrors the composer's checklist tray |
 | Sub-agents | See below |
 | Background | Only while Pi has bash commands in the background (the `bash-background` extension moves a command there after 20 seconds): one row per command with a live timer. Its Stop appears on hover; the first click asks, and the second sends Kill |
 
-The essentials, from Machine to Changes, always show. Goal, Sub-agents and Background are sections whose headers fold them. A fold lasts for the app run.
+The essentials, from Machine to Changes, always show. Goal, Todo, Sub-agents and Background are sections whose headers fold them. A fold lasts for the app run.
 
 ## Sub-agents
 
@@ -47,6 +48,8 @@ Fork chat is gone. The Files panel no longer has Subagents or Chats sections; th
 - the folds;
 - the armed Stop;
 - the change totals, from its own `WatchCheckoutDiffs` subscription. Frames are decoded off the UI thread, and their patches are dropped.
+
+`session_info/todos.rs` decides when the Todo section shows; the list, its folding and the status glyphs come from `todo_panel.rs`.
 
 `session_info/agents.rs` builds the Sub-agents rows from `AppState`:
 

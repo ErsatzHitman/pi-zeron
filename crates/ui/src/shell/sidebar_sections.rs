@@ -786,6 +786,115 @@ mod tests {
         assert!(cx.debug_bounds("session-info").is_none());
     }
 
+    /// Replace the selected chat's transcript with `entries`.
+    fn set_transcript(
+        window: &gpui::WindowHandle<super::Shell>,
+        cx: &mut gpui::VisualTestContext,
+        entries: Vec<zeron_doc::SessionMessageEntry>,
+    ) {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.transcript = entries;
+                    state.transcript_revision += 1;
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn todo_items(done: usize, total: usize) -> Vec<zeron_proto::TodoItem> {
+        (0..total)
+            .map(|i| {
+                zeron_proto::TodoItem::new(
+                    format!("step {i}"),
+                    if i < done {
+                        zeron_proto::TodoStatus::Completed
+                    } else {
+                        zeron_proto::TodoStatus::Pending
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn click_on(cx: &mut gpui::VisualTestContext, id: &str) {
+        let at = cx
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("{id}"))
+            .center();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_session_panel_lists_the_todo_only_while_there_is_work(cx: &mut gpui::TestAppContext) {
+        use crate::todo_panel::assistant_with_todo;
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                prepare(shell, cx);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                shell.settings.sidebar_collapsed = true;
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("regular".into()));
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+        cx.run_until_parked();
+
+        // No todo: no section.
+        assert!(cx.debug_bounds("session-info-todos-header").is_none());
+
+        // Unfinished work: header and rows sit inside the card.
+        set_transcript(
+            &window,
+            &mut cx,
+            vec![assistant_with_todo(todo_items(1, 3))],
+        );
+        let card = cx.debug_bounds("session-info").unwrap();
+        for id in [
+            "session-info-todos-header",
+            "session-info-todo-0",
+            "session-info-todo-2",
+        ] {
+            let bounds = cx.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
+            assert!(card.contains(&bounds.center()), "{id}");
+        }
+
+        // Folding the header hides the rows, not the header.
+        click_on(&mut cx, "session-info-todos-header");
+        assert!(cx.debug_bounds("session-info-todos-header").is_some());
+        assert!(cx.debug_bounds("session-info-todo-0").is_none());
+        click_on(&mut cx, "session-info-todos-header");
+
+        // A long list folds to its focus window; "earlier" reveals the rest.
+        set_transcript(
+            &window,
+            &mut cx,
+            vec![assistant_with_todo(todo_items(6, 9))],
+        );
+        assert!(cx.debug_bounds("session-info-todo-fold-earlier").is_some());
+        assert!(cx.debug_bounds("session-info-todo-0").is_none());
+        click_on(&mut cx, "session-info-todo-fold-earlier");
+        assert!(cx.debug_bounds("session-info-todo-0").is_some());
+
+        // The agent clearing its list, or an idle chat with it all done, removes it.
+        set_transcript(&window, &mut cx, vec![assistant_with_todo(Vec::new())]);
+        assert!(cx.debug_bounds("session-info-todos-header").is_none());
+        set_transcript(
+            &window,
+            &mut cx,
+            vec![assistant_with_todo(todo_items(3, 3))],
+        );
+        assert!(cx.debug_bounds("session-info-todos-header").is_none());
+    }
+
     #[gpui::test]
     fn copying_from_the_copy_submenu_shows_a_toast(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

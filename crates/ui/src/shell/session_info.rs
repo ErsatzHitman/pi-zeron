@@ -1,8 +1,8 @@
 //! The session panel: where this chat runs and what is working under it, in
 //! one card at the transcript's right. Its essentials (machine, project,
 //! working directory, session, branch and changes) always show; the goal,
-//! the sub-agents and sub-sessions, and the commands Pi runs in the
-//! background sit in sections that fold.
+//! the agent's todo list, the sub-agents and sub-sessions, and the commands
+//! Pi runs in the background sit in sections that fold.
 //!
 //! While the column has room the panel stays docked at its right, the
 //! transcript and composer shifting left as needed to clear it. Once
@@ -17,8 +17,12 @@ use zeron_proto::extension_ui::{ExtensionUiAction, PiUiAction};
 use zeron_proto::{Chat, ChatIndicator, CheckoutDiff};
 
 mod agents;
+mod todos;
 
+use crate::todo_panel::{self, FoldSide, TodoPanelState, TodoRow};
 use agents::{AgentKind, AgentList, AgentRow};
+use todos::TodoList;
+use zeron_proto::TodoItem;
 
 /// The card's width, its inset from the column's right edge, and the
 /// least gap the reading column keeps from it.
@@ -31,6 +35,7 @@ const SECTION_HEADER_HEIGHT: f32 = 26.0;
 const AGENT_ROW_HEIGHT: f32 = 28.0;
 /// Sections that fold, by key.
 const GOAL: &str = "goal";
+const TODOS: &str = "todos";
 const AGENTS: &str = "agents";
 const BACKGROUND: &str = "background";
 
@@ -48,6 +53,11 @@ pub(super) struct SessionPanel {
     diffs: Vec<CheckoutDiff>,
     diff_target: Option<Option<String>>,
     diff_task: Option<Task<()>>,
+    /// The agent's checklist for the selected chat, rescanned only when its
+    /// transcript changes (a chat with no todo walks the whole transcript).
+    todo_cache: todo_panel::TodoCache,
+    /// Per chat: whether the folded-away todo items are revealed.
+    todo_folds: std::collections::HashMap<String, TodoPanelState>,
 }
 
 /// One `WatchCheckoutDiffs` frame: every checkout, or one that changed.
@@ -398,7 +408,8 @@ impl Shell {
         }
         let theme = Theme::of(cx).for_popup();
         let now = Utc::now();
-        let (chat, device, local, online, project, branch, status, started, goal, agents) = {
+        let todo_cache = &mut self.session_panel.todo_cache;
+        let (chat, device, local, online, project, branch, status, started, goal, agents, todos) = {
             let state = self.state.read(cx);
             let chat = state.selected_chat_row()?.clone();
             let device: SharedString = state
@@ -431,8 +442,21 @@ impl Shell {
                 .filter(|goal| goal["active"] == true)
                 .cloned();
             let agents = agents::agent_list(state, &chat, now);
+            let live = matches!(
+                status,
+                ChatIndicator::Working | ChatIndicator::AwaitingInput
+            );
+            // `state.transcript` is the selected chat's own (selecting a chat
+            // clears it), and `chat` is the selected row.
+            let todos = TodoList::of(
+                todo_cache
+                    .latest(&chat.id, state.transcript_revision, &state.transcript)
+                    .map(<[TodoItem]>::to_vec),
+                live,
+                || todos::written_this_turn(&state.transcript),
+            );
             (
-                chat, device, local, online, project, branch, status, started, goal, agents,
+                chat, device, local, online, project, branch, status, started, goal, agents, todos,
             )
         };
         self.ensure_session_diff_watch(&chat, cx);
@@ -501,6 +525,7 @@ impl Shell {
 
         // ── Sections that fold.
         let goal = goal.map(|goal| self.render_goal(&goal, &theme, cx));
+        let todos = self.render_todos(todos.as_ref(), &chat.id, &theme, cx);
         let background = self.render_background(&agents.background, &theme, cx);
         let agents = self.render_agents(&agents, &theme, cx);
 
@@ -524,6 +549,7 @@ impl Shell {
                     .children(changes_row)
             })
             .children(goal.into_iter().flatten())
+            .children(todos)
             .children(agents)
             .children(background);
 
@@ -813,6 +839,161 @@ impl Shell {
 
     /// Sub-agents: the sub-sessions this chat hangs off and owns, the
     /// sub-agents at work, and the settled ones under Previous agents.
+    /// The agent's checklist: what is done, what it is on and what is left.
+    /// Absent while there is no list in play (see [`TodoList::of`]).
+    fn render_todos(
+        &mut self,
+        todos: Option<&TodoList>,
+        chat_id: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(todos) = todos else {
+            return Vec::new();
+        };
+        let mut out = vec![
+            popover::picker_divider().into_any_element(),
+            self.render_section_header(TODOS, "Todo", Some(todos.count_label()), None, theme, cx),
+        ];
+        if !self.session_panel.is_open(TODOS) {
+            return out;
+        }
+        let (show_earlier, show_later) = self
+            .session_panel
+            .todo_folds
+            .get(chat_id)
+            .map(TodoPanelState::folds)
+            .unwrap_or_default();
+        for row in todo_panel::rows(&todos.items, show_earlier, show_later) {
+            out.push(match row {
+                TodoRow::Item(ix) => {
+                    Self::render_todo_row(ix, &todos.items[ix], todos.live, theme, cx)
+                }
+                TodoRow::Fold { side, count, open } => {
+                    self.render_todo_fold(chat_id, side, count, open, theme, cx)
+                }
+            });
+        }
+        out
+    }
+
+    /// One checklist item: status glyph and text, wrapping. Completed work
+    /// recedes and the in-progress item is the brightest, as in the composer's
+    /// tray. Not interactive.
+    fn render_todo_row(
+        ix: usize,
+        item: &TodoItem,
+        live: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let status = item.status();
+        let (color, weight) = match status {
+            zeron_proto::TodoStatus::Completed => (theme.text_faint, gpui::FontWeight::NORMAL),
+            zeron_proto::TodoStatus::InProgress => (theme.text, gpui::FontWeight::MEDIUM),
+            zeron_proto::TodoStatus::Pending => (theme.text_muted, gpui::FontWeight::NORMAL),
+        };
+        let id = SharedString::from(format!("session-info-todo-{ix}"));
+        let view = cx.entity_id();
+        div()
+            .id(id.clone())
+            .debug_selector(move || id.to_string())
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(8.0))
+            .min_h(px(AGENT_ROW_HEIGHT))
+            .px(px(9.0))
+            .py(px(5.0))
+            .child(
+                div()
+                    .w(px(16.0))
+                    .h(px(18.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(todo_panel::status_glyph(
+                        format!("session-info-todo-active-{ix}"),
+                        2.0,
+                        status,
+                        live,
+                        theme,
+                        view,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .line_height(px(18.0))
+                    .font_weight(weight)
+                    .text_color(color)
+                    .child(SharedString::from(item.text.clone())),
+            )
+            .into_any_element()
+    }
+
+    /// "N earlier" / "N later": stands in for the items folded off one end of
+    /// a long list, styled like Previous agents.
+    fn render_todo_fold(
+        &self,
+        chat_id: &str,
+        side: FoldSide,
+        count: usize,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let noun = match side {
+            FoldSide::Earlier => "earlier",
+            FoldSide::Later => "later",
+        };
+        let id = SharedString::from(format!("session-info-todo-fold-{noun}"));
+        let chat_id = chat_id.to_owned();
+        div()
+            .id(id.clone())
+            .debug_selector(move || id.to_string())
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(format!(
+                "{} {count} {noun} items",
+                if open { "Hide" } else { "Show" }
+            )))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(AGENT_ROW_HEIGHT))
+            .px(px(9.0))
+            .rounded(px(popover::MENU_ITEM_RADIUS))
+            .cursor_pointer()
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(theme.text_muted)
+            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.session_panel
+                    .todo_folds
+                    .entry(chat_id.clone())
+                    .or_default()
+                    .toggle_fold(side);
+                cx.notify();
+            }))
+            .child(format!("{count} {noun}"))
+            .child(div().flex_1())
+            .child(
+                icon(if open {
+                    icons::ALT_ARROW_DOWN
+                } else {
+                    icons::ALT_ARROW_RIGHT
+                })
+                .size(px(12.0))
+                .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .into_any_element()
+    }
+
     fn render_agents(
         &mut self,
         list: &AgentList,
