@@ -346,8 +346,7 @@ impl Render for VoiceCard {
             .options(
                 Provider::ALL
                     .iter()
-                    .map(|p| widgets::SelectOption::new(p.label()))
-                    .collect(),
+                    .map(|p| widgets::SelectOption::new(p.label())),
                 Provider::ALL
                     .iter()
                     .position(|p| *p == provider)
@@ -406,10 +405,7 @@ impl Render for VoiceCard {
             &mut card.model_select
         })
         .options(
-            models
-                .iter()
-                .map(|m| widgets::SelectOption::new(*m))
-                .collect(),
+            models.iter().map(|m| widgets::SelectOption::new(*m)),
             saved
                 .stt_model
                 .as_deref()
@@ -431,8 +427,7 @@ impl Render for VoiceCard {
             .options(
                 LANGUAGES
                     .iter()
-                    .map(|(_, name)| widgets::SelectOption::new(*name))
-                    .collect(),
+                    .map(|(_, name)| widgets::SelectOption::new(*name)),
                 LANGUAGES
                     .iter()
                     .position(|(code, _)| *code == saved.stt_language.as_deref())
