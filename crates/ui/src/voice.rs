@@ -96,7 +96,7 @@ impl VoiceController {
 
     /// Start a call. `agent` lets the assistant drive the coding agent;
     /// `engine` is the connection it reports to.
-    pub fn start(
+    pub(crate) fn start(
         &mut self,
         mut config: call::Config,
         engine: Option<EngineHandle>,
@@ -735,6 +735,15 @@ mod tests {
                 cx,
             );
             assert_eq!(voice.orb_state(), OrbState::Composing);
+            voice.on_call(
+                call::Event::AssistantDone {
+                    turn: 1,
+                    text: "On it, I asked Pi.".into(),
+                },
+                cx,
+            );
+            assert_eq!(voice.caption.role(), Some(VoiceRole::Assistant));
+            // A notice is its own caption once the reply has settled.
             voice.on_call(call::Event::Notice("Deepgram is rate limiting.".into()), cx);
             assert_eq!(voice.caption.text(), "Deepgram is rate limiting.");
         });
