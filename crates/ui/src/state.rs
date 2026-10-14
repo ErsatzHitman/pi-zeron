@@ -2141,7 +2141,19 @@ impl AppState {
         if self.send_pending(&chat.id, now) {
             return ChatIndicator::Working;
         }
-        display_status(chat, self.session_for(&chat.id), now)
+        let status = display_status(chat, self.session_for(&chat.id), now);
+        // A PIUI sheet never reaches the engine's session row, so the chat on
+        // screen would spin Working while it waits on you. Only the selected
+        // chat has a live extension UI.
+        if status == ChatIndicator::Working
+            && self
+                .extension_ui
+                .of(&chat.id)
+                .is_some_and(|ui| ui.has_blocking_sheet())
+        {
+            return ChatIndicator::AwaitingInput;
+        }
+        status
     }
 
     /// The sidebar's Sessions list: every non-archived chat of a LIVE space,
@@ -2175,6 +2187,55 @@ impl AppState {
             .into_iter()
             .filter(|(_, chat)| in_filter(chat))
             .collect()
+    }
+
+    /// The sidebar's Needs input and Working groups, oldest start first. The
+    /// one list query that includes side chats: a child asking for input
+    /// shows (it lists under Needs input only; its parent carries its work).
+    /// Working follows the project filter; Needs input ignores it, so a
+    /// blocked chat is never hidden by browsing. Queued and undelivered sends
+    /// keep their own row marks and stay out.
+    pub fn activity_chats(
+        &self,
+        now: DateTime<Utc>,
+        space_filter: Option<&str>,
+    ) -> Vec<(zeron_proto::view::Activity, &Chat)> {
+        use zeron_proto::view::{Activity, activity};
+        let in_filter = self.project_filter(space_filter);
+        let mut rows: Vec<(Activity, &Chat)> = self
+            .chats
+            .iter()
+            .filter(|chat| {
+                !chat.archived
+                    && !zeron_proto::voice::is_orchestrator_chat(&chat.id)
+                    && !zeron_proto::orchestrator::is_root_chat(&chat.id)
+                    && chat
+                        .space_id
+                        .as_deref()
+                        .is_none_or(|id| self.space_row(id).is_some())
+                    && !self.send_queued(&chat.id, now)
+                    && !self.send_undelivered(&chat.id, now)
+            })
+            .filter_map(|chat| {
+                let kind = activity(
+                    self.display_status_for(chat, now),
+                    self.running_subagents_for(&chat.id, now),
+                )?;
+                match kind {
+                    Activity::Working if chat.parent_chat_id.is_some() || !in_filter(chat) => None,
+                    _ => Some((kind, chat)),
+                }
+            })
+            .collect();
+        rows.sort_by(|(_, a), (_, b)| {
+            let since = |chat: &Chat| {
+                self.session_for(&chat.id)
+                    .and_then(|session| session.started_at)
+                    .unwrap_or(chat.created_at)
+            };
+            since(a).cmp(&since(b)).then_with(|| a.id.cmp(&b.id))
+        });
+        rows
     }
 
     /// The sidebar's project filter matches by repository: it stores one
@@ -5474,6 +5535,58 @@ mod tests {
         state.apply_chats(vec![archived, chat("b", 1, None)]);
         let visible: Vec<&str> = state.visible_chats().map(|c| c.id.as_str()).collect();
         assert_eq!(visible, ["b"]);
+    }
+
+    #[test]
+    fn activity_chats_group_asking_and_running_chats() {
+        use zeron_proto::view::Activity;
+        let now = Utc::now();
+        let mut state = AppState::new();
+        let mut child = chat("child", 4, None);
+        child.parent_chat_id = Some("idle".into());
+        let mut busy_child = chat("busy-child", 5, None);
+        busy_child.parent_chat_id = Some("idle".into());
+        let mut archived = chat("archived", 6, None);
+        archived.archived = true;
+        state.apply_chats(vec![
+            chat("idle", 0, None),
+            chat("late", 3, None),
+            chat("early", 1, None),
+            chat("ask", 2, None),
+            child,
+            busy_child,
+            archived,
+        ]);
+        let mut subagents = session("idle", SessionStatus::Idle, 1, now);
+        subagents.running_subagents = 2;
+        state.apply_sessions_at(
+            vec![
+                session("late", SessionStatus::Working, 1, now),
+                session("early", SessionStatus::Working, 1, now),
+                session("ask", SessionStatus::AwaitingInput, 1, now),
+                session("child", SessionStatus::AwaitingInput, 1, now),
+                session("busy-child", SessionStatus::Working, 1, now),
+                session("archived", SessionStatus::Working, 1, now),
+                subagents,
+            ],
+            now,
+        );
+        let rows: Vec<(Activity, &str)> = state
+            .activity_chats(now, None)
+            .into_iter()
+            .map(|(kind, chat)| (kind, chat.id.as_str()))
+            .collect();
+        // Oldest start first; a child asks but never lists as working.
+        assert_eq!(
+            rows,
+            [
+                (Activity::Working, "idle"),
+                (Activity::Working, "early"),
+                (Activity::NeedsInput, "ask"),
+                (Activity::Working, "late"),
+                (Activity::NeedsInput, "child"),
+            ]
+        );
     }
 
     #[test]

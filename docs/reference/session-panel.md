@@ -16,7 +16,7 @@ A setting saved by an older build that hid the panel is ignored.
 | Machine | The device the chat runs on, with a warning mark while it is offline |
 | Project | The project's icon and name; hover for its path |
 | Directory | The working directory, shortened to its last two folders; hover for the full path. A worktree says so |
-| Session | The agent's mark and the chat's title. While the agent works it shows a spinner and a live timer; "Needs you" while it waits on the user; "Error" after a failure; otherwise the model. Its `+` button, "btw", starts a side chat |
+| Session | The agent's mark and the chat's title. While the agent works it shows a spinner and a live timer; "Needs input" while it waits on the user; "Error" after a failure; otherwise the model. Its `+` button, "btw", starts a side chat |
 | Branch | The conversation's branch |
 | Changes | The working tree's `+added −removed` line totals ("None" when clean). Clicking it opens the chat's diff tab, or a new one if none is open |
 | Goal | Only while pi-goal has an active goal: its status (Running, Waiting, Paused, Blocked, Budget reached), the objective and its progress line. It replaces the line that used to run beside the transcript and the goal chip in the composer footer |

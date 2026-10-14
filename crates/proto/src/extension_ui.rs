@@ -84,6 +84,13 @@ pub struct ExtensionUiState {
 }
 
 impl ExtensionUiState {
+    /// A sheet (the agent's question, a Pi dialog) waits on the user.
+    pub fn has_blocking_sheet(&self) -> bool {
+        self.elements
+            .iter()
+            .any(|element| element.get("placement").and_then(Value::as_str) == Some("sheet"))
+    }
+
     /// Nothing to draw.
     pub fn is_empty(&self) -> bool {
         self.elements.is_empty()
@@ -703,6 +710,22 @@ pub fn section_text(section: &PiUiSection) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_a_sheet_blocks() {
+        let mut state = ExtensionUiState::default();
+        assert!(!state.has_blocking_sheet());
+        state.elements = vec![
+            json!({"id": "s", "kind": "panel", "placement": "screen"}),
+            json!({"id": "f", "kind": "status", "placement": "footer"}),
+            json!({"id": "n", "kind": "panel"}),
+        ];
+        assert!(!state.has_blocking_sheet());
+        state
+            .elements
+            .push(json!({"id": "q", "ns": "ask-user", "kind": "panel", "placement": "sheet"}));
+        assert!(state.has_blocking_sheet());
+    }
 
     #[test]
     fn the_compact_status_travels_as_a_camel_case_channel() {

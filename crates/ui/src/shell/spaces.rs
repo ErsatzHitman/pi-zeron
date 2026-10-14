@@ -2627,9 +2627,10 @@ pub(crate) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
         // strength: at full alpha the colored words shouted across the
         // whole sidebar (user request) — only Done keeps its pop.
         ChatIndicator::Working => theme.busy.opacity(0.55),
-        // Blue: "asking you a question" must read differently from "busy
-        // working" at a glance.
-        ChatIndicator::AwaitingInput => theme.accent.opacity(0.6),
+        // Amber, muted like the others: busy == accent in every shipped
+        // theme, so an accent dot read as Working's hue. The row's triangle
+        // and "Needs input" word tell it from Queued.
+        ChatIndicator::AwaitingInput => theme.warning.opacity(0.75),
         ChatIndicator::Errored => theme.danger.opacity(0.65),
         // Green: finished-but-unseen reads as "ready for you".
         ChatIndicator::Completed => {
@@ -3462,7 +3463,12 @@ impl Shell {
             return;
         }
         let scroll_top = -f32::from(self.sidebar_scroll.offset().y);
-        let rel_y = pinned_session_pointer_y(pointer_y, viewport_top, scroll_top);
+        // Pinned sits below the activity digest.
+        let rel_y = pinned_session_pointer_y(
+            pointer_y,
+            viewport_top,
+            scroll_top - self.sidebar_activity.lead,
+        );
         let inside_pinned_section =
             row_drop_index(rel_y, &self.sidebar_pinned_heights, false).is_some();
         let Some(over) = row_drop_index(rel_y, &self.sidebar_pinned_heights, true) else {
@@ -3552,7 +3558,11 @@ impl Shell {
             return false;
         };
 
-        let rel_y = pinned_session_pointer_y(pointer_y, viewport_top, next_scroll);
+        let rel_y = pinned_session_pointer_y(
+            pointer_y,
+            viewport_top,
+            next_scroll - self.sidebar_activity.lead,
+        );
         let Some(over) = row_drop_index(rel_y, &self.sidebar_pinned_heights, false) else {
             if let Some(drag) = self.pinned_session_drag.as_mut() {
                 drag.autoscroll_active = false;

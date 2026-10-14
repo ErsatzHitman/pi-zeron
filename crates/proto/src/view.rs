@@ -93,6 +93,25 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
     }
 }
 
+/// Which of the sidebar's activity groups a chat belongs to. Settled
+/// statuses (Completed, Errored, Idle) belong to none: their row marks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Activity {
+    NeedsInput,
+    Working,
+}
+
+/// A chat's activity group: asking beats running, and a settled chat whose
+/// subagents still run is working.
+pub fn activity(status: ChatIndicator, running_subagents: u32) -> Option<Activity> {
+    match status {
+        ChatIndicator::AwaitingInput => Some(Activity::NeedsInput),
+        ChatIndicator::Working => Some(Activity::Working),
+        _ if running_subagents > 0 => Some(Activity::Working),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sort orders
 // ---------------------------------------------------------------------------
@@ -406,6 +425,19 @@ mod project_tests {
             ["a", "b"]
         );
         assert_eq!(keys(&recent_projects(&spaces, &[], Some("c"), 1)), ["c"]);
+    }
+
+    #[test]
+    fn activity_groups_asking_and_running_chats() {
+        use ChatIndicator::*;
+        assert_eq!(activity(AwaitingInput, 0), Some(Activity::NeedsInput));
+        assert_eq!(activity(AwaitingInput, 2), Some(Activity::NeedsInput));
+        assert_eq!(activity(Working, 0), Some(Activity::Working));
+        assert_eq!(activity(Idle, 2), Some(Activity::Working));
+        assert_eq!(activity(Errored, 1), Some(Activity::Working));
+        for settled in [Completed, Errored, Idle] {
+            assert_eq!(activity(settled, 0), None);
+        }
     }
 }
 

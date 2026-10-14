@@ -833,7 +833,7 @@ impl Shell {
                 trailing_text("Working", theme.text_muted).into_any_element()
             }
             (ChatIndicator::AwaitingInput, _) => {
-                trailing_text("Needs you", theme.warning).into_any_element()
+                trailing_text("Needs input", theme.warning).into_any_element()
             }
             (ChatIndicator::Errored, _) => trailing_text("Error", theme.danger).into_any_element(),
             _ => match &model {

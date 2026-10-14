@@ -85,6 +85,7 @@ mod panel_interaction_tests;
 pub(crate) mod project_icon;
 mod session_info;
 mod side_chats;
+mod sidebar_attention;
 mod sidebar_children;
 mod sidebar_pins;
 mod sidebar_sections;
@@ -2009,6 +2010,8 @@ pub struct Shell {
     pub(super) sidebar_children_auto: std::collections::HashSet<String>,
     /// Parents whose "Show N more" was clicked.
     pub(super) sidebar_children_all: std::collections::HashSet<String>,
+    /// The Needs input / Working digest above the session lists.
+    pub(super) sidebar_activity: sidebar_attention::SidebarActivity,
     /// In-flight disclosure tweens, shared by device groups, Pinned and Archived.
     pub(super) sidebar_disclosure_motion:
         std::collections::HashMap<String, SidebarDisclosureMotion>,
@@ -2591,6 +2594,7 @@ impl Shell {
             sidebar_children_override: std::collections::HashMap::new(),
             sidebar_children_auto: std::collections::HashSet::new(),
             sidebar_children_all: std::collections::HashSet::new(),
+            sidebar_activity: Default::default(),
             sidebar_reveal_motions: std::collections::HashSet::new(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
@@ -8169,7 +8173,7 @@ impl Shell {
         } else {
             match status {
                 zeron_proto::ChatIndicator::Working => Some("Working"),
-                zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
+                zeron_proto::ChatIndicator::AwaitingInput => Some("Needs input"),
                 zeron_proto::ChatIndicator::Errored => Some("Failed"),
                 zeron_proto::ChatIndicator::Completed => Some("Done"),
                 zeron_proto::ChatIndicator::Idle => None,
@@ -8204,6 +8208,12 @@ impl Shell {
                 .into_any_element()
             } else if status == zeron_proto::ChatIndicator::Completed && !queued && !undelivered {
                 icon(icons::CHECK)
+                    .size(px(11.0))
+                    .text_color(status_color)
+                    .into_any_element()
+            } else if status == zeron_proto::ChatIndicator::AwaitingInput && !queued && !undelivered
+            {
+                icon(icons::DANGER_TRIANGLE)
                     .size(px(11.0))
                     .text_color(status_color)
                     .into_any_element()
@@ -8313,6 +8323,15 @@ impl Shell {
                             cx,
                         )
                         .into_any_element()
+                    } else if status == zeron_proto::ChatIndicator::AwaitingInput
+                        && !queued
+                        && !undelivered
+                    {
+                        icon(icons::DANGER_TRIANGLE)
+                            .size(px(11.0))
+                            .flex_none()
+                            .text_color(status_color)
+                            .into_any_element()
                     } else {
                         div()
                             .size(px(6.0))
@@ -9386,6 +9405,9 @@ impl Shell {
         // rode the previous frame's offset, so the last frame of a content
         // shrink (row archived while scrolled) left a phantom fade stuck
         // over an unscrollable list (user report).
+        // Needs input / Working, mirrored above the lists (its rows keep
+        // their places below).
+        let attention = self.render_attention_block(theme, cx);
         let sidebar_lists = crate::edge_fade::edge_faded(
             SIDEBAR_GLASS_FADE_BAND,
             true,
@@ -9430,6 +9452,7 @@ impl Shell {
                     // No "Sessions" header (user request) — the list
                     // is the whole column; a little air stands in.
                     .pt(px(SIDEBAR_LIST_PAD_TOP))
+                    .children(attention)
                     .child(active_list)
                     .children(archived_section)
                     .children(moving_row),
