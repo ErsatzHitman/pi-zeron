@@ -179,9 +179,7 @@ impl FilesSurface {
             self.tree_drag.last_tick = Some(cx.background_executor().now());
             self.tree_drag.tick_task = Some(cx.spawn_in(window, async move |this, cx| {
                 loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(16))
-                        .await;
+                    crate::motion::next_frame(cx).await;
                     if !this
                         .update_in(cx, |files, window, cx| files.tree_drag_tick(window, cx))
                         .unwrap_or(false)

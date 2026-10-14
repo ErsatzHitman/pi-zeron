@@ -43,6 +43,42 @@ use serde::{Deserialize, Serialize};
 pub use gpui::AnimationExt;
 
 // ---------------------------------------------------------------------------
+// Display-frame pacing for async animation loops
+// ---------------------------------------------------------------------------
+
+/// The wait [`next_frame`] falls back to with no window to pace against.
+const FRAME_FALLBACK: Duration = Duration::from_millis(16);
+
+/// Resolves after the next painted frame, at the display's refresh rate (a
+/// 180 Hz screen gets 180 steps a second). Animation loops await this
+/// instead of a 16 ms timer: Windows delivers timers on its ~15.6 ms system
+/// tick, so a 16 ms timer fires about every 31 ms, near 32 fps. With no open
+/// window, and in tests (which have no frame loop), it waits 16 ms.
+pub async fn next_frame(cx: &mut gpui::AsyncApp) {
+    #[cfg(not(test))]
+    {
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let scheduled = cx.update(|cx| {
+            let window = cx
+                .active_window()
+                .or_else(|| cx.windows().into_iter().next())?;
+            window
+                .update(cx, |_, window, _| {
+                    window.on_next_frame(move |_, _| {
+                        let _ = tx.send(());
+                    })
+                })
+                .ok()
+        });
+        // A closed window drops the callback: fall back to the timer.
+        if scheduled.is_some() && rx.await.is_ok() {
+            return;
+        }
+    }
+    cx.background_executor().timer(FRAME_FALLBACK).await;
+}
+
+// ---------------------------------------------------------------------------
 // Pulse clock — throttled drive for the repeating loaders
 // ---------------------------------------------------------------------------
 

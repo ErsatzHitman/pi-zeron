@@ -8,7 +8,7 @@
 //! extension since the rail shares the transcript's rows and `ListState`.
 
 use gpui::{AnyElement, Context, ListOffset, SharedString, div, prelude::*, px};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 
@@ -264,11 +264,10 @@ impl Transcript {
             let mut timeline = GlideTimeline::new();
             let mut height_ema: Option<f32> = None;
             let trace = scroll_trace_enabled();
-            let frames = (total.as_millis() / 16) as usize + 90;
+            // A bound for frames at up to 240 Hz; the timeline ends the glide.
+            let frames = (total.as_millis() / 4) as usize + 360;
             for _ in 0..frames {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
+                motion::next_frame(cx).await;
                 let raw = (started.elapsed().as_secs_f32() / total.as_secs_f32()).min(1.0);
                 let eased = motion::SCROLL_GLIDE.curve.eval(raw);
                 let frac = timeline.step(eased);
