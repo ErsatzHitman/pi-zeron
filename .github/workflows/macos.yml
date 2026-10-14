@@ -141,6 +141,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
+      - name: Delete guard corpus
+        run: node crates/harness/tests/fixtures/pi-delete-guard-test.mjs crates/harness/src/pi/guard.mjs
       - name: Install preview fixture server
         run: npm ci --prefix edge
       - name: Project discovery, stable URLs and HMR in native WebKit

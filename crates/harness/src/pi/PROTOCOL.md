@@ -9,6 +9,11 @@ Executable: an explicit path, else the device setting (Settings → General →
 Pi, persisted in `harness-prefs.json` as `piExecutable`), else
 `PI_EXECUTABLE`. Zeron never searches PATH for Pi and never updates Pi.
 
+Delete guard: every chat run gets `--extension <data dir>/pi-guard/zeron-delete-guard-<hash>.mjs`
+(`guard.mjs`), which blocks deleting tool calls through `tool_call`. It reads
+`blockDeletes` from `harness-prefs.json` on each call (absent means on); see
+the Delete guard section of `docs/pi.md` for its env.
+
 `prompt` success acknowledges preflight with `data.disposition`
 (`started` | `queued` | `handled`). Normal runs finish at `agent_settled`
 (which carries `aborted`), not `agent_end`; a final error message determines

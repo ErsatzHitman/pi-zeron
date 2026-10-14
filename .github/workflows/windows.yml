@@ -73,6 +73,11 @@ jobs:
       - uses: ./.github/actions/windows-ci-setup
       - name: Native harness security and integration tests
         run: cargo test --release --locked -p zeron-harness --features native-fixture --lib --test codex_availability --test windows_native
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Delete guard corpus (Windows paths, cmd and PowerShell)
+        run: node crates/harness/tests/fixtures/pi-delete-guard-test.mjs crates/harness/src/pi/guard.mjs
       - name: Shader layout tests
         run: cargo test --release --locked -p gpui_windows --lib layout
       - name: Application and updater tests

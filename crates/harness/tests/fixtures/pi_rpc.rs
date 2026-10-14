@@ -249,6 +249,17 @@ fn main() {
                 if text == "args" {
                     text = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
                 }
+                if text == "guard-env" {
+                    let var = |key| std::env::var(key).unwrap_or_else(|_| "-".into());
+                    text = format!(
+                        "on={} file={} force={} ext={} args={}",
+                        var("ZERON_DELETE_GUARD"),
+                        var("ZERON_DELETE_GUARD_FILE"),
+                        var("ZERON_DELETE_GUARD_FORCE"),
+                        var("ZERON_DELETE_GUARD_EXT"),
+                        std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+                    );
+                }
                 if text == "which-model" {
                     text = format!("{model}/{thinking}");
                 }

@@ -937,6 +937,65 @@ async fn edit_diffs_come_from_pi_edits_array_and_transport_commands_stay_hidden(
     assert!(commands.iter().all(|c| !c.name.starts_with("pi_ui_")));
 }
 
+fn guard(dir: &std::path::Path) -> zeron_harness::pi::DeleteGuardSetting {
+    let guard = zeron_harness::pi::DeleteGuard {
+        enabled: false,
+        forced: false,
+        state_file: Some(dir.join("harness-prefs.json")),
+        dir: dir.join("pi-guard"),
+    };
+    std::sync::Arc::new(move || guard.clone())
+}
+
+/// Every chat run loads the delete guard, MCP bridge or not, and tells it
+/// the toggle, the live file and where it lives for the run's children.
+#[tokio::test]
+async fn chat_runs_load_the_delete_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    drop(tx);
+    let req = request(dir.path(), "guard-env");
+    let stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .with_delete_guard(guard(dir.path()))
+        .run(req, c)
+        .await
+        .unwrap();
+    let events: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.map(Result::unwrap).collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let file = dir.path().join("harness-prefs.json");
+    assert!(text.contains("on=0 "), "{text}");
+    assert!(
+        text.contains(&format!("file={} ", file.display())),
+        "{text}"
+    );
+    assert!(text.contains("force=- "), "{text}");
+    let installed = std::fs::read_dir(dir.path().join("pi-guard"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "mjs"))
+        .expect("the guard is installed");
+    assert!(
+        text.contains(&format!("ext={} ", installed.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("--extension {}", installed.display())),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn titles_run_in_a_bare_process_and_complete() {
     let dir = tempfile::tempdir().unwrap();
@@ -945,7 +1004,13 @@ async fn titles_run_in_a_bare_process_and_complete() {
     req.model = Some("mock/mock".into());
     let events: Vec<_> = tokio::time::timeout(
         Duration::from_secs(5),
-        harness().run_title(req, c).await.unwrap().map(Result::unwrap).collect::<Vec<_>>(),
+        harness()
+            .with_delete_guard(guard(dir.path()))
+            .run_title(req, c)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>(),
     )
     .await
     .unwrap();
@@ -963,6 +1028,9 @@ async fn titles_run_in_a_bare_process_and_complete() {
     ] {
         assert!(text.contains(flag), "{flag} missing from {text}");
     }
+    // A title runs no tools, so it loads no guard.
+    assert!(!text.contains("zeron-delete-guard"), "{text}");
+    assert!(!dir.path().join("pi-guard").exists());
     assert!(matches!(
         events.last(),
         Some(AgentEvent::Done { status: DoneStatus::Completed, .. })

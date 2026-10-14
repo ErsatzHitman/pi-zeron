@@ -2,6 +2,7 @@
 mod catalog;
 mod commands;
 mod compact;
+mod guard;
 mod mcp;
 mod normalize;
 mod piui;
@@ -41,9 +42,12 @@ pub const MIN_PI_VERSION: semver::Version = semver::Version::new(1, 1, 0);
 /// its version; give it far longer than a native binary's probe.
 const VERSION_PROBE: Duration = Duration::from_secs(20);
 
+pub use guard::{DeleteGuard, DeleteGuardSetting};
+
 pub struct PiHarness {
     models_cache: crate::catalog::Catalog,
     executable_setting: Option<ExecutableSetting>,
+    delete_guard: Option<DeleteGuardSetting>,
     workspace_commands: crate::skills::CommandDiscovery,
     commands: commands::Cache,
     session_store: Option<PathBuf>,
@@ -57,6 +61,7 @@ impl Default for PiHarness {
         Self {
             executable: None,
             executable_setting: None,
+            delete_guard: None,
             session_store: None,
             agent_dir: None,
             models_cache: Default::default(),
@@ -79,6 +84,12 @@ impl PiHarness {
     /// fallback when the setting is empty.
     pub fn with_executable_setting(mut self, setting: ExecutableSetting) -> Self {
         self.executable_setting = Some(setting);
+        self
+    }
+    /// The delete guard (Settings → Pi → Block deletes), read on every run.
+    /// Unset (tests), runs load no guard.
+    pub fn with_delete_guard(mut self, setting: DeleteGuardSetting) -> Self {
+        self.delete_guard = Some(setting);
         self
     }
     pub fn with_session_store(mut self, path: impl Into<PathBuf>) -> Self {
@@ -136,7 +147,7 @@ impl PiHarness {
         Ok((exe, version))
     }
     async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
-        let mut process = self.spawn(cwd, &["--no-session".into()], None)?;
+        let mut process = self.spawn(cwd, &["--no-session".into()], None, false)?;
         let (mut tx, rx) = tokio::sync::oneshot::channel();
         let grace = self.kill_grace;
         tokio::spawn(async move {
@@ -168,6 +179,7 @@ impl PiHarness {
         cwd: &Path,
         args: &[String],
         mcp: Option<&zeron_proto::McpServer>,
+        guarded: bool,
     ) -> Result<Process, HarnessError> {
         let (exe, _) = self.verified_executable()?;
         let mut cmd = Command::new(&exe);
@@ -187,6 +199,11 @@ impl PiHarness {
         let scratch = mcp
             .map(|config| self::mcp::configure(&mut cmd, config))
             .transpose()?;
+        // Loaded even while the toggle is off, so turning it on reaches a
+        // running chat without a restart. Probes and titles run no tools.
+        if let Some(setting) = self.delete_guard.as_ref().filter(|_| guarded) {
+            guard::configure(&mut cmd, &setting())?;
+        }
         let mut child = Child::new(cmd.spawn()?);
         let tail = crate::StderrTail::default();
         let mut lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
@@ -441,7 +458,7 @@ impl Harness for PiHarness {
         if let Some(model) = request.model.as_deref().filter(|m| *m != "default") {
             args.extend(["--model".into(), model.into()]);
         }
-        let mut process = self.spawn(Path::new(&request.cwd), &args, None)?;
+        let mut process = self.spawn(Path::new(&request.cwd), &args, None, false)?;
         let grace = self.kill_grace;
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
@@ -521,7 +538,7 @@ impl Harness for PiHarness {
         if lost_context.is_some() {
             request.resume = None;
         }
-        let process = self.spawn(Path::new(&request.cwd), &args, request.mcp.as_ref())?;
+        let process = self.spawn(Path::new(&request.cwd), &args, request.mcp.as_ref(), true)?;
         let commands_cache = (
             self.commands.clone(),
             self.commands_file(),
