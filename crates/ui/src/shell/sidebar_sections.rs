@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_session_card_shows_beside_a_wide_transcript_and_opens_over_a_narrow_one(
+    fn the_session_panel_stays_beside_a_wide_transcript_and_opens_over_a_narrow_one(
         cx: &mut gpui::TestAppContext,
     ) {
         let dir = tempfile::tempdir().unwrap();
@@ -741,8 +741,19 @@ mod tests {
             .expect("a wide column shows the card unasked");
         assert!(card.right() <= px(1600.0));
         assert!(card.left() > px(800.0 + 736.0 / 2.0));
-        let actions = cx.debug_bounds("session-info-side-chat").unwrap();
+        // Its essentials are always there.
+        for row in ["session-info-device", "session-info-session"] {
+            let bounds = cx.debug_bounds(row).unwrap();
+            assert!(card.contains(&bounds.center()), "{row}");
+        }
+        let actions = cx.debug_bounds("session-info-new-side-chat").unwrap();
         assert!(card.contains(&actions.center()));
+        // Docked, it cannot be hidden.
+        window
+            .update(&mut cx, |shell, _, cx| shell.toggle_session_info(cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-info").is_some());
 
         // Without room it hides, and opening it floats it over the transcript.
         cx.simulate_resize(gpui::size(px(900.0), px(900.0)));
@@ -769,8 +780,8 @@ mod tests {
             .update(&mut cx, |shell, _, cx| shell.toggle_session_info(cx))
             .unwrap();
         cx.run_until_parked();
-        let fork = cx.debug_bounds("session-info-fork").unwrap();
-        cx.simulate_click(fork.center(), gpui::Modifiers::none());
+        let new_side_chat = cx.debug_bounds("session-info-new-side-chat").unwrap();
+        cx.simulate_click(new_side_chat.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("session-info").is_none());
     }

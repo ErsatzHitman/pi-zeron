@@ -1019,8 +1019,11 @@ pub struct UiSettings {
     pub files_word_wrap: bool,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
-    /// The user hid the session card (project, device, side chats, actions)
-    /// that otherwise shows beside a transcript with room for it.
+    /// Hides the session panel that otherwise always shows beside a
+    /// transcript with room for it. Never saved: tests that measure the
+    /// composer centered in its column set it; a value saved by an older
+    /// build, when the panel could be hidden, is ignored.
+    #[serde(skip)]
     pub session_info_hidden: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
@@ -2867,7 +2870,7 @@ mod tests {
             code_font_family: crate::typography::UiFontFamily::Geist,
             code_font_size: 11.0,
             files_show_all: true,
-            session_info_hidden: true,
+            session_info_hidden: false,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             new_thread_composer_background: Some(NewThreadComposerBackground {

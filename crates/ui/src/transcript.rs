@@ -3243,22 +3243,9 @@ impl SavedViewportCache {
     }
 }
 
-/// The running goal the transcript's goal line shows (pi-goal's channel).
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct GoalLine {
-    /// The goal is working (not paused, blocked or waiting on the user).
-    running: bool,
-}
-
-/// Gap between the reading column's right edge and the goal line.
-const GOAL_LINE_GAP: f32 = 16.0;
-const GOAL_LINE_WIDTH: f32 = 2.0;
-
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
-    /// `Some` while the selected chat has an active goal.
-    goal_line: Option<GoalLine>,
     rows: Vec<Row>,
     last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
     chat_id: Option<String>,
@@ -3621,90 +3608,6 @@ impl Transcript {
         })
     }
 
-    /// The selected chat's running goal, from pi-goal's channel. Subagent
-    /// tabs never show it.
-    fn goal_line_state(&self, cx: &gpui::App) -> Option<GoalLine> {
-        if self.doc_override.is_some() {
-            return None;
-        }
-        let state = self.state.read(cx);
-        let chat = state.selected_chat.as_deref()?;
-        let goal = state
-            .extension_ui
-            .of(chat)?
-            .channels
-            .get(zeron_proto::extension_ui::GOAL_CHANNEL)?;
-        (goal["active"] == true).then(|| GoalLine {
-            running: goal["status"] == "active",
-        })
-    }
-
-    /// A goal in progress: a line down the reading column's right edge, from
-    /// under the titlebar to the composer, with a highlight travelling down
-    /// it while the goal works. Reduced motion keeps the line and fades it
-    /// gently instead; a paused or waiting goal's line is still.
-    fn render_goal_line(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let goal = self.goal_line?;
-        let viewport = self.list.viewport_bounds().size;
-        let width = f32::from(viewport.width);
-        let top = Theme::TITLEBAR_HEIGHT;
-        let bottom = (self.bottom_clearance - Theme::STATUS_STRIP_HEIGHT).max(0.0);
-        let height = f32::from(viewport.height) - top - bottom;
-        if width <= 0.0 || height <= 0.0 {
-            return None;
-        }
-        // The row gutters (`pl(48)`, `pr(48 + right_reserve)`) center a
-        // column of at most `content_width`.
-        let avail = (width - 96.0 - self.right_reserve).max(1.0);
-        let column = self.content_width.min(avail);
-        let left = 48.0 + avail / 2.0 + column / 2.0 + GOAL_LINE_GAP;
-        let theme = Theme::of(cx).clone();
-        let line = div()
-            .absolute()
-            .left(px(left))
-            .top(px(top))
-            .bottom(px(bottom))
-            .w(px(GOAL_LINE_WIDTH))
-            .rounded_full()
-            .overflow_hidden();
-        if !goal.running {
-            return Some(line.bg(theme.text_muted.opacity(0.25)).into_any_element());
-        }
-        let view = cx.entity_id();
-        if cx.reduce_motion() {
-            let fade = motion::activity_pulse_slow(view, cx).opacity(0.0, 0.0);
-            return Some(line.bg(theme.busy.opacity(0.45 * fade)).into_any_element());
-        }
-        let phase = motion::pulse_delta_slow(&motion::ZERON_PULSE, view, cx);
-        let sweep = (height * 0.3).clamp(48.0, 240.0);
-        let clear = theme.busy.opacity(0.0);
-        let glow = theme.busy.opacity(0.9);
-        Some(
-            line.bg(theme.busy.opacity(0.22))
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .w_full()
-                        .top(px(phase * (height + sweep) - sweep))
-                        .h(px(sweep))
-                        .flex()
-                        .flex_col()
-                        .child(div().flex_1().bg(gpui::linear_gradient(
-                            180.0,
-                            gpui::linear_color_stop(clear, 0.0),
-                            gpui::linear_color_stop(glow, 1.0),
-                        )))
-                        .child(div().flex_1().bg(gpui::linear_gradient(
-                            180.0,
-                            gpui::linear_color_stop(glow, 0.0),
-                            gpui::linear_color_stop(clear, 1.0),
-                        ))),
-                )
-                .into_any_element(),
-        )
-    }
-
     /// File badges on tool chips open through the same workspace-link route
     /// as Markdown file links, so only chats with a link handler get
     /// clickable badges.
@@ -3882,13 +3785,6 @@ impl Transcript {
         });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| {
             this.sync(cx);
-            // The goal line follows a live channel, not the doc: `sync`
-            // only repaints when the transcript itself moves.
-            let goal = this.goal_line_state(cx);
-            if goal != this.goal_line {
-                this.goal_line = goal;
-                cx.notify();
-            }
         });
         cx.on_release(|this: &mut Self, cx| {
             this.close_diagram_zoom(cx);
@@ -3921,7 +3817,6 @@ impl Transcript {
         let mut this = Self {
             state,
             list,
-            goal_line: None,
             rows: Vec::new(),
             last_source: None,
             // Pre-set so `sync` never sees an attach edge — an override
@@ -10687,8 +10582,7 @@ impl Render for Transcript {
                 cx.entity_id().as_u64(),
             ))
             .child(content)
-            .child(rail)
-            .children(self.render_goal_line(cx));
+            .child(rail);
         let root = root.children(self.render_image_menu(cx));
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).

@@ -31,69 +31,6 @@ impl Shell {
             .update(cx, |composer, cx| composer.show_error(message, cx));
     }
 
-    /// The surface picker's "Side chat": fork the current conversation
-    /// through its latest completed response, as a child of it.
-    pub(super) fn create_side_chat(&mut self, cx: &mut Context<Self>) {
-        let Some(source) = self.state.read(cx).selected_chat_row().cloned() else {
-            self.show_side_chat_error("Start a conversation before creating a side chat.", cx);
-            return;
-        };
-        let parent = source.id.clone();
-        self.fork_chat(source, parent, cx);
-    }
-
-    /// Fork `source` through its latest completed response into a new chat
-    /// hanging under `parent_id`, and open it in the right pane. A side
-    /// chat's own fork button passes its parent so the copy lists as a
-    /// sibling; the picker passes the source itself.
-    pub(super) fn fork_chat(
-        &mut self,
-        source: zeron_proto::Chat,
-        parent_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.side_chat_creating {
-            return;
-        }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let key = self.panel_key(cx);
-        self.side_chat_creating = true;
-        let params = serde_json::json!({
-            "chatId": uuid::Uuid::new_v4().to_string(),
-            "sourceChatId": source.id,
-            "parentChatId": parent_id,
-            "targetDeviceId": source.device_id,
-        });
-        cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call_as::<zeron_proto::Chat>(methods::FORK_SIDE_CHAT, params)
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.side_chat_creating = false;
-                match result {
-                    Ok(chat) => {
-                        if this
-                            .state
-                            .read(cx)
-                            .chats
-                            .iter()
-                            .any(|c| Some(&c.id) == chat.parent_chat_id.as_ref())
-                        {
-                            this.open_side_chat(chat, key, cx);
-                        }
-                    }
-                    Err(error) => this.show_side_chat_error(error.to_string(), cx),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
     /// A fresh, empty side chat under `parent_id` (the active chat when
     /// None), opened in the right pane ready for its first message. Nothing
     /// is written until that message: the first send mints it with the same
@@ -563,10 +500,10 @@ mod tests {
         use crate::markdown::render::{LinkAction, LinkActivation, LinkOutcome, LinkTarget};
         let dir = tempfile::tempdir().unwrap();
         let window = shell_window(dir.path(), cx);
-        // Nothing to fork yet: the reason shows in the composer.
+        // No conversation yet: the reason shows in the composer.
         window
             .update(cx, |shell, _, cx| {
-                shell.create_side_chat(cx);
+                shell.create_child_chat(None, cx);
                 assert!(
                     shell
                         .composer

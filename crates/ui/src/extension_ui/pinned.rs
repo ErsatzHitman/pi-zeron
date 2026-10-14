@@ -310,24 +310,10 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
     if let Some(goal) = state.channels.get(zeron_proto::extension_ui::GOAL_CHANNEL)
         && goal["active"] == true
     {
-        // The goal's channel says it all: its plain status line and
-        // element would say it again.
+        // The session panel's Goal section shows the goal; its plain
+        // status line and element would say it again here.
         chips.retain(|chip| {
             chip.action.is_some() || !chip.key.to_ascii_lowercase().contains("goal")
-        });
-        let text = goal["text"].as_str().unwrap_or_default();
-        let waiting = goal["status"] == "waiting";
-        chips.push(Chip {
-            key: "channel:goal".into(),
-            hint: None,
-            text: match (text.is_empty(), waiting) {
-                (true, false) => "Goal".into(),
-                (true, true) => "Goal · waiting".into(),
-                (false, false) => format!("Goal · {text}"),
-                (false, true) => format!("Goal · {text} · waiting"),
-            },
-            active: !waiting,
-            action: None,
         });
     }
     if let Some(footer) = state.channels.get("minimal-status:footer") {
@@ -755,7 +741,6 @@ mod tests {
                 "Build",
                 "Retrying · attempt 1/3",
                 "Background bash · 1 running",
-                "Goal · ship it",
                 "42 tok/s · $0.042"
             ]
         );

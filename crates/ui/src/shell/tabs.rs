@@ -577,10 +577,13 @@ impl Shell {
             )
         };
 
-        // The session card's toggle belongs to the transcript: it ends the
+        // The session panel's toggle belongs to the transcript: it ends the
         // transcript's stretch of the titlebar, left of the side pane's tabs
-        // when one is open, else just left of the explorer toggle.
-        let session_info_toggle = (!takeover && !on_canvas).then(|| {
+        // when one is open, else just left of the explorer toggle. Docked,
+        // the panel always shows; the toggle only floats it over a column
+        // too narrow to hold it.
+        let floating = !self.session_info_fits(cx);
+        let session_info_toggle = (!takeover && !on_canvas && floating).then(|| {
             let open = self.session_info_visible(cx);
             let label = if open {
                 "Hide session details"

@@ -99,16 +99,16 @@ the MCP child when the Pi session shuts down.
 Title runs never carry it. A run with no served port (embedded engine that
 lost the bind) gets no Zeron tools rather than a dead server.
 
-### Forks and the explorer
+### Forks and the session panel
 
 `ForkSideChat { chatId, sourceChatId, parentChatId? }` copies a chat's
 history through its latest completed response into a new chat and appends
 a `fork` part (a system entry: `sourceChatId`, `sourceTitle`) as the seam;
 the transcript draws it as "This chat was forked from <title>". `parentChatId`
 defaults to the source; a side chat's own fork button passes its parent so
-the copy lists as a sibling. The file explorer's footer lists a chat's
-**Subagents** (its spawn chips) and **Chats** (its children: forks and
-`kind: "side"` spawns) and opens either in the right pane.
+the copy lists as a sibling. The session panel's **Sub-agents** section
+lists a chat's parent, its children (forks and `kind: "side"` spawns), its
+spawn chips and Pi's sub-agent fleet, and opens each in the right pane.
 
 ## Tools
 
