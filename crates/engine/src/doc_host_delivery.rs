@@ -321,8 +321,9 @@ mod tests {
                 .is_some()
         );
         // Row delivery and wake delivery are independent: the rows drain
-        // while the wake keeps failing.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // while the wake keeps failing. Generous: a loaded Windows runner
+        // took over 5s here while the drain was still progressing.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             while store.has_pending_chat_updates("outgoing").unwrap() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
