@@ -226,6 +226,16 @@ fn chip_label(text: &str) -> &str {
     if label.is_empty() { text } else { label }
 }
 
+/// A plain status line as a chip reads it. pi-goal's terminal line
+/// (`goal 36.7k tok · steps 0/3 · 20s`), shown when no goal channel arrives,
+/// reads like the channel's chip.
+fn status_text(key: &str, text: &str) -> String {
+    match text.strip_prefix("goal ") {
+        Some(detail) if key == "goal" => format!("Goal · {}", detail.trim()),
+        _ => text.to_owned(),
+    }
+}
+
 /// Chips for the session footer, in a stable order.
 pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
     let mut chips: Vec<Chip> = state
@@ -271,7 +281,7 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
             .map(|s| Chip {
                 key: format!("status:{}", s.key),
                 hint: None,
-                text: s.text.trim().to_owned(),
+                text: status_text(&s.key, s.text.trim()),
                 // Zeron's own chips (Pi retrying a request) stand out.
                 active: s.key.starts_with("zeron:"),
                 action: None,
@@ -297,7 +307,7 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
                 })
             }),
     );
-    if let Some(goal) = state.channels.get("pi-goal:status")
+    if let Some(goal) = state.channels.get(zeron_proto::extension_ui::GOAL_CHANNEL)
         && goal["active"] == true
     {
         // The goal's channel says it all: its plain status line and
@@ -803,6 +813,16 @@ mod tests {
             "sections":[{"kind":"turns","id":"t","turns":[{"role":"assistant","text":"…","streaming":true}]}]}))
         .unwrap();
         assert!(working(&streaming));
+    }
+
+    #[test]
+    fn a_goal_status_line_reads_like_the_goal_chip() {
+        assert_eq!(
+            status_text("goal", "goal 36.7k tok · steps 0/3 · 20s"),
+            "Goal · 36.7k tok · steps 0/3 · 20s"
+        );
+        assert_eq!(status_text("goal", "goal: ship it"), "goal: ship it");
+        assert_eq!(status_text("other", "goal 1"), "goal 1");
     }
 
     #[test]

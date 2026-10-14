@@ -15,6 +15,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// pi-goal's state channel: `{active, status, text, detail, startedAt}`;
+/// `status` is `active`, `waiting`, `paused`, `blocked` or `budget_limited`.
+pub const GOAL_CHANNEL: &str = "pi-goal:status";
+
 /// One chat's live extension UI, as of `revision`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]

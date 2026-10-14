@@ -13,7 +13,7 @@ use std::{
 use zeron_proto::{
     AgentEvent, ToolCall,
     extension_ui::{ExtensionUiState, NoticeLevel},
-    view::PI_EXTENSION_SERVER,
+    view::{PI_EXTENSION_SERVER, is_goal_widget},
 };
 
 /// A row repaints at most this often while its element streams (the advisor
@@ -86,25 +86,29 @@ fn work(state: &ExtensionUiState) -> Vec<Work> {
                 failed,
             )
         });
-    let widgets = state.widgets.iter().map(|widget| {
-        let title = widget
-            .lines
-            .first()
-            .cloned()
-            .filter(|line| !line.trim().is_empty())
-            .unwrap_or_else(|| widget.key.clone());
-        // The PIUI hub's plain copy of an element (`piui:<ns>:<id>`, drawn
-        // while no client listens) continues that element's row.
-        let (key, tool) = match widget
-            .key
-            .strip_prefix("piui:")
-            .and_then(|key| Some((key, key.split_once(':')?.0)))
-        {
-            Some((key, ns)) => (key.to_owned(), ns.to_owned()),
-            None => (format!("widget:{}", widget.key), widget.key.clone()),
-        };
-        (key, tool, input(&title, widget.lines.clone()), false)
-    });
+    let widgets = state
+        .widgets
+        .iter()
+        .filter(|widget| !is_goal_widget(&widget.key))
+        .map(|widget| {
+            let title = widget
+                .lines
+                .first()
+                .cloned()
+                .filter(|line| !line.trim().is_empty())
+                .unwrap_or_else(|| widget.key.clone());
+            // The PIUI hub's plain copy of an element (`piui:<ns>:<id>`, drawn
+            // while no client listens) continues that element's row.
+            let (key, tool) = match widget
+                .key
+                .strip_prefix("piui:")
+                .and_then(|key| Some((key, key.split_once(':')?.0)))
+            {
+                Some((key, ns)) => (key.to_owned(), ns.to_owned()),
+                None => (format!("widget:{}", widget.key), widget.key.clone()),
+            };
+            (key, tool, input(&title, widget.lines.clone()), false)
+        });
     elements.chain(widgets).collect()
 }
 
@@ -369,6 +373,18 @@ mod tests {
             &notice[1],
             AgentEvent::ToolResult { is_error: true, .. }
         ));
+    }
+
+    #[test]
+    fn a_goal_status_widget_is_no_row() {
+        let mut rows = Rows::default();
+        let mut live = state(vec![]);
+        live.widgets.push(ExtensionWidget {
+            key: "minimal-status:goal".into(),
+            lines: vec!["> goal  36.7k tok · steps 0/3 · 20s".into()],
+            placement: None,
+        });
+        assert!(rows.sync(&live, Instant::now()).is_empty());
     }
 
     #[test]

@@ -574,6 +574,14 @@ fn unknown_chip(name: &str, input: Option<&serde_json::Value>) -> (&'static str,
 /// (`advisor-live-panel`) or the message type (`subagent-result`).
 pub const PI_EXTENSION_SERVER: &str = "pi";
 
+/// A plain widget that only restates the running goal (minimal-status
+/// repaints `goal  36.7k tok · steps 0/3 · 20s` every second). The
+/// transcript's goal line and the footer chip show the goal natively, so it
+/// is never recorded as a row, and rows recorded before are not drawn.
+pub fn is_goal_widget(key: &str) -> bool {
+    key == "goal" || key.ends_with(":goal")
+}
+
 /// The label a Pi extension's row wears, named like the stock tool it is
 /// closest to ("Run" for background shells, "Agent" for subagents).
 pub fn pi_extension_label(tool: &str) -> &'static str {
