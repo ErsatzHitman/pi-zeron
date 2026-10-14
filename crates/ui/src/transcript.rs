@@ -3471,6 +3471,8 @@ pub struct Transcript {
     /// row's media handler requests its fences while laying out, so only
     /// painted diagrams are rendered (see [`MermaidCache`]).
     diagrams: Rc<RefCell<MermaidCache>>,
+    /// ` ```chart ` series and source toggles, by frame id.
+    charts: Rc<RefCell<crate::markdown::chart::ChartState>>,
     /// The media handler over `diagrams`, built once and shared by every row.
     diagram_media: Option<render::MediaUi>,
     /// The single serialized diagram render loop, while requests remain.
@@ -3998,6 +4000,7 @@ impl Transcript {
             attachment_preview_focus: cx.focus_handle(),
             attachment_preview_return_focus: None,
             diagrams: Rc::default(),
+            charts: Rc::default(),
             diagram_media: None,
             diagram_worker: None,
             diagram_zoom: None,
@@ -6793,13 +6796,31 @@ impl Transcript {
     }
 
     /// Media wiring for settled Markdown: Mermaid fences become diagrams
-    /// once rendered and keep their source until then (or on failure).
-    /// Inline images keep their ordinary chat rendering.
+    /// once rendered and keep their source until then (or on failure), and
+    /// chart fences are drawn natively. Inline images keep their ordinary
+    /// chat rendering.
     fn diagram_media(&mut self, cx: &Context<Self>) -> render::MediaUi {
         let cache = self.diagrams.clone();
+        let charts = self.charts.clone();
         let owner = cx.weak_entity();
+        let chart_owner = owner.clone();
         let media = self.diagram_media.get_or_insert_with(|| render::MediaUi {
             image: None,
+            chart: Some(Rc::new(move |code, id, theme| {
+                let owner = chart_owner.clone();
+                crate::markdown::chart::view(
+                    code,
+                    id,
+                    theme,
+                    &charts,
+                    Rc::new(move |frame: &str, cx: &mut gpui::App| {
+                        let row = crate::markdown::chart::frame_row(frame).to_owned();
+                        let _ = owner.update(cx, |this, cx| {
+                            this.diagram_layout_changed(&[row.into()], cx);
+                        });
+                    }),
+                )
+            })),
             diagram: Some(Rc::new(move |code, id, _theme| {
                 let lookup = cache.borrow_mut().request(code, &id);
                 match lookup {

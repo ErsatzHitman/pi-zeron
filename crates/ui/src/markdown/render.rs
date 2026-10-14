@@ -110,11 +110,13 @@ pub struct TaskUi {
 #[derive(Clone)]
 pub struct MediaUi {
     pub diagram: Option<Rc<dyn Fn(&str, SharedString, &Theme) -> DiagramView>>,
+    /// ` ```chart ` fences ([`super::chart`]); `None` keeps them as source.
+    pub chart: Option<Rc<dyn Fn(&str, SharedString, &Theme) -> DiagramView>>,
     /// `None` keeps inline images in their ordinary text rendering.
     pub image: Option<Rc<dyn Fn(&super::parser::InlineImage, SharedString, &Theme) -> AnyElement>>,
 }
 
-/// How a Mermaid fence presents itself on the owning surface.
+/// How a Mermaid or chart fence presents itself on the owning surface.
 pub enum DiagramView {
     /// The ordinary source fence, unchanged (no diagram is available yet).
     Source,
@@ -2045,47 +2047,26 @@ fn render_code_block(
     theme: &Theme,
     highlight: CodeHighlight,
 ) -> AnyElement {
-    if language.is_some_and(|l| l.eq_ignore_ascii_case("mermaid")) {
-        if let Some(handler) = opts.media.as_ref().and_then(|media| media.diagram.as_ref()) {
-            let frame_id: SharedString = format!("{}-mermaid-{ix}", opts.row_key).into();
-            let diagram = match handler(code, frame_id.clone(), theme) {
-                DiagramView::Source => {
-                    return render_code_block_source(
-                        language, code, top_ix, ix, opts, theme, highlight,
-                    );
-                }
-                DiagramView::Failed(reason) => {
-                    let notice = code_notice(format!("{frame_id}-failure").into(), reason, theme);
-                    return render_code_block_source_with_actions(
-                        language,
-                        code,
-                        top_ix,
-                        ix,
-                        opts,
-                        theme,
-                        highlight,
-                        vec![notice],
-                    );
-                }
-                DiagramView::Diagram(diagram) => diagram,
-            };
-            let toggle = diagram.toggle_source.clone();
-            let toggle_action = code_icon_action(
-                format!("{frame_id}-source-toggle").into(),
-                if diagram.show_source {
-                    "Show diagram"
-                } else {
-                    "Show source"
-                },
-                if diagram.show_source {
-                    crate::icons::EYE
-                } else {
-                    crate::icons::FILE_CODE
-                },
-                Rc::new(move |window, cx| toggle(window, cx)),
-                theme,
-            );
-            if diagram.show_source {
+    let visual = opts.media.as_ref().and_then(|media| match language {
+        Some(l) if l.eq_ignore_ascii_case("mermaid") => media
+            .diagram
+            .as_ref()
+            .map(|h| (h, "mermaid", "Show diagram")),
+        Some(l) if l.eq_ignore_ascii_case("chart") => {
+            media.chart.as_ref().map(|h| (h, "chart", "Show chart"))
+        }
+        _ => None,
+    });
+    if let Some((handler, kind, show_label)) = visual {
+        let frame_id: SharedString = format!("{}-{kind}-{ix}", opts.row_key).into();
+        let diagram = match handler(code, frame_id.clone(), theme) {
+            DiagramView::Source => {
+                return render_code_block_source(
+                    language, code, top_ix, ix, opts, theme, highlight,
+                );
+            }
+            DiagramView::Failed(reason) => {
+                let notice = code_notice(format!("{frame_id}-failure").into(), reason, theme);
                 return render_code_block_source_with_actions(
                     language,
                     code,
@@ -2094,14 +2075,43 @@ fn render_code_block(
                     opts,
                     theme,
                     highlight,
-                    vec![toggle_action],
+                    vec![notice],
                 );
             }
-            let mut actions = vec![toggle_action];
-            actions.extend(code_copy_button(code, ix, opts, theme));
-            return code_block_frame(frame_id, language, actions, diagram.body, theme)
-                .into_any_element();
+            DiagramView::Diagram(diagram) => diagram,
+        };
+        let toggle = diagram.toggle_source.clone();
+        let toggle_action = code_icon_action(
+            format!("{frame_id}-source-toggle").into(),
+            if diagram.show_source {
+                show_label
+            } else {
+                "Show source"
+            },
+            if diagram.show_source {
+                crate::icons::EYE
+            } else {
+                crate::icons::FILE_CODE
+            },
+            Rc::new(move |window, cx| toggle(window, cx)),
+            theme,
+        );
+        if diagram.show_source {
+            return render_code_block_source_with_actions(
+                language,
+                code,
+                top_ix,
+                ix,
+                opts,
+                theme,
+                highlight,
+                vec![toggle_action],
+            );
         }
+        let mut actions = vec![toggle_action];
+        actions.extend(code_copy_button(code, ix, opts, theme));
+        return code_block_frame(frame_id, language, actions, diagram.body, theme)
+            .into_any_element();
     }
     render_code_block_source(language, code, top_ix, ix, opts, theme, highlight)
 }

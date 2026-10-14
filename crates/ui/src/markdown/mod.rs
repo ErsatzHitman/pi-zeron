@@ -26,5 +26,6 @@ pub mod veil;
 
 pub use parser::{Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full};
 
+pub(crate) mod chart;
 pub mod mermaid;
 pub(crate) mod mermaid_cache;
