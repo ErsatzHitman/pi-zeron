@@ -167,21 +167,31 @@ impl Phase {
     }
 
     /// Button names describe the action, independently of the live status.
-    pub fn action_label(&self) -> &'static str {
-        match self {
-            Self::Idle | Self::Tapped => "Hold to dictate",
-            Self::Requesting | Self::Listening => "Release to transcribe",
-            Self::Finalizing => "Transcribing",
-            Self::NoSpeech | Self::Denied(_) | Self::Unavailable(_) | Self::Failed(_) => {
+    /// `tap`: dictation starts and stops on a click instead of a hold.
+    pub fn action_label(&self, tap: bool) -> &'static str {
+        match (self, tap) {
+            (Self::Idle | Self::Tapped, false) => "Hold to dictate",
+            (Self::Idle | Self::Tapped, true) => "Dictate",
+            (Self::Requesting | Self::Listening, false) => "Release to transcribe",
+            (Self::Requesting | Self::Listening, true) => "Stop and transcribe",
+            (Self::Finalizing, _) => "Transcribing",
+            (Self::NoSpeech | Self::Denied(_) | Self::Unavailable(_) | Self::Failed(_), false) => {
                 "Hold to retry dictation"
+            }
+            (Self::NoSpeech | Self::Denied(_) | Self::Unavailable(_) | Self::Failed(_), true) => {
+                "Retry dictation"
             }
         }
     }
 
-    pub fn status(&self) -> Option<(&str, &str)> {
+    pub fn status(&self, tap: bool) -> Option<(&str, &str)> {
         Some(match self {
             Self::Idle => return None,
             Self::Requesting => ("Getting ready…", "Wait for Listening before speaking."),
+            Self::Listening if tap => (
+                "Listening",
+                "Click the microphone when you’re done · Up to 1 minute",
+            ),
             Self::Listening => ("Listening", "Release when you’re done · Up to 1 minute"),
             Self::Finalizing => ("Transcribing…", "Sending to your speech provider."),
             Self::NoSpeech => (

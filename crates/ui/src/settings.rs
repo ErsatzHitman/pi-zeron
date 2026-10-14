@@ -826,6 +826,9 @@ pub struct UiSettings {
     /// follows the system default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dictation_input: Option<String>,
+    /// Dictation starts and stops on a click or key press instead of
+    /// recording while held.
+    pub dictation_tap: bool,
     /// Dictation's speech-to-text provider. Its API key is kept in
     /// `stt-keys.json`, never here.
     pub stt_provider: zeron_voice::cloud::Provider,
@@ -1055,6 +1058,7 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             dictation_input: None,
+            dictation_tap: false,
             stt_provider: zeron_voice::cloud::Provider::default(),
             stt_model: None,
             stt_language: None,
@@ -1711,6 +1715,7 @@ impl UiSettings {
         }
         merge!(
             dictation_input,
+            dictation_tap,
             stt_provider,
             stt_model,
             stt_language,
@@ -2748,6 +2753,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
             dictation_input: Some("coreaudio:usb-mic".into()),
+            dictation_tap: true,
             stt_provider: zeron_voice::cloud::Provider::Groq,
             stt_model: Some("whisper-large-v3".into()),
             stt_language: Some("hi".into()),

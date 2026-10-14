@@ -111,6 +111,7 @@ pub(crate) struct VoiceCard {
     model_select: widgets::SelectState,
     language_select: widgets::SelectState,
     input_select: widgets::SelectState,
+    trigger_select: widgets::SelectState,
     voice: voice_mode::Selects,
     _subscriptions: Vec<Subscription>,
 }
@@ -181,6 +182,7 @@ impl VoiceCard {
             model_select: widgets::SelectState::default(),
             language_select: widgets::SelectState::default(),
             input_select: widgets::SelectState::default(),
+            trigger_select: widgets::SelectState::default(),
             voice: voice_mode::Selects::default(),
             _subscriptions: vec![key_sub, phrase_sub, openrouter_sub, voice_key_sub],
         }
@@ -510,6 +512,32 @@ impl Render for VoiceCard {
         })
         .render(&self.input_select, cx);
 
+        let trigger_control = widgets::select(
+            "voice-trigger",
+            "Start dictation",
+            &theme,
+            |card: &mut Self| &mut card.trigger_select,
+        )
+        .options(
+            ["Hold to talk", "Tap to start and stop"]
+                .into_iter()
+                .map(widgets::SelectOption::new),
+            usize::from(saved.dictation_tap),
+        )
+        .width(200.0)
+        .on_select(move |_, ix, _, cx| {
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.dictation_tap = ix == 1
+            });
+            cx.notify();
+        })
+        .render(&self.trigger_select, cx);
+        let trigger_meta = if saved.dictation_tap {
+            "Click the microphone or press the shortcut to start, and again to stop"
+        } else {
+            "Hold the microphone or the shortcut while you speak"
+        };
+
         let fillers = saved.stt_remove_fillers;
         fn toggle_fillers(cx: &mut App) {
             settings::update(settings::SavePolicy::Immediate, cx, |s| {
@@ -624,6 +652,13 @@ impl Render for VoiceCard {
                                             "Microphone",
                                             None,
                                             microphone_control,
+                                        ))
+                                        .child(row(
+                                            &theme,
+                                            false,
+                                            "Start dictation",
+                                            Some(trigger_meta.into()),
+                                            trigger_control,
                                         )),
                                 )
                                 .child(

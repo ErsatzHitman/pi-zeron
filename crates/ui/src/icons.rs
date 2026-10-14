@@ -185,6 +185,8 @@ icon_assets![
     // Hand-drawn microphone pair in the Solar Linear style — voice controls.
     (MICROPHONE, "microphone"),
     (MICROPHONE_OFF, "microphone-off"),
+    // Hand-drawn level bars in the same style: voice mode at rest.
+    (VOICE_WAVE, "voice-wave"),
     (PHONE_HANG_UP, "phone-hang-up"),
     // Hand-drawn zeron glyphs (terminal-panel.tsx / composer-actions.tsx /
     // menu-check.tsx / logo.tsx).

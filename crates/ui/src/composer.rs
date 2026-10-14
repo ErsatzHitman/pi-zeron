@@ -10539,6 +10539,14 @@ impl Composer {
     fn press_dictation(&mut self, source: HoldSource, cx: &mut Context<Self>) {
         use crate::dictation::Phase;
         let phase = self.input.read(cx).dictation.phase.clone();
+        // Tap to talk: each press starts or finishes; releases do nothing.
+        if crate::settings::current(cx).dictation_tap {
+            self.dictation_hold = None;
+            if phase != Phase::Finalizing {
+                self.toggle_dictation(source != HoldSource::Button, cx);
+            }
+            return;
+        }
         // Repeats from the same source are ignored. Another source takes the
         // session over, so a hold whose release went missing (focus moved
         // within the composer) can always be ended.
@@ -10628,7 +10636,9 @@ impl Composer {
         let theme = Theme::of(cx).clone();
         let phase = self.input.read(cx).dictation.phase.clone();
         let active = phase.active();
-        let label = phase.action_label().to_owned();
+        let label = phase
+            .action_label(crate::settings::current(cx).dictation_tap)
+            .to_owned();
         let live = frame.is_some_and(|f| f.mode == Mode::Live);
         let glow = frame.map_or(0.0, |f| f.level * f.level.sqrt());
         // Spinner while the microphone opens or the model transcribes; the
@@ -10811,7 +10821,7 @@ impl Composer {
         if phase.active() {
             return None;
         }
-        let (title, detail) = phase.status()?;
+        let (title, detail) = phase.status(crate::settings::current(cx).dictation_tap)?;
         let (title, detail) = (title.to_owned(), detail.to_owned());
         let phase = &phase;
         let failed = matches!(
@@ -10887,7 +10897,7 @@ impl Composer {
             };
             let label = dictation
                 .phase
-                .status()
+                .status(crate::settings::current(cx).dictation_tap)
                 .map(|(title, detail)| format!("{title}. {detail}"))
                 .unwrap_or_default();
             self.voice_last = Some(VoiceFrame {
@@ -11067,7 +11077,8 @@ impl Composer {
         }
         let hovered = slot.hovered;
         slot.orb.update(cx, |o, cx| {
-            o.set_visible(t < 1.0, cx);
+            // At rest the slot shows the wave glyph; the orb is the live call.
+            o.set_visible(live && t < 1.0, cx);
             o.set_state(
                 if live {
                     state
@@ -11160,6 +11171,7 @@ impl Composer {
         };
         let live = slot.voice.read(cx).is_live();
         let orb = slot.orb.clone();
+        let hovered = slot.hovered;
         let blocked = !voice && self.send_blocked(cx);
         let dim = if blocked { 0.35 } else { 1.0 };
         let arrow_scale = 0.25 + 0.75 * t;
@@ -11181,6 +11193,20 @@ impl Composer {
                     ))),
             );
         let orb = (t < 1.0).then(|| {
+            let glyph = if live {
+                orb.into_any_element()
+            } else {
+                let scale = 1.0 - 0.75 * t;
+                crate::icons::icon(crate::icons::VOICE_WAVE)
+                    .size(px(18.0))
+                    .text_color(if hovered {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .with_transformation(gpui::Transformation::scale(gpui::size(scale, scale)))
+                    .into_any_element()
+            };
             div()
                 .absolute()
                 .inset_0()
@@ -11188,7 +11214,7 @@ impl Composer {
                 .items_center()
                 .justify_center()
                 .opacity(1.0 - t)
-                .child(orb)
+                .child(glyph)
         });
         let slot = div()
             .relative()
