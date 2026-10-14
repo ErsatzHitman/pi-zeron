@@ -34,7 +34,7 @@ use zeron_rpc::methods;
 /// pagination plumbing).
 const MAX_REF_ROWS: usize = 300;
 
-const FOOTER_CHIP_RADIUS: f32 = 6.0;
+pub(crate) const FOOTER_CHIP_RADIUS: f32 = 6.0;
 
 /// Both sides of the composer handoff share one leading-aligned workspace
 /// cluster. Available width belongs after the pair, never between its labels.

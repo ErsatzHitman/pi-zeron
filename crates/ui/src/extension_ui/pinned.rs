@@ -191,6 +191,41 @@ fn money(value: f64) -> String {
     }
 }
 
+/// The footer's monochrome glyph for a chip, like the checkout and branch
+/// labels beside it.
+fn chip_icon(chip: &Chip) -> &'static str {
+    let key = chip.key.to_ascii_lowercase();
+    let text = chip_label(&chip.text).to_ascii_lowercase();
+    if key == "plan:mode" {
+        if text.starts_with("plan") {
+            icons::CHECKLIST
+        } else {
+            icons::ACTION_BUILD
+        }
+    } else if key == "channel:footer" {
+        icons::FAST_TIER
+    } else if key.starts_with("status:zeron:") {
+        icons::RESTART
+    } else if key.contains("goal") {
+        icons::CHECKLIST
+    } else if key.starts_with("work:") {
+        icons::CLOCK_CIRCLE
+    } else if key.contains("mcp") || text.starts_with("mcp") {
+        icons::REMOTE_SERVER
+    } else {
+        icons::WIDGET
+    }
+}
+
+/// A chip's text without the emoji an extension leads it with for a
+/// terminal: the footer draws its own icon.
+fn chip_label(text: &str) -> &str {
+    let label = text
+        .trim_start_matches(|c: char| !c.is_ascii() && !c.is_alphanumeric())
+        .trim_start();
+    if label.is_empty() { text } else { label }
+}
+
 /// Chips for the session footer, in a stable order.
 pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
     let mut chips: Vec<Chip> = state
@@ -523,34 +558,37 @@ impl Composer {
                 .flex()
                 .items_center()
                 .gap(px(4.0))
-                .pl(px(4.0))
                 .children(chips.into_iter().map(|chip| {
+                    // The footer's own labels (checkout, branch): a muted
+                    // 12px icon and medium 12px text, no fill. Active chips
+                    // read brighter rather than tinted.
+                    let color = if chip.active {
+                        theme.text.opacity(0.8)
+                    } else {
+                        theme.text_muted.opacity(0.6)
+                    };
+                    let text = chip_label(&chip.text).to_owned();
                     let chip_el = div()
                         .id(SharedString::from(format!("ext-chip-{}", chip.key)))
                         .flex_none()
                         .max_w(px(CHIP_MAX_WIDTH))
                         .h(px(20.0))
-                        .px(px(6.0))
+                        .px(px(8.0))
                         .flex()
+                        .flex_row()
                         .items_center()
-                        .gap(px(4.0))
-                        .rounded(px(6.0))
-                        .bg(if chip.active {
-                            accent.opacity(0.16)
-                        } else {
-                            theme.ink(0.05)
-                        })
-                        .text_size(px(11.0))
-                        .text_color(if chip.active {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
+                        .gap(px(6.0))
+                        .rounded(px(crate::pickers::FOOTER_CHIP_RADIUS))
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(color)
                         .child(
-                            div()
-                                .truncate()
-                                .child(SharedString::from(chip.text.clone())),
+                            icon(chip_icon(&chip))
+                                .size(px(12.0))
+                                .flex_none()
+                                .text_color(color),
                         )
+                        .child(div().min_w_0().truncate().child(SharedString::from(text)))
                         .tooltip(crate::settings::widgets::text_tooltip(
                             chip.hint.clone().unwrap_or_else(|| chip.text.clone()),
                         ))
@@ -562,7 +600,10 @@ impl Composer {
                                 .role(gpui::Role::Button)
                                 .aria_label(SharedString::from(chip.text.clone()))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme.element_hover))
+                                .hover(|s| {
+                                    s.bg(theme.element_hover)
+                                        .text_color(theme.text.opacity(0.8))
+                                })
                                 .tab_index(0)
                                 .focus_visible(move |s| s.border_1().border_color(accent))
                                 .on_click(move |_, _, cx| {
@@ -762,5 +803,38 @@ mod tests {
             "sections":[{"kind":"turns","id":"t","turns":[{"role":"assistant","text":"…","streaming":true}]}]}))
         .unwrap();
         assert!(working(&streaming));
+    }
+
+    #[test]
+    fn a_footer_chip_drops_its_terminal_emoji_and_wears_a_footer_icon() {
+        let chip = |key: &str, text: &str| Chip {
+            key: key.into(),
+            text: text.into(),
+            hint: None,
+            active: false,
+            action: None,
+        };
+        assert_eq!(
+            chip_label("🔌 MCP: 8 servers enabled"),
+            "MCP: 8 servers enabled"
+        );
+        assert_eq!(chip_label("$0.014"), "$0.014");
+        assert_eq!(chip_label("Économie"), "Économie");
+        assert_eq!(chip_label("✨"), "✨");
+        assert_eq!(chip_icon(&chip("plan:mode", "Build")), icons::ACTION_BUILD);
+        assert_eq!(chip_icon(&chip("plan:mode", "Plan")), icons::CHECKLIST);
+        assert_eq!(
+            chip_icon(&chip("status:mcp", "🔌 MCP: 8 servers enabled")),
+            icons::REMOTE_SERVER
+        );
+        assert_eq!(
+            chip_icon(&chip("channel:footer", "121 tok/s · $0.014")),
+            icons::FAST_TIER
+        );
+        assert_eq!(
+            chip_icon(&chip("status:zeron:retry", "Retrying")),
+            icons::RESTART
+        );
+        assert_eq!(chip_icon(&chip("status:other", "Indexing")), icons::WIDGET);
     }
 }
