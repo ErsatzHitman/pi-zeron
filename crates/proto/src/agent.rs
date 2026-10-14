@@ -500,6 +500,24 @@ pub struct SlashCommand {
     /// Placeholder hint for the command's argument, when it takes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
+    /// Sub-commands and other argument values the command offers, in order
+    /// (Pi's `getArgumentCompletions`: `/goal draft`, `/mcp reconnect <server>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<ArgumentCompletion>,
+}
+
+/// One value a slash command accepts as its argument. `value` is the text
+/// that replaces the typed argument (a trailing space hands over to the next
+/// word); `children` are the values that may follow it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArgumentCompletion {
+    pub value: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ArgumentCompletion>,
 }
 
 /// A file modification carried inline on a tool result (ACP

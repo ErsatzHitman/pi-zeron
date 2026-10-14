@@ -142,7 +142,11 @@ impl PiHarness {
             let result = tokio::select! {
                 result=tokio::time::timeout(Duration::from_secs(60),async {
                     if models {Ok(serde_json::to_value(catalog::models(&mut process).await?).unwrap())}
-                    else {process.query(json!({"type":"get_commands"}),&mut vec![]).await}
+                    else {
+                        let mut data = process.query(json!({"type":"get_commands"}),&mut vec![]).await?;
+                        data[catalog::COMPLETIONS_KEY] = catalog::completions(&mut process, &data, &mut vec![]).await;
+                        Ok(data)
+                    }
                 })=>result.unwrap_or_else(|_|Err(HarnessError::Protocol("Pi discovery timed out".into()))),
                 _=tx.closed()=>Err(HarnessError::Protocol("Pi discovery cancelled".into())),
             };
@@ -534,6 +538,7 @@ impl Harness for PiHarness {
                 auto_compaction: true,
                 live_model: request.model.clone().filter(|model| model != "default"),
                 refresh_commands: false,
+                completions: Value::Null,
                 initial_pending: true,
                 deliveries: VecDeque::new(),
                 native_queue: Vec::new(),
@@ -607,6 +612,9 @@ enum Pending {
     /// The command list again, after a slash command that may change it
     /// (`/reload`, an extension that registers commands).
     Commands,
+    /// The command completions asked before that list; the list and the
+    /// barrier of the turn (its epoch) are asked once they are in.
+    Completions(u64),
 }
 struct Delivery {
     epoch: u64,
@@ -625,6 +633,9 @@ struct Runner {
     /// A slash command ran this turn: fetch the command list again once
     /// it settles.
     refresh_commands: bool,
+    /// The last argument completions Pi's extensions offered, by command
+    /// name (`catalog::COMPLETIONS_KEY`); `Null` without that extension.
+    completions: Value,
     interrupted: bool,
     initial_pending: bool,
     deliveries: VecDeque<Delivery>,
@@ -834,6 +845,7 @@ impl Runner {
             .process
             .query(json!({"type":"get_commands"}), backlog)
             .await?;
+        self.completions = catalog::completions(&mut self.process, &commands, backlog).await;
         self.take_commands(&commands, true).await?;
         self.process
             .query(json!({"type":"get_state"}), backlog)
@@ -858,7 +870,9 @@ impl Runner {
             .filter(|c| c["source"] == "extension")
             .map(|c| string(c, "name").to_owned())
             .collect();
-        let available = catalog::commands(commands);
+        let mut commands = commands.clone();
+        commands[catalog::COMPLETIONS_KEY] = self.completions.clone();
+        let available = catalog::commands(&commands);
         let (cache, file, key) = &self.commands_cache;
         cache.store(file, key, available.clone());
         if announce {
@@ -1075,6 +1089,10 @@ impl Runner {
                 tracing::debug!(%error, "Pi refused the command list");
                 return Ok(());
             }
+            Pending::Completions(epoch) => {
+                tracing::debug!(%error, "Pi refused the completions command");
+                return self.request_settled(*epoch, false);
+            }
         };
         if epoch != self.epoch || !self.active {
             tracing::debug!(%error, "Pi refused a request of an earlier turn");
@@ -1251,6 +1269,10 @@ impl Runner {
             self.native_queue = queue;
             return Ok(());
         }
+        if let Some(completions) = catalog::completions_notice(&frame) {
+            self.completions = completions;
+            return Ok(());
+        }
         if frame["type"] == "extension_ui_request" {
             self.ui.set_in_turn(self.active);
             match self.ui.handle(&frame) {
@@ -1332,6 +1354,7 @@ impl Runner {
                     let announce = self.active;
                     self.take_commands(&data, announce).await?;
                 }
+                Pending::Completions(epoch) => self.request_settled(epoch, true)?,
                 Pending::EmptyEntries(epoch, session) if epoch == self.epoch && self.active => {
                     let clean = data["entries"].as_array().is_some_and(|entries| {
                         entries.iter().all(|entry| {
@@ -1430,23 +1453,41 @@ impl Runner {
             self.emit(event).await?;
         }
         if frame["type"] == "agent_settled" {
-            // Asked before the barrier, so the answer comes while the turn
-            // is still open.
-            if std::mem::take(&mut self.refresh_commands) {
+            let refresh = std::mem::take(&mut self.refresh_commands);
+            if refresh && self.pi_commands.contains(catalog::COMPLETIONS_COMMAND) {
+                // Pi answers a command prompt only after its handler ran,
+                // behind a barrier asked now: the list and the barrier wait
+                // for the completions.
                 let id = self
                     .process
                     .transport
                     .client
-                    .request(json!({"type":"get_commands"}))?;
-                self.pending.insert(id, Pending::Commands);
+                    .request(catalog::completions_prompt())?;
+                self.pending.insert(id, Pending::Completions(self.epoch));
+                return Ok(());
             }
+            self.request_settled(self.epoch, refresh)?;
+        }
+        Ok(())
+    }
+    /// Close turn `epoch` with a barrier, after the command list when
+    /// `refresh`. Both are asked before the barrier, so the list comes while
+    /// the turn is still open.
+    fn request_settled(&mut self, epoch: u64, refresh: bool) -> Result<(), HarnessError> {
+        if refresh {
             let id = self
                 .process
                 .transport
                 .client
-                .request(json!({"type":"get_state"}))?;
-            self.pending.insert(id, Pending::Barrier(self.epoch));
+                .request(json!({"type":"get_commands"}))?;
+            self.pending.insert(id, Pending::Commands);
         }
+        let id = self
+            .process
+            .transport
+            .client
+            .request(json!({"type":"get_state"}))?;
+        self.pending.insert(id, Pending::Barrier(epoch));
         Ok(())
     }
 }

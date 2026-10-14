@@ -85,6 +85,16 @@ write to stdin. Missing history/custom entries never authorize recreating the
 same UUID; an unrestorable session starts a new one with a visible "without the
 previous context" notice, like the other harnesses.
 
+Command completions (`catalog.rs`): `get_commands` carries no argument
+completions. When it lists `pi_ui_completions` (the user extension
+`00-zeron-completions.ts`), the driver sends the prompt `/pi_ui_completions`
+after `get_commands` at bootstrap, in discovery, and before the list is fetched
+again after a turn's slash command (the turn's barrier waits for it). The
+extension answers with one notify `ZERON-COMPLETIONS {v:1, commands:{name:
+[{value, label, description?, children?}]}}` (two levels of
+`getArgumentCompletions`), which never reaches the transcript; it rides each
+`SlashCommand.arguments`. Without the extension commands have no arguments.
+
 PIUI (extension UI, `piui.rs`; spec: the user's `~/.pi/agent/extensions/PIUI.md`)
 
 Transport: extensions publish `notify` messages whose text is `PIUI ` + JSON

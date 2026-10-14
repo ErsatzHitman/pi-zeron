@@ -87,6 +87,7 @@ impl Harness for RecordingHarness {
             name: "probe".into(),
             description: cwd.to_string_lossy().into_owned(),
             input_hint: None,
+            arguments: vec![],
         }])
     }
     async fn skills(

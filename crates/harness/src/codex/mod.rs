@@ -697,11 +697,13 @@ impl Harness for CodexHarness {
                 name: "compact".into(),
                 description: "Compact this conversation's context".into(),
                 input_hint: None,
+                arguments: vec![],
             },
             SlashCommand {
                 name: "review".into(),
                 description: "Review uncommitted changes, or supply review instructions".into(),
                 input_hint: Some("optional instructions".into()),
+                arguments: vec![],
             },
         ])
     }

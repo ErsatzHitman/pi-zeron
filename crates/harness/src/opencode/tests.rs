@@ -290,6 +290,7 @@ impl TurnWire {
                 .into(),
                 description: String::new(),
                 input_hint: None,
+                arguments: vec![],
             }]),
             initial_native_command_selected: native_command_reply.is_some(),
         }));

@@ -1221,6 +1221,7 @@ fn commands_from_wire(commands: &Value) -> Vec<SlashCommand> {
                             .unwrap_or_default()
                             .to_owned(),
                         input_hint: None,
+                        arguments: vec![],
                     })
                 })
                 .collect()

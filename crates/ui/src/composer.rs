@@ -26,8 +26,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
-    UserInputQuestion, capabilities,
+    ArgumentCompletion, FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand,
+    UserInputAnswer, UserInputQuestion, capabilities,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -5660,6 +5660,75 @@ fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
     invocation_token(text, cursor, '/')
 }
 
+/// The argument typed after the draft's leading command (`/goal dr|`, or
+/// the command's link and a space): the command's name, and the argument's
+/// token, whose query runs from the argument's start to the cursor. Only on
+/// the draft's first line, where the command's argument is.
+fn argument_token(text: &str, cursor: usize) -> Option<(String, MentionToken)> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) || text[..cursor].contains('\n') {
+        return None;
+    }
+    let (name, head_end) = match zeron_proto::invocation::invocation_links(text)
+        .into_iter()
+        .next()
+    {
+        Some((range, zeron_proto::invocation::Invocation::Command { name }))
+            if range.start == 0 =>
+        {
+            (name, range.end)
+        }
+        _ => {
+            let rest = text.strip_prefix('/')?;
+            let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (rest[..len].to_string(), 1 + len)
+        }
+    };
+    if name.is_empty() || !text[head_end..].starts_with(' ') {
+        return None;
+    }
+    let start = text.len() - text[head_end..].trim_start_matches(' ').len();
+    if cursor < start {
+        return None;
+    }
+    let end = text[cursor..]
+        .find(char::is_whitespace)
+        .map_or(text.len(), |offset| cursor + offset);
+    Some((
+        name,
+        MentionToken {
+            range: start..end,
+            query: text[start..cursor].to_string(),
+        },
+    ))
+}
+
+/// The values to offer for an argument `query`: the first word's, or, after
+/// the first word and a space, the values that may follow it. A value typed
+/// in full with nothing to follow it is left out, so the menu closes and
+/// Enter sends. Returns the level and its ranked indices; both empty when
+/// nothing is left to offer.
+fn argument_matches(
+    arguments: &[ArgumentCompletion],
+    query: &str,
+) -> (Vec<ArgumentCompletion>, Vec<usize>) {
+    let level = match query.split_once(' ') {
+        None => arguments,
+        Some((first, _)) => match arguments.iter().find(|a| a.value.trim() == first) {
+            Some(parent) => parent.children.as_slice(),
+            None => return (vec![], vec![]),
+        },
+    };
+    let values: Vec<&str> = level.iter().map(|a| a.value.trim()).collect();
+    let filtered: Vec<usize> = crate::popover::filter_indices(query, &values)
+        .into_iter()
+        .filter(|&ix| values[ix] != query.trim() || !level[ix].children.is_empty())
+        .collect();
+    if filtered.is_empty() {
+        return (vec![], vec![]);
+    }
+    (level.to_vec(), filtered)
+}
+
 fn invocation_token(text: &str, cursor: usize, prefix: char) -> Option<MentionToken> {
     if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
@@ -5856,6 +5925,7 @@ fn with_workspace_commands(
             name,
             description: description.into(),
             input_hint: None,
+            arguments: vec![],
             workspace_command: Some(command),
         });
     }
@@ -5882,6 +5952,8 @@ struct InvocationCandidate {
     name: String,
     description: String,
     input_hint: Option<String>,
+    /// The command's sub-commands, offered once its name and a space are typed.
+    arguments: Vec<ArgumentCompletion>,
     invocation: zeron_proto::invocation::Invocation,
 }
 
@@ -5915,6 +5987,10 @@ struct SlashState {
     token: Option<MentionToken>,
     /// Indices into the cached command list, filter-ranked for the query.
     filtered: Vec<usize>,
+    /// The command whose argument the token is (`/goal dr|`): `filtered`
+    /// then indexes `arguments`, the values offered at the typed word.
+    argument_of: Option<String>,
+    arguments: Vec<ArgumentCompletion>,
     active: Option<usize>,
     /// Harness the popup is showing commands for (cache key).
     harness: Option<HarnessId>,
@@ -6005,6 +6081,7 @@ fn invocation_candidates(
         .map(|c| InvocationCandidate {
             workspace_command: None,
             input_hint: c.input_hint,
+            arguments: c.arguments,
             name: c.name.clone(),
             description: c.description,
             invocation: zeron_proto::invocation::Invocation::Command { name: c.name },
@@ -6016,6 +6093,7 @@ fn invocation_candidates(
                 .map(|s| InvocationCandidate {
                     workspace_command: None,
                     input_hint: None,
+                    arguments: vec![],
                     name: s.name.clone(),
                     description: if zeron_proto::invocation::native_skill_identity(&s.path) {
                         s.description.clone()
@@ -8109,10 +8187,17 @@ impl Composer {
         let (token, skill, include_skills, commands_allowed) =
             completion_trigger(text, cursor, preferences);
         if token.is_none() {
+            if self.update_slash_arguments(text, cursor, cx) {
+                return;
+            }
             // Leaving a token must not replace the catalog identity with the
             // idle (commands_allowed=false) context and evict the warm cache.
             self.reset_slash(None, cx);
             return;
+        }
+        if self.slash.argument_of.take().is_some() {
+            self.slash.arguments.clear();
+            self.slash.token = None;
         }
         let params = self.catalog_params(cx);
         let catalog_context = format!(
@@ -8265,8 +8350,63 @@ impl Composer {
         cx.notify();
     }
 
+    /// Offer the sub-commands of the draft's leading command while its
+    /// argument is typed, in the same menu as the commands. False when there
+    /// is nothing to offer, which closes the menu.
+    fn update_slash_arguments(
+        &mut self,
+        text: &str,
+        cursor: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((name, token)) = argument_token(text, cursor) else {
+            return false;
+        };
+        if self.slash.dismissed.as_ref().is_some_and(|(range, value)| {
+            token.range == *range && text.get(range.clone()) == Some(value.as_str())
+        }) {
+            return true;
+        }
+        if self.slash.argument_of.as_deref() == Some(name.as_str())
+            && self.slash.token.as_ref() == Some(&token)
+        {
+            return true;
+        }
+        // The catalog the command was picked from: the current one first.
+        let arguments = std::iter::once(self.slash_cache.get(&self.slash.context))
+            .flatten()
+            .chain(self.slash_cache.values())
+            .flatten()
+            .find(|c| c.invocation.prefix() == '/' && c.name == name && !c.arguments.is_empty())
+            .map(|c| c.arguments.clone());
+        let Some(arguments) = arguments else {
+            return false;
+        };
+        let (level, filtered) = argument_matches(&arguments, &token.query);
+        if filtered.is_empty() {
+            return false;
+        }
+        // A command discovery still in flight must not refilter this list.
+        self.slash.request = self.slash.request.wrapping_add(1);
+        self.slash_task = None;
+        self.slash.loading = false;
+        self.slash.dismissed = None;
+        self.slash.token = Some(token);
+        self.slash.argument_of = Some(name);
+        self.slash.arguments = level;
+        self.slash.filtered = filtered;
+        self.slash.active = Some(0);
+        crate::popover::reset_menu_scroll(&self.slash_scroll, &mut self.popup_bar);
+        self.sync_mention_controls(cx);
+        cx.notify();
+        true
+    }
+
     /// Re-rank the cached list for the current query (pure local filter).
     fn refilter_slash(&mut self, cx: &mut Context<Self>) {
+        if self.slash.argument_of.is_some() {
+            return;
+        }
         let query = self
             .slash
             .token
@@ -8314,6 +8454,24 @@ impl Composer {
         let Some(token) = self.slash.token.clone() else {
             return;
         };
+        if self.slash.argument_of.is_some() {
+            let Some(argument) = self
+                .slash
+                .active
+                .and_then(|active| self.slash.filtered.get(active))
+                .and_then(|&ix| self.slash.arguments.get(ix))
+                .cloned()
+            else {
+                return;
+            };
+            // The value replaces the whole argument typed so far; the input
+            // supplies the space after it, which opens the next level.
+            self.input.update(cx, |input, cx| {
+                input.replace_plain_token(token.range, argument.value.trim_end(), cx)
+            });
+            cx.notify();
+            return;
+        }
         let Some(command) = self
             .slash
             .active
@@ -8368,11 +8526,6 @@ impl Composer {
         let theme = &theme.for_popup();
         // Only while a slash token is active.
         self.slash.token.as_ref()?;
-        let commands = self
-            .slash_cache
-            .get(&self.slash.context)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         // Full pill width at the mention card's height budget — both composer
         // completions share the same surface shape.
         let mut card = crate::popover::completion_card(theme)
@@ -8383,6 +8536,60 @@ impl Composer {
                 }),
             )
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
+        if self.slash.argument_of.is_some() {
+            // A command's sub-commands: the command rows' shape, never empty
+            // (the menu closes when nothing matches).
+            let rows: Vec<gpui::AnyElement> = self
+                .slash
+                .filtered
+                .iter()
+                .enumerate()
+                .filter_map(|(row_ix, &ix)| {
+                    let argument = self.slash.arguments.get(ix)?;
+                    let selected = self.slash.active == Some(row_ix);
+                    Some(
+                        crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
+                            .id(("slash-result", row_ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.slash.active = Some(row_ix);
+                                this.accept_slash(cx);
+                            }))
+                            .child(crate::popover::completion_row_content(
+                                theme,
+                                crate::icons::icon(crate::icons::COMMAND)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted)
+                                    .into_any_element(),
+                                SharedString::from(argument.label.clone()),
+                                SharedString::from(
+                                    argument.description.clone().unwrap_or_default(),
+                                ),
+                            ))
+                            .into_any_element(),
+                    )
+                })
+                .collect();
+            card = card.child(
+                crate::popover::menu_scroll_host("slash-scroll-host")
+                    .on_hover(cx.listener(Self::on_popup_list_hover))
+                    .child(crate::popover::completion_list(
+                        "slash-list",
+                        &self.slash_scroll,
+                        rows,
+                    ))
+                    .children(crate::popover::rail(self, "slash-scrollbar", theme, cx)),
+            );
+            return Some(crate::popover::full_width_menu_above(
+                "slash-popup",
+                card.into_any_element(),
+                None,
+            ));
+        }
+        let commands = self
+            .slash_cache
+            .get(&self.slash.context)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if let Some(error) = self.slash.error.clone() {
             card = card.child(
                 div()
@@ -12648,11 +12855,13 @@ mod tests {
                     name: "model".into(),
                     description: "Native model command".into(),
                     input_hint: Some("model id".into()),
+                    arguments: vec![],
                 },
                 SlashCommand {
                     name: "zeron:model".into(),
                     description: "Plugin command".into(),
                     input_hint: None,
+                    arguments: vec![],
                 },
             ],
             vec![],
@@ -12786,6 +12995,7 @@ mod tests {
                             name: "review".into(),
                             description: String::new(),
                             input_hint: None,
+                            arguments: vec![],
                             workspace_command: None,
                             invocation: invocation.clone(),
                         }],
@@ -14951,6 +15161,7 @@ mod tests {
             name: "review".into(),
             description: String::new(),
             input_hint: None,
+            arguments: vec![],
         };
         let skill = zeron_proto::invocation::Skill {
             command: None,
@@ -15055,6 +15266,7 @@ mod tests {
                     name: name.into(),
                     description: String::new(),
                     input_hint: None,
+                    arguments: vec![],
                 })
                 .collect();
             let skills = [
@@ -15099,11 +15311,13 @@ mod tests {
                     name: "review".into(),
                     description: String::new(),
                     input_hint: None,
+                    arguments: vec![],
                 },
                 SlashCommand {
                     name: "compact".into(),
                     description: String::new(),
                     input_hint: None,
+                    arguments: vec![],
                 },
             ];
             let skills = vec![Skill {
@@ -15136,6 +15350,7 @@ mod tests {
             name: "review".into(),
             description: "Command".into(),
             input_hint: None,
+            arguments: vec![],
         }];
         let skills = vec![
             Skill {
@@ -15171,6 +15386,58 @@ mod tests {
             assert!(candidate.invocation.prompt_text().contains("SKILL.md"));
         }
         assert_ne!(slash[1].invocation, slash[2].invocation);
+    }
+
+    #[test]
+    fn a_leading_command_offers_its_sub_commands() {
+        let arg = |value: &str, children: Vec<ArgumentCompletion>| ArgumentCompletion {
+            value: value.into(),
+            label: value.trim().into(),
+            description: None,
+            children,
+        };
+        let token = |text: &str, cursor: usize| {
+            argument_token(text, cursor).map(|(name, t)| (name, t.range, t.query))
+        };
+        assert_eq!(
+            token("/goal ", 6),
+            Some(("goal".into(), 6..6, String::new()))
+        );
+        assert_eq!(
+            token("/goal dr", 8),
+            Some(("goal".into(), 6..8, "dr".into()))
+        );
+        assert_eq!(token("/goal", 5), None, "the name is still typed");
+        assert_eq!(token("hi /goal dr", 11), None, "only a leading command");
+        assert_eq!(token("/goal x\nmore", 12), None, "only on the first line");
+        let link = zeron_proto::invocation::Invocation::Command {
+            name: "goal".into(),
+        }
+        .link();
+        let text = format!("{link} dr");
+        assert_eq!(
+            token(&text, text.len()),
+            Some(("goal".into(), link.len() + 1..text.len(), "dr".into()))
+        );
+
+        let arguments = vec![
+            arg("draft ", vec![]),
+            arg("drop", vec![]),
+            arg("reconnect ", vec![arg("reconnect github", vec![])]),
+        ];
+        let values = |query: &str| {
+            let (level, filtered) = argument_matches(&arguments, query);
+            filtered
+                .iter()
+                .map(|&ix| level[ix].value.trim().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(""), ["draft", "drop", "reconnect"]);
+        assert_eq!(values("dr"), ["draft", "drop"]);
+        assert_eq!(values("drop"), Vec::<String>::new(), "typed in full");
+        assert_eq!(values("reconnect "), ["reconnect github"]);
+        assert_eq!(values("reconnect gi"), ["reconnect github"]);
+        assert_eq!(values("draft ship it"), Vec::<String>::new(), "free text");
     }
 
     #[test]

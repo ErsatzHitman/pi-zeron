@@ -13,7 +13,7 @@ use std::{
 };
 use zeron_proto::SlashCommand;
 
-const FILE_VERSION: u32 = 2;
+const FILE_VERSION: u32 = 3;
 
 /// The same workspace under another Pi executable can list other commands.
 pub(super) fn key(executable: &Path, cwd: &Path) -> String {
@@ -121,6 +121,7 @@ mod tests {
             name: name.into(),
             description: String::new(),
             input_hint: None,
+            arguments: vec![],
         }
     }
 
