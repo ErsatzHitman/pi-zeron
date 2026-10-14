@@ -350,10 +350,17 @@ impl VoiceController {
                 self.sync_work(cx);
             }
             call::Event::User { turn, text } => {
+                // Shown at once, even over a message being read, then settled.
+                let item = format!("user-{turn}");
                 self.reduce(
-                    transcript(format!("user-{turn}"), VoiceRole::User, text.clone()),
+                    VoiceEvent::Partial {
+                        generation: GENERATION,
+                        item_id: Some(item.clone()),
+                        text: text.clone(),
+                    },
                     cx,
                 );
+                self.reduce(transcript(item, VoiceRole::User, text.clone()), cx);
                 self.send_prompt(text, cx);
             }
             // Each message read aloud builds one caption, a sentence at a time.
@@ -391,7 +398,8 @@ impl VoiceController {
         }
     }
 
-    /// Caption a failure the call survives; `speak` also says it.
+    /// Caption a failure the call survives, in place of whatever was being
+    /// read; `speak` also says it.
     fn notice(&mut self, text: String, speak: bool, cx: &mut Context<Self>) {
         self.notices += 1;
         let item = format!("notice-{}", self.notices);
@@ -404,18 +412,11 @@ impl VoiceController {
                 cx,
             );
         }
-        let Some(session_id) = self.session_id() else {
-            return;
-        };
         self.reduce(
-            VoiceEvent::Final {
-                transcript: VoiceTranscript {
-                    session_id,
-                    item_id: item,
-                    role: VoiceRole::Assistant,
-                    text,
-                    promoted_message_id: None,
-                },
+            VoiceEvent::Partial {
+                generation: GENERATION,
+                item_id: Some(item),
+                text,
             },
             cx,
         );
@@ -782,9 +783,26 @@ mod tests {
                 cx,
             );
             assert_eq!(voice.orb_state(), OrbState::Composing);
-            // A notice is its own caption.
+            // A notice, and the next thing the user says, each take the
+            // caption from a message still being read.
             voice.on_call(call::Event::Notice("Deepgram is rate limiting.".into()), cx);
             assert_eq!(voice.caption.text(), "Deepgram is rate limiting.");
+            voice.on_call(
+                call::Event::Speaking {
+                    item: "a1/t2".into(),
+                    text: "Done.".into(),
+                },
+                cx,
+            );
+            voice.on_call(
+                call::Event::User {
+                    turn: 2,
+                    text: "Now make it green.".into(),
+                },
+                cx,
+            );
+            assert_eq!(voice.caption.text(), "Now make it green.");
+            assert_eq!(voice.caption.role(), Some(VoiceRole::User));
         });
     }
 
