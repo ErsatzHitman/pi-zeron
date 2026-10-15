@@ -9161,8 +9161,11 @@ fn agent_message_display(text: &str) -> String {
     let Some(id) = id.strip_suffix('.') else {
         return text.to_owned();
     };
-    let suffix = format!(" ({id})");
-    let name = label.strip_suffix(&suffix).unwrap_or(label);
+    // The label is "<title> (<id prefix>)" (or just the prefix, untitled).
+    let name = match label.rsplit_once(" (") {
+        Some((name, short)) if short.strip_suffix(')').is_some_and(|s| id.starts_with(s)) => name,
+        _ => label,
+    };
     format!("Message from {name}\n\n{body}")
 }
 

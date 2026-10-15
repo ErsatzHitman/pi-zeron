@@ -99,7 +99,8 @@ the corpus, run on macOS and Windows CI.
 
 A Pi that a Zeron run's Pi starts (a sub-agent of the user's subagent or
 delegate extensions) loads the same guard extension. The guard counts Pi
-levels below the Zeron session in `ZERON_SUBAGENT_DEPTH` (Zeron clears it on
+levels below the Zeron session in `ZERON_SUBAGENT_DEPTH`, keyed by the Pi's pid in
+`ZERON_PI_PID` so a reload keeps its level (Zeron clears both on
 every run it starts) and appends a note to a sub-agent's system prompt: whose
 sub-agent it is (the session's title and id, and its orchestrator and level
 from the `ZERON_*` place env it inherits), that its task is the prompt it was

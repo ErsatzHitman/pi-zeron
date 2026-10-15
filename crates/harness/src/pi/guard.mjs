@@ -513,8 +513,12 @@ export function shellWrites(src, dialect = "posix", depth = 0) {
   for (const n of nested) { const r = shellWrites(n.src, n.dialect, depth + 1); if (r) return r; }
 }
 
+// Zeron's own tools that change no file: a read-only session still posts
+// what it finds to its orchestrator's board.
+const RO_ZERON_TOOLS = new Set(["zeron_board_post", "zeron_board_read"]);
+
 export function classifyReadOnly({ toolName, input = {}, annotations }) {
-  if (READONLY_TOOLS.has(toolName)) return;
+  if (READONLY_TOOLS.has(toolName) || RO_ZERON_TOOLS.has(toolName)) return;
   if (toolName === "write" || toolName === "edit") return hit("ro-edit", `${toolName} changes files`);
   if (SHELL_TOOLS.has(toolName)) return shellWrites(String(input.command ?? ""), toolName === "bash" ? "posix" : "ps");
   if (/(bash|shell|exec|terminal|run_command|powershell|pwsh)/i.test(toolName))
@@ -532,8 +536,17 @@ const READ_ONLY_REASON = (h) =>
   `Finish with what reading tells you, and say in your final answer what you would change and where.`;
 
 // ---- sub-agents: a Pi started by a Pi Zeron runs (a sub-agent) is not a
-// Zeron session; tell it whose it is. `ZERON_SUBAGENT_DEPTH` counts Pi levels
-// below the Zeron session; Zeron clears it on every run it starts.
+// Zeron session; tell it whose it is. Each guarded Pi records its pid and its
+// level below the Zeron session (`ZERON_PI_PID`, `ZERON_SUBAGENT_DEPTH`) for
+// the Pis it starts; Zeron clears both on every run it starts. Keyed by pid,
+// so Pi re-running this factory in the same process (a reload, a new
+// session) keeps its level.
+export function piDepth(env, pid) {
+  const level = Number(env.ZERON_SUBAGENT_DEPTH) || 0;
+  if (!env.ZERON_PI_PID) return 0;
+  return env.ZERON_PI_PID === String(pid) ? level : level + 1;
+}
+
 export function subagentNote(env, depth) {
   if (!(depth >= 1)) return undefined;
   let chat;
@@ -553,8 +566,9 @@ export function subagentNote(env, depth) {
 export default function deleteGuard(pi) {
   inheritIntoChildren();
   guardCompiledChildren();
-  const depth = Number(process.env.ZERON_SUBAGENT_DEPTH) || 0;
-  process.env.ZERON_SUBAGENT_DEPTH = String(depth + 1);    // for the Pis this one starts
+  const depth = piDepth(process.env, process.pid);
+  process.env.ZERON_PI_PID = String(process.pid);          // for the Pis this one starts
+  process.env.ZERON_SUBAGENT_DEPTH = String(depth);
   const note = subagentNote(process.env, depth);
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
     const annotationsOf = () => {
@@ -576,6 +590,15 @@ export default function deleteGuard(pi) {
     }
     if (h) return { block: true, reason: REASON(h) };
   });
-  if (note) pi.on("before_agent_start", (event) => ({ systemPrompt: [event.systemPrompt, note].join("\n\n") }));
+  // A prompt section of its own, so other extensions' sections still apply;
+  // an older Pi without sections gets it appended.
+  if (note) pi.on("before_agent_start", (event) => {
+    const sections = event.systemPromptOptions?.sections;
+    if (sections && typeof sections === "object") {
+      sections.zeron_subagent = note;
+      return undefined;
+    }
+    return { systemPrompt: [event.systemPrompt, note].join("\n\n") };
+  });
   // The user's own `!cmd` (user_bash) is deliberately not hooked.
 }

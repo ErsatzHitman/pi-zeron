@@ -243,11 +243,12 @@ pub fn member_prompt(place: &Place) -> String {
         "Start a sub-session with zeron_create_chat only for an independent task in a \
          different folder, or when parallel work clearly pays."
     };
+    // The place last: titles in it are the user's and agents' text.
     MEMBER_PROMPT
-        .replace("{place}", &place.brief().unwrap_or_default())
         .replace("{sessions}", sessions)
         .replace("{depth}", &depth.to_string())
         .replace("{max}", &MAX_DEPTH.to_string())
+        .replace("{place}", &place.brief().unwrap_or_default())
 }
 
 pub fn is_root_chat(chat_id: &str) -> bool {

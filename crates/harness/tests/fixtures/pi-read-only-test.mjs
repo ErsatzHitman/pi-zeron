@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 
 const guard = await import(pathToFileURL(process.argv[2]).href);
-const {classifyReadOnly, gitReadOnly, readOnlyOn, shellWrites, subagentNote} = guard;
+const {classifyReadOnly, gitReadOnly, piDepth, readOnlyOn, shellWrites, subagentNote} = guard;
 
 const failures = [];
 const check = (label, got, expect) => {
@@ -80,17 +80,32 @@ assert.match(subagentNote(member, 1), /sub-agent \(level 1\) of the agent in the
 assert.match(subagentNote({ZERON_PI_MCP: mcp}, 2), /\(level 2\) of the agent in the Zeron session chat member-1\. /);
 assert.equal(subagentNote({}, 1), undefined, 'not under Zeron');
 assert.equal(subagentNote({ZERON_PI_MCP: '{'}, 1), undefined);
-const priorSub = {depth: process.env.ZERON_SUBAGENT_DEPTH, mcp: process.env.ZERON_PI_MCP};
-process.env.ZERON_SUBAGENT_DEPTH = '1';
+assert.equal(piDepth({}, 7), 0, 'the Zeron session itself');
+assert.equal(piDepth({ZERON_PI_PID: '7', ZERON_SUBAGENT_DEPTH: '0'}, 8), 1, 'its sub-agent');
+assert.equal(piDepth({ZERON_PI_PID: '8', ZERON_SUBAGENT_DEPTH: '1'}, 8), 1, 'a reload keeps the level');
+assert.equal(piDepth({ZERON_PI_PID: '8', ZERON_SUBAGENT_DEPTH: '1'}, 9), 2, "a sub-agent's sub-agent");
+check('zeron_board_post', call('zeron_board_post', {kind: 'finding', text: 'x'}), false);
+check('zeron_board_read', call('zeron_board_read'), false);
+const keys = ['ZERON_SUBAGENT_DEPTH', 'ZERON_PI_PID', 'ZERON_PI_MCP'];
+const priorSub = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+process.env.ZERON_PI_PID = String(process.pid + 1);   // started by another Pi
+process.env.ZERON_SUBAGENT_DEPTH = '0';
 process.env.ZERON_PI_MCP = mcp;
 const child = [];
-guard.default({on: (event, handler) => child.push([event, handler]), getAllTools: () => []});
-assert.equal(process.env.ZERON_SUBAGENT_DEPTH, '2', 'its own children are one level deeper');
+const load = () => guard.default({on: (event, handler) => child.push([event, handler]), getAllTools: () => []});
+load();
+assert.equal(process.env.ZERON_SUBAGENT_DEPTH, '1');
+assert.equal(process.env.ZERON_PI_PID, String(process.pid));
+load();
+assert.equal(process.env.ZERON_SUBAGENT_DEPTH, '1', 'loading again in the same Pi keeps its level');
 const start = child.find(([event]) => event === 'before_agent_start')?.[1];
 assert.ok(start, 'a sub-agent gets the note');
-assert.match(start({systemPrompt: 'BASE'}).systemPrompt, /^BASE\n\nZeron: you are a sub-agent \(level 1\)/);
+const options = {sections: {preamble: 'BASE'}};
+assert.equal(start({systemPrompt: 'BASE', systemPromptOptions: options}), undefined);
+assert.match(options.sections.zeron_subagent, /^Zeron: you are a sub-agent \(level 1\)/);
+assert.match(start({systemPrompt: 'BASE'}).systemPrompt, /^BASE\n\nZeron: you are a sub-agent \(level 1\)/, 'an older Pi');
 assert.ok(!handlers.some(([event]) => event === 'before_agent_start'), 'the session itself gets none');
-for (const [key, value] of [['ZERON_SUBAGENT_DEPTH', priorSub.depth], ['ZERON_PI_MCP', priorSub.mcp]]) {
+for (const [key, value] of Object.entries(priorSub)) {
   if (value === undefined) delete process.env[key]; else process.env[key] = value;
 }
 
