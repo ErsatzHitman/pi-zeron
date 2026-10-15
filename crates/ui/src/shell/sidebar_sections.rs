@@ -842,6 +842,170 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Put `payload` on the selected chat's `workflow:state` channel, as the
+    /// Pi workflows extension publishes it.
+    fn set_workflow_state(
+        window: &gpui::WindowHandle<super::Shell>,
+        cx: &mut gpui::VisualTestContext,
+        payload: serde_json::Value,
+    ) {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.extension_ui.chat = Some("regular".into());
+                    state.extension_ui.state.channels.insert(
+                        zeron_proto::extension_ui::WORKFLOW_STATE_CHANNEL.into(),
+                        payload,
+                    );
+                    cx.notify();
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_session_panel_follows_a_workflow_run_from_live_to_interrupted(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                prepare(shell, cx);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                shell.settings.sidebar_collapsed = true;
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("regular".into()));
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1600.0), px(1400.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-info-workflow-header").is_none());
+
+        // A live run, shaped as the extension's state.ts publishes it.
+        let now = chrono::Utc::now().timestamp_millis();
+        let action = |id: &str, confirm: bool| json!({"id": id, "label": "", "runId": "wf-1", "confirm": confirm});
+        set_workflow_state(
+            &window,
+            &mut cx,
+            json!({
+                "v": 1, "updatedAt": now,
+                "run": {"id": "wf-1", "name": "review-changes", "goal": "Review the diff",
+                        "status": "running", "startedAt": now - 90_000, "phase": "Verify",
+                        "dryRun": false, "resumed": true},
+                "progress": {"total": 6, "done": 2, "running": 1, "queued": 2,
+                             "failed": 0, "cached": 1, "retrying": 1, "skipped": 0},
+                "phases": [
+                    {"title": "Find", "state": "done", "done": 2, "total": 2},
+                    {"title": "Verify", "state": "active", "done": 0, "total": 2},
+                    {"title": "Report", "state": "pending", "done": 0, "total": 0}
+                ],
+                "tasks": [
+                    {"id": "0", "label": "find bugs", "state": "done", "attempt": 1,
+                     "maxAttempts": 3, "dependsOn": [], "cached": false,
+                     "startedAt": now - 80_000, "endedAt": now - 60_000},
+                    {"id": "1", "label": "find perf", "state": "cached", "attempt": 1,
+                     "maxAttempts": 3, "dependsOn": [], "cached": true, "reusedFrom": 4},
+                    {"id": "2", "label": "verify bugs", "state": "running", "attempt": 1,
+                     "maxAttempts": 3, "dependsOn": [], "cached": false,
+                     "startedAt": now - 20_000},
+                    {"id": "3", "label": "verify perf", "state": "retrying", "attempt": 2,
+                     "maxAttempts": 3, "dependsOn": [], "cached": false,
+                     "nextAttemptAt": now + 30_000,
+                     "error": {"code": "AGENT_RATE_LIMIT", "message": "429 Too Many Requests",
+                               "retriable": true}},
+                    {"id": "node:report", "label": "report", "state": "queued", "attempt": 0,
+                     "maxAttempts": 0, "node": "report", "dependsOn": ["verify"],
+                     "cached": false}
+                ],
+                "tasksTruncated": 0,
+                "checkpoints": [
+                    {"at": now - 60_000, "kind": "phase", "doneCount": 2, "label": "Find"}
+                ],
+                "recovery": {"resumable": false, "reused": 1, "invalidated": 0,
+                             "interrupted": [],
+                             "actions": [action("pause", false), action("stop", true)]}
+            }),
+        );
+        let card = cx.debug_bounds("session-info").unwrap();
+        for id in [
+            "session-info-workflow-header",
+            "session-info-workflow",
+            "session-info-workflow-progress",
+            "session-info-workflow-pause",
+            "session-info-workflow-stop",
+            "session-info-workflow-task-2",
+            "session-info-workflow-task-3",
+            "session-info-workflow-queued",
+            "session-info-workflow-finished",
+            "session-info-workflow-notes",
+        ] {
+            let bounds = cx.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
+            assert!(card.contains(&bounds.center()), "{id}");
+        }
+        // Live and retrying work leads; queued and finished work folds.
+        assert!(
+            cx.debug_bounds("session-info-workflow-task-node:report")
+                .is_none()
+        );
+        assert!(cx.debug_bounds("session-info-workflow-task-0").is_none());
+        assert!(cx.debug_bounds("session-info-workflow-recovery").is_none());
+        click_on(&mut cx, "session-info-workflow-queued");
+        assert!(
+            cx.debug_bounds("session-info-workflow-task-node:report")
+                .is_some()
+        );
+        click_on(&mut cx, "session-info-workflow-finished");
+        assert!(cx.debug_bounds("session-info-workflow-task-0").is_some());
+        assert!(cx.debug_bounds("session-info-workflow-task-1").is_some());
+        // Stop asks first: the first click arms it, and the button stays.
+        click_on(&mut cx, "session-info-workflow-stop");
+        assert!(cx.debug_bounds("session-info-workflow-stop").is_some());
+
+        // Pi quit mid-run: the run ends interrupted and is offered for resume.
+        set_workflow_state(
+            &window,
+            &mut cx,
+            json!({
+                "v": 1, "updatedAt": now + 1_000,
+                "run": {"id": "wf-1", "name": "review-changes", "goal": "Review the diff",
+                        "status": "interrupted", "statusReason": "shutdown",
+                        "startedAt": now - 90_000, "endedAt": now - 1_000},
+                "progress": {"total": 6, "done": 2, "failed": 0, "queued": 1},
+                "tasks": [
+                    {"id": "2", "label": "verify bugs", "state": "aborted", "attempt": 1,
+                     "maxAttempts": 3}
+                ],
+                "recovery": {"resumable": true, "reason": "shutdown",
+                             "actions": [action("resume", false), action("discard", true)]}
+            }),
+        );
+        for id in [
+            "session-info-workflow-header",
+            "session-info-workflow-recovery",
+            "session-info-workflow-resume",
+            "session-info-workflow-discard",
+        ] {
+            assert!(cx.debug_bounds(id).is_some(), "{id}");
+        }
+        assert!(cx.debug_bounds("session-info-workflow-stop").is_none());
+        assert!(cx.debug_bounds("session-info-workflow-pause").is_none());
+
+        // Discarded, with nothing else to resume: the section goes.
+        set_workflow_state(
+            &window,
+            &mut cx,
+            json!({"v": 1, "updatedAt": now + 2_000, "run": null,
+                   "recovery": {"resumable": false, "interrupted": [], "actions": []}}),
+        );
+        assert!(cx.debug_bounds("session-info-workflow-header").is_none());
+    }
+
     #[gpui::test]
     fn the_session_panel_lists_the_todo_only_while_there_is_work(cx: &mut gpui::TestAppContext) {
         use crate::todo_panel::assistant_with_todo;
