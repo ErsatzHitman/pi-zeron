@@ -310,10 +310,8 @@ mod tests {
         machines: Vec<settings::Machine>,
     ) -> (tempfile::TempDir, Entity<Shell>, &mut VisualTestContext) {
         let dir = tempfile::tempdir().unwrap();
-        let ui = settings::UiSettings {
-            machines,
-            ..Default::default()
-        };
+        let mut ui = settings::UiSettings::default();
+        ui.machines = machines;
         cx.update(|cx| {
             gpui_base::init(cx);
             cx.set_global(Theme::default());
