@@ -23,6 +23,17 @@ const MIN_HEIGHT: f32 = 220.0;
 /// prompt pill lines up with the pane.
 const COMPOSER_PAD: f32 = 16.0;
 
+/// The height a pane opens at: the session card's, at least [`MIN_HEIGHT`].
+fn opened_height(card: f32) -> f32 {
+    card.max(MIN_HEIGHT)
+}
+
+/// The pane's height this frame: the latched one, cut to the room above
+/// its prompt bar (never below 160).
+fn pane_height(latched: f32, max_height: f32, bar: f32) -> f32 {
+    latched.min((max_height - bar - BTW_GAP).max(160.0))
+}
+
 pub(super) struct BtwPane {
     /// The conversation it opened from (its panel key).
     key: String,
@@ -112,7 +123,7 @@ impl Shell {
             .as_ref()
             .filter(|pane| pane.key == key)
             .map(|pane| pane.height)
-            .unwrap_or_else(|| self.session_panel.card_height().max(MIN_HEIGHT));
+            .unwrap_or_else(|| opened_height(self.session_panel.card_height()));
         if let Some(old) = self.btw.take()
             && old.side_chat != id
         {
@@ -304,7 +315,7 @@ impl Shell {
             height if height > 0.0 => height,
             _ => 120.0,
         };
-        let height = latched.min((max_height - bar_h - BTW_GAP).max(160.0));
+        let height = pane_height(latched, max_height, bar_h);
         let working = status == ChatIndicator::Working;
 
         let glyph = if working {
@@ -600,5 +611,20 @@ impl Shell {
                 )
         }))
         .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pane_opens_the_session_cards_size() {
+        assert_eq!(opened_height(360.0), 360.0);
+        assert_eq!(opened_height(90.0), MIN_HEIGHT);
+        assert_eq!(pane_height(360.0, 900.0, 120.0), 360.0);
+        // A short window cuts it to the room above the prompt bar.
+        assert_eq!(pane_height(360.0, 400.0, 120.0), 400.0 - 120.0 - BTW_GAP);
+        assert_eq!(pane_height(360.0, 200.0, 120.0), 160.0);
     }
 }
