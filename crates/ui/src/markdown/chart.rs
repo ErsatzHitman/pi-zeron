@@ -17,7 +17,7 @@ use super::render::{DiagramUi, DiagramView};
 use crate::settings::widgets::text_tooltip;
 use crate::theme::Theme;
 
-const MAX_SERIES: usize = 8;
+pub(crate) const MAX_SERIES: usize = 8;
 const MAX_POINTS: usize = 200;
 const PLOT_HEIGHT: f32 = 200.0;
 const AXIS_WIDTH: f32 = 44.0;

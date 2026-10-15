@@ -16,6 +16,7 @@ pub mod orchestrator;
 pub mod preview;
 pub mod projectless;
 pub mod sidebar_pins;
+pub mod usage;
 pub mod view;
 pub mod voice;
 pub mod workspace;

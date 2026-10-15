@@ -48,6 +48,7 @@ use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::usage::UsagePage;
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, FILES_PANEL_MIN, JUMP_SLOTS, KeymapConfig,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
@@ -559,17 +560,20 @@ pub enum SettingsSection {
     General,
     Appshots,
     Archived,
+    /// Tokens and spend per Pi provider and model on this machine.
+    Usage,
 }
 
 impl SettingsSection {
     /// Sections shown in Settings. `Agents` is a legacy Accounts route alias.
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Voice,
         SettingsSection::Shortcuts,
         SettingsSection::Harnesses,
+        SettingsSection::Usage,
         SettingsSection::Devices,
         SettingsSection::Files,
         SettingsSection::Appshots,
@@ -616,6 +620,7 @@ impl SettingsSection {
             SettingsSection::General => "general",
             SettingsSection::Appshots => "appshots",
             SettingsSection::Archived => "archived",
+            SettingsSection::Usage => "usage",
         }
     }
 
@@ -633,6 +638,7 @@ impl SettingsSection {
             "general" | "conversations" => SettingsSection::General,
             "appshots" => SettingsSection::Appshots,
             "archived" => SettingsSection::Archived,
+            "usage" => SettingsSection::Usage,
             _ => return None,
         })
     }
@@ -658,6 +664,7 @@ impl SettingsSection {
             SettingsSection::General => "General",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
+            SettingsSection::Usage => "Usage",
         }
     }
 }
@@ -2110,6 +2117,7 @@ pub struct Shell {
         std::rc::Rc<std::cell::RefCell<crate::pull_request_detail::PullRequestCache>>,
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
+    usage_page: Option<Entity<UsagePage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -2664,6 +2672,7 @@ impl Shell {
             pull_request_cache: Default::default(),
             devices_page: None,
             archived_page: None,
+            usage_page: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
@@ -5418,6 +5427,10 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
+        // Each visit reads the active machine's latest usage.
+        if section == SettingsSection::Usage {
+            self.usage_page = None;
+        }
         if !matches!(self.route, Route::Settings(_)) {
             self.settings_focus_pending = true;
             self.settings_return_route = self.route;
@@ -5857,6 +5870,16 @@ impl Shell {
                     self.archived_page = Some(cx.new(|cx| ArchivedPage::new(state, cx)));
                 }
                 match &self.archived_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Usage => {
+                if self.usage_page.is_none() {
+                    let state = self.state.clone();
+                    self.usage_page = Some(cx.new(|cx| UsagePage::new(state, cx)));
+                }
+                match &self.usage_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -8023,6 +8046,7 @@ impl Shell {
             SettingsSection::General => icons::SETTINGS,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::Usage => icons::CHART,
         };
         settings::widgets::scroll_faded(
             "settings-nav-scroll",
@@ -18769,6 +18793,7 @@ mod settings_modal_regressions {
             ("settings/files", SettingsSection::Files),
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/archived", SettingsSection::Archived),
+            ("settings/usage", SettingsSection::Usage),
         ] {
             assert_eq!(
                 settings_open_route(route, remembered),

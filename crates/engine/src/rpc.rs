@@ -654,6 +654,7 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
     harness_updates: Option<crate::harness_updates::HarnessUpdateCoordinator>,
+    usage: Option<crate::usage::UsageTracker>,
     local_import: Option<crate::local_import::LocalImporter>,
     engine_info: EngineInfo,
 }
@@ -702,6 +703,7 @@ impl EngineRpc {
             links: None,
             updater: None,
             harness_updates: None,
+            usage: None,
             local_import: None,
             engine_info,
         }
@@ -735,6 +737,12 @@ impl EngineRpc {
         coordinator: crate::harness_updates::HarnessUpdateCoordinator,
     ) -> Self {
         self.harness_updates = Some(coordinator);
+        self
+    }
+
+    /// Attach the usage tracker (`GetUsageReport`).
+    pub fn with_usage(mut self, usage: crate::usage::UsageTracker) -> Self {
+        self.usage = Some(usage);
         self
     }
 
@@ -1546,6 +1554,8 @@ fn forwardable(method: &str) -> bool {
             | methods::COMPLETE_AGENT_LOGIN
             | methods::POLL_AGENT_LOGIN
             | methods::CANCEL_AGENT_LOGIN
+            // Usage is read from the device's own Pi session files.
+            | methods::GET_USAGE_REPORT
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -3662,6 +3672,14 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::GET_USAGE_REPORT => {
+                let query: zeron_proto::usage::UsageQuery = parse_params(params)?;
+                let usage = self
+                    .usage
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("usage tracker unavailable".into()))?;
+                RpcReply::value(&usage.report(query).await)
+            }
             methods::LIST_AGENT_ACCOUNTS => {
                 let p: ListAgentAccountsParams = parse_params(params)?;
                 let snapshot = self
@@ -4352,6 +4370,7 @@ mod tests {
         assert!(forwardable(methods::EXTENSION_UI_ACTION));
         assert!(!is_stream_method(methods::EXTENSION_UI_ACTION));
         assert!(forwardable(methods::CHECK_HARNESS_UPDATES));
+        assert!(forwardable(methods::GET_USAGE_REPORT));
         assert!(forwardable(methods::APPLY_HARNESS_UPDATE));
         assert!(forwardable(methods::LIST_CHANGE_REQUEST_PAGE));
         assert!(!is_stream_method(methods::LIST_CHANGE_REQUEST_PAGE));

@@ -44,6 +44,7 @@ pub mod terminals;
 pub mod titles;
 mod transcript_history;
 pub mod uploads;
+pub mod usage;
 pub mod voice;
 pub mod workspace_files;
 pub mod workspace_host;
@@ -148,6 +149,8 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
+    /// Tokens and spend per Pi provider and model, from Pi's session files.
+    pub usage: usage::UsageTracker,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
@@ -315,6 +318,7 @@ impl EngineCore {
         let harness_updates =
             harness_updates::HarnessUpdateCoordinator::new(data_dir, registry.clone());
         harness_updates.start();
+        let usage = usage::UsageTracker::new(data_dir);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -343,6 +347,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             harness_updates,
+            usage,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -477,7 +482,8 @@ impl EngineCore {
         )
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
-        .with_harness_updates(self.harness_updates.clone());
+        .with_harness_updates(self.harness_updates.clone())
+        .with_usage(self.usage.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }

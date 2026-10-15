@@ -81,6 +81,9 @@ icon_assets![
     (QUEUE_PAPERCLIP, "queue-paperclip"),
     (CLOCK_CIRCLE, "clock-circle"),
     (CALENDAR, "calendar"),
+    // Hand-drawn bar chart in a rounded frame, Solar Linear weight: Settings →
+    // Usage.
+    (CHART, "chart"),
     (LIST, "list"),
     (FOLDER_WITH_FILES, "folder-with-files"),
     // Original tree glyph with compact nodes for the independent Files panel.
@@ -374,6 +377,7 @@ mod tests {
             GIT_BRANCH,
             CLOSE_CIRCLE,
             FOLDER_TREE,
+            CHART,
         ] {
             let bytes = Assets.load(path).unwrap().unwrap();
             let image = renderer.render_single_frame(&bytes, 1.0).unwrap();

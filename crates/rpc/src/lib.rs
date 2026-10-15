@@ -236,6 +236,9 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    /// Tokens and spend per Pi provider and model on the target device
+    /// (`UsageQuery` -> `UsageReport`).
+    pub const GET_USAGE_REPORT: &str = "GetUsageReport";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
