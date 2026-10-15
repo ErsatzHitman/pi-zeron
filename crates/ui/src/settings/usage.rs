@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn the_chart_has_a_line_per_top_provider_and_every_day_of_the_window() {
-        let now = 1_790_884_800_000; // 2026-10-01 20:00 UTC
+        let now: i64 = 1_790_884_800_000; // 2026-10-01 20:00 UTC
         let day = |n: i64| now.div_euclid(DAY_MS) * DAY_MS - n * DAY_MS;
         let mut models = vec![];
         let mut series = vec![];
@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn a_long_history_merges_days_to_stay_readable() {
-        let now = 1_790_884_800_000;
+        let now: i64 = 1_790_884_800_000;
         let report = UsageReport {
             models: vec![row("p", "m", 10, 1.0, 0.0)],
             series: vec![UsagePoint {
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn periods_start_at_whole_hours_and_local_days() {
-        let now = 1_790_884_800_000 + 1_234; // 2026-10-01 20:00:01.234 UTC
+        let now: i64 = 1_790_884_800_000 + 1_234; // 2026-10-01 20:00:01.234 UTC
         assert_eq!(
             Period::Day.since_ms(now, 0),
             Some(1_790_884_800_000 - 23 * HOUR_MS)
