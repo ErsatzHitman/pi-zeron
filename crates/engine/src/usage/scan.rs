@@ -267,8 +267,9 @@ fn record(entry: Entry) -> Option<(String, String, Record)> {
         count(&usage, "reasoning"),
     ];
     let recorded = cost(&usage);
-    // An aborted request spent nothing.
-    if tokens.iter().all(|n| *n == 0) && recorded == 0.0 {
+    // An aborted request spent nothing. Reasoning is part of output, so it
+    // alone is no spend.
+    if tokens[..4].iter().all(|n| *n == 0) && recorded == 0.0 {
         return None;
     }
     // A fork copies entries verbatim into a new file: the same entry hashes
