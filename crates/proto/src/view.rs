@@ -478,6 +478,7 @@ mod gate_tests {
                     doc_id: format!("sub-{ix}"),
                     title: format!("Agent {ix}"),
                     started_at: updated_at,
+                    fleet_row: None,
                 })
                 .collect(),
         }

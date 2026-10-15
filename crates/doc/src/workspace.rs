@@ -1011,11 +1011,20 @@ mod tests {
         // The running-subagent count rides the row and survives the round trip.
         let mut busy = session("chat-1", "dev-a", SessionStatus::Working);
         busy.running_subagents = 4;
-        busy.subagents = vec![zeron_proto::RunningSubagent {
-            doc_id: "chat-1--sub--t1".into(),
-            title: "audit the auth flow".into(),
-            started_at: ts(4_000),
-        }];
+        busy.subagents = vec![
+            zeron_proto::RunningSubagent {
+                doc_id: "chat-1--sub--t1".into(),
+                title: "audit the auth flow".into(),
+                started_at: ts(4_000),
+                fleet_row: None,
+            },
+            zeron_proto::RunningSubagent {
+                doc_id: String::new(),
+                title: "scan the repo".into(),
+                started_at: ts(5_000),
+                fleet_row: Some("j1".into()),
+            },
+        ];
         ws.upsert_session(&busy).unwrap();
         assert_eq!(ws.read_sessions().unwrap(), vec![busy]);
         ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))

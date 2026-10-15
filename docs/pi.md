@@ -170,7 +170,7 @@ live state; it never enters the synced chat document.
 | `status`, `setStatus`, footer channel, plan mode (Plan only; Build is the resting state and shows nothing) | chips in the composer footer (a `setStatus` line repeating an element chip shows once) |
 | `zeron:compact` (Zeron's own channel, not an extension's: the harness publishes whether auto-compaction is on, where Pi compacts and a running compaction) | the session panel's Compaction section, near the limit and while compacting |
 | goal channel (`pi-goal:status`) | the session panel's Goal section: status, objective and progress line. The goal's own status line is not repeated as a chip |
-| subagent fleet (`subagents:fleet`) | also listed in the session panel's Sub-agents section, with a live timer per running job; a row runs View, and its Stop sends Kill after a second click |
+| subagent fleet (`subagents:fleet`) | also listed in the session panel's Sub-agents section, with a live timer per running job; a row runs View, and its Stop sends Kill after a second click. The engine also mirrors the running jobs onto the chat's session row (from the roster, or from its `piui:subagents:fleet` text mirror while no UI watches the chat), so the sidebar nests them under a session that is not open |
 | background bash (`bash:jobs`, `bash-bg:fleet`) | also listed in the session panel's Background section, with a live timer per running command; its Stop sends Kill after a second click |
 | `notify` (plain) | during a turn, a `pi · notice` row in the transcript; between turns, a toast. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
 | `setTitle` | renames the chat |

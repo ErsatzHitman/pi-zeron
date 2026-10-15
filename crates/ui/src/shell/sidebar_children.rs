@@ -114,13 +114,23 @@ pub(super) fn rollup(kids: &[ChildEntry], agents: &[AgentRow], counted: u32) -> 
 }
 
 /// A session row's synced subagents as sidebar rows: working, timed from
-/// their start, opening their transcript.
+/// their start. A harness subagent opens its transcript; a Pi fleet job
+/// opens its session, whose roster then offers View.
 pub(super) fn synced_agent_rows(list: &[zeron_proto::RunningSubagent]) -> Vec<AgentRow> {
     list.iter()
         .map(|sub| AgentRow {
-            kind: AgentKind::Subagent {
-                doc_id: sub.doc_id.clone(),
-                frozen: false,
+            kind: match &sub.fleet_row {
+                Some(row) => AgentKind::Fleet {
+                    // The roster element's key (`ns:id`).
+                    element: zeron_proto::extension_ui::FLEET_CHANNEL.into(),
+                    row: row.clone(),
+                    view: None,
+                    stop: None,
+                },
+                None => AgentKind::Subagent {
+                    doc_id: sub.doc_id.clone(),
+                    frozen: false,
+                },
             },
             title: sub.title.clone().into(),
             status: ChatIndicator::Working,
@@ -706,10 +716,11 @@ impl Shell {
             )
             .into_any_element()
         };
+        // Any row of a session that is not open opens it.
         let clickable = matches!(
             &agent.kind,
             AgentKind::Fleet { view: Some(_), .. } | AgentKind::Subagent { .. }
-        );
+        ) || self.state.read(cx).selected_chat.as_deref() != Some(parent);
         let hover = theme.glass_hover();
         let row = div()
             .id(SharedString::from(id.clone()))
@@ -949,12 +960,33 @@ mod tests {
     #[test]
     fn synced_sub_agents_become_working_rows_that_open_their_transcript() {
         let at = DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::minutes(3);
-        let rows = synced_agent_rows(&[zeron_proto::RunningSubagent {
-            doc_id: "chat--sub--t1".into(),
-            title: "audit the auth flow".into(),
-            started_at: at,
-        }]);
-        assert_eq!(rows.len(), 1);
+        let rows = synced_agent_rows(&[
+            zeron_proto::RunningSubagent {
+                doc_id: "chat--sub--t1".into(),
+                title: "audit the auth flow".into(),
+                started_at: at,
+                fleet_row: None,
+            },
+            zeron_proto::RunningSubagent {
+                doc_id: String::new(),
+                title: "scan the repo".into(),
+                started_at: at,
+                fleet_row: Some("j1".into()),
+            },
+        ]);
+        assert_eq!(rows.len(), 2);
+        // A Pi fleet job: its roster row, with no View until the session
+        // is open and its roster watched.
+        assert_eq!(
+            rows[1].kind,
+            AgentKind::Fleet {
+                element: zeron_proto::extension_ui::FLEET_CHANNEL.into(),
+                row: "j1".into(),
+                view: None,
+                stop: None,
+            }
+        );
+        assert_eq!(rows[1].started, Some(at));
         assert_eq!(rows[0].status, ChatIndicator::Working);
         assert_eq!(rows[0].started, Some(at));
         assert_eq!(rows[0].title.as_ref(), "audit the auth flow");

@@ -62,6 +62,17 @@ fn subagent(doc_id: &str, title: &str) -> zeron_proto::RunningSubagent {
         doc_id: doc_id.into(),
         title: title.into(),
         started_at: Utc::now() - chrono::Duration::seconds(30),
+        fleet_row: None,
+    }
+}
+
+/// A Pi fleet job, as the engine mirrors an unwatched roster.
+fn fleet_job(row: &str, title: &str) -> zeron_proto::RunningSubagent {
+    zeron_proto::RunningSubagent {
+        doc_id: String::new(),
+        title: title.into(),
+        started_at: Utc::now() - chrono::Duration::seconds(30),
+        fleet_row: Some(row.into()),
     }
 }
 
@@ -142,6 +153,46 @@ fn a_session_that_is_not_open_lists_its_subagents_under_it(cx: &mut TestAppConte
     assert!(cx.debug_bounds("sidebar-agents-busy").is_none());
     // The open session has none.
     assert!(cx.debug_bounds("sidebar-agents-open").is_none());
+}
+
+#[gpui::test]
+fn a_session_that_is_not_open_lists_its_pi_fleet_and_a_click_opens_it(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = sidebar(
+        cx,
+        vec![working(
+            "busy",
+            2,
+            vec![
+                fleet_job("j1", "reviewer"),
+                subagent("busy--sub--t1", "audit the auth flow"),
+            ],
+        )],
+    );
+    let parent = cx.debug_bounds("chat-busy").expect("the session row");
+    let fleet = cx
+        .debug_bounds("sidebar-agent-fleet-j1")
+        .expect("the fleet job's row");
+    let harness = cx
+        .debug_bounds("sidebar-agent-subagent-busy--sub--t1")
+        .expect("the harness subagent's row");
+    assert!(fleet.origin.x > parent.origin.x);
+    assert!(fleet.origin.y >= parent.origin.y + parent.size.height);
+    assert!(harness.origin.y > fleet.origin.y);
+    assert!(cx.debug_bounds("sidebar-agents-busy").is_none());
+    cx.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: fleet.center(),
+        click_count: 1,
+        ..Default::default()
+    });
+    cx.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: fleet.center(),
+        click_count: 1,
+        ..Default::default()
+    });
+    let selected = shell.read_with(cx, |shell, cx| shell.state.read(cx).selected_chat.clone());
+    assert_eq!(selected.as_deref(), Some("busy"));
 }
 
 #[gpui::test]

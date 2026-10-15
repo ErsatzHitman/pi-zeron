@@ -11,7 +11,7 @@
 //! client (an older desktop, the phone) answers through the transcript.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -37,6 +37,8 @@ struct ChatUi {
     state: watch::Sender<ExtensionUiState>,
     watchers: AtomicUsize,
     watched: watch::Sender<bool>,
+    /// The engine follows this chat's state (see [`ExtensionUiHub::follow`]).
+    followed: AtomicBool,
     /// The live run's action inbox; replaced by each new run.
     actions: Mutex<Option<mpsc::UnboundedSender<ExtensionUiAction>>>,
 }
@@ -47,6 +49,7 @@ impl ChatUi {
             state: watch::channel(ExtensionUiState::default()).0,
             watchers: AtomicUsize::new(0),
             watched: watch::channel(false).0,
+            followed: AtomicBool::new(false),
             actions: Mutex::new(None),
         }
     }
@@ -114,6 +117,19 @@ impl ExtensionUiHub {
         (receiver, WatcherGuard { chat })
     }
 
+    /// Follow `chat_id`'s state without watching it: the harness keeps its
+    /// plain fallbacks. `None` once something already follows it. The
+    /// receiver yields the current state first.
+    pub fn follow(&self, chat_id: &str) -> Option<watch::Receiver<ExtensionUiState>> {
+        let chat = self.chat(chat_id);
+        if chat.followed.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let mut receiver = chat.state.subscribe();
+        receiver.mark_changed();
+        Some(receiver)
+    }
+
     #[cfg(test)]
     pub fn state(&self, chat_id: &str) -> ExtensionUiState {
         self.chat(chat_id).state.borrow().clone()
@@ -178,5 +194,22 @@ mod tests {
         drop(port);
         assert!(hub.act("chat", action).is_err());
         assert!(hub.act("other", ExtensionUiAction::default()).is_err());
+    }
+
+    #[tokio::test]
+    async fn following_reads_the_state_without_watching_it() {
+        let hub = ExtensionUiHub::default();
+        let mut port = hub.port("chat");
+        let watched = port.watched.take().unwrap();
+        let mut followed = hub.follow("chat").expect("the first follower");
+        assert!(hub.follow("chat").is_none(), "one follower per chat");
+        assert!(followed.has_changed().unwrap(), "it starts with the state");
+        port.state.as_ref().unwrap().send_replace(ExtensionUiState {
+            revision: 2,
+            ..Default::default()
+        });
+        assert_eq!(followed.borrow_and_update().revision, 2);
+        // Pi keeps its plain fallbacks.
+        assert!(!*watched.borrow());
     }
 }

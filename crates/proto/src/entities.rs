@@ -331,14 +331,19 @@ pub struct Session {
     pub subagents: Vec<RunningSubagent>,
 }
 
-/// A subagent streaming under a chat, as its session row carries it.
+/// A subagent at work under a chat, as its session row carries it: a
+/// harness subagent streaming into its transcript doc, or a Pi fleet job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunningSubagent {
-    /// Its transcript doc (the spawn chip's ref).
+    /// Its transcript doc (the spawn chip's ref); empty for a fleet job.
+    #[serde(default)]
     pub doc_id: String,
     pub title: String,
     pub started_at: DateTime<Utc>,
+    /// A Pi fleet job's roster row; `None` for a harness subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_row: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

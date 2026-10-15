@@ -288,6 +288,44 @@ impl SessionsEngine {
         }
     }
 
+    /// Mirror `chat_id`'s Pi fleet onto its session row, so every client's
+    /// sidebar lists its jobs, the chat watched or not. One follower per
+    /// chat for the engine's life; it heartbeats the row while jobs run (a
+    /// fleet outlives the turn that launched it).
+    fn follow_fleet(&self, chat_id: &str) {
+        const BEAT: std::time::Duration = std::time::Duration::from_secs(10);
+        let Some(mut state) = self.inner.extension_ui.follow(chat_id) else {
+            return;
+        };
+        let inner = Arc::downgrade(&self.inner);
+        let chat_id = chat_id.to_owned();
+        tokio::spawn(async move {
+            let mut seen = HashMap::new();
+            loop {
+                let jobs = state.borrow_and_update().running_fleet();
+                let list = fleet_list(jobs, &mut seen, Utc::now());
+                let busy = !list.is_empty();
+                {
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    inner.set_running_fleet(&chat_id, list);
+                    if busy {
+                        inner.touch_session(&chat_id);
+                    }
+                }
+                tokio::select! {
+                    changed = state.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    () = tokio::time::sleep(BEAT), if busy => {}
+                }
+            }
+        });
+    }
+
     /// Watch a chat's live extension UI; see [`crate::extension_ui`].
     pub(crate) fn watch_extension_ui(
         &self,
@@ -831,6 +869,7 @@ impl SessionsEngine {
             turn: turn.clone(),
             extension_ui: self.inner.extension_ui.port(chat_id),
         };
+        self.follow_fleet(chat_id);
 
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
@@ -1505,17 +1544,33 @@ impl Inner {
         self.set_status_with_completion(chat_id, status, fresh_start, None);
     }
 
-    /// Publish which subagents of `chat_id` are streaming. A change is
-    /// mirrored like any status transition (it doubles as a heartbeat); an
-    /// unchanged list is a no-op, and a chat without a status row has
-    /// nothing to badge yet.
+    /// Publish which harness subagents of `chat_id` are streaming.
     fn set_running_subagents(&self, chat_id: &str, list: Vec<zeron_proto::RunningSubagent>) {
-        let running = u32::try_from(list.len()).unwrap_or(u32::MAX);
+        self.publish_subagents(chat_id, false, list);
+    }
+
+    /// Publish which Pi fleet jobs of `chat_id` are at work.
+    fn set_running_fleet(&self, chat_id: &str, list: Vec<zeron_proto::RunningSubagent>) {
+        self.publish_subagents(chat_id, true, list);
+    }
+
+    /// Replace one source's part (the fleet's, or the harness's) of the
+    /// subagents `chat_id`'s session row carries. A change is mirrored like
+    /// any status transition (it doubles as a heartbeat); an unchanged list
+    /// is a no-op, and a chat without a status row has nothing to badge yet.
+    fn publish_subagents(
+        &self,
+        chat_id: &str,
+        fleet: bool,
+        part: Vec<zeron_proto::RunningSubagent>,
+    ) {
         let session = {
             let mut statuses = lock(&self.statuses);
             let Some(entry) = statuses.get_mut(chat_id) else {
                 return;
             };
+            let list = merge_subagents(&entry.subagents, fleet, part);
+            let running = u32::try_from(list.len()).unwrap_or(u32::MAX);
             if entry.running_subagents == running && entry.subagents == list {
                 return;
             }
@@ -1977,6 +2032,53 @@ struct SubagentSink {
     dirty: bool,
 }
 
+/// `current` with one source's part replaced (the Pi fleet's jobs, or the
+/// harness's subagents), oldest first.
+fn merge_subagents(
+    current: &[zeron_proto::RunningSubagent],
+    fleet: bool,
+    part: Vec<zeron_proto::RunningSubagent>,
+) -> Vec<zeron_proto::RunningSubagent> {
+    let mut list: Vec<zeron_proto::RunningSubagent> = current
+        .iter()
+        .filter(|sub| sub.fleet_row.is_some() != fleet)
+        .cloned()
+        .chain(part)
+        .collect();
+    list.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+            .then_with(|| a.fleet_row.cmp(&b.fleet_row))
+    });
+    list
+}
+
+/// The fleet's jobs as the session row carries them, timed from the
+/// roster's channel, else from when `seen` first met them (by title: a
+/// job's row id changes as its chat goes between watched and not).
+fn fleet_list(
+    jobs: Vec<zeron_proto::extension_ui::FleetJob>,
+    seen: &mut HashMap<String, chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<zeron_proto::RunningSubagent> {
+    seen.retain(|title, _| jobs.iter().any(|job| job.label == *title));
+    jobs.into_iter()
+        .map(|job| {
+            let first = *seen.entry(job.label.clone()).or_insert(now);
+            zeron_proto::RunningSubagent {
+                doc_id: String::new(),
+                started_at: job
+                    .started_at_ms
+                    .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+                    .unwrap_or(first),
+                title: job.label,
+                fleet_row: Some(job.row),
+            }
+        })
+        .collect()
+}
+
 /// The streaming subagents, oldest first, as the session row carries them.
 fn running_list(
     subagents: &std::collections::HashMap<String, SubagentSink>,
@@ -1988,6 +2090,7 @@ fn running_list(
             title: sink.title.clone(),
             started_at: chrono::DateTime::<Utc>::from_timestamp_millis(sink.started_at)
                 .unwrap_or_else(Utc::now),
+            fleet_row: None,
         })
         .collect();
     list.sort_by(|a, b| {
@@ -3577,6 +3680,67 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sub(title: &str, at: i64, fleet_row: Option<&str>) -> zeron_proto::RunningSubagent {
+        zeron_proto::RunningSubagent {
+            doc_id: if fleet_row.is_some() {
+                String::new()
+            } else {
+                format!("chat--sub--{title}")
+            },
+            title: title.into(),
+            started_at: chrono::DateTime::<Utc>::from_timestamp_millis(at).unwrap(),
+            fleet_row: fleet_row.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn the_fleet_and_the_harness_each_replace_only_their_own_subagents() {
+        let harness = vec![sub("audit", 2_000, None)];
+        let list = merge_subagents(&[], false, harness.clone());
+        let list = merge_subagents(&list, true, vec![sub("scan", 1_000, Some("j1"))]);
+        assert_eq!(
+            list,
+            vec![sub("scan", 1_000, Some("j1")), sub("audit", 2_000, None)]
+        );
+        // The run ends: its subagents go, the fleet stays.
+        let list = merge_subagents(&list, false, Vec::new());
+        assert_eq!(list, vec![sub("scan", 1_000, Some("j1"))]);
+        // The fleet settles: nothing is left.
+        assert!(merge_subagents(&list, true, Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn fleet_jobs_without_a_start_keep_the_one_first_seen() {
+        use zeron_proto::extension_ui::FleetJob;
+        let job = |row: &str, label: &str, at: Option<i64>| FleetJob {
+            row: row.into(),
+            label: label.into(),
+            started_at_ms: at,
+        };
+        let t0 = chrono::DateTime::<Utc>::from_timestamp_millis(10_000).unwrap();
+        let t1 = t0 + chrono::Duration::seconds(30);
+        let mut seen = HashMap::new();
+        let list = fleet_list(
+            vec![job("scan", "scan", None), job("j2", "lint", Some(5_000))],
+            &mut seen,
+            t0,
+        );
+        assert_eq!(
+            list,
+            vec![
+                sub("scan", 10_000, Some("scan")),
+                sub("lint", 5_000, Some("j2"))
+            ]
+        );
+        // Watched now: the row id changes, the start does not.
+        let list = fleet_list(vec![job("j1", "scan", None)], &mut seen, t1);
+        assert_eq!(list, vec![sub("scan", 10_000, Some("j1"))]);
+        // Gone, then back: a new job, timed afresh.
+        fleet_list(Vec::new(), &mut seen, t1);
+        let list = fleet_list(vec![job("j1", "scan", None)], &mut seen, t1);
+        assert_eq!(list[0].started_at, t1);
+    }
 
     #[test]
     fn cursor_recovery_converts_rich_messages_before_json_encoding() {

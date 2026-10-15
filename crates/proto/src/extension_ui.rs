@@ -106,6 +106,98 @@ impl ExtensionUiState {
             .filter_map(|value| serde_json::from_value(value.clone()).ok())
             .collect()
     }
+
+    /// The Pi sub-agents at work (running or waiting), from the fleet
+    /// roster: its typed rows while a UI watches the chat, timed from the
+    /// [`FLEET_CHANNEL`]; otherwise the plain-text lines Pi mirrors the
+    /// roster to, which carry no start.
+    pub fn running_fleet(&self) -> Vec<FleetJob> {
+        let live = |state: Option<PiUiRowState>| {
+            matches!(state, Some(PiUiRowState::Running | PiUiRowState::Waiting))
+        };
+        if let Some(roster) = self
+            .typed_elements()
+            .into_iter()
+            .find(|element| element.ns == FLEET_NS && element.kind == PiUiKind::Roster)
+        {
+            let entries = self
+                .channels
+                .get(FLEET_CHANNEL)
+                .and_then(|fleet| fleet["entries"].as_array());
+            let started = |key: &str| {
+                entries?
+                    .iter()
+                    .find(|entry| entry["key"] == key)
+                    .and_then(|entry| entry["startedAt"].as_i64())
+            };
+            return roster
+                .rows
+                .into_iter()
+                .filter(|row| live(row.state))
+                .map(|row| FleetJob {
+                    started_at_ms: started(&row.id),
+                    row: row.id,
+                    label: row.label,
+                })
+                .collect();
+        }
+        if self.connected {
+            return Vec::new();
+        }
+        let Some(widget) = self.widgets.iter().find(|w| w.key == FLEET_TEXT_WIDGET) else {
+            return Vec::new();
+        };
+        let mut jobs: Vec<FleetJob> = Vec::new();
+        for line in &widget.lines {
+            let Some((state, label)) = fleet_text_row(line) else {
+                continue;
+            };
+            if !live(Some(state)) {
+                continue;
+            }
+            // The text has no row ids: the label is one, numbered on repeats.
+            let repeats = jobs.iter().filter(|job| job.label == label).count();
+            let row = match repeats {
+                0 => label.to_owned(),
+                n => format!("{label} #{}", n + 1),
+            };
+            jobs.push(FleetJob {
+                row,
+                label: label.to_owned(),
+                started_at_ms: None,
+            });
+        }
+        jobs
+    }
+}
+
+/// The Pi extension that publishes the sub-agent fleet roster.
+pub const FLEET_NS: &str = "subagents";
+/// The fleet's live channel: each job's `key`, `state` and `startedAt`.
+pub const FLEET_CHANNEL: &str = "subagents:fleet";
+/// The widget Pi mirrors the fleet roster to while no UI watches the chat.
+pub const FLEET_TEXT_WIDGET: &str = "piui:subagents:fleet";
+
+/// A Pi sub-agent at work, as [`ExtensionUiState::running_fleet`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetJob {
+    /// Its roster row id (in the text mirror, its label).
+    pub row: String,
+    pub label: String,
+    /// Unix milliseconds, when the fleet channel carries it.
+    pub started_at_ms: Option<i64>,
+}
+
+/// One mirrored roster line, `{indent}[{state}] {label} — {detail}`: its
+/// state and label. Other lines (the title) are not rows.
+fn fleet_text_row(line: &str) -> Option<(PiUiRowState, &str)> {
+    let (state, rest) = line.trim_start().strip_prefix('[')?.split_once("] ")?;
+    let state = serde_json::from_value(Value::String(state.to_owned())).ok()?;
+    let label = rest
+        .split_once(" \u{2014} ")
+        .map_or(rest, |(label, _)| label)
+        .trim();
+    (!label.is_empty()).then_some((state, label))
 }
 
 /// How many recent notices a state keeps for late or reconnecting UIs.
@@ -710,6 +802,82 @@ pub fn section_text(section: &PiUiSection) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_fleet_reads_from_the_watched_roster_with_its_start_times() {
+        let mut state = ExtensionUiState {
+            connected: true,
+            ..Default::default()
+        };
+        state.elements = vec![json!({
+            "id": "fleet", "ns": "subagents", "kind": "roster", "placement": "pinned",
+            "rows": [
+                {"id": "j1", "label": "audit", "state": "running"},
+                {"id": "j1/c1", "label": "grep", "state": "waiting", "depth": 1},
+                {"id": "j2", "label": "scan", "state": "done"}
+            ]
+        })];
+        state.channels.insert(
+            FLEET_CHANNEL.into(),
+            json!({"entries": [{"key": "j1", "startedAt": 1_000}]}),
+        );
+        assert_eq!(
+            state.running_fleet(),
+            vec![
+                FleetJob {
+                    row: "j1".into(),
+                    label: "audit".into(),
+                    started_at_ms: Some(1_000),
+                },
+                FleetJob {
+                    row: "j1/c1".into(),
+                    label: "grep".into(),
+                    started_at_ms: None,
+                },
+            ]
+        );
+        // Watched but no roster: nothing runs, whatever text lingers.
+        state.elements.clear();
+        state.widgets = vec![ExtensionWidget {
+            key: FLEET_TEXT_WIDGET.into(),
+            lines: vec!["[running] audit".into()],
+            placement: None,
+        }];
+        assert!(state.running_fleet().is_empty());
+    }
+
+    #[test]
+    fn the_fleet_reads_from_its_text_mirror_while_unwatched() {
+        let state = ExtensionUiState {
+            widgets: vec![ExtensionWidget {
+                key: FLEET_TEXT_WIDGET.into(),
+                lines: vec![
+                    "Sub-agents · 2 running".into(),
+                    "[running] audit (reviewer) \u{2014} opus · 12k tokens".into(),
+                    "  [waiting] grep".into(),
+                    "[done] scan \u{2014} 3k tokens".into(),
+                    "[running] audit (reviewer)".into(),
+                ],
+                placement: None,
+            }],
+            ..Default::default()
+        };
+        let jobs = state.running_fleet();
+        let rows: Vec<(&str, &str)> = jobs
+            .iter()
+            .map(|job| (job.row.as_str(), job.label.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("audit (reviewer)", "audit (reviewer)"),
+                ("grep", "grep"),
+                ("audit (reviewer) #2", "audit (reviewer)"),
+            ]
+        );
+        assert!(jobs.iter().all(|job| job.started_at_ms.is_none()));
+        assert!(ExtensionUiState::default().running_fleet().is_empty());
+    }
 
     #[test]
     fn only_a_sheet_blocks() {
