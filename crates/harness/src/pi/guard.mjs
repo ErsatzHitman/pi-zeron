@@ -531,9 +531,31 @@ const READ_ONLY_REASON = (h) =>
   `Do not retry, rephrase, or get the same effect through another tool, script, interpreter or subagent. ` +
   `Finish with what reading tells you, and say in your final answer what you would change and where.`;
 
+// ---- sub-agents: a Pi started by a Pi Zeron runs (a sub-agent) is not a
+// Zeron session; tell it whose it is. `ZERON_SUBAGENT_DEPTH` counts Pi levels
+// below the Zeron session; Zeron clears it on every run it starts.
+export function subagentNote(env, depth) {
+  if (!(depth >= 1)) return undefined;
+  let chat;
+  try { chat = JSON.parse(env.ZERON_PI_MCP ?? "{}")?.env?.ZERON_CHAT_ID; } catch { return undefined; }
+  if (!chat) return undefined;
+  const session = env.ZERON_CHAT_TITLE ? `"${env.ZERON_CHAT_TITLE}" (chat ${chat})` : `chat ${chat}`;
+  const tree = env.ZERON_ROOT_CHAT_ID
+    ? env.ZERON_ROOT_CHAT_ID === chat
+      ? ", the orchestrator of its tree"
+      : `, at level ${env.ZERON_TREE_DEPTH ?? "?"} of the tree of orchestrator chat ${env.ZERON_ROOT_CHAT_ID}`
+    : "";
+  return `Zeron: you are a sub-agent (level ${depth}) of the agent in the Zeron session ${session}${tree}. ` +
+    `Your task is the prompt that agent gave you: report your result to it, not to the user. ` +
+    `You are not a Zeron session yourself.`;
+}
+
 export default function deleteGuard(pi) {
   inheritIntoChildren();
   guardCompiledChildren();
+  const depth = Number(process.env.ZERON_SUBAGENT_DEPTH) || 0;
+  process.env.ZERON_SUBAGENT_DEPTH = String(depth + 1);    // for the Pis this one starts
+  const note = subagentNote(process.env, depth);
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
     const annotationsOf = () => {
       try { return pi.getAllTools().find((t) => t.name === event.toolName)?.annotations; } catch { return undefined; }
@@ -554,5 +576,6 @@ export default function deleteGuard(pi) {
     }
     if (h) return { block: true, reason: REASON(h) };
   });
+  if (note) pi.on("before_agent_start", (event) => ({ systemPrompt: [event.systemPrompt, note].join("\n\n") }));
   // The user's own `!cmd` (user_bash) is deliberately not hooked.
 }

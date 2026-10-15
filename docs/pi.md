@@ -95,6 +95,17 @@ preload. A read-only run without the guard extension fails to start rather
 than run writable. `crates/harness/tests/fixtures/pi-read-only-test.mjs` is
 the corpus, run on macOS and Windows CI.
 
+## Sub-agents
+
+A Pi that a Zeron run's Pi starts (a sub-agent of the user's subagent or
+delegate extensions) loads the same guard extension. The guard counts Pi
+levels below the Zeron session in `ZERON_SUBAGENT_DEPTH` (Zeron clears it on
+every run it starts) and appends a note to a sub-agent's system prompt: whose
+sub-agent it is (the session's title and id, and its orchestrator and level
+from the `ZERON_*` place env it inherits), that its task is the prompt it was
+given and its result goes to the agent that started it. The read-only corpus
+checks it.
+
 ## Updates
 
 Zeron for Pi updates itself from this fork's GitHub releases

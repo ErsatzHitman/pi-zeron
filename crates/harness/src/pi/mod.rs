@@ -208,6 +208,8 @@ impl PiHarness {
         } else {
             cmd.env_remove("ZERON_READ_ONLY");
         }
+        // This Pi is the session itself; the guard counts the sub-agents below it.
+        cmd.env_remove("ZERON_SUBAGENT_DEPTH");
         cmd.args(["--mode", "rpc", "--no-themes"])
             .args(args)
             .current_dir(cwd)

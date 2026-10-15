@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {pathToFileURL} from 'node:url';
 
 const guard = await import(pathToFileURL(process.argv[2]).href);
-const {classifyReadOnly, gitReadOnly, readOnlyOn, shellWrites} = guard;
+const {classifyReadOnly, gitReadOnly, readOnlyOn, shellWrites, subagentNote} = guard;
 
 const failures = [];
 const check = (label, got, expect) => {
@@ -70,6 +70,28 @@ process.env.ZERON_DELETE_GUARD = '1';
 assert.equal(hook({toolName: 'bash', input: {command: 'rm -rf /'}}, {})?.block, true);
 for (const key of ['ZERON_DELETE_GUARD', 'ZERON_READ_ONLY', 'ZERON_DELETE_GUARD_FILE']) {
   if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key];
+}
+
+// A Pi that a Zeron session's Pi starts is told whose sub-agent it is.
+const mcp = JSON.stringify({env: {ZERON_CHAT_ID: 'member-1'}});
+const member = {ZERON_PI_MCP: mcp, ZERON_CHAT_TITLE: 'Fix the parser', ZERON_ROOT_CHAT_ID: 'orchestrator-r', ZERON_TREE_DEPTH: '2'};
+assert.equal(subagentNote(member, 0), undefined, 'the session itself');
+assert.match(subagentNote(member, 1), /sub-agent \(level 1\) of the agent in the Zeron session "Fix the parser" \(chat member-1\), at level 2 of the tree of orchestrator chat orchestrator-r\./);
+assert.match(subagentNote({ZERON_PI_MCP: mcp}, 2), /\(level 2\) of the agent in the Zeron session chat member-1\. /);
+assert.equal(subagentNote({}, 1), undefined, 'not under Zeron');
+assert.equal(subagentNote({ZERON_PI_MCP: '{'}, 1), undefined);
+const priorSub = {depth: process.env.ZERON_SUBAGENT_DEPTH, mcp: process.env.ZERON_PI_MCP};
+process.env.ZERON_SUBAGENT_DEPTH = '1';
+process.env.ZERON_PI_MCP = mcp;
+const child = [];
+guard.default({on: (event, handler) => child.push([event, handler]), getAllTools: () => []});
+assert.equal(process.env.ZERON_SUBAGENT_DEPTH, '2', 'its own children are one level deeper');
+const start = child.find(([event]) => event === 'before_agent_start')?.[1];
+assert.ok(start, 'a sub-agent gets the note');
+assert.match(start({systemPrompt: 'BASE'}).systemPrompt, /^BASE\n\nZeron: you are a sub-agent \(level 1\)/);
+assert.ok(!handlers.some(([event]) => event === 'before_agent_start'), 'the session itself gets none');
+for (const [key, value] of [['ZERON_SUBAGENT_DEPTH', priorSub.depth], ['ZERON_PI_MCP', priorSub.mcp]]) {
+  if (value === undefined) delete process.env[key]; else process.env[key] = value;
 }
 
 if (failures.length) {

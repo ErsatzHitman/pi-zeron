@@ -246,8 +246,38 @@ fn catalog() -> Vec<ToolDef> {
             "required": ["script", "title"]
         }),
     });
+    tools.push(ToolDef {
+        name: BOARD_POST,
+        description: "Post to your orchestrator tree's message board: a finding (a fact about the code or task), a discovery (a command, tool or shortcut that works) or a blocker (something stopping you that others may hit or can fix). Only for a session in an orchestrator's tree. The post reaches the other sessions of your folder and the orchestrator by itself (a running session at its next step; an idle one reads it when it next starts), and the root's posts reach the whole tree. Post only what they need now; no progress reports.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["finding", "discovery", "blocker"] },
+                "text": { "type": "string", "maxLength": zeron_proto::board::BOARD_MAX_TEXT, "description": "The post, self-contained: name files, commands and errors exactly." }
+            },
+            "required": ["kind", "text"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: BOARD_READ,
+        description: "Read your orchestrator tree's message board: the posts your folder's sessions and the orchestrator made, oldest first (the orchestrator sees every folder). Call it when you start and after a resume or compaction. Pass since (the last id you saw) for only newer posts.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "since": { "type": "string", "description": "An entry id: only posts after it." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 30, "description": "The newest this many." }
+            }
+        }),
+    });
     tools
 }
+
+/// The message board of the CALLING chat's orchestrator tree, offered only
+/// to an agent Zeron launched (`ZERON_CHAT_ID` set).
+const BOARD_POST: &str = "board_post";
+const BOARD_READ: &str = "board_read";
+/// Tools that act for the calling chat.
+const IN_CHAT_ONLY: [&str; 3] = [SHOW_VISUAL, BOARD_POST, BOARD_READ];
 
 /// Shows a page in the CALLING chat, so it is offered only to an agent that
 /// Zeron launched (`ZERON_CHAT_ID` set).
@@ -552,6 +582,18 @@ struct SendArgs {
 }
 
 #[derive(Deserialize)]
+struct BoardPostArgs {
+    kind: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct BoardReadArgs {
+    since: Option<String>,
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
 struct WaitArgs {
     chat: String,
     timeout_secs: Option<u64>,
@@ -668,7 +710,7 @@ impl Tools {
         let in_chat = self.zeron.origin().chat_id.is_some();
         catalog()
             .into_iter()
-            .filter(|tool| in_chat || tool.name != SHOW_VISUAL)
+            .filter(|tool| in_chat || !IN_CHAT_ONLY.contains(&tool.name))
             .collect()
     }
 
@@ -697,6 +739,8 @@ impl Tools {
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
+            BOARD_POST => self.board_post(parse(args)?).await,
+            BOARD_READ => self.board_read(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
@@ -738,11 +782,16 @@ impl Tools {
         let origin = self.zeron.origin().clone();
         let local_device = self.zeron.local_device_id().await?;
         let engine = self.zeron.engine_info().await.unwrap_or(Value::Null);
+        let mut place = Value::Null;
         let chat = match origin.chat_id.as_deref() {
             Some(id) => match self.zeron.resolve_chat(id).await {
                 Ok(chat) => {
-                    let (spaces, sessions) =
-                        tokio::try_join!(self.zeron.spaces(), self.zeron.sessions())?;
+                    let (chats, spaces, sessions) = tokio::try_join!(
+                        self.zeron.chats(),
+                        self.zeron.spaces(),
+                        self.zeron.sessions()
+                    )?;
+                    place = describe_place(&chats, &chat.id);
                     summarize_chat(&chat, &spaces, &sessions)
                 }
                 Err(_) => json!({ "id": id }),
@@ -751,6 +800,7 @@ impl Tools {
         };
         Ok(json!({
             "chat": chat,
+            "place": place,
             "originDeviceId": origin.device_id,
             "localDeviceId": local_device,
             "workspaceScope": engine.get("workspaceScope").cloned().unwrap_or(Value::Null),
@@ -1285,6 +1335,94 @@ impl Tools {
         Ok(json!({ "chatId": chat.id, "title": chat.title, "archived": archived }))
     }
 
+    /// Store the post, then hand it to every other session that sees it:
+    /// a running one is steered at its next step, one waiting on a question
+    /// gets it after that turn, and an idle one is not woken (it reads the
+    /// board when it next starts), except an idle root for a blocker.
+    async fn board_post(&self, args: BoardPostArgs) -> anyhow::Result<Value> {
+        use zeron_proto::board::{self, BoardEntry, BoardKind};
+        let chat_id = self.zeron.origin().chat_id.clone().context(
+            "board_post only works from an agent Zeron launched in an orchestrator's tree",
+        )?;
+        let posted = self
+            .zeron
+            .call(
+                zeron_rpc::methods::POST_BOARD,
+                json!({ "chatId": chat_id, "kind": args.kind, "text": args.text }),
+            )
+            .await?;
+        let entry: BoardEntry = serde_json::from_value(posted["entry"].clone())?;
+        let (chats, spaces, sessions) = tokio::try_join!(
+            self.zeron.chats(),
+            self.zeron.spaces(),
+            self.zeron.sessions()
+        )?;
+        let (entry, notice) = (&entry, board::notice(&entry));
+        let deliveries = chats
+            .iter()
+            .filter(|chat| {
+                chat.id != entry.author_chat_id
+                    && !chat.archived
+                    && zeron_proto::orchestrator::root_of(&chats, &chat.id)
+                        .is_some_and(|root| root.id == entry.root_id)
+                    && board::visible_to(entry, chat)
+            })
+            .map(|chat| {
+                let (notice, spaces, sessions) = (notice.clone(), &spaces, &sessions);
+                async move {
+                    let session = session_for(sessions, chat);
+                    let mode = match session.as_ref().map(|s| s.status) {
+                        Some(SessionStatus::Working) => "steer",
+                        Some(SessionStatus::AwaitingInput) => "queue",
+                        _ if entry.kind == BoardKind::Blocker
+                            && zeron_proto::orchestrator::is_root_chat(&chat.id) =>
+                        {
+                            "run"
+                        }
+                        _ => {
+                            return json!({
+                                "chatId": chat.id, "title": chat.title,
+                                "delivery": "none: not running; it reads the board when it next starts",
+                            });
+                        }
+                    };
+                    let space = chat
+                        .space_id
+                        .as_deref()
+                        .and_then(|id| spaces.iter().find(|s| s.id == id));
+                    match self
+                        .deliver(chat, space, &[], session.as_ref(), notice, mode, None)
+                        .await
+                    {
+                        Ok(sent) => json!({
+                            "chatId": chat.id, "title": chat.title, "delivery": sent["delivery"],
+                        }),
+                        Err(error) => json!({
+                            "chatId": chat.id, "title": chat.title, "error": format!("{error:#}"),
+                        }),
+                    }
+                }
+            });
+        let recipients = futures::future::join_all(deliveries).await;
+        Ok(json!({ "entry": entry, "recipients": recipients }))
+    }
+
+    async fn board_read(&self, args: BoardReadArgs) -> anyhow::Result<Value> {
+        let chat_id = self.zeron.origin().chat_id.clone().context(
+            "board_read only works from an agent Zeron launched in an orchestrator's tree",
+        )?;
+        let mut params = json!({ "chatId": chat_id });
+        if let Some(since) = args.since.filter(|s| !s.trim().is_empty()) {
+            params["since"] = json!(since.trim());
+        }
+        if let Some(limit) = args.limit {
+            params["limit"] = json!(limit);
+        }
+        self.zeron
+            .call(zeron_rpc::methods::LIST_BOARD, params)
+            .await
+    }
+
     async fn show_visual(&self, args: ShowVisualArgs) -> anyhow::Result<Value> {
         let chat_id = self
             .zeron
@@ -1596,6 +1734,32 @@ fn ensure_room_below(chats: &[Chat], parent: &Chat) -> anyhow::Result<()> {
 
 /// The same folder, spelled with either separator, a trailing separator,
 /// or (Windows paths) another case.
+/// `whoami`'s `place`: the calling chat's role, task, parent and
+/// orchestrator, so a session (of any harness) knows where it is.
+fn describe_place(chats: &[Chat], chat_id: &str) -> Value {
+    use zeron_proto::orchestrator::{Place, Role};
+    let place = Place::of(chats, chat_id);
+    let title_of = |id: &str| {
+        chats
+            .iter()
+            .find(|c| c.id == id)
+            .and_then(|c| c.title.clone())
+    };
+    json!({
+        "role": match place.role {
+            Role::Chat if place.parent_id.is_some() => "side chat",
+            Role::Chat => "chat",
+            Role::Root => "orchestrator",
+            Role::Member { .. } => "session in an orchestrator's tree",
+        },
+        "level": place.depth(),
+        "task": &place.title,
+        "parent": place.parent_id.as_ref().map(|id| json!({ "id": id, "title": &place.parent_title })),
+        "orchestrator": place.root_id.as_ref().map(|id| json!({ "id": id, "title": title_of(id) })),
+        "brief": place.brief(),
+    })
+}
+
 /// The worktree a writing session in a git project's folder runs in: one of
 /// its own, started from `base` (the project's HEAD by default). None for a
 /// read-only session, a non-git project, or a session given another folder
@@ -1663,6 +1827,7 @@ mod tests {
         beta_parent: Option<String>,
         beta_remote: bool,
         extra_chats: Vec<Value>,
+        sessions: Vec<Value>,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
     }
@@ -1724,7 +1889,26 @@ mod tests {
                         .extend(self.extra_chats.clone());
                     stream(chats)
                 }
-                methods::WATCH_SESSIONS => stream(json!([])),
+                methods::WATCH_SESSIONS => stream(json!(self.sessions)),
+                methods::POST_BOARD => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({ "entry": {
+                        "id": "0000000000001-000000-dev-local", "rootId": "orchestrator-t",
+                        "folder": "space:space-1", "authorChatId": params["chatId"],
+                        "authorTitle": "Member A", "authorDepth": 1,
+                        "kind": params["kind"], "text": params["text"], "at": 1,
+                    }}))
+                }
+                methods::LIST_BOARD => {
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({ "entries": [], "total": 0, "olderSkipped": 0 }))
+                }
                 methods::LIST_HARNESSES if remote => RpcReply::Value(json!([
                     {"id":"codex", "name":"Remote Codex", "installed":true},
                     {"id":"cursor", "name":"Disabled Cursor", "installed":true, "enabled":false}
@@ -1843,6 +2027,193 @@ mod tests {
         assert_eq!(method, methods::PUBLISH_VISUAL);
         assert_eq!(params["chatId"], "chat-alpha-1");
         assert_eq!(params["script"], "return ui.text 'chart'");
+    }
+
+    /// An orchestrator tree whose sessions are in every state, a second tree,
+    /// and a session in another folder.
+    fn board_world() -> World {
+        let chat = |id: &str, parent: Option<&str>, space: &str, title: &str, archived: bool| {
+            json!({
+                "id": id, "deviceId": "dev-local", "title": title, "archived": archived,
+                "spaceId": if space.is_empty() { Value::Null } else { json!(space) },
+                "parentChatId": parent,
+                "config": { "harness": "claude-code", "model": null, "reasoning": null, "sandbox": "workspace-write" },
+                "createdAt": "2026-10-16T00:00:00Z"
+            })
+        };
+        let session = |id: &str, status: &str| {
+            json!({ "chatId": id, "deviceId": "dev-local", "status": status,
+                    "startedAt": null, "updatedAt": "2026-10-16T00:00:00Z" })
+        };
+        let root = Some("orchestrator-t");
+        World {
+            extra_chats: vec![
+                chat("orchestrator-t", None, "", "Orchestrator", false),
+                chat("m-a", root, "space-1", "Member A", false),
+                chat("m-work", root, "space-1", "Working", false),
+                chat("m-ask", root, "space-1", "Asking", false),
+                chat("m-idle", root, "space-1", "Idle", false),
+                chat("m-gone", root, "space-1", "Archived", true),
+                chat("m-elsewhere", root, "space-2", "Elsewhere", false),
+                chat("orchestrator-x", None, "", "Orchestrator", false),
+                chat(
+                    "x-1",
+                    Some("orchestrator-x"),
+                    "space-1",
+                    "Other tree",
+                    false,
+                ),
+            ],
+            sessions: vec![
+                session("m-work", "working"),
+                session("m-ask", "awaitingInput"),
+                session("m-idle", "idle"),
+                session("m-gone", "working"),
+                session("m-elsewhere", "working"),
+                session("x-1", "working"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_board_post_reaches_the_live_sessions_of_its_folder_only() {
+        let world = Arc::new(board_world());
+        let outside = tools(world.clone(), Origin::default());
+        assert!(!outside.has("board_post") && !outside.has("board_read"));
+        let member = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("m-a".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        assert!(member.has("board_post") && member.has("board_read"));
+        let posted = member
+            .call(
+                "board_post",
+                json!({ "kind": "finding", "text": "the parser is in src/parse.rs" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(posted["entry"]["text"], "the parser is in src/parse.rs");
+        let delivery = |id: &str| {
+            posted["recipients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["chatId"] == id)
+                .map(|r| r["delivery"].clone())
+        };
+        assert_eq!(delivery("m-work"), Some(json!("steer")));
+        assert_eq!(delivery("m-ask"), Some(json!("queue")));
+        assert!(
+            delivery("m-idle")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("none")
+        );
+        assert!(
+            delivery("orchestrator-t")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .starts_with("none"),
+            "an idle root is not woken for a finding"
+        );
+        for absent in ["m-a", "m-gone", "m-elsewhere", "orchestrator-x", "x-1"] {
+            assert_eq!(delivery(absent), None, "{absent}");
+        }
+        {
+            let writes = world.writes.lock().unwrap();
+            assert_eq!(writes[0].0, methods::POST_BOARD);
+            assert_eq!(writes[0].1["chatId"], "m-a");
+            assert_eq!(writes[0].1["kind"], "finding");
+            let steer = writes
+                .iter()
+                .find(|(method, params)| {
+                    method == methods::QUEUE_COMMAND && params["chatId"] == "m-work"
+                })
+                .expect("the working session is steered");
+            let prompt = steer.1["command"]["prompt"].as_str().unwrap();
+            assert!(
+                prompt.starts_with("[Board finding from Zeron chat Member A (m-a), level 1."),
+                "{prompt}"
+            );
+            assert!(prompt.ends_with("the parser is in src/parse.rs"));
+            assert!(
+                writes
+                    .iter()
+                    .any(|(method, params)| method == methods::QUEUE_MESSAGE
+                        && params["chatId"] == "m-ask")
+            );
+        }
+        // A blocker wakes an idle orchestrator.
+        let blocked = member
+            .call(
+                "board_post",
+                json!({ "kind": "blocker", "text": "CI is red on main" }),
+            )
+            .await
+            .unwrap();
+        let root = blocked["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["chatId"] == "orchestrator-t")
+            .unwrap()
+            .clone();
+        assert_eq!(root["delivery"], "run");
+
+        member
+            .call(
+                "board_read",
+                json!({ "since": "0000000000001-000000-dev-local", "limit": 5 }),
+            )
+            .await
+            .unwrap();
+        let reads = world.reads.lock().unwrap();
+        let (method, params) = reads.last().unwrap();
+        assert_eq!(method, methods::LIST_BOARD);
+        assert_eq!(params["chatId"], "m-a");
+        assert_eq!(params["since"], "0000000000001-000000-dev-local");
+        assert_eq!(params["limit"], 5);
+    }
+
+    #[tokio::test]
+    async fn whoami_names_the_role_task_parent_and_orchestrator() {
+        let world = Arc::new(board_world());
+        let member = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("m-a".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        let me = member.call("whoami", json!({})).await.unwrap();
+        assert_eq!(me["place"]["role"], "session in an orchestrator's tree");
+        assert_eq!(me["place"]["level"], 1);
+        assert_eq!(me["place"]["task"], "Member A");
+        assert_eq!(me["place"]["parent"]["id"], "orchestrator-t");
+        assert_eq!(me["place"]["orchestrator"]["title"], "Orchestrator");
+        assert!(
+            me["place"]["brief"]
+                .as_str()
+                .unwrap()
+                .contains("the orchestrator itself")
+        );
+        let root = tools(
+            world,
+            Origin {
+                chat_id: Some("orchestrator-t".into()),
+                device_id: None,
+            },
+        );
+        let me = root.call("whoami", json!({})).await.unwrap();
+        assert_eq!(me["place"]["role"], "orchestrator");
+        assert_eq!(me["place"]["level"], 0);
+        assert_eq!(me["place"]["orchestrator"]["id"], "orchestrator-t");
     }
 
     #[tokio::test]

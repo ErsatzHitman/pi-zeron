@@ -9143,6 +9143,10 @@ impl Transcript {
 /// Keep routing instructions in the stored prompt for agents, but show a
 /// concise attribution in the human transcript (including existing messages).
 fn agent_message_display(text: &str) -> String {
+    // A post from the orchestrator tree's message board.
+    if let Some((kind, name, body)) = zeron_proto::board::read_notice(text) {
+        return format!("Message from {name}\n\nBoard {kind}: {body}");
+    }
     let Some(rest) = text.strip_prefix("[Message from Zeron chat ") else {
         return text.to_owned();
     };
@@ -10880,6 +10884,32 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_and_board_messages_show_who_sent_them() {
+        let board = zeron_proto::board::notice(&zeron_proto::board::BoardEntry {
+            id: "1".into(),
+            root_id: "orchestrator-r".into(),
+            folder: String::new(),
+            author_chat_id: "member-1".into(),
+            author_title: Some("Fix the parser".into()),
+            author_depth: 1,
+            kind: zeron_proto::board::BoardKind::Discovery,
+            text: "use cargo nextest".into(),
+            at: 1,
+        });
+        assert_eq!(
+            agent_message_display(&board),
+            "Message from Fix the parser\n\nBoard discovery: use cargo nextest"
+        );
+        assert_eq!(
+            agent_message_display(
+                "[Message from Zeron chat Beta (chat-bet). Reply to it with the Zeron `send_message` tool, chat chat-beta-2.]\n\nhi"
+            ),
+            "Message from Beta\n\nhi"
+        );
+        assert_eq!(agent_message_display("[Board] plain"), "[Board] plain");
+    }
 
     #[test]
     fn jump_button_stays_available_when_scrolling_down_until_near_bottom() {

@@ -43,6 +43,9 @@ pub const KIND_PREFERENCES: &str = "preferences";
 /// Readiness only; membership and order live on individual pins.
 pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
 pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
+/// One row per post on an orchestrator tree's message board.
+pub const KIND_BOARD: &str = "boardPosts";
+mod board;
 mod sidebar_pins;
 mod sidebar_sections;
 
@@ -1493,6 +1496,9 @@ impl RegistryDoc {
     pub fn delete_chat(&mut self, chat_id: &str) -> Result<bool, DocError> {
         let existed = self.row_exists(KIND_CHATS, chat_id);
         self.delete_row_ops(&[(KIND_CHATS, chat_id), (KIND_SESSIONS, chat_id)]);
+        if zeron_proto::orchestrator::is_root_chat(chat_id) {
+            self.delete_board(chat_id);
+        }
         Ok(existed)
     }
 

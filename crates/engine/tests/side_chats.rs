@@ -195,6 +195,9 @@ async fn fork_is_frozen_durable_idempotent_and_has_an_independent_provider_sessi
     assert_eq!(mcp.env["ZERON_IPC_PORT"], "27699");
     assert_eq!(mcp.env["ZERON_CHAT_ID"], "side");
     assert_eq!(mcp.env["ZERON_DEVICE_ID"], core.device_id);
+    // It knows the chat it branched from, outside any orchestrator's tree.
+    assert_eq!(mcp.env["ZERON_PARENT_CHAT_ID"], "main");
+    assert!(!mcp.env.contains_key("ZERON_ROLE"));
     assert!(request.prompt.contains("PINEAPPLE"));
     assert!(!request.prompt.contains("unfinished turn"));
     assert_eq!(source.doc().read_entries().unwrap().len(), 4);

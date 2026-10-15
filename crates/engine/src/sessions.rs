@@ -1716,9 +1716,12 @@ impl Inner {
         ]
         .into_iter()
         .collect();
-        let role = zeron_proto::orchestrator::Role::of(&self.lineage(chat_id), chat_id);
+        // Who the run is and who it answers to: role, task label, parent
+        // and orchestrator (see `Place`).
+        let place = zeron_proto::orchestrator::Place::of(&self.lineage(chat_id), chat_id);
         env.extend(
-            role.env()
+            place
+                .env()
                 .into_iter()
                 .map(|(key, value)| (key.to_owned(), value)),
         );

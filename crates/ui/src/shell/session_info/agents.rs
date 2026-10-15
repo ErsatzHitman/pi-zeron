@@ -156,21 +156,39 @@ pub(super) fn background_since(rows: &[AgentRow]) -> Option<DateTime<Utc>> {
 
 pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> AgentList {
     let mut list = AgentList::default();
+    // In an orchestrator's tree, the way up names the orchestrator too, and
+    // where this session sits below it.
+    let root = zeron_proto::orchestrator::root_of(&state.chats, &chat.id)
+        .filter(|root| root.id != chat.id);
+    let level = zeron_proto::orchestrator::depth(&state.chats, &chat.id).unwrap_or(0);
+    let way_up = |row: &Chat, label: String| AgentRow {
+        kind: AgentKind::Parent {
+            chat_id: row.id.clone(),
+        },
+        title: child_chat_title(row, "Untitled chat").into(),
+        status: state.display_status_for(row, now),
+        started: None,
+        trailing: Some(label.into()),
+        detail: None,
+    };
+    if let Some(root) = root.filter(|root| chat.parent_chat_id.as_deref() != Some(root.id.as_str()))
+    {
+        list.sessions.push(way_up(
+            root,
+            format!("Orchestrator · you are level {level}"),
+        ));
+    }
     if let Some(parent) = chat
         .parent_chat_id
         .as_deref()
         .and_then(|id| state.chats.iter().find(|c| c.id == id))
     {
-        list.sessions.push(AgentRow {
-            kind: AgentKind::Parent {
-                chat_id: parent.id.clone(),
-            },
-            title: child_chat_title(parent, "Untitled chat").into(),
-            status: state.display_status_for(parent, now),
-            started: None,
-            trailing: Some("Parent".into()),
-            detail: None,
-        });
+        let label = if root.is_some_and(|root| root.id == parent.id) {
+            format!("Orchestrator · you are level {level}")
+        } else {
+            "Parent".to_owned()
+        };
+        list.sessions.push(way_up(parent, label));
     }
     list.sessions.extend(child_chat_rows(state, &chat.id, now));
     if let Some(ui) = state.extension_ui.of(&chat.id) {
@@ -576,6 +594,38 @@ mod tests {
         assert_eq!(list.sessions[2].title.as_ref(), "Investigate caching");
         assert_eq!(list.running(), 0);
         assert!(list.active.is_empty() && list.previous.is_empty());
+    }
+
+    #[test]
+    fn a_tree_session_names_its_orchestrator_and_level() {
+        let mut state = AppState::new();
+        let root = zeron_proto::orchestrator::new_root_chat_id();
+        state.apply_chats(vec![
+            chat(&root, None, 90),
+            chat("member", Some(&root), 60),
+            chat("nested", Some("member"), 30),
+        ]);
+        let row = |id: &str| state.chats.iter().find(|c| c.id == id).unwrap().clone();
+        let nested = agent_list(&state, &row("nested"), Utc::now());
+        assert_eq!(
+            nested
+                .sessions
+                .iter()
+                .map(AgentRow::key)
+                .collect::<Vec<_>>(),
+            [format!("parent-{root}"), "parent-member".to_owned()]
+        );
+        assert_eq!(
+            nested.sessions[0].trailing.as_deref(),
+            Some("Orchestrator · you are level 2")
+        );
+        assert_eq!(nested.sessions[1].trailing.as_deref(), Some("Parent"));
+        let member = agent_list(&state, &row("member"), Utc::now());
+        assert_eq!(member.sessions.len(), 1, "its parent is the orchestrator");
+        assert_eq!(
+            member.sessions[0].trailing.as_deref(),
+            Some("Orchestrator · you are level 1")
+        );
     }
 
     #[test]

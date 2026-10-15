@@ -23,6 +23,16 @@ originating chat in the environment:
 | `ZERON_DEVICE_ID` | That chat's host device.                                      |
 | `ZERON_ROLE`      | `orchestrator` for a root, `member` inside a tree, else unset. |
 | `ZERON_TREE_DEPTH` | A member's level below its root.                             |
+| `ZERON_CHAT_TITLE` | The chat's title: its task's label (tree chats and side chats). |
+| `ZERON_PARENT_CHAT_ID`, `ZERON_PARENT_TITLE` | The chat that started it.   |
+| `ZERON_ROOT_CHAT_ID` | Its orchestrator root (its own id, for a root).             |
+
+These come from `zeron_proto::orchestrator::Place`, computed by the host from
+the chat and its ancestors on every run. Pi gets them in its process env too
+(sub-agents inherit them), plus a prompt paragraph naming its task, parent and
+orchestrator; `whoami` returns them as `place` (role, level, task, parent,
+orchestrator, brief) for any harness. Titles are one line of at most 120
+characters.
 
 When `ZERON_CHAT_ID` is set, every `send_message` is prefixed with a
 `[Message from Zeron chat <title> (<id8>) …]` line so the receiving agent and the
@@ -151,6 +161,30 @@ name (default: the local engine's device).
 | `respond_to_input` | `QueueCommand` RespondInput                               |
 | `archive_chat`     | `Mutate setChatArchived`                                  |
 | `show_visual`      | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |
+| `board_post`       | `PostBoard {chatId, kind, text}`, then a `send_message`-style delivery to each other session that sees the post (origin chat only) |
+| `board_read`       | `ListBoard {chatId, since?, limit?}` (origin chat only)    |
+
+### Message board
+
+The sessions of one orchestrator tree share a board of findings, discoveries
+and blockers (`zeron_proto::board`). A post's board is the author's folder
+(`folder_of`: its project, so writers in their own worktrees still share one;
+else its working folder). The root reads every folder's posts, and its own
+posts reach the whole tree. A different tree never sees them: the engine
+derives the tree from the calling chat (`root_of`), never from the caller.
+
+`PostBoard` stores the post as a registry row (kind `boardPosts`, id an HLC,
+so posts sort in order and sync to other devices; at most 200 per tree, the
+oldest dropped; text 1 to 2000 characters; deleted with the root).
+`board_post` then hands it on as `[Board <kind> from Zeron chat <title> (<id8>),
+level N. ...]` followed by the text: a working session is steered at its next
+step, one awaiting input gets it queued after that turn, an idle one is not
+woken (it calls `board_read` when it next starts, as its prompt says), and an
+idle root is woken only for a blocker. The result lists each recipient's
+delivery. `ListBoard` returns the posts the caller sees, oldest first: the
+newest `limit` (default 30, at most 100) after `since`, with `total` and
+`olderSkipped`. The transcript shows a post as "Message from <title>" and
+"Board <kind>: ...".
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

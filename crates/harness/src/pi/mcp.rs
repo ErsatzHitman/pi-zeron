@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use zeron_proto::orchestrator::{self, Role};
+use zeron_proto::orchestrator::{self, Place, Role};
 
 use crate::{HarnessError, process::Command, scratch::ScratchDir};
 
@@ -15,34 +15,34 @@ pub(super) fn configure(
     config: &zeron_proto::McpServer,
 ) -> Result<ScratchDir, HarnessError> {
     let scratch = ScratchDir::new("pi-mcp")?;
-    let role = Role::from_env(&config.env);
-    for arg in role_args(role, scratch.path())? {
+    let place = Place::from_env(&config.env);
+    for arg in role_args(&place, scratch.path())? {
         cmd.arg(arg);
     }
     cmd.env(
         "ZERON_PI_MCP",
         serde_json::to_string(config).expect("serializable MCP config"),
     );
-    // Extensions read the role too; a plain chat never inherits one.
-    if role == Role::Chat {
-        cmd.env_remove(orchestrator::ENV_ROLE)
-            .env_remove(orchestrator::ENV_TREE_DEPTH);
+    // Extensions and sub-agents read the place too; a run never inherits a
+    // stale one.
+    for key in orchestrator::PLACE_ENV {
+        cmd.env_remove(key);
     }
-    for (key, value) in role.env() {
+    for (key, value) in place.env() {
         cmd.env(key, value);
     }
     Ok(scratch)
 }
 
-/// Pi's arguments for a run in `role`, writing the files they name into
+/// Pi's arguments for a run at `place`, writing the files they name into
 /// `scratch`, which lives as long as the process.
 ///
 /// Every run loads the Zeron tools and learns the visuals Zeron draws
 /// (charts, diagrams, tables). A root swaps Pi's coding prompt for the
 /// orchestrator's and keeps only its own tools: no bash, edits, MCP servers,
 /// skills, prompt templates or context files. A member learns its place in
-/// the tree.
-fn role_args(role: Role, scratch: &Path) -> Result<Vec<OsString>, HarnessError> {
+/// the tree, and a side chat its parent.
+fn role_args(place: &Place, scratch: &Path) -> Result<Vec<OsString>, HarnessError> {
     let extension = scratch.join("zeron-mcp.mjs");
     std::fs::write(&extension, include_str!("mcp.mjs"))?;
     let visuals = scratch.join("zeron-visuals.md");
@@ -53,8 +53,14 @@ fn role_args(role: Role, scratch: &Path) -> Result<Vec<OsString>, HarnessError> 
         "--append-system-prompt".into(),
         visuals.into(),
     ];
-    match role {
-        Role::Chat => {}
+    match place.role {
+        Role::Chat => {
+            if let Some(brief) = place.brief() {
+                let prompt = scratch.join("zeron-place.md");
+                std::fs::write(&prompt, brief)?;
+                args.extend(["--append-system-prompt".into(), prompt.into()]);
+            }
+        }
         Role::Root => {
             let prompt = scratch.join("zeron-orchestrator.md");
             std::fs::write(&prompt, orchestrator::ROOT_SYSTEM_PROMPT)?;
@@ -71,9 +77,9 @@ fn role_args(role: Role, scratch: &Path) -> Result<Vec<OsString>, HarnessError> 
                 .map(OsString::from),
             );
         }
-        Role::Member { depth } => {
+        Role::Member { .. } => {
             let prompt = scratch.join("zeron-member.md");
-            std::fs::write(&prompt, orchestrator::member_prompt(depth))?;
+            std::fs::write(&prompt, orchestrator::member_prompt(place))?;
             args.extend(["--append-system-prompt".into(), prompt.into()]);
         }
     }
@@ -84,9 +90,25 @@ fn role_args(role: Role, scratch: &Path) -> Result<Vec<OsString>, HarnessError> 
 mod tests {
     use super::*;
 
+    fn at(role: Role, parent: Option<&str>) -> Place {
+        Place {
+            role,
+            chat_id: "chat-1".into(),
+            title: Some("Fix the parser".into()),
+            parent_id: parent.map(str::to_owned),
+            parent_title: Some("Plan".into()),
+            root_id: (role != Role::Chat).then(|| "orchestrator-r".to_owned()),
+        }
+    }
+
     fn args(role: Role) -> (crate::scratch::ScratchDir, Vec<String>) {
+        let parent = (role != Role::Root).then_some("parent-1");
+        args_at(&at(role, parent.filter(|_| role != Role::Chat)))
+    }
+
+    fn args_at(place: &Place) -> (crate::scratch::ScratchDir, Vec<String>) {
         let scratch = ScratchDir::new("pi-mcp-test").unwrap();
-        let args = role_args(role, scratch.path())
+        let args = role_args(place, scratch.path())
             .unwrap()
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -151,19 +173,36 @@ mod tests {
             .iter()
             .find(|arg| arg.ends_with("zeron-member.md"))
             .expect("the member prompt");
-        assert!(
-            std::fs::read_to_string(member)
-                .unwrap()
-                .contains("You are 2 levels below the root")
-        );
+        let member = std::fs::read_to_string(member).unwrap();
+        assert!(member.contains("You are 2 levels below the root"));
+        assert!(member.contains(
+            "Your place: you are the session \"Fix the parser\" (chat chat-1), at level 2 of \
+             the tree of orchestrator chat orchestrator-r. Your parent, who started you, is the \
+             session \"Plan\" (chat parent-1)."
+        ));
+        assert!(member.contains("zeron_board_read"));
         assert!(!args.iter().any(|arg| arg == "--tools"));
+    }
+
+    #[test]
+    fn a_side_chat_learns_its_parent() {
+        let (_scratch, args) = args_at(&at(Role::Chat, Some("parent-1")));
+        let place = args
+            .iter()
+            .find(|arg| arg.ends_with("zeron-place.md"))
+            .expect("the side chat's place");
+        assert!(
+            std::fs::read_to_string(place)
+                .unwrap()
+                .contains("of \"Plan\" (chat parent-1), outside any orchestrator's tree")
+        );
     }
 
     #[test]
     fn the_prompts_name_only_zeron_tools_that_exist() {
         let prompts = [
             orchestrator::ROOT_SYSTEM_PROMPT.to_owned(),
-            orchestrator::member_prompt(1),
+            orchestrator::member_prompt(&at(Role::Member { depth: 1 }, Some("orchestrator-r"))),
         ];
         let known = [
             "whoami",
@@ -177,6 +216,8 @@ mod tests {
             "read_chat",
             "respond_to_input",
             "interrupt_chat",
+            "board_post",
+            "board_read",
         ];
         for prompt in prompts {
             for word in prompt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {

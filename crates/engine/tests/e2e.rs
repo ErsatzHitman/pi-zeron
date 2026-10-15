@@ -3509,3 +3509,133 @@ async fn publish_visual_lands_in_the_live_turn() {
     );
     core.shutdown().await;
 }
+
+async fn board_texts(client: &zeron_rpc::RpcClient, chat: &str) -> Vec<String> {
+    let read = client
+        .call(
+            zeron_rpc::methods::LIST_BOARD,
+            serde_json::json!({ "chatId": chat }),
+        )
+        .await
+        .expect("ListBoard");
+    read["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_orchestrator_tree_shares_a_board_per_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    for (id, parent, cwd) in [
+        ("orchestrator-a", None, "/scratch/a"),
+        ("a-1", Some("orchestrator-a"), "/repo"),
+        ("a-2", Some("orchestrator-a"), "/repo/"),
+        ("a-3", Some("orchestrator-a"), "/other"),
+        ("a-1-1", Some("a-1"), "/repo"),
+        ("orchestrator-b", None, "/scratch/b"),
+        ("b-1", Some("orchestrator-b"), "/repo"),
+        ("plain", None, "/repo"),
+    ] {
+        let mut op = serde_json::json!({
+            "op": "createChat", "chatId": id, "deviceId": core.device_id, "cwd": cwd,
+        });
+        if let Some(parent) = parent {
+            op["parentChatId"] = parent.into();
+        }
+        client
+            .call(zeron_rpc::methods::MUTATE, op)
+            .await
+            .expect("createChat");
+    }
+    core.workspace
+        .rename_chat("a-1-1", "Map the\nparser")
+        .expect("rename chat");
+    let post = |chat: &str, kind: &str, text: &str| {
+        client.call(
+            zeron_rpc::methods::POST_BOARD,
+            serde_json::json!({ "chatId": chat, "kind": kind, "text": text }),
+        )
+    };
+    let posted = post("a-1-1", "finding", "  the parser lives in src/parse.rs  ")
+        .await
+        .expect("PostBoard");
+    assert_eq!(posted["entry"]["text"], "the parser lives in src/parse.rs");
+    assert_eq!(posted["entry"]["authorDepth"], 2);
+    assert_eq!(posted["entry"]["authorTitle"], "Map the parser");
+    assert_eq!(posted["entry"]["rootId"], "orchestrator-a");
+    post("orchestrator-a", "discovery", "use cargo nextest")
+        .await
+        .expect("the root posts to the whole tree");
+    post("b-1", "blocker", "another tree's post")
+        .await
+        .expect("PostBoard");
+    assert!(
+        post("plain", "finding", "x").await.is_err(),
+        "outside a tree"
+    );
+    assert!(post("a-1", "rumor", "x").await.is_err(), "unknown kind");
+    assert!(post("a-1", "finding", "  ").await.is_err(), "empty");
+    assert!(
+        post("a-1", "finding", &"x".repeat(2001)).await.is_err(),
+        "too long"
+    );
+
+    let both = ["the parser lives in src/parse.rs", "use cargo nextest"];
+    assert_eq!(board_texts(&client, "a-2").await, both, "same folder");
+    assert_eq!(
+        board_texts(&client, "a-3").await,
+        ["use cargo nextest"],
+        "another folder sees only the root's posts"
+    );
+    assert_eq!(board_texts(&client, "orchestrator-a").await, both);
+    assert_eq!(
+        board_texts(&client, "b-1").await,
+        ["another tree's post"],
+        "trees are isolated"
+    );
+    let all = client
+        .call(
+            zeron_rpc::methods::LIST_BOARD,
+            serde_json::json!({ "chatId": "a-2" }),
+        )
+        .await
+        .unwrap();
+    let newer = client
+        .call(
+            zeron_rpc::methods::LIST_BOARD,
+            serde_json::json!({ "chatId": "a-2", "since": all["entries"][0]["id"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(newer["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(newer["total"], 2);
+    let last = client
+        .call(
+            zeron_rpc::methods::LIST_BOARD,
+            serde_json::json!({ "chatId": "a-2", "limit": 1 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(last["entries"][0]["text"], "use cargo nextest");
+    assert_eq!(last["olderSkipped"], 1);
+    assert!(
+        client
+            .call(
+                zeron_rpc::methods::LIST_BOARD,
+                serde_json::json!({ "chatId": "plain" }),
+            )
+            .await
+            .is_err()
+    );
+    core.shutdown().await;
+}

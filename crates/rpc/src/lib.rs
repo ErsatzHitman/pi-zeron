@@ -246,6 +246,12 @@ pub mod methods {
     /// Store an agent's HTML page and show it inline in that chat's live
     /// turn (`show_visual`). Local only: the calling agent runs on this device.
     pub const PUBLISH_VISUAL: &str = "PublishVisual";
+    /// Post to the calling chat's orchestrator tree message board
+    /// (`board_post`) -> `{ entry }`. Local only: the registry syncs it.
+    pub const POST_BOARD: &str = "PostBoard";
+    /// The board posts the calling chat sees (`board_read`) ->
+    /// `{ entries, total }`, oldest first. Local only.
+    pub const LIST_BOARD: &str = "ListBoard";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";

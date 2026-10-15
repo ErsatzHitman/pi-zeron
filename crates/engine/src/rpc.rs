@@ -538,6 +538,43 @@ struct PublishVisualParams {
     assets: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PostBoardParams {
+    chat_id: String,
+    kind: zeron_proto::board::BoardKind,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListBoardParams {
+    chat_id: String,
+    /// Only posts after this entry id.
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// The chat a board call speaks for, and its tree's root.
+fn board_member<'a>(
+    chats: &'a [zeron_proto::Chat],
+    chat_id: &str,
+) -> Result<(&'a zeron_proto::Chat, String), RpcError> {
+    let chat = chats
+        .iter()
+        .find(|c| c.id == chat_id)
+        .ok_or_else(|| RpcError::BadParams(format!("unknown chat {chat_id}")))?;
+    let root = zeron_proto::orchestrator::root_of(chats, chat_id).ok_or_else(|| {
+        RpcError::BadParams(
+            "The message board belongs to an orchestrator's tree, and this chat is not in one."
+                .into(),
+        )
+    })?;
+    Ok((chat, root.id.clone()))
+}
+
 fn no_turn_for_visual() -> RpcError {
     RpcError::Failed(
         "This chat has no running turn on this device; show_visual only works from inside a turn.".into(),
@@ -3851,6 +3888,69 @@ impl RpcService for EngineRpc {
                 .map_err(|e| RpcError::Failed(e.to_string()))?
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&chunk)
+            }
+            methods::POST_BOARD => {
+                use zeron_proto::board::{BOARD_MAX_TEXT, BoardEntry, folder_of};
+                let p: PostBoardParams = parse_params(params)?;
+                let text = p.text.trim();
+                if text.is_empty() || text.chars().count() > BOARD_MAX_TEXT {
+                    return Err(RpcError::BadParams(format!(
+                        "text must be 1 to {BOARD_MAX_TEXT} characters"
+                    )));
+                }
+                let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
+                let chats = self.workspace.read_chats().map_err(failed)?;
+                let (chat, root) = board_member(&chats, &p.chat_id)?;
+                let place = zeron_proto::orchestrator::Place::of(&chats, &chat.id);
+                let entry = BoardEntry {
+                    id: String::new(),
+                    // The root's posts reach its whole tree.
+                    folder: if chat.id == root {
+                        String::new()
+                    } else {
+                        folder_of(chat)
+                    },
+                    root_id: root,
+                    author_chat_id: chat.id.clone(),
+                    author_depth: place.depth().unwrap_or(0),
+                    author_title: place.title,
+                    kind: p.kind,
+                    text: text.to_owned(),
+                    at: 0,
+                };
+                let entry = self.workspace.post_board_entry(entry).map_err(failed)?;
+                RpcReply::value(&serde_json::json!({ "entry": entry }))
+            }
+            methods::LIST_BOARD => {
+                let p: ListBoardParams = parse_params(params)?;
+                let chats = self
+                    .workspace
+                    .read_chats()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let (chat, root) = board_member(&chats, &p.chat_id)?;
+                let visible: Vec<_> = self
+                    .workspace
+                    .board_entries(&root)
+                    .into_iter()
+                    .filter(|entry| zeron_proto::board::visible_to(entry, chat))
+                    .collect();
+                let total = visible.len();
+                let newer: Vec<_> = visible
+                    .into_iter()
+                    .filter(|entry| {
+                        p.since
+                            .as_deref()
+                            .is_none_or(|since| entry.id.as_str() > since)
+                    })
+                    .collect();
+                // The newest `limit`, oldest first.
+                let limit = p.limit.unwrap_or(30).clamp(1, 100);
+                let skipped = newer.len().saturating_sub(limit);
+                RpcReply::value(&serde_json::json!({
+                    "entries": &newer[skipped..],
+                    "total": total,
+                    "olderSkipped": skipped,
+                }))
             }
             methods::PUBLISH_VISUAL => {
                 let p: PublishVisualParams = parse_params(params)?;

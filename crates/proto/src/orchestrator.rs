@@ -17,6 +17,24 @@ pub const MAX_DEPTH: usize = 4;
 pub const ENV_ROLE: &str = "ZERON_ROLE";
 /// A member's level below its root.
 pub const ENV_TREE_DEPTH: &str = "ZERON_TREE_DEPTH";
+/// The run's own chat title: the label of its task.
+pub const ENV_CHAT_TITLE: &str = "ZERON_CHAT_TITLE";
+/// The chat that started this one, and its title.
+pub const ENV_PARENT_CHAT_ID: &str = "ZERON_PARENT_CHAT_ID";
+pub const ENV_PARENT_TITLE: &str = "ZERON_PARENT_TITLE";
+/// The orchestrator root of the run's tree (its own id, for a root).
+pub const ENV_ROOT_CHAT_ID: &str = "ZERON_ROOT_CHAT_ID";
+/// Every key [`Place::env`] may set, for clearing a stale inherited one.
+pub const PLACE_ENV: [&str; 6] = [
+    ENV_ROLE,
+    ENV_TREE_DEPTH,
+    ENV_CHAT_TITLE,
+    ENV_PARENT_CHAT_ID,
+    ENV_PARENT_TITLE,
+    ENV_ROOT_CHAT_ID,
+];
+/// Titles go into env and prompts as one short line.
+const MAX_LABEL_CHARS: usize = 120;
 
 /// The root agent's whole system prompt (Pi `--system-prompt`): it plans and
 /// delegates, and has no coding prompt to fall back on.
@@ -79,8 +97,146 @@ impl Role {
     }
 }
 
+/// Who a run is and who it answers to: its role, the label of its task (its
+/// chat title), the chat that started it and its orchestrator. A run gets
+/// it in its env ([`Place::env`]) and, for Pi, in its prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub role: Role,
+    pub chat_id: String,
+    pub title: Option<String>,
+    pub parent_id: Option<String>,
+    pub parent_title: Option<String>,
+    /// The orchestrator root; `None` outside a tree.
+    pub root_id: Option<String>,
+}
+
+impl Place {
+    /// The place of `chat_id`, given it and its ancestors (any order).
+    pub fn of(chats: &[Chat], chat_id: &str) -> Self {
+        let chat = chats.iter().find(|c| c.id == chat_id);
+        let parent_id = chat.and_then(|c| c.parent_chat_id.clone());
+        let parent_title = parent_id
+            .as_deref()
+            .and_then(|id| chats.iter().find(|c| c.id == id))
+            .and_then(|c| c.title.clone());
+        let role = Role::of(chats, chat_id);
+        let root_id = match role {
+            Role::Chat => None,
+            Role::Root => Some(chat_id.to_owned()),
+            Role::Member { .. } => root_of(chats, chat_id).map(|root| root.id.clone()),
+        };
+        Place {
+            role,
+            chat_id: chat_id.to_owned(),
+            title: chat.and_then(|c| c.title.clone()).and_then(label),
+            parent_id,
+            parent_title: parent_title.and_then(label),
+            root_id,
+        }
+    }
+
+    /// The process env that carries this place ([`Role::env`] plus ids and
+    /// titles). Empty for a plain top-level chat.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        let mut env = self.role.env();
+        if self.role == Role::Chat && self.parent_id.is_none() {
+            return env;
+        }
+        let optional = [
+            (ENV_CHAT_TITLE, &self.title),
+            (ENV_PARENT_CHAT_ID, &self.parent_id),
+            (ENV_PARENT_TITLE, &self.parent_title),
+            (ENV_ROOT_CHAT_ID, &self.root_id),
+        ];
+        env.extend(
+            optional
+                .into_iter()
+                .filter_map(|(key, value)| value.clone().map(|value| (key, value))),
+        );
+        env
+    }
+
+    /// The place an MCP server's env carries (see [`Role::from_env`]).
+    pub fn from_env(env: &std::collections::BTreeMap<String, String>) -> Self {
+        let get = |key: &str| env.get(key).cloned().and_then(label);
+        let role = Role::from_env(env);
+        let chat_id = env.get("ZERON_CHAT_ID").cloned().unwrap_or_default();
+        Place {
+            role,
+            root_id: get(ENV_ROOT_CHAT_ID)
+                .or_else(|| (role == Role::Root).then(|| chat_id.clone())),
+            chat_id,
+            title: get(ENV_CHAT_TITLE),
+            parent_id: get(ENV_PARENT_CHAT_ID),
+            parent_title: get(ENV_PARENT_TITLE),
+        }
+    }
+
+    /// The level below the root: 0 for the root, `None` outside a tree.
+    pub fn depth(&self) -> Option<usize> {
+        match self.role {
+            Role::Chat => None,
+            Role::Root => Some(0),
+            Role::Member { depth } => Some(depth),
+        }
+    }
+
+    /// One paragraph telling the run where it is, for its prompt. `None` for
+    /// a root (its own prompt says) and a plain top-level chat.
+    pub fn brief(&self) -> Option<String> {
+        let me = match &self.title {
+            Some(title) => format!("\"{title}\" (chat {})", self.chat_id),
+            None => format!("chat {}", self.chat_id),
+        };
+        let parent = self
+            .parent_id
+            .as_deref()
+            .map(|id| match &self.parent_title {
+                Some(title) => format!("\"{title}\" (chat {id})"),
+                None => format!("chat {id}"),
+            });
+        match self.role {
+            Role::Root => None,
+            Role::Chat => parent.map(|parent| {
+                format!(
+                    "You are a side chat ({me}) of {parent}, outside any orchestrator's tree. \
+                     Your task is your first message."
+                )
+            }),
+            Role::Member { depth } => {
+                let root = self.root_id.as_deref().unwrap_or("unknown");
+                let parent = match parent {
+                    Some(_) if depth == 1 => "the orchestrator itself".to_owned(),
+                    Some(parent) => format!("the session {parent}"),
+                    None => "unknown".to_owned(),
+                };
+                Some(format!(
+                    "Your place: you are the session {me}, at level {depth} of the tree of \
+                     orchestrator chat {root}. Your parent, who started you, is {parent}. Your \
+                     task is your first message; your title is its label."
+                ))
+            }
+        }
+    }
+}
+
+/// A title as one line of at most [`MAX_LABEL_CHARS`]; `None` when blank.
+fn label(text: String) -> Option<String> {
+    let line: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_LABEL_CHARS)
+        .collect();
+    (!line.is_empty()).then_some(line)
+}
+
 /// Appended to a member's system prompt.
-pub fn member_prompt(depth: usize) -> String {
+pub fn member_prompt(place: &Place) -> String {
+    let depth = place.depth().unwrap_or(1);
     let sessions = if depth >= MAX_DEPTH {
         "You cannot start sessions; do the work here."
     } else {
@@ -88,6 +244,7 @@ pub fn member_prompt(depth: usize) -> String {
          different folder, or when parallel work clearly pays."
     };
     MEMBER_PROMPT
+        .replace("{place}", &place.brief().unwrap_or_default())
         .replace("{sessions}", sessions)
         .replace("{depth}", &depth.to_string())
         .replace("{max}", &MAX_DEPTH.to_string())
@@ -143,8 +300,12 @@ mod tests {
     use super::*;
 
     fn chat(id: &str, parent: Option<&str>) -> Chat {
+        titled(id, parent, None)
+    }
+
+    fn titled(id: &str, parent: Option<&str>, title: Option<&str>) -> Chat {
         serde_json::from_value(serde_json::json!({
-            "id": id, "deviceId": "dev", "title": null, "archived": false,
+            "id": id, "deviceId": "dev", "title": title, "archived": false,
             "cwd": null, "branch": null, "checkoutId": null, "config": null,
             "lastMessagePreview": null, "lastMessageAt": null,
             "createdAt": "2026-10-14T00:00:00Z", "parentChatId": parent,
@@ -210,12 +371,96 @@ mod tests {
     }
 
     #[test]
+    fn every_run_knows_its_task_parent_and_orchestrator() {
+        let root = new_root_chat_id();
+        let chats = vec![
+            titled(&root, None, Some("Orchestrator")),
+            titled("child", Some(&root), Some("Fix the parser")),
+            titled("grandchild", Some("child"), Some("Write\nthe  tests")),
+            titled("plain", None, Some("Notes")),
+            titled("side", Some("plain"), None),
+        ];
+        let grandchild = Place::of(&chats, "grandchild");
+        assert_eq!(grandchild.role, Role::Member { depth: 2 });
+        assert_eq!(
+            grandchild.title.as_deref(),
+            Some("Write the tests"),
+            "one line"
+        );
+        assert_eq!(grandchild.parent_id.as_deref(), Some("child"));
+        assert_eq!(grandchild.parent_title.as_deref(), Some("Fix the parser"));
+        assert_eq!(grandchild.root_id.as_deref(), Some(root.as_str()));
+        let brief = grandchild.brief().unwrap();
+        assert!(
+            brief.contains("\"Write the tests\" (chat grandchild)"),
+            "{brief}"
+        );
+        assert!(brief.contains("level 2"), "{brief}");
+        assert!(
+            brief.contains(&format!("orchestrator chat {root}")),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("the session \"Fix the parser\" (chat child)"),
+            "{brief}"
+        );
+        let child = Place::of(&chats, "child");
+        assert!(child.brief().unwrap().contains("the orchestrator itself"));
+        assert_eq!(
+            Place::of(&chats, &root).root_id.as_deref(),
+            Some(root.as_str())
+        );
+        assert_eq!(Place::of(&chats, &root).brief(), None);
+        // A side chat outside a tree knows its parent; a plain chat gets nothing.
+        let side = Place::of(&chats, "side");
+        assert!(
+            side.brief()
+                .unwrap()
+                .contains("side chat (chat side) of \"Notes\"")
+        );
+        assert!(
+            side.env()
+                .iter()
+                .any(|(k, v)| *k == ENV_PARENT_CHAT_ID && v == "plain")
+        );
+        assert!(Place::of(&chats, "plain").env().is_empty());
+        assert_eq!(Place::of(&chats, "plain").brief(), None);
+        // The env carries it whole to the MCP server and the Pi process.
+        for id in [root.as_str(), "child", "grandchild", "side"] {
+            let place = Place::of(&chats, id);
+            let mut env: std::collections::BTreeMap<String, String> = place
+                .env()
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect();
+            env.insert("ZERON_CHAT_ID".into(), id.into());
+            assert_eq!(Place::from_env(&env), place, "{id}");
+            assert!(
+                env.keys()
+                    .all(|k| k == "ZERON_CHAT_ID" || PLACE_ENV.contains(&k.as_str()))
+            );
+        }
+        let long = "x".repeat(500);
+        assert_eq!(label(long).unwrap().len(), MAX_LABEL_CHARS);
+        assert_eq!(label(" \n ".into()), None);
+    }
+
+    #[test]
     fn prompts_fill_in_the_tree_limits() {
-        let member = member_prompt(2);
+        let at = |depth| Place {
+            role: Role::Member { depth },
+            chat_id: "c".into(),
+            title: Some("Task".into()),
+            parent_id: Some("p".into()),
+            parent_title: None,
+            root_id: Some("orchestrator-r".into()),
+        };
+        let member = member_prompt(&at(2));
+        assert!(member.contains("Your place: you are the session \"Task\" (chat c), at level 2"));
         assert!(member.contains("You are 2 levels below the root; the limit is 4."));
         assert!(member.contains("zeron_create_chat only for an independent task"));
         assert!(!member.contains('{'), "{member}");
-        assert!(member_prompt(MAX_DEPTH).contains("You cannot start sessions"));
+        assert!(member_prompt(&at(MAX_DEPTH)).contains("You cannot start sessions"));
         assert!(ROOT_SYSTEM_PROMPT.starts_with("You are the orchestrator in Zeron"));
         assert_eq!(
             ROOT_TOOLS,

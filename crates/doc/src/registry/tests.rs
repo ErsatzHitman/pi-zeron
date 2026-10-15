@@ -2224,3 +2224,52 @@ fn attaching_an_edge_after_local_only_writes_reseeds_them() {
     doc.set_local_only(false);
     assert_eq!(doc.pending_len(), 0);
 }
+
+fn board_post(root: &str, folder: &str, text: &str) -> zeron_proto::board::BoardEntry {
+    zeron_proto::board::BoardEntry {
+        id: String::new(),
+        root_id: root.into(),
+        folder: folder.into(),
+        author_chat_id: "member-1".into(),
+        author_title: Some("Fix it".into()),
+        author_depth: 1,
+        kind: zeron_proto::board::BoardKind::Finding,
+        text: text.into(),
+        at: 0,
+    }
+}
+
+#[test]
+fn a_board_keeps_its_tree_s_posts_in_order_and_drops_the_oldest() {
+    use zeron_proto::board::BOARD_MAX_ENTRIES;
+    let mut ws = RegistryDoc::new("dev-a");
+    let first = ws
+        .post_board_entry(board_post("orchestrator-a", "space:s", "one"))
+        .unwrap();
+    ws.post_board_entry(board_post("orchestrator-b", "space:s", "other tree"))
+        .unwrap();
+    let second = ws
+        .post_board_entry(board_post("orchestrator-a", "", "two"))
+        .unwrap();
+    assert!(first.id < second.id && first.at > 0);
+    let texts: Vec<String> = ws
+        .board_entries("orchestrator-a")
+        .into_iter()
+        .map(|post| post.text)
+        .collect();
+    assert_eq!(texts, ["one", "two"]);
+    assert_eq!(ws.board_entries("orchestrator-b").len(), 1);
+    for n in 0..BOARD_MAX_ENTRIES {
+        ws.post_board_entry(board_post("orchestrator-a", "", &n.to_string()))
+            .unwrap();
+    }
+    let posts = ws.board_entries("orchestrator-a");
+    assert_eq!(posts.len(), BOARD_MAX_ENTRIES);
+    assert_eq!(posts[0].text, "0", "the oldest went first");
+    assert_eq!(posts[0].author_title.as_deref(), Some("Fix it"));
+    // The root takes its board with it; other trees keep theirs.
+    ws.upsert_chat(&chat("orchestrator-a", "dev-a")).unwrap();
+    ws.delete_chat("orchestrator-a").unwrap();
+    assert!(ws.board_entries("orchestrator-a").is_empty());
+    assert_eq!(ws.board_entries("orchestrator-b").len(), 1);
+}

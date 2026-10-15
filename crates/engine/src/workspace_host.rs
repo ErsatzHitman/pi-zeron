@@ -692,6 +692,19 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.read_sessions())?)
     }
 
+    /// Post to an orchestrator tree's message board (id and time stamped).
+    pub fn post_board_entry(
+        &self,
+        entry: zeron_proto::board::BoardEntry,
+    ) -> Result<zeron_proto::board::BoardEntry, EngineError> {
+        Ok(self.mutate(|doc| doc.post_board_entry(entry))?)
+    }
+
+    /// A tree's board, oldest first.
+    pub fn board_entries(&self, root_id: &str) -> Vec<zeron_proto::board::BoardEntry> {
+        self.read(|doc| doc.board_entries(root_id))
+    }
+
     pub fn change_sidebar_pin(
         &self,
         change: &zeron_proto::SidebarPinChange,
