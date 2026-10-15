@@ -67,6 +67,7 @@ jobs:
             // The app links the Rust mobile core and everything it depends on.
             const mobileCore = ['crates/mobile/', 'crates/client/', 'crates/text/', 'crates/markdown/',
               'crates/doc/', 'crates/sync/', 'crates/proto/', 'crates/rpc/', 'crates/syntax/',
+              'crates/visual/', 'crates/visual-gpu/',
               'scripts/ios/'];
             const affectsIOS = path => path?.startsWith('apps/ios/')
               || mobileCore.some(prefix => path?.startsWith(prefix))
@@ -196,7 +197,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.ios == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rust toolchain
@@ -232,7 +233,7 @@ jobs:
     needs: [changes, ios-core, macos-frame-source]
     if: needs.changes.outputs.ios == 'true'
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Select an available iPhone simulator

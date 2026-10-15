@@ -81,6 +81,7 @@ pub mod toast;
 pub mod transcript;
 pub mod typography;
 pub(crate) mod visual_pages;
+pub mod visuals;
 pub mod voice;
 mod workspace_links;
 

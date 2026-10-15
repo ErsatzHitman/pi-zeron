@@ -18,6 +18,10 @@ Chart fields:
 - Optional: `title`, `description`, `xLabel`, `yLabel`, `unit` (`"%"`, `"$"`, `"ms"`), `source`.
 - Real numbers only; if illustrative or estimated, say so in `source`. At most 8 series and 200 points. Valid JSON: no comments or trailing commas.
 
+## Showing a visual
+
+When these blocks cannot draw it (interaction, tabs, sliders, a dashboard, a canvas, a simulation, a 3D view or a shader), write a Luau script and show it with `zeron_show_visual {script, title}` before your final reply. Its description lists the `ui.*` API. Zeron runs the script first and returns any error with its line number: fix it and call again. Colors are theme tokens; lay content straight on the chat, with no cards or boxes. It shows live above your reply: don't announce or restate it.
+
 ## Showing a page
 
-When these blocks cannot draw it (interaction, many panels, custom layout), build one self-contained HTML page, check it with `zeron_html_preview`, then publish it with `zeron_html_render` before your final reply. It shows live in your reply: don't announce or restate it.
+Only when a Luau visual cannot express it, build one self-contained HTML page, check it with `zeron_html_preview`, then publish it with `zeron_html_render` before your final reply. It shows live in your reply: don't announce or restate it.

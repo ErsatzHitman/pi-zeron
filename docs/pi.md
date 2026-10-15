@@ -227,7 +227,9 @@ stay out of the transcript (they are in Pi's history for the next turn).
 Zeron's existing delegation uses a temporary MCP bridge loaded with
 `--extension`. Every Pi chat also gets `--append-system-prompt` with
 `crates/harness/src/pi/visuals.md`, which describes the charts, diagrams and
-tables Zeron draws ([chat visuals](reference/chat-visuals.md)). An
+tables Zeron draws ([chat visuals](reference/chat-visuals.md)) and the
+interactive Luau visuals Pi shows with `zeron_show_visual` (see
+[MCP](mcp.md)). An
 orchestrator's root chat (the sidebar's Orchestrator tab) runs with its own
 profile instead of the coding one:
 

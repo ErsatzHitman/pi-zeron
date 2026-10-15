@@ -30,4 +30,8 @@ Scatter points are `{x, y, label?}`. A pie takes one series of values of zero or
 
 Series take colours from the theme accent first, then a fixed palette. Pi learns the format through `crates/harness/src/pi/visuals.md`, which is appended to every Pi chat's system prompt. Other harnesses render the same fences when their agents write them.
 
+## Interactive visuals
+
+When a fence cannot draw it (tabs, sliders, a canvas, a simulation, a 3D scene or a shader), an agent calls the Zeron MCP tool `show_visual` (Pi: `zeron_show_visual`) with a Luau script. The engine runs the script in a sandbox first and returns errors with line numbers; a script that passes is stored beside the chat's uploads and shown inline above the reply, rendered natively by GPUI (`crates/ui/src/visuals.rs`; runtime `crates/visual`, GPU scenes and shaders `crates/visual-gpu`). Ported from upstream Zeron 8a0fded8.
+
 Code: `crates/ui/src/markdown/chart.rs` (parse, layout, paint and state), wired through `MediaUi::chart` in the transcript and the Markdown file preview.
