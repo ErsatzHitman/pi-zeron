@@ -35,7 +35,7 @@ impl Shell {
         if self.runtime_change_task.is_some() {
             self.show_notice(
                 crate::toast::ToastKind::Info,
-                "Wait for the account change to finish".into(),
+                "Wait for the account change to finish",
                 cx,
             );
             return;
@@ -303,7 +303,7 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, VisualTestContext};
 
     fn window(
         cx: &mut TestAppContext,

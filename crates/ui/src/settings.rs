@@ -2935,6 +2935,11 @@ mod tests {
             last_pull_request_repository: Some("acme/zeron".into()),
             last_pull_request_device: Some("remote-device".into()),
             pull_request_stars: vec!["https://github.com/acme/zeron/pull/123".into()],
+            machines: vec![Machine {
+                ssh: "akshat@lab-box".into(),
+                name: "Lab".into(),
+            }],
+            active_machine: Some("akshat@lab-box".into()),
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
