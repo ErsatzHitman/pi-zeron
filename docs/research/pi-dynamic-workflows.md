@@ -32,9 +32,10 @@ Nine agents ran as one research workflow: six non-overlapping researchers
 (Claude Code's workflows, the Pi workflows extension, Pi core extension APIs,
 Zeron's ingestion and panel, durable-execution frameworks, the Pi agent
 ecosystem), two verifiers that re-read every load-bearing claim against source,
-and a completeness critic that produced the failure matrix. Claims below are
-marked **verified** (re-read in source by a second agent or by me) or
-**assumption**. File references are to the Pi config checkout unless prefixed
+and a completeness critic that produced the failure matrix. All nine ran on
+Sonnet 5.5 (`claude-sonnet-5-5`) at high effort (workflow run `wf_29a7b5d1-bc9`).
+Claims below are marked **verified** (re-read in source by a second agent or
+by me) or **assumption**. File references are to the Pi config checkout unless prefixed
 with a Zeron crate path.
 
 ## Verified behavior
