@@ -1394,9 +1394,12 @@ impl SessionsEngine {
 impl Inner {
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     /// Sanitize before ANY journal/publish path, including nested subagent events.
+    /// `cwd` is the run's working directory: images the agent shared from
+    /// there (`share_images`) are copied in like generated ones.
     async fn prepare_generated_image(
         &self,
         chat_id: &str,
+        cwd: &str,
         event: AgentEvent,
         seen: &mut std::collections::HashSet<String>,
     ) -> Vec<AgentEvent> {
@@ -1425,9 +1428,15 @@ impl Inner {
             if seen.contains(&key) {
                 return vec![];
             }
+            let shared = zeron_proto::shared_image_tool(&id).is_some();
             let result = if let Some((uploads, allowed_root)) = self.generated_images.get() {
                 let uploads = uploads.clone();
-                let root = allowed_root.clone();
+                // A shared image must come from the chat's own folder.
+                let root = if shared {
+                    std::path::PathBuf::from(cwd)
+                } else {
+                    allowed_root.clone()
+                };
                 let stable_key = key.clone();
                 tokio::task::spawn_blocking(move || {
                     let path = std::path::Path::new(&path);
@@ -1435,6 +1444,16 @@ impl Inner {
                     // folder stays where it is, under the agent's title.
                     if mime_type == crate::uploads::PAGE_MIME {
                         uploads.accept_page(path, &name)
+                    } else if shared {
+                        // Shown under its own file name, never a path.
+                        let name = std::path::Path::new(&name)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().chars().take(120).collect::<String>())
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| "Image".into());
+                        uploads
+                            .import_generated_image(path, &root, &stable_key)
+                            .map(|image| crate::uploads::ImportedImage { name, ..image })
                     } else {
                         uploads.import_generated_image(path, &root, &stable_key)
                     }
@@ -1463,6 +1482,7 @@ impl Inner {
                             id: id
                                 .strip_suffix(":image")
                                 .or_else(|| id.strip_suffix(":page"))
+                                .or_else(|| zeron_proto::shared_image_tool(&id))
                                 .unwrap_or(&id)
                                 .into(),
                             is_error: true,
@@ -1470,7 +1490,12 @@ impl Inner {
                             diff: None,
                         },
                         AgentEvent::Error {
-                            message: "Generated image unavailable".into(),
+                            message: if shared {
+                                "Shared image unavailable"
+                            } else {
+                                "Generated image unavailable"
+                            }
+                            .into(),
                         },
                     ]
                 }
@@ -2949,7 +2974,7 @@ async fn drive_run(
 
             prepared_events.extend(
                 inner
-                    .prepare_generated_image(&chat_id, raw_event, &mut seen_images)
+                    .prepare_generated_image(&chat_id, &run_cwd, raw_event, &mut seen_images)
                     .await,
             );
             let Some(event) = prepared_events.pop_front() else {
@@ -3836,6 +3861,77 @@ mod tests {
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 
     #[tokio::test]
+    async fn a_shared_image_is_copied_in_from_the_chat_folder_only() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let uploads = crate::uploads::Uploads::from_root(&dir.path().join("uploads"));
+        sessions.set_generated_images(uploads, dir.path().join("codex-images"));
+        let cwd = dir.path().join("project");
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir_all(cwd.join(".pi/screenshots")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let png = b"\x89PNG\r\n\x1a\nfixture";
+        let shot = cwd.join(".pi/screenshots/login.png");
+        std::fs::write(&shot, png).unwrap();
+        std::fs::write(outside.join("private.png"), png).unwrap();
+        let share = |path: &std::path::Path, index| AgentEvent::GeneratedImage {
+            id: zeron_proto::shared_image_id("s", index),
+            path: path.to_string_lossy().into_owned(),
+            name: "/w/login.png".into(),
+            mime_type: "image/png".into(),
+        };
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        let mut seen = std::collections::HashSet::new();
+        let events = sessions
+            .inner
+            .prepare_generated_image("chat", &cwd_text, share(&shot, 0), &mut seen)
+            .await;
+        let [
+            AgentEvent::GeneratedImage {
+                id,
+                path,
+                name,
+                mime_type,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(id, "s:share0");
+        assert_eq!(name, "login.png", "the name is a file name, not a path");
+        assert_eq!(mime_type, "image/png");
+        let uploads_root = dir.path().join("uploads").canonicalize().unwrap();
+        assert!(
+            std::path::Path::new(path).starts_with(&uploads_root),
+            "{path}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), png);
+
+        // Outside the chat's folder: the share call fails, nothing is copied.
+        let events = sessions
+            .inner
+            .prepare_generated_image(
+                "chat",
+                &cwd_text,
+                share(&outside.join("private.png"), 1),
+                &mut seen,
+            )
+            .await;
+        assert!(
+            matches!(&events[0], AgentEvent::ToolResult { id, is_error: true, .. } if id == "s"),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[1], AgentEvent::Error { message } if message == "Shared image unavailable")
+        );
+    }
+
+    #[tokio::test]
     async fn generated_image_failure_is_sanitized_even_inside_subagents() {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
@@ -3856,7 +3952,7 @@ mod tests {
         };
         let events = sessions
             .inner
-            .prepare_generated_image("chat", event, &mut std::collections::HashSet::new())
+            .prepare_generated_image("chat", "", event, &mut std::collections::HashSet::new())
             .await;
         assert_eq!(events.len(), 2);
         let mut parts = vec![];

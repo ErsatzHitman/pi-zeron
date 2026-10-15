@@ -294,6 +294,21 @@ pub struct WorktreeSpec {
 /// life of a run.
 pub const LIVE_PLAN_TOOL_ID: &str = "acp-plan";
 
+/// The generated-image id of the `index`th image an agent chose to show the
+/// user (Pi's `share_images` tool). The engine copies these from the chat's
+/// working directory, and the transcript shows a run of them as one strip of
+/// thumbnails.
+pub fn shared_image_id(tool_id: &str, index: usize) -> String {
+    format!("{tool_id}:share{index}")
+}
+
+/// The tool id a [`shared_image_id`] came from, or `None` for any other id.
+pub fn shared_image_tool(id: &str) -> Option<&str> {
+    let (tool, tail) = id.rsplit_once(':')?;
+    let index = tail.strip_prefix("share")?;
+    (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())).then_some(tool)
+}
+
 /// A decoded tool invocation, reduced to the fields each kind renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -962,6 +977,11 @@ mod generated_image_tests {
 
     #[test]
     fn generated_image_event_round_trip() {
+        assert_eq!(shared_image_tool(&shared_image_id("t:1", 3)), Some("t:1"));
+        assert_eq!(shared_image_tool("t:image"), None);
+        assert_eq!(shared_image_tool("t:page"), None);
+        assert_eq!(shared_image_tool("t:share"), None);
+        assert_eq!(shared_image_tool("t:sharex"), None);
         let event = AgentEvent::GeneratedImage {
             id: "item:image".into(),
             path: "/uploads/generated.png".into(),

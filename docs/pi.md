@@ -242,6 +242,38 @@ extension sees `ZERON_PI_MCP` and starts its children the same way, so they
 join the tree. Image attachments are sent as native image blocks; image-only
 tool results do not yet render inline.
 
+## Screenshots
+
+The `screenshot` extension (in the Pi config, `agent/extensions/screenshot/`)
+gives the agent two tools:
+
+- `screenshot` captures the primary monitor, another monitor (`monitor`, 0
+  for all), one window by title (`window`) or a rectangle (`region`). The PNG
+  goes to `<cwd>/.pi/screenshots/`, a folder that ignores itself in git. The
+  agent gets it back as an image block, resized to fit the model. The user
+  does not see it.
+- `share_images` takes the paths the agent wants the user to see. The
+  normalizer turns its result's `details.images` into one generated image per
+  file, with the id `{tool id}:share{n}` (`zeron_proto::shared_image_id`).
+  The engine copies each into the uploads folder, but only from inside the
+  run's cwd; anything else fails the call with "Shared image unavailable".
+  The extension already copies images from elsewhere into `.pi/screenshots/`
+  first. In the transcript, consecutive shared images form one strip of
+  thumbnails the size of a user's attachments
+  (`RowKind::SharedImages`). Each opens the image viewer, and right-click
+  offers the image menu.
+
+Capture uses what the OS has:
+
+| OS | Programs |
+|---|---|
+| Windows | PowerShell with System.Drawing, DPI-aware. A window is drawn with `PrintWindow`, so it can be covered. |
+| macOS | `screencapture`. A window resolves to its bounds through System Events. This needs the Screen Recording and Accessibility permissions. |
+| Wayland | `grim`, then `gnome-screenshot`, then `spectacle`. Capturing one window is not supported. |
+| X11 | `maim`, `import` or `scrot`; `gnome-screenshot` for a whole monitor. A window is found with `xdotool`. |
+
+A machine with no display says so instead of failing silently.
+
 ## Pi on another machine
 
 The engine runs Pi, so Pi lives wherever the engine does. To keep Zeron's

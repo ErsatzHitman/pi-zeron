@@ -3,6 +3,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use zeron_proto::{AgentEvent, DoneStatus, TodoItem, TodoStatus, ToolCall, ToolDiff};
 
+/// The most images one `share_images` call shows (the extension's own cap).
+const SHARED_IMAGES_MAX: usize = 8;
+
 #[derive(Default)]
 pub(super) struct Normalizer {
     text: HashMap<usize, String>,
@@ -253,6 +256,25 @@ impl Normalizer {
                             mime_type: "text/html".into(),
                         })
                     });
+                // Images the agent chose to show with `share_images` follow
+                // the call in the reply, as thumbnails.
+                let shared: Vec<AgentEvent> = info
+                    .as_ref()
+                    .filter(|(name, _)| name == "share_images" && frame["isError"] != true)
+                    .and_then(|_| result["details"]["images"].as_array())
+                    .into_iter()
+                    .flatten()
+                    .take(SHARED_IMAGES_MAX)
+                    .enumerate()
+                    .filter_map(|(index, image)| {
+                        Some(AgentEvent::GeneratedImage {
+                            id: zeron_proto::shared_image_id(&id, index),
+                            path: image["path"].as_str().filter(|p| !p.is_empty())?.into(),
+                            name: image["name"].as_str().unwrap_or("Image").into(),
+                            mime_type: image["mimeType"].as_str().unwrap_or("image/png").into(),
+                        })
+                    })
+                    .collect();
                 events.push(AgentEvent::ToolResult {
                     id,
                     is_error: frame["isError"].as_bool().unwrap_or(false),
@@ -260,6 +282,7 @@ impl Normalizer {
                     diff,
                 });
                 events.extend(page);
+                events.extend(shared);
             }
             "compaction_end" => {
                 if let Some(tokens) = frame["result"]["estimatedTokensAfter"].as_u64() {
@@ -595,6 +618,51 @@ mod tests {
             tool("lsp_diagnostics", &json!({"paths":["a.rs"]})),
             ToolCall::Unknown { name, .. } if name == "LSP: diagnostics a.rs"
         ));
+    }
+
+    #[test]
+    fn shared_images_follow_their_tool_result_as_image_parts() {
+        let mut n = Normalizer::default();
+        n.map(
+            &json!({"type":"tool_execution_start","toolCallId":"s","toolName":"share_images",
+            "args":{"paths":["a.png","b.png"]}}),
+        );
+        let events = n.map(
+            &json!({"type":"tool_execution_end","toolCallId":"s","isError":false,
+            "result":{"content":[{"type":"text","text":"Shown to the user: a.png, b.png."}],
+            "details":{"images":[
+                {"path":"/w/a.png","name":"a.png","mimeType":"image/png"},
+                {"path":"","name":"lost.png"},
+                {"path":"/w/.pi/screenshots/b.jpg","name":"b.jpg","mimeType":"image/jpeg"}]}}}),
+        );
+        assert!(
+            matches!(&events[0], AgentEvent::ToolResult { id, is_error: false, .. } if id == "s")
+        );
+        assert!(
+            matches!(&events[1], AgentEvent::GeneratedImage { id, path, name, mime_type }
+                if id == "s:share0" && path == "/w/a.png" && name == "a.png" && mime_type == "image/png"),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[2], AgentEvent::GeneratedImage { id, path, mime_type, .. }
+                if id == "s:share2" && path == "/w/.pi/screenshots/b.jpg" && mime_type == "image/jpeg"),
+            "{events:?}"
+        );
+        assert_eq!(events.len(), 3);
+        // A failed share shows nothing, and so does any other tool's `images`.
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"f","toolName":"share_images","args":{}}));
+        let failed = n.map(
+            &json!({"type":"tool_execution_end","toolCallId":"f","isError":true,
+            "result":{"content":[{"type":"text","text":"Nothing to show."}],
+            "details":{"images":[{"path":"/w/a.png","name":"a.png"}]}}}),
+        );
+        assert_eq!(failed.len(), 1);
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"o","toolName":"screenshot","args":{}}));
+        let other = n.map(
+            &json!({"type":"tool_execution_end","toolCallId":"o","isError":false,
+            "result":{"content":[],"details":{"images":[{"path":"/w/a.png","name":"a.png"}]}}}),
+        );
+        assert_eq!(other.len(), 1);
     }
 
     #[test]

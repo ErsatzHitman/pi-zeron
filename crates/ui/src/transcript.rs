@@ -1165,6 +1165,14 @@ struct InlinePage {
     _events: Option<Subscription>,
 }
 
+/// One image an agent chose to show the user (Pi's `share_images`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharedImage {
+    pub path: String,
+    pub name: String,
+    pub mime_type: String,
+}
+
 #[derive(Clone)]
 pub enum RowKind {
     GeneratedImage {
@@ -1172,6 +1180,12 @@ pub enum RowKind {
         path: String,
         name: String,
         mime_type: String,
+    },
+    /// A run of images the agent shared, as one strip of thumbnails like a
+    /// user's attachments. Each opens the image viewer.
+    SharedImages {
+        owner: String,
+        images: Arc<Vec<SharedImage>>,
     },
     User {
         /// Visible prompt (attachment-ref trailer already stripped). When the
@@ -1753,6 +1767,45 @@ pub fn rows_for_entry(
                                         tree: tree.clone(),
                                         block_ix,
                                     }
+                                },
+                            });
+                        }
+                    }
+                    MessagePart::Image {
+                        id: part_id,
+                        path,
+                        name,
+                        mime_type,
+                    } if zeron_proto::shared_image_tool(part_id).is_some() => {
+                        let image = SharedImage {
+                            path: path.clone(),
+                            name: name.clone(),
+                            mime_type: mime_type.clone(),
+                        };
+                        let hash = |seed: &str| {
+                            fnv1a(format!("{seed}\0{path}\0{name}\0{mime_type}").as_bytes())
+                        };
+                        // Images shared one after another join one strip.
+                        if let Some(Row {
+                            version,
+                            kind: RowKind::SharedImages { images, .. },
+                            ..
+                        }) = rows.last_mut()
+                        {
+                            Arc::make_mut(images).push(image);
+                            *version = hash(&version.to_string());
+                        } else {
+                            rows.push(Row {
+                                id: format!("{}#{}", entry.id, part_id).into(),
+                                version: hash(&entry.device_id),
+                                turn_start: false,
+                                entry_id: entry_id.clone(),
+                                timestamp: None,
+                                copy_text: None,
+                                compact_fold: None,
+                                kind: RowKind::SharedImages {
+                                    owner: entry.device_id.clone(),
+                                    images: Arc::new(vec![image]),
                                 },
                             });
                         }
@@ -7030,6 +7083,111 @@ impl Transcript {
         }
     }
 
+    /// Images the agent shared: thumbnails like a user's attachments, at the
+    /// start of the reply's column. Each opens the image viewer.
+    fn render_shared_images(
+        &mut self,
+        row_id: &SharedString,
+        owner: &str,
+        images: &[SharedImage],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::attachments::AttachmentSnapshot;
+        let devices = self.generated_attachment_device_ids(owner, cx);
+        let accent = Theme::of(cx).accent;
+        let mut strip = div()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap(px(8.0))
+            .px(px(4.0))
+            .pt(px(4.0))
+            .pb(px(6.0));
+        for (ix, image) in images.iter().enumerate() {
+            let state = self.attachment_state(&devices, &image.path, Some(&image.mime_type), cx);
+            let selector = format!("{row_id}-shared-{ix}");
+            let frame = div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector)
+                .flex_none()
+                .w(px(ATT_THUMB_W))
+                .h(px(ATT_THUMB_H))
+                .rounded(px(8.0))
+                .overflow_hidden();
+            let thumb = match state {
+                AttachmentSnapshot::Loaded(loaded) => {
+                    let preview = crate::attachments::PreviewImage::new(
+                        image.name.clone(),
+                        loaded.image.clone(),
+                    );
+                    let (menu_path, menu_devices) = (image.path.clone(), devices.clone());
+                    frame
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_image_menu(
+                                    menu_path.clone(),
+                                    menu_devices.clone(),
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .border_1()
+                        .border_color(crate::theme::hairline(0.11))
+                        .bg(crate::theme::ink(0.035))
+                        .role(gpui::Role::Button)
+                        .aria_label(SharedString::from(format!("Open {}", image.name)))
+                        .tab_index(0)
+                        .cursor_pointer()
+                        .focus_visible(move |style| style.border_2().border_color(accent))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.attachment_preview_return_focus = window.focused(cx);
+                            preview.viewer.reset();
+                            this.attachment_preview = Some(preview.clone());
+                            window.focus(&this.attachment_preview_focus, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            img(loaded.image)
+                                .w(px(ATT_THUMB_W - 2.0))
+                                .h(px(ATT_THUMB_H - 2.0))
+                                .rounded(px(7.0))
+                                .object_fit(ObjectFit::Cover),
+                        )
+                        .into_any_element()
+                }
+                AttachmentSnapshot::Error { .. } => frame
+                    .border_1()
+                    .border_dashed()
+                    .border_color(crate::theme::hairline(0.14))
+                    .bg(crate::theme::ink(0.025))
+                    .into_any_element(),
+                AttachmentSnapshot::Loading => frame
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.08))
+                    .bg(crate::theme::ink(0.055))
+                    .opacity(
+                        0.35 + 0.4
+                            * motion::pulse_wave(motion::pulse_delta(
+                                &motion::ZERON_PULSE,
+                                cx.entity_id(),
+                                cx,
+                            )),
+                    )
+                    .into_any_element(),
+            };
+            strip = strip.child(thumb);
+        }
+        strip.into_any_element()
+    }
+
     /// A page the agent published with `html_render`, live in the reply: a
     /// native webview fitted to the page's reported height (up to
     /// [`crate::visual_pages::MAX_HEIGHT`]), under a caption that opens it
@@ -8158,6 +8316,9 @@ impl Transcript {
                 name,
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
+            RowKind::SharedImages { owner, images } => {
+                self.render_shared_images(&row.id, owner, images, cx)
+            }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         };
@@ -12608,6 +12769,72 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_shared_thumbnail_opens_the_image_viewer(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        let transcript = cx.new(|cx| Transcript::new(state, cx));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(64, 48)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::attachments::store_loaded_for(
+            &crate::attachments::AttachmentKey::new("owner", "/up/b.png", Some("image/png")),
+            "b.png".into(),
+            Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                bytes.into_inner(),
+            )),
+        );
+        let images = vec![
+            SharedImage {
+                path: "/up/a.png".into(),
+                name: "a.png".into(),
+                mime_type: "image/png".into(),
+            },
+            SharedImage {
+                path: "/up/b.png".into(),
+                name: "b.png".into(),
+                mime_type: "image/png".into(),
+            },
+        ];
+        struct StripFixture(Entity<Transcript>, Vec<SharedImage>);
+        impl Render for StripFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let images = self.1.clone();
+                self.0.update(cx, |this, cx| {
+                    this.render_shared_images(&"strip".into(), "owner", &images, cx)
+                })
+            }
+        }
+        let (_fixture, cx) =
+            cx.add_window_view(|_, _| StripFixture(transcript.clone(), images.clone()));
+        cx.run_until_parked();
+        let first = cx.debug_bounds("strip-shared-0").expect("first thumbnail");
+        let second = cx.debug_bounds("strip-shared-1").expect("second thumbnail");
+        assert_eq!(first.size, second.size, "every thumbnail is the same size");
+        assert_eq!(first.size.width, px(ATT_THUMB_W));
+        assert!(
+            second.left() > first.right(),
+            "the thumbnails sit side by side"
+        );
+        // The unloaded one does nothing; the loaded one opens the viewer.
+        cx.simulate_click(first.center(), gpui::Modifiers::default());
+        transcript.read_with(cx, |this, _| assert!(this.attachment_preview.is_none()));
+        cx.simulate_click(second.center(), gpui::Modifiers::default());
+        transcript.read_with(cx, |this, _| {
+            assert_eq!(
+                this.attachment_preview.as_ref().map(|p| p.name.to_string()),
+                Some("b.png".to_string())
+            );
+        });
+    }
+
+    #[gpui::test]
     fn a_published_page_shows_in_the_reply_and_says_when_it_cannot_load(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -12728,6 +12955,54 @@ mod tests {
                 this.refresh_protected_attachments(cx);
             });
         });
+    }
+
+    #[test]
+    fn shared_images_in_a_row_make_one_strip() {
+        let shared = |n: usize| MessagePart::Image {
+            id: zeron_proto::shared_image_id("s", n),
+            path: format!("/w/.pi/screenshots/{n}.png"),
+            name: format!("{n}.png"),
+            mime_type: "image/png".into(),
+        };
+        let entry = assistant(
+            "a",
+            MessageStatus::Complete,
+            vec![
+                tool_part("s", "share_images"),
+                shared(0),
+                shared(1),
+                text_part("t", "between"),
+                shared(2),
+                MessagePart::Image {
+                    id: "i:image".into(),
+                    path: "/uploads/i.png".into(),
+                    name: "generated.png".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        assert_eq!(rows.len(), 5);
+        let names = |row: &Row| match &row.kind {
+            RowKind::SharedImages { owner, images } => {
+                assert_eq!(owner, "dev");
+                images.iter().map(|i| i.name.clone()).collect::<Vec<_>>()
+            }
+            _ => panic!("a strip"),
+        };
+        assert_eq!(names(&rows[1]), ["0.png", "1.png"]);
+        assert_eq!(names(&rows[3]), ["2.png"]);
+        assert!(matches!(rows[4].kind, RowKind::GeneratedImage { .. }));
+        // The strip changes when an image joins it.
+        let first = rows_for_entry(
+            &assistant("a", MessageStatus::Complete, vec![shared(0)]),
+            false,
+            false,
+            &mut parse,
+        );
+        assert_eq!(first[0].id, rows[1].id);
+        assert_ne!(first[0].version, rows[1].version);
     }
 
     #[test]
