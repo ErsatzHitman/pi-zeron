@@ -87,6 +87,8 @@ mod session_info;
 mod side_chats;
 mod sidebar_attention;
 mod sidebar_children;
+#[cfg(test)]
+mod sidebar_children_tests;
 mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
