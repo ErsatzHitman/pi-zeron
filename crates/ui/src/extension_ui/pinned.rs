@@ -220,6 +220,8 @@ fn chip_icon(chip: &Chip) -> &'static str {
         icons::CLOCK_CIRCLE
     } else if key.contains("mcp") || text.starts_with("mcp") {
         icons::REMOTE_SERVER
+    } else if key == FREEFLOW_STATUS_KEY {
+        icons::GLOBE
     } else {
         icons::WIDGET
     }
@@ -234,14 +236,47 @@ fn chip_label(text: &str) -> &str {
     if label.is_empty() { text } else { label }
 }
 
-/// A plain status line as a chip reads it. pi-goal's terminal line
-/// (`goal 36.7k tok · steps 0/3 · 20s`), shown when no goal channel arrives,
-/// reads like the channel's chip.
-fn status_text(key: &str, text: &str) -> String {
-    match text.strip_prefix("goal ") {
+/// pi-freeflow's relay line, as a chip's key.
+const FREEFLOW_STATUS_KEY: &str = "status:freeflow";
+
+/// A plain status line as a chip reads it, or none for a resting state.
+/// pi-goal's terminal line (`goal 36.7k tok · steps 0/3 · 20s`), shown when
+/// no goal channel arrives, reads like the channel's chip.
+fn status_text(key: &str, text: &str) -> Option<String> {
+    if key == "freeflow" {
+        return freeflow_status(text);
+    }
+    Some(match text.strip_prefix("goal ") {
         Some(detail) if key == "goal" => format!("Goal · {}", detail.trim()),
         _ => text.to_owned(),
+    })
+}
+
+/// pi-freeflow's relay line (`relay: AUTO (ON) | cf 1/3`) as a chip: the
+/// relay in use, and nothing while requests go direct.
+fn freeflow_status(text: &str) -> Option<String> {
+    let Some(state) = text.strip_prefix("relay:") else {
+        // Work in progress (`deploying cloudflare relay…`).
+        let mut chars = text.chars();
+        let first = chars.next()?;
+        return Some(first.to_uppercase().chain(chars).collect());
+    };
+    let (mode, relay) = state.split_once('|').unwrap_or((state, ""));
+    let mode = mode.trim();
+    if mode.starts_with("OFF") {
+        return None;
     }
+    let name = if mode.starts_with("AUTO") {
+        "Relay auto"
+    } else {
+        "Relay"
+    };
+    let relay = relay.trim();
+    Some(if relay.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name} · {relay}")
+    })
 }
 
 /// Chips for the session footer, in a stable order.
@@ -294,13 +329,15 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
             .filter(|s| !s.text.trim().is_empty())
             .filter(|s| !(s.key == MODE_STATUS_KEY && is_build_mode(&s.text)))
             .filter(|s| !element_texts.iter().any(|t| t == s.text.trim()))
-            .map(|s| Chip {
-                key: format!("status:{}", s.key),
-                hint: None,
-                text: status_text(&s.key, s.text.trim()),
-                // Zeron's own chips (Pi retrying a request) stand out.
-                active: s.key.starts_with("zeron:"),
-                action: None,
+            .filter_map(|s| {
+                Some(Chip {
+                    key: format!("status:{}", s.key),
+                    hint: None,
+                    text: status_text(&s.key, s.text.trim())?,
+                    // Zeron's own chips (Pi retrying a request) stand out.
+                    active: s.key.starts_with("zeron:"),
+                    action: None,
+                })
             }),
     );
     // Work an extension goes on with between turns (background jobs, a
@@ -850,11 +887,46 @@ mod tests {
     #[test]
     fn a_goal_status_line_reads_like_the_goal_chip() {
         assert_eq!(
-            status_text("goal", "goal 36.7k tok · steps 0/3 · 20s"),
-            "Goal · 36.7k tok · steps 0/3 · 20s"
+            status_text("goal", "goal 36.7k tok · steps 0/3 · 20s").as_deref(),
+            Some("Goal · 36.7k tok · steps 0/3 · 20s")
         );
-        assert_eq!(status_text("goal", "goal: ship it"), "goal: ship it");
-        assert_eq!(status_text("other", "goal 1"), "goal 1");
+        assert_eq!(
+            status_text("goal", "goal: ship it").as_deref(),
+            Some("goal: ship it")
+        );
+        assert_eq!(status_text("other", "goal 1").as_deref(), Some("goal 1"));
+    }
+
+    #[test]
+    fn the_freeflow_relay_line_names_the_relay_and_hides_when_direct() {
+        let text = |line: &str| status_text("freeflow", line);
+        assert_eq!(
+            text("relay: AUTO (ON) | cf 1/3").as_deref(),
+            Some("Relay auto · cf 1/3")
+        );
+        assert_eq!(
+            text("relay: ON | home 2/2").as_deref(),
+            Some("Relay · home 2/2")
+        );
+        assert_eq!(text("relay: OFF (direct)"), None);
+        assert_eq!(
+            text("deploying cloudflare relay…").as_deref(),
+            Some("Deploying cloudflare relay…")
+        );
+        let status = |key: &str, text: &str| ExtensionStatus {
+            key: key.into(),
+            text: text.into(),
+        };
+        let state = ExtensionUiState {
+            statuses: vec![
+                status("freeflow", "relay: OFF (direct)"),
+                status("other", "Indexing"),
+            ],
+            ..Default::default()
+        };
+        let chips = footer_chips(&state);
+        assert_eq!(chips.len(), 1, "{chips:?}");
+        assert_eq!(chips[0].key, "status:other");
     }
 
     #[test]
@@ -886,6 +958,10 @@ mod tests {
         assert_eq!(
             chip_icon(&chip("status:zeron:retry", "Retrying")),
             icons::RESTART
+        );
+        assert_eq!(
+            chip_icon(&chip("status:freeflow", "Relay · cf 1/3")),
+            icons::GLOBE
         );
         assert_eq!(chip_icon(&chip("status:other", "Indexing")), icons::WIDGET);
     }
