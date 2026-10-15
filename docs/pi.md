@@ -69,8 +69,9 @@ the env, such as a Pi typed into a herdr pane or opened in a new terminal
 tab by herdr-delegate, is guarded too: there the preload matches Pi's
 `cli` entry script and restores the env for the child's own children. A
 missing guard file stops the child. A compiled Pi binary takes
-no node flags, so its children rely on launchers passing
-`-e $ZERON_DELETE_GUARD_EXT`. A nested `pi --no-extensions`
+no node flags, so there the extension wraps `child_process` instead: each
+spawn of the same executable (Pi's launchers start a compiled Pi that way)
+gets `--extension <guard>` and inherits the env. A nested `pi --no-extensions`
 and non-interactive agent CLIs (`claude -p`, `codex exec`) run from bash are
 blocked, since they would run unguarded.
 

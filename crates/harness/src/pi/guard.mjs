@@ -2,6 +2,7 @@
 // resources, in every Pi run Zeron starts and every child that inherits it.
 // A guard against mistakes and model-driven deletes, not a sandbox.
 import { readFileSync, statSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -398,8 +399,43 @@ export function inheritIntoChildren(proc = process) {
 }
 
 const SHELL_TOOLS = new Set(["bash", "powershell"]);
+// ---- children of a compiled Pi: a single executable takes no node flags,
+// so the preload cannot ride along. Its launchers start the same executable
+// again (`piInvocation`), so the guard wraps child_process here: each spawn
+// of this executable gets `--extension <guard>`, and inherits the env.
+const NODE_RUNTIME = /^(node|bun)(\.exe)?$/i;
+const samePath = (a, b, platform = process.platform) =>
+  platform === "win32" ? resolve(a).toLowerCase() === resolve(b).toLowerCase() : resolve(a) === resolve(b);
+
+export function guardSpawnArgs(command, args, ext, execPath, platform = process.platform) {
+  if (!ext || typeof command !== "string" || !Array.isArray(args)) return args;
+  if (!samePath(command, execPath, platform)) return args;
+  if (args.some((arg, i) => arg === ext && (args[i - 1] === "-e" || args[i - 1] === "--extension"))) return args;
+  return ["--extension", ext, ...args];
+}
+
+const SPAWNERS = ["spawn", "spawnSync", "execFile", "execFileSync"];
+export function guardCompiledChildren(proc = process, cp = createRequire(import.meta.url)("node:child_process")) {
+  const ext = proc.env.ZERON_DELETE_GUARD_EXT;
+  if (!ext || NODE_RUNTIME.test(basename(proc.execPath))) return false;
+  if (cp.__zeronDeleteGuard) return true;
+  for (const name of SPAWNERS) {
+    const original = cp[name];
+    if (typeof original !== "function") continue;
+    cp[name] = function (command, ...rest) {
+      if (Array.isArray(rest[0])) rest[0] = guardSpawnArgs(command, rest[0], ext, proc.execPath, proc.platform);
+      return original.call(this, command, ...rest);
+    };
+  }
+  Object.defineProperty(cp, "__zeronDeleteGuard", { value: true });
+  // `import { spawn } from "node:child_process"` sees the wrapper too.
+  try { syncBuiltinESMExports(); } catch {}
+  return true;
+}
+
 export default function deleteGuard(pi) {
   inheritIntoChildren();
+  guardCompiledChildren();
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
     if (!guardOn()) return;
     let h;

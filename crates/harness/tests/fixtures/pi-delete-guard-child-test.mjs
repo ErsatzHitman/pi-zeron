@@ -3,6 +3,7 @@
 // extension. Run as `node <this> <guard.mjs> <guard-preload.mjs>`.
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
+import {createRequire} from 'node:module';
 import {mkdtempSync, readFileSync, realpathSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
@@ -10,7 +11,7 @@ import {pathToFileURL} from 'node:url';
 
 const guardPath = resolve(process.argv[2]);
 const preloadPath = resolve(process.argv[3]);
-const {inheritIntoChildren} = await import(pathToFileURL(guardPath).href);
+const {inheritIntoChildren, guardSpawnArgs, guardCompiledChildren} = await import(pathToFileURL(guardPath).href);
 const {addGuard} = await import(pathToFileURL(preloadPath).href);
 const preloadFlag = `--import=${pathToFileURL(preloadPath).href}`;
 
@@ -101,5 +102,34 @@ assert.equal(paneSeen.ext, guardPath);
 assert.equal(paneSeen.file, join(dir, 'prefs.json'));
 // macOS temp is a symlink (/var -> /private/var).
 assert.equal(realpathSync(paneSeen.preload), realpathSync(configured));
+
+// A compiled Pi (one executable, no node flags): each spawn of itself gets
+// the guard; other programs and an already-guarded spawn are left alone.
+const piExe = resolve('/opt/pi/pi');
+assert.deepEqual(guardSpawnArgs(piExe, ['--mode', 'rpc'], guardPath, piExe), ['--extension', guardPath, '--mode', 'rpc']);
+assert.deepEqual(guardSpawnArgs('/bin/sh', ['-c', 'ls'], guardPath, piExe), ['-c', 'ls']);
+assert.deepEqual(guardSpawnArgs(piExe, ['-e', guardPath], guardPath, piExe), ['-e', guardPath]);
+assert.deepEqual(guardSpawnArgs('C:/PI/PI.EXE', ['-p'], guardPath, 'C:/pi/pi.exe', 'win32'), ['--extension', guardPath, '-p']);
+const calls = [];
+const fakeCp = {spawn: (command, args, options) => calls.push({command, args, options})};
+const compiled = {execPath: piExe, platform: process.platform, env: {ZERON_DELETE_GUARD_EXT: guardPath}};
+assert.equal(guardCompiledChildren({...compiled, execPath: process.execPath}, fakeCp), false);
+assert.equal(guardCompiledChildren({...compiled, env: {}}, fakeCp), false);
+assert.equal(guardCompiledChildren(compiled, fakeCp), true);
+assert.equal(guardCompiledChildren(compiled, fakeCp), true);
+fakeCp.spawn(piExe, ['--mode', 'json'], {stdio: 'pipe'});
+fakeCp.spawn('/bin/sh', ['-c', 'ls']);
+fakeCp.spawn(piExe);
+assert.deepEqual(calls[0], {command: piExe, args: ['--extension', guardPath, '--mode', 'json'], options: {stdio: 'pipe'}});
+assert.deepEqual(calls[1].args, ['-c', 'ls']);
+assert.equal(calls[2].args, undefined);
+// On the real module, named ESM imports see the wrapper too.
+const realCp = createRequire(import.meta.url)('node:child_process');
+const before = realCp.spawnSync;
+assert.equal(guardCompiledChildren(compiled), true);
+assert.notEqual(realCp.spawnSync, before);
+assert.equal(spawnSync, realCp.spawnSync);
+const still = spawnSync(process.execPath, ['-e', 'console.log(1)'], {encoding: 'utf8'});
+assert.equal(still.stdout.trim(), '1');
 
 console.log('delete guard child coverage passed');
