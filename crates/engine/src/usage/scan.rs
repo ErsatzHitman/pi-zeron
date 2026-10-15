@@ -578,6 +578,13 @@ pub(super) mod tests {
             assistant("b1", "q", "m", 1_000, 10, 0.5).replace("T10:00", "T11:00"),
         ];
         write(&path, &rewritten);
+        // Windows can stamp both writes with the same mtime.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
         let again = scan_file(&path, Some(&shrunk)).unwrap().unwrap();
         assert_eq!(again.name(&again.records[0]), ("q", "m"));
         assert_eq!(again.records.len(), 1);
