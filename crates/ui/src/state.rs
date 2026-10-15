@@ -477,6 +477,12 @@ impl EngineHandle {
     /// Probe the IPC port and, if a live engine answers, attach as a remote
     /// viewport. `None` means embed: nothing listening, a non-engine listener,
     /// or a listener without an identity.
+    /// An engine already serving `ipc_port` (a machine's, through its
+    /// tunnel), or `None` if nothing answers there yet.
+    pub(crate) async fn attach(ipc_port: u16) -> Option<EngineHandle> {
+        Self::attach_to_daemon(ipc_port).await
+    }
+
     async fn attach_to_daemon(ipc_port: u16) -> Option<EngineHandle> {
         let url = format!("ws://127.0.0.1:{ipc_port}");
         let probe = tokio::time::timeout(
@@ -886,6 +892,9 @@ pub struct AppState {
     /// Notifies at clock-driven transitions (see [`Self::watch_clock_transitions`]).
     clock: ClockTransitions,
     engine: Option<EngineHandle>,
+    /// This PC's engine while the window drives another machine: kept
+    /// running (its agents, its IPC port) so switching back is instant.
+    parked_local: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
     change_requests: ChangeRequestClientState,
@@ -1002,6 +1011,7 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            parked_local: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -2488,6 +2498,46 @@ impl AppState {
 
     pub fn engine(&self) -> Option<&EngineHandle> {
         self.engine.as_ref()
+    }
+
+    /// This PC's engine, parked while another machine's is attached.
+    pub fn parked_local(&self) -> Option<&EngineHandle> {
+        self.parked_local.as_ref()
+    }
+
+    /// Detach the current engine for a machine switch and return it: every
+    /// view and subscription of its workspace goes, as on an account
+    /// switch, and so do the per-chat feeds that one keeps. Leaving This PC
+    /// (`park`), its engine is kept running in [`Self::parked_local`].
+    pub fn detach_for_machine_switch(
+        &mut self,
+        park: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<EngineHandle> {
+        let engine = self.engine.clone();
+        self.prepare_runtime_replacement(cx);
+        self.queue.clear();
+        self.queue_task = None;
+        self.extension_ui = Default::default();
+        self.sub_transcripts.clear();
+        self.sub_watch_tasks.clear();
+        self.review_comments.clear();
+        self.harness_updates.clear();
+        if park && engine.is_some() {
+            self.parked_local = engine.clone();
+        }
+        engine
+    }
+
+    /// Back to This PC: its parked engine, if one is kept.
+    pub fn take_parked_local(&mut self) -> Option<EngineHandle> {
+        self.parked_local.take()
+    }
+
+    /// Attach an engine opened elsewhere (a machine's, through its tunnel;
+    /// This PC's parked one) as [`Self::bootstrap`] attaches its own.
+    pub fn adopt_engine(state: Entity<AppState>, handle: EngineHandle, cx: &mut App) {
+        state.update(cx, |s, cx| s.attach_engine(handle, cx));
     }
 
     #[cfg(test)]

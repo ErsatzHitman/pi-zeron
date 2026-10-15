@@ -1029,6 +1029,14 @@ pub struct UiSettings {
     pub last_pull_request_device: Option<String>,
     /// Device-local bookmarks, keyed by provider/repository/PR, never GitHub mutations.
     pub pull_request_stars: Vec<String>,
+    /// Other computers whose Zeron engine this window can drive over SSH
+    /// (see [`crate::machines`]), in the order they were added.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<Machine>,
+    /// The machine (its SSH destination) this window drove last; `None` is
+    /// This PC. Zeron reconnects to it at launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_machine: Option<String>,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
@@ -1158,6 +1166,8 @@ impl Default for UiSettings {
             last_pull_request_repository: None,
             last_pull_request_device: None,
             pull_request_stars: Vec::new(),
+            machines: Vec::new(),
+            active_machine: None,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
@@ -1359,6 +1369,28 @@ pub struct KeymapConfig {
     /// fixed-length array would let one malformed entry reset every unrelated
     /// setting. [`Self::healed`] restores the length instead.
     pub jump_session: Vec<String>,
+}
+
+/// Another computer running Zeron's engine, reached over SSH.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Machine {
+    /// `user@host` or an `~/.ssh/config` alias, as `ssh` takes it.
+    pub ssh: String,
+    /// What the switcher calls it; empty is its host.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+impl Machine {
+    pub fn label(&self) -> String {
+        let name = self.name.trim();
+        if name.is_empty() {
+            crate::machines::default_name(&self.ssh)
+        } else {
+            name.to_owned()
+        }
+    }
 }
 
 /// Stable key for device-local preferences that belong to one workspace
@@ -1838,6 +1870,8 @@ impl UiSettings {
             last_pull_request_repository,
             last_pull_request_device,
             pull_request_stars,
+            machines,
+            active_machine,
         );
         current
     }

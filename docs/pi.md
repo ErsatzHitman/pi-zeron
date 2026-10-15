@@ -252,9 +252,13 @@ keys):
    needs (`OPENROUTER_API_KEY=…`). Run `zeron daemon install` (and
    `loginctl enable-linger $USER` so it starts at boot). `zeron status` should
    show the engine listening on `127.0.0.1:27654`; it stays loopback-only.
-2. **On the desktop**, run `dist/windows/Zeron Remote.cmd user@host` (next to
-   `zeron.exe`). It forwards local port 27755 to the engine over SSH and
-   opens a window with `ZERON_IPC_PORT=27755`, its own data dir
+2. **On the desktop**, add the machine in Settings → Devices → Machines
+   (`user@host`, the SSH key must already log in) and pick it from the
+   titlebar's machine switcher (see `docs/reference/machines.md`). The
+   window's sidebar, chats and projects become that machine's; This PC is
+   one click back. Alternatively, `dist/windows/Zeron Remote.cmd user@host`
+   (next to `zeron.exe`) forwards local port 27755 to the engine over SSH and
+   opens a separate window with `ZERON_IPC_PORT=27755`, its own data dir
    (`%LOCALAPPDATA%\ZeronRemote`) and `ZERON_ATTACH_ONLY=1`: that window only
    views the remote engine, and says so rather than starting a local one when
    the tunnel is down. The normal Zeron keeps running beside it.

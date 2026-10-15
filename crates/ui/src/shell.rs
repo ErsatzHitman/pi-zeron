@@ -74,6 +74,7 @@ mod command_palette;
 mod file_mutations;
 mod files_panel;
 mod harness_updates;
+mod machines;
 mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
@@ -2215,6 +2216,16 @@ pub struct Shell {
     harness_update_geometry: [Option<WidthTween>; 2],
     harness_update_scroll: settings::widgets::PageScroll,
     user_menu: popover::Popup<()>,
+    /// The titlebar's machine switcher (see [`machines`]).
+    machine_menu: popover::Popup<()>,
+    /// The machine in view, as its SSH destination; `None` is This PC.
+    machine: Option<String>,
+    /// The open SSH tunnel to [`Self::machine`]'s engine.
+    machine_tunnel: Option<crate::machines::Tunnel>,
+    /// The switch to a machine whose tunnel is still opening.
+    machine_task: Option<Task<()>>,
+    /// The launch-time return to the last machine has been considered.
+    machine_restored: bool,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Repaints the update strip and dialog as the app-level update
@@ -2718,6 +2729,11 @@ impl Shell {
             harness_update_geometry: [None; 2],
             harness_update_scroll: settings::widgets::PageScroll::default(),
             user_menu: popover::Popup::default(),
+            machine_menu: popover::Popup::default(),
+            machine: None,
+            machine_tunnel: None,
+            machine_task: None,
+            machine_restored: false,
             sidebar_notice: None,
             _app_update_observation: crate::app_update::AppUpdate::global(cx).map(|update| {
                 cx.observe(&update, |this, update, cx| {
@@ -2904,9 +2920,10 @@ impl Shell {
         // AuthStatus is shared by every viewport. Whichever viewport owns the
         // embedded runtime drains it; remote viewports request daemon shutdown
         // and all of them independently reattach to the new local runtime.
-        if signed_out_synced && self.runtime_change_task.is_none() {
+        if signed_out_synced && self.runtime_change_task.is_none() && self.machine.is_none() {
             self.start_local_runtime_transition(false, cx);
         }
+        self.restore_machine(cx);
         // Capture knob: the add-space palette needs only the device registry.
         if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
@@ -4994,6 +5011,12 @@ impl Shell {
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
+        // Another machine's engine: open its tunnel again.
+        if let Some(machine) = self.machine.clone() {
+            self.machine = None;
+            self.switch_machine(Some(machine), cx);
+            return;
+        }
         AppState::bootstrap(self.state.clone(), self.boot.clone(), cx);
     }
 
@@ -6091,6 +6114,10 @@ impl Shell {
     }
 
     fn active_sidebar_pin_profile_key(&self, cx: &App) -> Option<String> {
+        // Each machine keeps its own pins and sections.
+        if let Some(machine) = &self.machine {
+            return Some(format!("machine:{machine}"));
+        }
         let state = self.state.read(cx);
         sidebar_pin_profile_key(
             state.workspace_scope,
@@ -6435,6 +6462,15 @@ impl Shell {
         if self.runtime_change_task.is_some() {
             return;
         }
+        // Accounts belong to This PC's engine; never stop another machine's.
+        if self.machine.is_some() {
+            self.show_notice(
+                crate::toast::ToastKind::Info,
+                "Switch to This PC to change accounts",
+                cx,
+            );
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.runtime_change_error = Some("Engine not connected".into());
             self.sync_flow = SyncFlow::SignedOutRestartRequired;
@@ -6577,6 +6613,14 @@ impl Shell {
     /// untouched, so the old path is always a safe exit.
     fn start_synced_switch(&mut self, import: bool, cx: &mut Context<Self>) {
         if self.runtime_change_task.is_some() {
+            return;
+        }
+        if self.machine.is_some() {
+            self.show_notice(
+                crate::toast::ToastKind::Info,
+                "Switch to This PC to change accounts",
+                cx,
+            );
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -7421,8 +7465,19 @@ impl Shell {
             ),
         ) + CLUSTER_BUTTONS_WIDTH
             + TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
-        let left = (sidebar - Theme::SPACE_SM - 24.0).max(cluster_end + TITLEBAR_GROUP_GAP);
+        // The machine switcher rides just before the options while the
+        // sidebar has room for both past the cluster.
+        let with_machine = sidebar - Theme::SPACE_SM - 24.0 - machines::MACHINE_SLOT_WIDTH
+            >= cluster_end + TITLEBAR_GROUP_GAP;
+        let width = 24.0
+            + if with_machine {
+                machines::MACHINE_SLOT_WIDTH
+            } else {
+                0.0
+            };
+        let left = (sidebar - Theme::SPACE_SM - width).max(cluster_end + TITLEBAR_GROUP_GAP);
         let theme = Theme::of(cx).clone();
+        let machine = with_machine.then(|| self.render_machine_trigger(&theme, cx));
         let trigger = self.render_sidebar_view_trigger(&theme, cx);
         Some(
             div()
@@ -7433,7 +7488,9 @@ impl Shell {
                 .pt(px(Theme::TITLEBAR_TOP_PAD))
                 .flex()
                 .items_center()
+                .gap(px(TITLEBAR_CONTROL_GAP))
                 .opacity(reveal)
+                .children(machine)
                 .child(trigger)
                 .into_any_element(),
         )
@@ -10638,6 +10695,10 @@ impl Shell {
         {
             return true;
         }
+        if self.machine_menu.is_open() {
+            self.close_machine_menu(cx);
+            return true;
+        }
         if self.harness_update_expanded {
             self.set_harness_updates_expanded(false, cx);
             return true;
@@ -12908,6 +12969,20 @@ impl Shell {
                         .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
                         .child(SharedString::from("Retry")),
                 )
+                // Another machine is unreachable: This PC is one click away.
+                .when(self.machine.is_some(), |el| {
+                    el.child(
+                        div()
+                            .id("use-this-pc")
+                            .debug_selector(|| "use-this-pc".into())
+                            .text_size(crate::typography::ui_rems(13.0))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.text))
+                            .on_click(cx.listener(|this, _, _, cx| this.switch_machine(None, cx)))
+                            .child(SharedString::from("Use This PC")),
+                    )
+                })
                 .into_any_element(),
             // Login card (zeron App.tsx Gate): centered card on the grid —
             // logo, "Log in to Zeron", copy, full-width white Log in button.

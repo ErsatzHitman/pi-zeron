@@ -44,6 +44,7 @@ pub(crate) mod image_media;
 pub(crate) mod image_viewer;
 pub mod links;
 pub mod loaders;
+pub mod machines;
 pub mod markdown;
 pub mod motion;
 mod new_thread_background_effects;
@@ -248,12 +249,22 @@ pub fn run_app(config: UiConfig) {
         cx.on_app_quit(move |cx| {
             settings::flush(cx);
             app_update::install_on_quit(cx);
-            let shutdown =
-                quit_state.read(cx).engine().cloned().map(|handle| {
-                    gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
-                });
+            // The engine in view, and This PC's when another machine's is.
+            let engines: Vec<_> = {
+                let state = quit_state.read(cx);
+                state
+                    .engine()
+                    .into_iter()
+                    .chain(state.parked_local())
+                    .cloned()
+                    .collect()
+            };
+            let shutdown: Vec<_> = engines
+                .into_iter()
+                .map(|handle| gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await }))
+                .collect();
             async move {
-                if let Some(task) = shutdown {
+                for task in shutdown {
                     let _ = task.await;
                 }
             }

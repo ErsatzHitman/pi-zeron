@@ -1,6 +1,8 @@
 //! Settings → Devices (feature-inventory §1.5): the device registry — name,
 //! platform, last-seen, an Online/Offline badge, a "This device" badge, click-to-copy id,
-//! and a Rename dialog (Mutate renameDevice).
+//! and a Rename dialog (Mutate renameDevice). Above it, the machines the
+//! titlebar switcher offers (see [`crate::machines`]): add one by its SSH
+//! destination, remove one.
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -61,10 +63,38 @@ struct RenameDialog {
     _events: Subscription,
 }
 
+/// Add a machine: its SSH destination, and what to call it.
+struct AddMachineDialog {
+    target: Entity<ComposerInput>,
+    name: Entity<ComposerInput>,
+    error: Option<SharedString>,
+    _events: Vec<Subscription>,
+}
+
+/// `machines` with `target` (trimmed) added under `name`, or why not.
+pub fn add_machine(
+    machines: &[crate::settings::Machine],
+    target: &str,
+    name: &str,
+) -> Result<Vec<crate::settings::Machine>, &'static str> {
+    crate::machines::validate_target(target)?;
+    let target = target.trim();
+    if machines.iter().any(|machine| machine.ssh == target) {
+        return Err("That machine is already listed");
+    }
+    let mut list = machines.to_vec();
+    list.push(crate::settings::Machine {
+        ssh: target.to_owned(),
+        name: name.trim().to_owned(),
+    });
+    Ok(list)
+}
+
 pub struct DevicesPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
     rename: Option<RenameDialog>,
+    add_machine: Option<AddMachineDialog>,
     /// Device id whose id-chip shows "Copied" right now.
     copied: Option<String>,
     error: Option<SharedString>,
@@ -80,6 +110,7 @@ impl DevicesPage {
             state,
             scroll: widgets::PageScroll::default(),
             rename: None,
+            add_machine: None,
             copied: None,
             error: None,
             task: None,
@@ -112,11 +143,200 @@ impl DevicesPage {
     /// Escape that reached Settings unclaimed closes the rename dialog first,
     /// so it never closes Settings under the dialog. Returns whether it did.
     pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.rename.take().is_none() {
+        if self.rename.take().is_none() && self.add_machine.take().is_none() {
             return false;
         }
         cx.notify();
         true
+    }
+
+    pub(crate) fn open_add_machine(&mut self, cx: &mut Context<Self>) {
+        let target = cx.new(|cx| ComposerInput::new("user@host", cx));
+        let name = cx.new(|cx| ComposerInput::new("Name (optional)", cx));
+        let submit = |this: &mut Self,
+                      _: Entity<ComposerInput>,
+                      event: &ComposerInputEvent,
+                      cx: &mut Context<Self>| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_add_machine(cx);
+            }
+        };
+        let events = vec![cx.subscribe(&target, submit), cx.subscribe(&name, submit)];
+        self.add_machine = Some(AddMachineDialog {
+            target,
+            name,
+            error: None,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    fn submit_add_machine(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.add_machine.as_mut() else {
+            return;
+        };
+        let target = dialog.target.read(cx).text().to_string();
+        let name = dialog.name.read(cx).text().to_string();
+        let current = crate::settings::current(cx).machines;
+        match add_machine(&current, &target, &name) {
+            Ok(machines) => {
+                self.add_machine = None;
+                crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                    settings.machines = machines;
+                });
+            }
+            Err(reason) => dialog.error = Some(reason.into()),
+        }
+        cx.notify();
+    }
+
+    fn remove_machine(&mut self, target: String, cx: &mut Context<Self>) {
+        crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+            settings.machines.retain(|machine| machine.ssh != target);
+        });
+        cx.notify();
+    }
+
+    fn render_add_machine_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).for_popup();
+        let dialog = self.add_machine.as_ref()?;
+        let target = dialog.target.clone();
+        let name = dialog.name.clone();
+        let error = dialog.error.clone();
+        let card = popover::dialog_card(&theme)
+            .id("add-machine-card")
+            .role(gpui::Role::Dialog)
+            .aria_label("Add machine")
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.add_machine = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(popover::dialog_title(&theme, "Add machine"))
+            .child(
+                div()
+                    .mt(px(6.0))
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        "A computer running Zeron's engine (`zeron daemon install`), \
+                         reached with your SSH key.",
+                    )),
+            )
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .child(popover::dialog_field(target.into_any_element())),
+            )
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .child(popover::dialog_field(name.into_any_element())),
+            )
+            .children(error.map(|error| {
+                div()
+                    .mt(px(8.0))
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(theme.warning)
+                    .child(error)
+            }))
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        widgets::text_action(&theme, widgets::ActionTone::Quiet, "Cancel")
+                            .id("add-machine-cancel")
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.add_machine = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        widgets::text_action(&theme, widgets::ActionTone::Solid, "Add")
+                            .id("add-machine-save")
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_add_machine(cx))),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("add-machine-dialog", viewport, card))
+    }
+
+    /// The machines the titlebar switcher offers, and Add.
+    fn render_machines(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let machines = crate::settings::current(cx).machines;
+        let mut block = widgets::section_card(theme).mt(px(8.0));
+        if machines.is_empty() {
+            block = block.child(
+                widgets::card_row(theme, true).child(
+                    div()
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(
+                            "Add another computer running Zeron to switch to it from the titlebar.",
+                        )),
+                ),
+            );
+        }
+        for (ix, machine) in machines.into_iter().enumerate() {
+            let target = machine.ssh.clone();
+            block = block.child(
+                widgets::card_row(theme, ix == 0)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.0))
+                            .child(widgets::row_title(theme, machine.label()))
+                            .child(widgets::meta_line(
+                                theme,
+                                vec![
+                                    div()
+                                        .child(SharedString::from(machine.ssh.clone()))
+                                        .into_any_element(),
+                                ],
+                            )),
+                    )
+                    .child(
+                        widgets::text_action(theme, widgets::ActionTone::Quiet, "Remove")
+                            .id(("machine-remove", ix))
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label(format!("Remove {}", machine.label()))
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_machine(target.clone(), cx);
+                            })),
+                    ),
+            );
+        }
+        let add = widgets::card_row(theme, false).child(
+            widgets::text_action(theme, widgets::ActionTone::Filled, "Add machine")
+                .id("machine-add")
+                .tab_index(0)
+                .role(gpui::Role::Button)
+                .focus_visible(|s| s.border_2().border_color(theme.accent))
+                .on_click(cx.listener(|this, _, _, cx| this.open_add_machine(cx))),
+        );
+        div()
+            .flex()
+            .flex_col()
+            .child(widgets::section_label(theme, "Machines").mt(px(28.0)))
+            .child(block.child(add))
     }
 
     fn submit_rename(&mut self, cx: &mut Context<Self>) {
@@ -275,6 +495,8 @@ impl Render for DevicesPage {
         };
         let copied = self.copied.clone();
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
+        let add_dialog = self.render_add_machine_dialog(window.viewport_size(), cx);
+        let machines = self.render_machines(&theme, cx);
         // Split into this device and the rest; each renders as rows in one
         // block, like every other settings page.
         let (local, others): (Vec<_>, Vec<_>) = devices
@@ -391,6 +613,7 @@ impl Render for DevicesPage {
         let card = div()
             .flex()
             .flex_col()
+            .child(machines)
             .when_some(local_block, |el, block| {
                 el.child(widgets::section_label(&theme, "This device").mt(px(28.0)))
                     .child(block)
@@ -431,6 +654,7 @@ impl Render for DevicesPage {
             )
             .children(scrollbar)
             .when_some(dialog, |el, dialog| el.child(dialog))
+            .when_some(add_dialog, |el, dialog| el.child(dialog))
     }
 }
 
@@ -438,6 +662,25 @@ impl Render for DevicesPage {
 mod tests {
     use super::*;
     use chrono::TimeDelta;
+
+    #[test]
+    fn a_machine_is_added_once_by_its_ssh_destination() {
+        let list = add_machine(&[], " akshat@lab-box ", "  Lab ").unwrap();
+        assert_eq!(
+            list,
+            vec![crate::settings::Machine {
+                ssh: "akshat@lab-box".into(),
+                name: "Lab".into(),
+            }]
+        );
+        assert_eq!(
+            add_machine(&list, "akshat@lab-box", ""),
+            Err("That machine is already listed")
+        );
+        assert_eq!(add_machine(&list, "", ""), Err("Enter user@host"));
+        let two = add_machine(&list, "pi-box", "").unwrap();
+        assert_eq!(two[1].label(), "pi-box");
+    }
 
     #[test]
     fn presence_window() {
