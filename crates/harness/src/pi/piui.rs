@@ -473,8 +473,13 @@ impl ExtensionUi {
                 if self.in_turn {
                     return Handled::Notice(message);
                 }
-                if let Some(element) =
-                    report_element(&format!("report-{}", self.dialog_seq + 1), &message)
+                // Only a command's own output (info) opens as a report. A
+                // warning nobody asked for (Pi's "MCP servers need attention"
+                // at startup) is a toast, not a tab in the composer's place.
+                let level = notice_level(frame);
+                if level == NoticeLevel::Info
+                    && let Some(element) =
+                        report_element(&format!("report-{}", self.dialog_seq + 1), &message)
                 {
                     self.dialog_seq += 1;
                     let key = format!("{DIALOG_NS}:report-{}", self.dialog_seq);
@@ -482,7 +487,6 @@ impl ExtensionUi {
                     self.publish();
                     return Handled::Consumed;
                 }
-                let level = notice_level(frame);
                 let seq = self.next_seq();
                 self.state.notices.push(ExtensionNotice {
                     seq,
@@ -1097,6 +1101,13 @@ mod tests {
             row_id: None,
         };
         assert!(ui.close_report(&close));
+        assert!(rx.borrow().elements.is_empty());
+        // An unasked-for warning, however long, is a toast and opens no tab.
+        let warning = "MCP servers need attention:\n  a: failed\n  b: failed\n  c: needs auth\nRun /mcp to fix.";
+        assert_eq!(
+            ui.handle(&json!({"method":"notify","message":warning,"notifyType":"warning"})),
+            Handled::Notice(warning.into())
+        );
         assert!(rx.borrow().elements.is_empty());
         // Short notices stay toasts.
         assert_eq!(

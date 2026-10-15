@@ -370,8 +370,14 @@ pub fn menu_scroll_list(id: &'static str, scroll: &ScrollHandle) -> Stateful<Div
 
 /// Completion surfaces share the picker card, inset and scroll fade. Keep
 /// rails outside this wrapper so fading text never fades the scrollbar.
+/// The composer's completion menus (`/` commands and their sub-commands,
+/// `@` mentions) open over the transcript's text: an opaque surface, even on
+/// frost, so what is behind never reads through the rows.
 pub fn completion_card(theme: &Theme) -> Div {
-    popover_card(theme).w_full().max_h(px(320.0))
+    popover_card(theme)
+        .w_full()
+        .max_h(px(320.0))
+        .bg(crate::theme::flatten(surface_bg(theme), theme.bg))
 }
 
 pub fn completion_list(

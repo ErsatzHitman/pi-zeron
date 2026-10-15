@@ -24,7 +24,7 @@ A setting saved by an older build that hid the panel is ignored.
 | Sub-agents | See below |
 | Compaction | Pi chats only, with auto-compaction on: shown once the context is within 10% of the model's window of where Pi compacts (the window less its reserve from Pi's settings), and while a compaction runs, manual ones too. A bar fills toward that point with its percent, and the caption says where it compacts, or that it is compacting with a live timer, or why the last one failed. Once shown it stays until the context is 12% away. The header's pill reads Near limit, Compacting or Failed |
 | Workflow | See below |
-| Background | Only while one of Pi's background bash commands runs (the `bash-background` extension moves a command there after 20 seconds): one row per command with a live timer. Its Stop appears on hover; the first click asks, and the second sends Kill |
+| Background | Only while one of Pi's background bash commands runs (the `bash-background` extension moves a command there after 20 seconds): one row per command with a live timer. A Stop button sits at its right end; the first click asks, and the second sends Kill |
 
 The essentials, from Machine to Changes, always show. Goal, Todo, Sub-agents, Workflow, Background and Compaction appear only while active: nothing running means no sections. They have no fixed order. A section that becomes active grows in at the bottom, and one whose work ends folds away while the others close up; the card does not reorder what is already showing. Sections already active when a chat opens appear at once, ordered by when their work started. A section's header folds it, and a fold lasts for the app run.
 
@@ -37,7 +37,7 @@ Shown while a sub-agent or side chat runs, or when the chat has a parent (the Pa
    - this chat's side chats (forks, and chats an agent started through the Zeron MCP server), newest first. A side chat's row shows its pull request badge and when it was last active.
    - Clicking a side chat opens it in the right pane. Double-clicking renames it in place, and right-clicking opens the chat menu.
 2. **Running sub-agents:**
-   - Pi's sub-agent fleet (the `subagents` extension). Each row has a live timer. Clicking it runs the roster's View. Its Stop appears on hover; the first click asks, and the second sends Kill.
+   - Pi's sub-agent fleet (the `subagents` extension). Each row has a live timer. Clicking it runs the roster's View. A Stop button sits at its right end; the first click asks, and the second sends Kill.
    - Subagents a harness spawned (the transcript's spawn chips). Clicking one opens its transcript.
 3. **Previous agents (N):** finished and failed sub-agents. This group is closed until opened.
 

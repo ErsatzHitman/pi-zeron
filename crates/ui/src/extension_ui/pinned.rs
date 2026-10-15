@@ -22,7 +22,7 @@ const ROW_PAD_X: f32 = 8.0;
 const SIDE_INSET: f32 = 16.0;
 const CHIP_MAX_WIDTH: f32 = 200.0;
 
-/// Per-element presentation, in memory for the app run (like the todo tray).
+/// Per-element presentation, in memory for the app run.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TrayState {
     /// The user's choice; `None` follows the element (open while it works).

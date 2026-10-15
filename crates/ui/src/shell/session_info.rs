@@ -1479,7 +1479,7 @@ impl Shell {
                 element,
                 row: row_id,
                 stop: Some(stop),
-            } => Some(self.render_fleet_stop(element, row_id, stop, &group, theme, cx)),
+            } => Some(self.render_fleet_stop(element, row_id, stop, theme, cx)),
             _ => None,
         };
         let clickable = !matches!(
@@ -1519,8 +1519,8 @@ impl Shell {
             )
             .child(title)
             .children(badge)
-            .children(stop)
-            .children(time);
+            .children(time)
+            .children(stop);
         if let Some(detail) = row.detail.clone() {
             element = element.tooltip(crate::settings::widgets::text_tooltip(detail));
         }
@@ -1582,14 +1582,13 @@ impl Shell {
         element.into_any_element()
     }
 
-    /// A running Pi sub-agent's or background command's Stop: shown on
-    /// hover; a first click asks, the second stops it.
+    /// A running Pi sub-agent's or background command's Stop, always at the
+    /// row's right end: a first click asks ("Stop?"), the second stops it.
     fn render_fleet_stop(
         &self,
         element: &str,
         row: &str,
         stop: &PiUiAction,
-        group: &SharedString,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1614,19 +1613,17 @@ impl Shell {
             .aria_label(label)
             .flex_none()
             .h(px(20.0))
-            .px(px(5.0))
+            .min_w(px(20.0))
+            .px(px(if armed { 5.0 } else { 0.0 }))
             .flex()
             .items_center()
+            .justify_center()
             .gap(px(3.0))
             .rounded(px(5.0))
+            .cursor_pointer()
             .text_size(crate::typography::ui_rems(11.0))
             .text_color(theme.danger)
-            .when(!armed, |button| {
-                button
-                    .invisible()
-                    .group_hover(group.clone(), |style| style.visible())
-            })
-            .when(armed, |button| button.bg(theme.danger.opacity(0.12)))
+            .bg(theme.danger.opacity(if armed { 0.12 } else { 0.06 }))
             .hover(|style| style.bg(theme.danger.opacity(0.16)))
             .tooltip(crate::settings::widgets::text_tooltip(tip))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1643,12 +1640,12 @@ impl Shell {
                 cx.notify();
             }))
             .child(icon(icons::STOP).size(px(10.0)).text_color(theme.danger))
-            .child(label)
+            .when(armed, |button| button.child(label))
             .into_any_element()
     }
 
     /// Bash commands Pi moved to the background, each with a live timer
-    /// and a Stop on hover. Active while one runs.
+    /// and a Stop. Active while one runs.
     fn render_background(
         &mut self,
         rows: &[AgentRow],

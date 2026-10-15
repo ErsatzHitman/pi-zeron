@@ -2,8 +2,9 @@
 //! (the agent's questions, extension sheets, the btw thread and the reports
 //! a command opens) takes the composer's place, one at a time. Several at
 //! once queue behind each other as tabs above the panel; the front one is
-//! the one shown. A panel nobody waits on (btw, a report) also offers the
-//! message box itself as a tab, so the chat can go on beside it.
+//! the one shown. A panel nobody waits on (btw, a report) can step back to
+//! the message box, so the chat can go on beside it: its tab toggles it.
+//! The message box has no tab of its own.
 
 use std::collections::HashSet;
 
@@ -304,11 +305,12 @@ impl Composer {
         cx.stop_propagation();
     }
 
-    /// The tabs above the panel, when more than one thing can be shown.
+    /// The tabs above the panel: when more than one prompt is open, or a
+    /// screen can step back to the message box (its tab toggles it).
     pub(crate) fn render_prompt_tabs(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let tabs = self.prompt_queue(cx);
         let message = offers_message(&tabs);
-        if tabs.len() + usize::from(message) < 2 {
+        if tabs.len() < 2 && !message {
             return None;
         }
         let theme = Theme::of(cx).clone();
@@ -322,15 +324,7 @@ impl Composer {
             .map(|at| format!("{} of {}", at + 1, tabs.len()));
         let entries = tabs
             .into_iter()
-            .map(|tab| (tab.id, tab.label, tab.icon, tab.blocking))
-            .chain(message.then(|| {
-                (
-                    MESSAGE_TAB.to_owned(),
-                    "Message".to_owned(),
-                    icons::PEN,
-                    false,
-                )
-            }));
+            .map(|tab| (tab.id, tab.label, tab.icon, tab.blocking));
         let mut row: Vec<AnyElement> = Vec::new();
         for (ix, (id, label, glyph, blocking)) in entries.enumerate() {
             let active = id == current;
@@ -367,7 +361,13 @@ impl Composer {
                     .role(gpui::Role::Tab)
                     .aria_label(SharedString::from(label.clone()))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.pick_prompt(id.clone(), window, cx)
+                        // A shown screen's tab steps back to the message box.
+                        let pick = if active && !blocking && message {
+                            MESSAGE_TAB.to_owned()
+                        } else {
+                            id.clone()
+                        };
+                        this.pick_prompt(pick, window, cx)
                     }))
                     .child(icon(glyph).size(px(12.0)).text_color(color))
                     .child(

@@ -173,7 +173,7 @@ live state; it never enters the synced chat document.
 | subagent fleet (`subagents:fleet`) | also listed in the session panel's Sub-agents section, with a live timer per running job; a row runs View, and its Stop sends Kill after a second click. The engine also mirrors the running jobs onto the chat's session row (from the roster, or from its `piui:subagents:fleet` text mirror while no UI watches the chat), so the sidebar nests them under a session that is not open |
 | background bash (`bash:jobs`, `bash-bg:fleet`) | also listed in the session panel's Background section, with a live timer per running command; its Stop sends Kill after a second click |
 | workflow run state (`workflow:state`, from the `workflows` extension) | the session panel's Workflow section: the run's progress, phase, tasks by state, retries, errors, checkpoints and reused results, with Pause and Stop, and Resume or Discard for a run that stopped early. Actions go back on the `workflows:state` element with the run id as the row. A live run counts once as background work, whether the extension sends this channel, the `workflow:progress` footer line, or both |
-| `notify` (plain) | during a turn, a `pi · notice` row in the transcript; between turns, a toast. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
+| `notify` (plain) | during a turn, a `pi · notice` row in the transcript; between turns, a toast. A long info notice between turns (a command's report, four lines or more) opens as a report screen instead; a warning or error never does, so Pi's startup "MCP servers need attention" is a toast. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
 | `setTitle` | renames the chat |
 | `set_editor_text` | fills the composer |
 
@@ -182,9 +182,10 @@ sheets, screens) takes the composer's place one at a time. With more than one
 open they queue as tabs above the panel ("2 of 3"); Ctrl+Tab and Ctrl+Shift+Tab
 walk them, and a dot marks a question waiting behind another tab. A new prompt
 comes to the front only over the message box; one that arrives while another
-is shown waits as a tab. While only screens are open (btw, a report), a
-**Message** tab returns to the normal composer beside them. Opening a chat
-whose screen is still up starts on the message box.
+is shown waits as a tab. While only screens are open (btw, a report), their
+tabs stay above the composer: clicking the shown screen's tab steps back to the
+message box, and clicking it again reopens the screen. There is no separate
+Message tab. Opening a chat whose screen is still up starts on the message box.
 
 **The agent's work as rows.** The driver records what the extensions draw
 while the agent works (non-prompt elements and widgets) as `pi` tool calls in

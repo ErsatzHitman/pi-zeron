@@ -3647,6 +3647,9 @@ impl Transcript {
     /// clickable badges.
     /// The live controls of a Pi extension's row while its element is up,
     /// drawn over the row's right end (rows keep their measured heights).
+    /// The row's live controls and the width they take at its right end
+    /// (the row keeps that much clear, so its title truncates instead of
+    /// running under them).
     fn pi_row_controls(
         &mut self,
         tool: &ToolItem,
@@ -3654,7 +3657,7 @@ impl Transcript {
         height: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Option<(AnyElement, f32)> {
         let ToolCall::Mcp { server, .. } = &tool.call else {
             return None;
         };
@@ -3678,6 +3681,7 @@ impl Transcript {
         if controls.is_empty() || self.newest_pi_row(&key) != Some(tool.part_id.as_str()) {
             return None;
         }
+        let width = pi_controls_width(controls.iter().map(|control| control.label.as_str()));
         let buttons: Vec<AnyElement> = controls
             .into_iter()
             .enumerate()
@@ -3705,8 +3709,9 @@ impl Transcript {
                 let armed_id = button.clone();
                 div()
                     .id(button)
-                    .flex_none()
-                    .max_w(px(180.0))
+                    .flex_shrink()
+                    .min_w(px(PI_CONTROL_MIN_WIDTH))
+                    .max_w(px(PI_CONTROL_MAX_WIDTH))
                     .h(px(20.0))
                     .px(px(7.0))
                     .flex()
@@ -3747,16 +3752,19 @@ impl Transcript {
                     .into_any_element()
             })
             .collect();
-        Some(
+        Some((
             div()
                 .h(px(height))
-                .pl(px(8.0))
+                .max_w(px(width))
+                .overflow_hidden()
+                .pl(px(PI_CONTROLS_GAP))
                 .flex()
                 .items_center()
                 .gap(px(4.0))
                 .children(buttons)
                 .into_any_element(),
-        )
+            width,
+        ))
     }
 
     fn tool_file_opener(&mut self, cx: &mut Context<Self>) -> Option<ToolFileOpener> {
@@ -8956,10 +8964,11 @@ impl Transcript {
         // A Pi extension row's live controls float over its right end, placed
         // by the measured row heights so no row changes size.
         let mut pi_controls: Vec<AnyElement> = Vec::new();
+        let mut reserved = vec![0.0_f32; tools.len()];
         let mut row_top = CHIPS_TOP_PAD;
         for (ix, tool) in tools.iter().enumerate() {
             if reveal_progress[ix] >= 1.0
-                && let Some(controls) = self.pi_row_controls(
+                && let Some((controls, width)) = self.pi_row_controls(
                     tool,
                     &format!("{row_id}#pi{ix}"),
                     base_row_height,
@@ -8967,6 +8976,7 @@ impl Transcript {
                     cx,
                 )
             {
+                reserved[ix] = width;
                 pi_controls.push(
                     div()
                         .absolute()
@@ -9021,23 +9031,20 @@ impl Transcript {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
                 if detail.is_none() && invocation.is_none() && !chip_has_images(tool) {
-                    return reveal_tool_row(
-                        tool_chip(
-                            tool,
-                            collapses,
-                            ix > 0,
-                            ix + 1 < tools.len(),
-                            content_reveal,
-                            connector_reveal,
-                            continuation_reveal,
-                            file_opener.as_ref(),
-                            theme,
-                            cx.entity_id(),
-                            cx,
-                        ),
-                        row_height,
-                        reveal,
+                    let chip = tool_chip(
+                        tool,
+                        collapses,
+                        ix > 0,
+                        ix + 1 < tools.len(),
+                        content_reveal,
+                        connector_reveal,
+                        continuation_reveal,
+                        file_opener.as_ref(),
+                        theme,
+                        cx.entity_id(),
+                        cx,
                     );
+                    return reveal_tool_row(clear_controls(chip, reserved[ix]), row_height, reveal);
                 }
                 let affordance = affordances[ix].clone();
                 let open = detail_opens[ix];
@@ -9189,7 +9196,7 @@ impl Transcript {
                             .opacity(content_reveal)
                     }))
                     .into_any_element();
-                reveal_tool_row(row, row_height, reveal)
+                reveal_tool_row(clear_controls(row, reserved[ix]), row_height, reveal)
             }))
             .children(pi_controls);
 
@@ -10406,6 +10413,42 @@ pub(crate) fn subagent_tab_title(call: &ToolCall) -> SharedString {
 /// Clip one newly appended task row to its committed height. Fade and lift are
 /// applied to the row content itself, leaving the connector at full contrast
 /// while it draws; fading the whole row made the path animation imperceptible.
+/// A Pi row control's width bounds, and the gap before the first one.
+const PI_CONTROL_MIN_WIDTH: f32 = 56.0;
+const PI_CONTROL_MAX_WIDTH: f32 = 180.0;
+const PI_CONTROLS_GAP: f32 = 8.0;
+/// The most a row gives its controls; past it they shrink and truncate.
+const PI_CONTROLS_MAX_WIDTH: f32 = 320.0;
+
+/// The width a row's controls take: each label at about 6.5px a character
+/// plus its padding, clamped per button, plus the gaps, at most
+/// [`PI_CONTROLS_MAX_WIDTH`].
+fn pi_controls_width<'a>(labels: impl Iterator<Item = &'a str>) -> f32 {
+    let (count, width) = labels.fold((0usize, 0.0_f32), |(count, width), label| {
+        let button = (label.chars().count() as f32 * 6.5 + 14.0)
+            .clamp(PI_CONTROL_MIN_WIDTH, PI_CONTROL_MAX_WIDTH);
+        (count + 1, width + button)
+    });
+    if count == 0 {
+        return 0.0;
+    }
+    (PI_CONTROLS_GAP + width + 4.0 * (count - 1) as f32).min(PI_CONTROLS_MAX_WIDTH)
+}
+
+/// A row with live controls keeps their `width` clear at its right end.
+fn clear_controls(row: AnyElement, width: f32) -> AnyElement {
+    if width <= 0.0 {
+        return row;
+    }
+    div()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .pr(px(width))
+        .child(row)
+        .into_any_element()
+}
+
 fn reveal_tool_row(row: AnyElement, height: f32, progress: f32) -> AnyElement {
     if progress >= 1.0 {
         return row;
