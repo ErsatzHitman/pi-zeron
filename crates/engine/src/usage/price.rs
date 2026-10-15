@@ -1,6 +1,7 @@
 //! What a request cost when Pi recorded $0: a provider's own price table, a
-//! custom model's `cost` in `models.json`, or what the same model cost where
-//! Pi did record it.
+//! custom model's `cost` in `models.json`, the catalog of every model Pi can
+//! call that its usage ledger writes, or what the same model cost where Pi
+//! did record it.
 use serde_json::Value;
 use std::{collections::HashMap, path::Path};
 use zeron_proto::usage::UsageTokens;
@@ -75,6 +76,8 @@ fn free_name(model: &str) -> bool {
 pub(super) struct PriceBook {
     /// `(provider, model)` → rates from the agent dir.
     tables: HashMap<(String, String), Rates>,
+    /// `(provider, bare model)` → every route's model and rates, by name.
+    routes: HashMap<(String, String), Vec<(String, Rates)>>,
     /// `(provider, model)` and bare model → USD per weighted token, learned
     /// from recorded requests.
     learned: HashMap<(String, String), f64>,
@@ -83,8 +86,10 @@ pub(super) struct PriceBook {
 
 impl PriceBook {
     /// Every `<provider>-prices.json` table (pi-clinepass writes one) and
-    /// every `models.json` model with a `cost`, in Pi's agent directory.
-    pub fn load(agent_dir: &Path) -> Self {
+    /// every `models.json` model with a `cost`, in Pi's agent directory, then
+    /// the ledger's `catalog.json`: every model Pi's registry had, extension
+    /// and `/login` providers included.
+    pub fn load(agent_dir: &Path, ledger_dir: &Path) -> Self {
         let mut book = Self::default();
         let read = |path: &Path| -> Option<Value> {
             serde_json::from_slice(&std::fs::read(path).ok()?).ok()
@@ -106,7 +111,13 @@ impl PriceBook {
                 }
             }
         }
-        if let Some(models) = read(&agent_dir.join("models.json")) {
+        for path in [
+            agent_dir.join("models.json"),
+            ledger_dir.join("catalog.json"),
+        ] {
+            let Some(models) = read(&path) else {
+                continue;
+            };
             for (provider, config) in models["providers"].as_object().into_iter().flatten() {
                 for model in config["models"].as_array().into_iter().flatten() {
                     if let (Some(id), Some(rates)) =
@@ -118,6 +129,15 @@ impl PriceBook {
                     }
                 }
             }
+        }
+        for ((provider, model), rates) in &book.tables {
+            book.routes
+                .entry((provider.clone(), bare(model)))
+                .or_default()
+                .push((model.clone(), *rates));
+        }
+        for routes in book.routes.values_mut() {
+            routes.sort_by(|a, b| a.0.cmp(&b.0));
         }
         book
     }
@@ -154,19 +174,12 @@ impl PriceBook {
         }
         // The same model under another route of this provider; a paid route
         // over a free one, since the request was not on a free model.
-        let bare = bare(model);
-        let mut matches: Vec<(&String, &Rates)> = self
-            .tables
-            .iter()
-            .filter(|((p, m), _)| p == provider && self::bare(m) == bare)
-            .map(|((_, m), rates)| (m, rates))
-            .collect();
-        matches.sort_by(|a, b| a.0.cmp(b.0));
-        matches
+        let routes = self.routes.get(&(provider.to_owned(), bare(model)))?;
+        routes
             .iter()
             .find(|(_, rates)| !rates.free())
-            .or(matches.first())
-            .map(|(_, rates)| **rates)
+            .or(routes.first())
+            .map(|(_, rates)| *rates)
     }
 
     pub fn price(&self, provider: &str, model: &str, tokens: &UsageTokens, recorded: f64) -> Price {
@@ -242,8 +255,52 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let book = PriceBook::load(dir.path());
+        let book = PriceBook::load(dir.path(), &dir.path().join("usage-ledger"));
         (dir, book)
+    }
+
+    #[test]
+    fn the_ledger_catalog_prices_providers_nothing_else_knows_and_yields_to_models_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("usage-ledger");
+        std::fs::create_dir_all(&ledger).unwrap();
+        std::fs::write(
+            dir.path().join("models.json"),
+            json!({"providers":{"runinfra":{"models":[
+                {"id":"m","cost":{"input":0.2,"output":0.8}}
+            ]}}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            ledger.join("catalog.json"),
+            json!({"v":1,"providers":{
+                "freeflow":{"models":[{"id":"big-pickle","cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]},
+                "new-login":{"models":[{"id":"x-1","cost":{"input":2,"output":4,"cacheRead":0,"cacheWrite":0}}]},
+                "runinfra":{"models":[{"id":"m","cost":{"input":9,"output":9,"cacheRead":0,"cacheWrite":0}}]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let book = PriceBook::load(dir.path(), &ledger);
+        assert_eq!(
+            book.price("freeflow", "big-pickle", &tokens(5, 5), 0.0),
+            Price::Free
+        );
+        assert_eq!(
+            book.price("new-login", "x-1", &tokens(1_000_000, 1_000_000), 0.0),
+            Price::Estimated(6.0)
+        );
+        assert_eq!(
+            book.price("runinfra", "m", &tokens(1_000_000, 0), 0.0),
+            Price::Estimated(0.2)
+        );
+        // Without a catalog the new provider is unpriced, as before.
+        let bare = PriceBook::load(dir.path(), &dir.path().join("elsewhere"));
+        assert_eq!(
+            bare.price("new-login", "x-1", &tokens(5, 5), 0.0),
+            Price::Unpriced
+        );
     }
 
     #[test]

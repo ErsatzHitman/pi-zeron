@@ -271,7 +271,7 @@ impl UsageTracker {
                 files.insert(key, file);
             }
         }
-        let book = price::PriceBook::load(&dirs.agent);
+        let book = price::PriceBook::load(&dirs.agent, &dirs.ledger);
         let scanned_at_ms = now_ms();
         {
             let mut state = self.state();
