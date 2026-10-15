@@ -274,7 +274,7 @@ pub fn surface_label(surface: &str) -> String {
 
 /// The provider lines over the window: one per top provider, the rest as
 /// "Other", every bucket present even when nothing was spent.
-pub fn chart_for(
+pub(crate) fn chart_for(
     report: &UsageReport,
     metric: Metric,
     period: Period,
@@ -307,7 +307,9 @@ pub fn chart_for(
         names.push("Other".into());
     }
     let mut values = vec![vec![0.0; slots]; names.len()];
-    for point in &report.series {
+    // No model in the window, no line to draw.
+    let last_line = names.len().saturating_sub(1);
+    for point in report.series.iter().filter(|_| !names.is_empty()) {
         let slot = ((point.start_ms - start).max(0) / step) as usize;
         if slot >= slots {
             continue;
@@ -315,7 +317,7 @@ pub fn chart_for(
         let line = ranked
             .iter()
             .position(|p| p.provider == point.provider)
-            .map_or(names.len() - 1, |ix| ix.min(names.len() - 1));
+            .map_or(last_line, |ix| ix.min(last_line));
         values[line][slot] += match metric {
             Metric::Cost => point.cost_usd,
             Metric::Tokens => point.tokens as f64,
@@ -1258,6 +1260,11 @@ mod tests {
             models: vec![],
             ..report.clone()
         };
+        assert!(
+            chart_for(&none_here, Metric::Cost, Period::Month, now, 0)
+                .series
+                .is_empty()
+        );
         let subagent = Some("subagent".to_owned());
         for (status, metric, surface) in [
             (Status::Loading, Metric::Cost, None),

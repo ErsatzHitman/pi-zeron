@@ -347,7 +347,7 @@ mod tests {
                 ledger_call("2-a-1", "subagent", "openai", "gpt-5.6", 1_790_848_000_000, 30),
                 ledger_call("3-a-1", "jev", "openrouter", "typesafe/jev-1", 1_790_848_100_000, 40),
                 // The cache warm Pi also wrote into the session, 20 s earlier.
-                json!({"v":1,"t":"call","id":"1-a-2","ts":1_790_848_900_000,"provider":"anthropic",
+                json!({"v":1,"t":"call","id":"1-a-2","ts":1_790_848_900_000_i64,"provider":"anthropic",
                     "model":"claude-opus-5-5","u":{"i":0,"o":0,"cr":0,"cw":900},"cost":0.01,"surface":"core"})
                 .to_string(),
                 json!({"v":1,"t":"warn","ts":ledger_from,"what":"stream-hook-blind"}).to_string(),
