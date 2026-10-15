@@ -514,8 +514,9 @@ export function shellWrites(src, dialect = "posix", depth = 0) {
 }
 
 // Zeron's own tools that change no file: a read-only session still posts
-// what it finds to its orchestrator's board.
-const RO_ZERON_TOOLS = new Set(["zeron_board_post", "zeron_board_read"]);
+// what it finds to its orchestrator's board, and answers the sessions that
+// message it. Starting sessions stays blocked (a writer would escape).
+const RO_ZERON_TOOLS = new Set(["zeron_board_post", "zeron_board_read", "zeron_send_message", "zeron_send_messages"]);
 
 export function classifyReadOnly({ toolName, input = {}, annotations }) {
   if (READONLY_TOOLS.has(toolName) || RO_ZERON_TOOLS.has(toolName)) return;

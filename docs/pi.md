@@ -90,7 +90,9 @@ A run with sandbox `read-only` (MCP `create_chat` with `write: false`) gets
 delete-guard switch says: `write`, `edit`, tools marked destructive or named
 for a change (`delete`, `create`, `push`, ...), and bash that writes (redirects, `tee`, `sed -i`, package
 installs, git commands other than read-only ones, and any command not on its
-read-only list). Child Pi processes inherit it through the env and the
+read-only list). Zeron's board and messaging tools (`zeron_board_post`,
+`zeron_board_read`, `zeron_send_message(s)`) stay usable; starting sessions
+does not. Child Pi processes inherit it through the env and the
 preload. A read-only run without the guard extension fails to start rather
 than run writable. `crates/harness/tests/fixtures/pi-read-only-test.mjs` is
 the corpus, run on macOS and Windows CI.

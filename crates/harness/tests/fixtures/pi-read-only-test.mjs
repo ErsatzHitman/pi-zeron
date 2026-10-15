@@ -38,7 +38,7 @@ check('ps: Get-ChildItem', shellWrites('Get-ChildItem -Recurse', 'ps'), false);
 
 // Tools: Pi's own, extension and MCP tools.
 for (const [name, input] of [['write', {path: 'a', content: 'x'}], ['edit', {path: 'a'}], ['bash', {command: 'touch x'}],
-  ['zeron_create_chat', {}], ['zeron_send_message', {}], ['zeron_archive_chat', {}], ['zeron_respond_to_input', {}],
+  ['zeron_create_chat', {}], ['zeron_archive_chat', {}], ['zeron_respond_to_input', {}],
   ['mcp__fs__write_file', {}], ['apply_patch', {}], ['memory_save', {}], ['run_command', {}], ['git_commit', {}]])
   check(`tool: ${name}`, call(name, input), true);
 for (const [name, input] of [['read', {path: 'a'}], ['grep', {}], ['find', {}], ['ls', {}], ['bash', {command: 'git status'}],
@@ -86,6 +86,8 @@ assert.equal(piDepth({ZERON_PI_PID: '8', ZERON_SUBAGENT_DEPTH: '1'}, 8), 1, 'a r
 assert.equal(piDepth({ZERON_PI_PID: '8', ZERON_SUBAGENT_DEPTH: '1'}, 9), 2, "a sub-agent's sub-agent");
 check('zeron_board_post', call('zeron_board_post', {kind: 'finding', text: 'x'}), false);
 check('zeron_board_read', call('zeron_board_read'), false);
+check('zeron_send_message', call('zeron_send_message', {chat: 'orchestrator-r', text: 'done'}), false);
+check('zeron_create_chat', call('zeron_create_chat', {prompt: 'write it'}), true);
 const keys = ['ZERON_SUBAGENT_DEPTH', 'ZERON_PI_PID', 'ZERON_PI_MCP'];
 const priorSub = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 process.env.ZERON_PI_PID = String(process.pid + 1);   // started by another Pi
