@@ -33,7 +33,7 @@ use crate::todo_panel::{self, FoldSide, TodoPanelState, TodoRow};
 use agents::AgentList;
 pub(super) use agents::{AgentKind, AgentRow};
 use compact::{CompactMeter, Phase};
-use sections::{ActiveSections, Entry, SectionKey, stack_height};
+use sections::{ActiveSections, Entry, RowArrivals, SectionKey, stack_height};
 use todos::TodoList;
 use workflow::{RunPhase, TaskRow, WorkflowView};
 use zeron_proto::TodoItem;
@@ -84,6 +84,8 @@ pub(super) struct SessionPanel {
     todo_folds: std::collections::HashMap<String, TodoPanelState>,
     /// The sections up now, in the order they became active.
     sections: ActiveSections<SectionData>,
+    /// When each row of the sections first appeared, for its entrance.
+    arrivals: RowArrivals,
     body_scroll: gpui::ScrollHandle,
     /// While a newcomer grows in, the body keeps scrolled to the bottom so
     /// it is seen.
@@ -230,6 +232,12 @@ fn section_frame(
         .px(px(popover::CARD_INSET))
         .child(probe)
         .children(rows);
+    // Growing in, the content also settles a few pixels up into place.
+    let content = if t < 0.999 {
+        content.top(px(6.0 * (1.0 - t)))
+    } else {
+        content
+    };
     let frame = div()
         .id(SharedString::from(format!("session-info-section-{id}")))
         .debug_selector(move || format!("session-info-section-{id}"))
@@ -241,6 +249,39 @@ fn section_frame(
         return frame.into_any_element();
     }
     frame.h(px(natural * t)).opacity(t).into_any_element()
+}
+
+/// A row `t` of the way into a section already shown: it grows to its height
+/// (`measured` once painted), fades in and settles up into place.
+fn arriving_row(t: f32, measured: Rc<Cell<f32>>, row: AnyElement) -> AnyElement {
+    if t >= 0.999 {
+        return row;
+    }
+    let natural = match measured.get() {
+        height if height > 0.0 => height,
+        _ => AGENT_ROW_HEIGHT,
+    };
+    let probe = gpui::canvas(
+        move |bounds, _, _| measured.set(f32::from(bounds.size.height)),
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .inset_0();
+    div()
+        .w_full()
+        .flex_none()
+        .overflow_hidden()
+        .h(px(natural * t))
+        .opacity(t)
+        .child(
+            div()
+                .relative()
+                .w_full()
+                .top(px(6.0 * (1.0 - t)))
+                .child(probe)
+                .child(row),
+        )
+        .into_any_element()
 }
 
 /// A non-interactive card row: icon slot, label, optional trailing detail.
@@ -557,6 +598,7 @@ impl Shell {
     ) -> Option<AnyElement> {
         if reveal <= 0.001 {
             self.session_panel.sections.reset();
+            self.session_panel.arrivals.reset();
             return None;
         }
         let theme = Theme::of(cx).for_popup();
@@ -744,14 +786,18 @@ impl Shell {
             self.motion_active.set(true);
         }
         if pulse.entered {
-            self.session_panel.follow_until = Some(frame_time + crate::motion::COLLAPSE.total());
+            self.session_panel.follow_until = Some(frame_time + crate::motion::PANEL_ENTER.total());
         }
+        self.session_panel.arrivals.begin(&chat.id);
         let entries = self.session_panel.sections.take();
         let sections: Vec<AnyElement> = entries
             .iter()
             .map(|entry| self.render_section(entry, &chat.id, frame_time, &theme, cx))
             .collect();
         self.session_panel.sections.restore(entries);
+        if self.session_panel.arrivals.finish() {
+            self.motion_active.set(true);
+        }
         if self
             .session_panel
             .follow_until
@@ -963,6 +1009,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = entry.reveal.value(now, self.reduced_motion);
+        if t >= 0.999 {
+            self.session_panel.arrivals.section_shown(entry.key.id());
+        }
         let (rows, estimate) = match &entry.data {
             SectionData::Goal(goal) => {
                 let chars = goal["text"].as_str().unwrap_or_default().chars().count();
@@ -999,6 +1048,16 @@ impl Shell {
             }
         };
         section_frame(entry.key.id(), t, estimate, entry.measured.clone(), rows)
+    }
+
+    /// `row` of `section`, arriving if it just turned up there.
+    fn arriving(&mut self, section: &'static str, key: &str, row: AnyElement) -> AnyElement {
+        let now = self.render_time.unwrap_or_else(|| self.motion_time());
+        let (t, measured) =
+            self.session_panel
+                .arrivals
+                .arrive(section, key, now, self.reduced_motion);
+        arriving_row(t, measured, row)
     }
 
     /// Changes: the working tree's line totals; it opens the diff.
@@ -1192,7 +1251,8 @@ impl Shell {
         for row in todo_panel::rows(&todos.items, show_earlier, show_later) {
             out.push(match row {
                 TodoRow::Item(ix) => {
-                    Self::render_todo_row(ix, &todos.items[ix], todos.live, theme, cx)
+                    let row = Self::render_todo_row(ix, &todos.items[ix], todos.live, theme, cx);
+                    self.arriving(TODOS, &todos.items[ix].text, row)
                 }
                 TodoRow::Fold { side, count, open } => {
                     self.render_todo_fold(chat_id, side, count, open, theme, cx)
@@ -1343,7 +1403,8 @@ impl Shell {
             return rows;
         }
         for row in list.sessions.iter().chain(&list.active) {
-            rows.push(self.render_agent_row(row, theme, cx));
+            let element = self.render_agent_row(row, theme, cx);
+            rows.push(self.arriving(AGENTS, &row.key(), element));
         }
         if !list.previous.is_empty() {
             let open = self.session_panel.previous_open;
@@ -1382,7 +1443,8 @@ impl Shell {
             );
             if open {
                 for row in &list.previous {
-                    rows.push(self.render_agent_row(row, theme, cx));
+                    let element = self.render_agent_row(row, theme, cx);
+                    rows.push(self.arriving(AGENTS, &row.key(), element));
                 }
             }
         }
@@ -1668,7 +1730,8 @@ impl Shell {
             return out;
         }
         for row in rows {
-            out.push(self.render_agent_row(row, theme, cx));
+            let element = self.render_agent_row(row, theme, cx);
+            out.push(self.arriving(BACKGROUND, &row.key(), element));
         }
         out
     }
@@ -1860,7 +1923,8 @@ impl Shell {
 
         // ── The tasks: live and failed work, then the folds.
         for row in &view.lead {
-            rows.push(self.render_workflow_task(row, theme, cx));
+            let element = self.render_workflow_task(row, theme, cx);
+            rows.push(self.arriving(WORKFLOW, &row.id, element));
         }
         let queued = view.queued.len() + view.queued_more as usize;
         if queued > 0 {
@@ -1875,7 +1939,8 @@ impl Shell {
             ));
             if open {
                 for row in view.queued.iter().take(workflow::GROUP_ROWS) {
-                    rows.push(self.render_workflow_task(row, theme, cx));
+                    let element = self.render_workflow_task(row, theme, cx);
+                    rows.push(self.arriving(WORKFLOW, &row.id, element));
                 }
                 let shown = view.queued.len().min(workflow::GROUP_ROWS);
                 rows.extend(workflow_more_row("queued", queued - shown, theme));
@@ -1893,7 +1958,8 @@ impl Shell {
             ));
             if open {
                 for row in view.finished.iter().take(workflow::GROUP_ROWS) {
-                    rows.push(self.render_workflow_task(row, theme, cx));
+                    let element = self.render_workflow_task(row, theme, cx);
+                    rows.push(self.arriving(WORKFLOW, &row.id, element));
                 }
                 let hidden = view.finished.len().saturating_sub(workflow::GROUP_ROWS);
                 rows.extend(workflow_more_row("finished", hidden, theme));

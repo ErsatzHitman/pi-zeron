@@ -8,6 +8,7 @@
 //! while it folds away, so the sections above it never jump.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +44,7 @@ impl SectionKey {
     }
 }
 
-/// How far a section is shown, 0..1: in over [`motion::COLLAPSE`], out over
+/// How far a section is shown, 0..1: in over [`motion::PANEL_ENTER`], out over
 /// the quicker [`motion::MENU_OUT`].
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Reveal {
@@ -71,7 +72,7 @@ impl Reveal {
 
     fn spec(&self) -> MotionSpec {
         if self.to > 0.5 {
-            motion::COLLAPSE
+            motion::PANEL_ENTER
         } else {
             motion::MENU_OUT
         }
@@ -238,6 +239,90 @@ impl<D> ActiveSections<D> {
     }
 }
 
+/// When each row of the sections first appeared. A row that turns up in a
+/// section already on screen (a sub-agent, a todo, a background command, a
+/// workflow task) arrives over [`motion::PANEL_ENTER`]; the rows a section
+/// first shows with arrive with the section itself.
+#[derive(Default)]
+pub(super) struct RowArrivals {
+    chat: Option<String>,
+    rows: HashMap<String, Arrival>,
+    /// Sections fully shown last frame: a newcomer to one of these animates.
+    seeded: HashSet<&'static str>,
+    shown: HashSet<&'static str>,
+    drawn: HashSet<String>,
+}
+
+struct Arrival {
+    /// When it began arriving; `None` once it is in place.
+    started: Option<Instant>,
+    /// The row's painted height, written by a probe while it arrives.
+    measured: Rc<Cell<f32>>,
+}
+
+impl RowArrivals {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Start a frame of `chat`'s panel; another chat starts afresh.
+    pub fn begin(&mut self, chat: &str) {
+        if self.chat.as_deref() != Some(chat) {
+            self.reset();
+            self.chat = Some(chat.to_owned());
+        }
+    }
+
+    /// `section` is fully shown this frame.
+    pub fn section_shown(&mut self, section: &'static str) {
+        self.shown.insert(section);
+    }
+
+    /// How far row `key` of `section` has arrived, 0..1, and its height probe.
+    pub fn arrive(
+        &mut self,
+        section: &'static str,
+        key: &str,
+        now: Instant,
+        reduced: bool,
+    ) -> (f32, Rc<Cell<f32>>) {
+        let key = format!("{section}/{key}");
+        let animate = !reduced && self.seeded.contains(section);
+        let arrival = self.rows.entry(key.clone()).or_insert_with(|| Arrival {
+            started: animate.then_some(now),
+            measured: Rc::new(Cell::new(0.0)),
+        });
+        self.drawn.insert(key);
+        let t = match arrival.started {
+            Some(started) if !reduced => {
+                let total = motion::PANEL_ENTER.total().mul_f32(motion::speed_scale());
+                let raw = now.saturating_duration_since(started).as_secs_f32()
+                    / total.as_secs_f32().max(f32::EPSILON);
+                if raw >= 1.0 {
+                    arrival.started = None;
+                    1.0
+                } else {
+                    motion::PANEL_ENTER.progress(raw)
+                }
+            }
+            _ => {
+                arrival.started = None;
+                1.0
+            }
+        };
+        (t, arrival.measured.clone())
+    }
+
+    /// End the frame. A row not drawn is forgotten, so one that comes back
+    /// arrives again. Returns whether a row is still arriving.
+    pub fn finish(&mut self) -> bool {
+        let drawn = std::mem::take(&mut self.drawn);
+        self.rows.retain(|key, _| drawn.contains(key));
+        self.seeded = std::mem::take(&mut self.shown);
+        self.rows.values().any(|row| row.started.is_some())
+    }
+}
+
 /// A section's height before its first measurement: the top gap, the
 /// divider, the header, the rows and their gaps.
 pub(super) fn stack_height(rows: usize) -> f32 {
@@ -264,7 +349,85 @@ mod tests {
     }
 
     fn in_total() -> Duration {
-        motion::COLLAPSE.total().mul_f32(motion::speed_scale())
+        motion::PANEL_ENTER.total().mul_f32(motion::speed_scale())
+    }
+
+    fn arrive(rows: &mut RowArrivals, section: &'static str, key: &str, now: Instant) -> f32 {
+        rows.arrive(section, key, now, false).0
+    }
+
+    #[test]
+    fn rows_a_section_opens_with_are_in_place_and_later_ones_arrive() {
+        let mut rows = RowArrivals::default();
+        let t0 = Instant::now();
+        rows.begin("a");
+        assert_eq!(arrive(&mut rows, "agents", "one", t0), 1.0);
+        rows.section_shown("agents");
+        assert!(!rows.finish());
+
+        rows.begin("a");
+        assert_eq!(arrive(&mut rows, "agents", "one", t0), 1.0);
+        assert_eq!(arrive(&mut rows, "agents", "two", t0), 0.0);
+        // A section still growing in brings its rows with it.
+        assert_eq!(arrive(&mut rows, "todos", "first", t0), 1.0);
+        rows.section_shown("agents");
+        assert!(rows.finish());
+
+        let mid = t0 + in_total() / 2;
+        rows.begin("a");
+        arrive(&mut rows, "agents", "one", mid);
+        let t = arrive(&mut rows, "agents", "two", mid);
+        assert!(t > 0.0 && t < 1.0, "{t}");
+        rows.section_shown("agents");
+        assert!(rows.finish());
+
+        let done = t0 + in_total();
+        rows.begin("a");
+        arrive(&mut rows, "agents", "one", done);
+        assert_eq!(arrive(&mut rows, "agents", "two", done), 1.0);
+        rows.section_shown("agents");
+        assert!(!rows.finish());
+    }
+
+    #[test]
+    fn a_row_that_leaves_arrives_again_and_another_chat_starts_settled() {
+        let mut rows = RowArrivals::default();
+        let t0 = Instant::now();
+        rows.begin("a");
+        arrive(&mut rows, "background", "x", t0);
+        rows.section_shown("background");
+        rows.finish();
+        // Gone for a frame (its fold closed): it arrives again.
+        rows.begin("a");
+        rows.section_shown("background");
+        rows.finish();
+        rows.begin("a");
+        assert_eq!(arrive(&mut rows, "background", "x", t0), 0.0);
+        rows.section_shown("background");
+        rows.finish();
+        // The same keys in another chat are simply there.
+        rows.begin("b");
+        assert_eq!(arrive(&mut rows, "background", "x", t0), 1.0);
+        assert_eq!(arrive(&mut rows, "background", "y", t0), 1.0);
+        // Keys are per section.
+        rows.section_shown("background");
+        rows.finish();
+        rows.begin("b");
+        assert_eq!(arrive(&mut rows, "agents", "x", t0), 1.0);
+    }
+
+    #[test]
+    fn reduced_motion_rows_are_always_in_place() {
+        let mut rows = RowArrivals::default();
+        let t0 = Instant::now();
+        rows.begin("a");
+        rows.arrive("agents", "one", t0, true);
+        rows.section_shown("agents");
+        rows.finish();
+        rows.begin("a");
+        assert_eq!(rows.arrive("agents", "two", t0, true).0, 1.0);
+        rows.section_shown("agents");
+        assert!(!rows.finish());
     }
 
     fn out_total() -> Duration {

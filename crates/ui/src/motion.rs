@@ -485,6 +485,9 @@ pub const PANEL_RESIZE: MotionSpec = DIALOG_IN;
 pub const TAB_SLIDE: MotionSpec = MotionSpec::new(150, EASE_OUT);
 /// Diff-pane per-file collapse: 180ms height (§1.11).
 pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
+/// Something arriving in the session panel (a section, or a row in one): it
+/// grows to its height, fades in and settles into place.
+pub const PANEL_ENTER: MotionSpec = MotionSpec::new(280, EASE_OUT_QUINT);
 /// Reversible new-thread ↔ session handoff. The shared composer moves and
 /// morphs on a fast-starting, soft-landing curve while the canvas/transcript
 /// crossfade is staged around it. Slightly longer than a utility transition,
