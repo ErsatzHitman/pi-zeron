@@ -533,6 +533,78 @@ mod tests {
         assert!((view.fraction() - 2.0 / 6.0).abs() < 1e-6);
     }
 
+    /// Every frame a real run published, then its resume: Pi 1.1.0 on a Linux
+    /// box, the workflows extension, DeepSeek subagents, and one agent on a
+    /// model that does not exist so it retries, fails, and its dependent skips.
+    #[test]
+    fn a_real_run_and_its_resume_render_frame_by_frame() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/workflow-live-run.json"
+        ))
+        .unwrap();
+        let view_at = |frame: &serde_json::Value| {
+            let at = DateTime::from_timestamp_millis(frame["updatedAt"].as_i64().unwrap()).unwrap();
+            WorkflowView::of(&ui(frame.clone()), at).expect("every frame of a live run shows")
+        };
+        let views: Vec<WorkflowView> = fixture["run"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(view_at)
+            .collect();
+        assert!(
+            views.iter().any(|v| v.phase == RunPhase::Retrying
+                && v.lead
+                    .iter()
+                    .any(|t| t.label == "pick a fruit" && t.state == WorkflowTaskState::Retrying)),
+            "the failing agent was seen waiting to retry"
+        );
+        assert!(
+            views.iter().any(|v| v
+                .lead
+                .iter()
+                .filter(|t| t.state == WorkflowTaskState::Running)
+                .count()
+                >= 2),
+            "the parallel agents were seen running together"
+        );
+        let last = views.last().unwrap();
+        assert_eq!(last.phase, RunPhase::Completed);
+        assert_eq!((last.done, last.total), (4, 6));
+        assert_eq!(last.lead.len(), 1);
+        assert_eq!(last.lead[0].label, "pick a fruit");
+        assert_eq!(last.lead[0].state, WorkflowTaskState::Failed);
+        assert!(
+            last.finished
+                .iter()
+                .any(|t| t.label == "salad" && t.state == WorkflowTaskState::Skipped)
+        );
+        assert!(
+            last.recovery
+                .as_ref()
+                .and_then(|r| r.resume.as_ref())
+                .is_some(),
+            "a run with a failure offers resume"
+        );
+
+        let resumed: Vec<WorkflowView> = fixture["resume"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(view_at)
+            .collect();
+        let last = resumed.last().unwrap();
+        assert_eq!(
+            last.finished
+                .iter()
+                .filter(|t| t.state == WorkflowTaskState::Cached)
+                .count(),
+            4,
+            "finished work was reused, not run again"
+        );
+        assert_eq!(last.lead.len(), 1, "only the failed agent ran again");
+    }
+
     #[test]
     fn a_finished_run_lingers_then_goes() {
         let mut payload = running();

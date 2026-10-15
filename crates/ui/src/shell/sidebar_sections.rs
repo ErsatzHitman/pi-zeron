@@ -1006,6 +1006,63 @@ mod tests {
         assert!(cx.debug_bounds("session-info-workflow-header").is_none());
     }
 
+    /// The frames a real run published on the Linux box, played into the panel
+    /// in order (see `a_real_run_and_its_resume_render_frame_by_frame`).
+    #[gpui::test]
+    fn the_session_panel_follows_a_real_workflow_run_frame_by_frame(cx: &mut gpui::TestAppContext) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/workflow-live-run.json"))
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                prepare(shell, cx);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                shell.settings.sidebar_collapsed = true;
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("regular".into()));
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1600.0), px(1400.0)));
+        cx.run_until_parked();
+        let mut saw_retry = false;
+        for frame in fixture["run"].as_array().unwrap() {
+            set_workflow_state(&window, &mut cx, frame.clone());
+            assert!(
+                cx.debug_bounds("session-info-workflow-header").is_some(),
+                "a frame of the live run hid the section"
+            );
+            let retrying = frame["tasks"]
+                .as_array()
+                .is_some_and(|tasks| tasks.iter().any(|t| t["state"] == "retrying"));
+            if retrying {
+                saw_retry = true;
+                assert!(cx.debug_bounds("session-info-workflow-task-2").is_some());
+                assert!(cx.debug_bounds("session-info-workflow-stop").is_some());
+            }
+        }
+        assert!(saw_retry);
+        // Ended with a failure: the failed agent leads and resume is offered.
+        for id in [
+            "session-info-workflow-task-2",
+            "session-info-workflow-resume",
+            "session-info-workflow-finished",
+        ] {
+            assert!(cx.debug_bounds(id).is_some(), "{id}");
+        }
+        assert!(cx.debug_bounds("session-info-workflow-stop").is_none());
+        for frame in fixture["resume"].as_array().unwrap() {
+            set_workflow_state(&window, &mut cx, frame.clone());
+            assert!(cx.debug_bounds("session-info-workflow-header").is_some());
+        }
+        click_on(&mut cx, "session-info-workflow-finished");
+        assert!(cx.debug_bounds("session-info-workflow-task-0").is_some());
+    }
+
     #[gpui::test]
     fn the_session_panel_lists_the_todo_only_while_there_is_work(cx: &mut gpui::TestAppContext) {
         use crate::todo_panel::assistant_with_todo;
