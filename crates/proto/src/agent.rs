@@ -397,6 +397,67 @@ impl ToolCall {
             .map(str::trim)
             .filter(|model| !model.is_empty())
     }
+
+    /// A subagent's title: the BARE task description ("verify the marker
+    /// pipeline"). A fixed-width tab spent on "Agent: " never shows the task,
+    /// so the genus is stripped and the call input's description/prompt
+    /// fields back up a bare name (older docs); "Subagent" only as the last
+    /// resort.
+    pub fn subagent_title(&self) -> String {
+        let (name, input) = match self {
+            ToolCall::Unknown { name, input } => (name.as_str(), input.as_ref()),
+            ToolCall::Mcp { tool, input, .. } => (tool.as_str(), input.as_ref()),
+            _ => return "Subagent".into(),
+        };
+        let candidates = [
+            Some(name),
+            input.and_then(|i| i.get("description")?.as_str()),
+            input.and_then(|i| i.get("prompt")?.as_str()),
+        ];
+        for text in candidates.into_iter().flatten() {
+            if let Some(title) = title_line(strip_spawn_prefix(text), SUBAGENT_TITLE_MAX) {
+                return title;
+            }
+        }
+        "Subagent".into()
+    }
+}
+
+/// Max chars a subagent title keeps. The strip chip is fixed-width and
+/// truncates visually, but the derived title also rides drag ghosts, the
+/// sidebar and the session row — cap it at the source.
+pub const SUBAGENT_TITLE_MAX: usize = 40;
+
+/// First line of `text`, trimmed, capped at `max` chars with an ellipsis.
+fn title_line(text: &str, max: usize) -> Option<String> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
+    let mut out: String = line.chars().take(max).collect();
+    if line.chars().count() > max {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// Drop a leading "Agent"/"Task" genus (with its `:` and spacing) from a
+/// spawn-title candidate. Only a real word boundary strips — "Taskmaster"
+/// keeps its name. A bare "Agent"/"Task" strips to "" (no context at all).
+fn strip_spawn_prefix(text: &str) -> &str {
+    let t = text.trim();
+    for prefix in ["agent", "task"] {
+        if t.len() >= prefix.len()
+            && t.is_char_boundary(prefix.len())
+            && t[..prefix.len()].eq_ignore_ascii_case(prefix)
+        {
+            let rest = &t[prefix.len()..];
+            if rest.is_empty() {
+                return "";
+            }
+            if rest.starts_with(':') || rest.starts_with(char::is_whitespace) {
+                return rest.trim_start_matches(':').trim();
+            }
+        }
+    }
+    t
 }
 
 /// Spawn-input keys that carry a child model, in precedence order. Drivers

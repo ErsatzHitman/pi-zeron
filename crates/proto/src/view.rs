@@ -14,7 +14,9 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
-use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope};
+use crate::{
+    AuthState, Chat, ChatIndicator, RunningSubagent, Session, SessionStatus, Space, WorkspaceScope,
+};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -72,6 +74,14 @@ pub fn running_subagents(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
     session
         .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
         .map_or(0, |s| s.running_subagents)
+}
+
+/// The subagents running under a chat, under the same staleness gate as
+/// [`running_subagents`]. Pure.
+pub fn running_subagent_list(session: Option<&Session>, now: DateTime<Utc>) -> &[RunningSubagent] {
+    session
+        .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
+        .map_or(&[], |s| s.subagents.as_slice())
 }
 
 /// The full display status for a chat row / tab dot: live states win, then the
@@ -463,6 +473,13 @@ mod gate_tests {
             started_at: None,
             updated_at,
             running_subagents: running,
+            subagents: (0..running)
+                .map(|ix| RunningSubagent {
+                    doc_id: format!("sub-{ix}"),
+                    title: format!("Agent {ix}"),
+                    started_at: updated_at,
+                })
+                .collect(),
         }
     }
 
@@ -478,6 +495,9 @@ mod gate_tests {
         );
         assert_eq!(running_subagents(Some(&stale), now), 0);
         assert_eq!(running_subagents(None, now), 0);
+        assert_eq!(running_subagent_list(Some(&fresh), now).len(), 3);
+        assert!(running_subagent_list(Some(&stale), now).is_empty());
+        assert!(running_subagent_list(None, now).is_empty());
     }
 
     #[test]

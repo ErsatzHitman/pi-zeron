@@ -2,10 +2,11 @@
 //! (docs/reference/sidebar-side-chats.md). A listed session with live side
 //! chats wears a fold chip; open, its children hang below it on the
 //! Orchestrator tab's tree rail, in the order they started. Sub-agents at
-//! work hang there too, after the side chats: one row each under the
-//! selected session (Pi fleet, harness), and one "N sub-agents working" row
-//! under any other session, whose roster is not watched. Children never join
-//! the jump slots, cycling, pins or sections: the parent carries them.
+//! work hang there too, one row each after the side chats: the selected
+//! session's from its roster and transcript (Pi fleet, harness), any other
+//! session's from its synced session row (harness). An engine that only
+//! publishes the count gets one "N sub-agents working" row. Children never
+//! join the jump slots, cycling, pins or sections: the parent carries them.
 
 use super::session_info::{AgentKind, AgentRow};
 use super::*;
@@ -110,6 +111,24 @@ pub(super) fn rollup(kids: &[ChildEntry], agents: &[AgentRow], counted: u32) -> 
         .chain((counted > 0).then_some(ChatIndicator::Working))
         .min_by_key(|status| attention_rank(*status))
         .unwrap_or(ChatIndicator::Idle)
+}
+
+/// A session row's synced subagents as sidebar rows: working, timed from
+/// their start, opening their transcript.
+pub(super) fn synced_agent_rows(list: &[zeron_proto::RunningSubagent]) -> Vec<AgentRow> {
+    list.iter()
+        .map(|sub| AgentRow {
+            kind: AgentKind::Subagent {
+                doc_id: sub.doc_id.clone(),
+                frozen: false,
+            },
+            title: sub.title.clone().into(),
+            status: ChatIndicator::Working,
+            started: Some(sub.started_at),
+            trailing: None,
+            detail: None,
+        })
+        .collect()
 }
 
 /// The summary row of a session whose sub-agents are counted, not listed.
@@ -300,17 +319,21 @@ impl Shell {
             .unwrap_or_default();
         let agent_parent = selected.filter(|_| !working.is_empty());
         let parents: Vec<&str> = parents.into_iter().collect();
-        let counted: HashMap<&str, u32> = {
+        // Every other session's subagents ride its synced session row.
+        let synced: HashMap<&str, (u32, Vec<AgentRow>)> = {
             let state = self.state.read(cx);
             parents
                 .iter()
                 .filter(|parent| agent_parent != Some(**parent))
-                .map(|parent| (*parent, state.running_subagents_for(parent, now)))
-                .filter(|(_, count)| *count > 0)
+                .map(|parent| {
+                    let rows = synced_agent_rows(state.running_subagent_list_for(parent, now));
+                    (*parent, (state.running_subagents_for(parent, now), rows))
+                })
+                .filter(|(_, (count, _))| *count > 0)
                 .collect()
         };
         let listed = |parent: &str| {
-            index.has(parent) || agent_parent == Some(parent) || counted.contains_key(parent)
+            index.has(parent) || agent_parent == Some(parent) || synced.contains_key(parent)
         };
         self.sidebar_children_auto
             .retain(|parent| listed(parent.as_str()));
@@ -322,12 +345,14 @@ impl Shell {
         let mut families = HashMap::new();
         for parent in parents {
             let kids = index.of(parent);
+            let (count, rows) = synced.get(parent).cloned().unwrap_or_default();
             let agents = if agent_parent == Some(parent) {
                 working.clone()
             } else {
-                Vec::new()
+                rows
             };
-            let count = counted.get(parent).copied().unwrap_or(0);
+            // Listed by name, or (an older engine) counted.
+            let count = if agents.is_empty() { count } else { 0 };
             if kids.is_empty() && agents.is_empty() && count == 0 {
                 continue;
             }
@@ -475,7 +500,7 @@ impl Shell {
             items.push(child_slot(child, items.len() + 1 == count, rail));
         }
         for agent in &family.agents {
-            let child = self.render_sidebar_agent_row(agent, theme, cx);
+            let child = self.render_sidebar_agent_row(parent, agent, theme, cx);
             items.push(child_slot(child, items.len() + 1 == count, rail));
         }
         if family.counted > 0 {
@@ -652,12 +677,14 @@ impl Shell {
             .into_any_element()
     }
 
-    /// A sub-agent at work under the selected session, in the child rows'
-    /// compact shape: its state, a bot glyph, its name and running time.
-    /// A click opens it as the session panel's row does: a Pi sub-agent
-    /// through its roster View, a harness subagent in its transcript tab.
+    /// A sub-agent at work under `parent`, in the child rows' compact shape:
+    /// its state, a bot glyph, its name and running time. A click opens
+    /// `parent` and the sub-agent as the session panel's row does: a Pi
+    /// sub-agent through its roster View, a harness subagent in its
+    /// transcript tab.
     fn render_sidebar_agent_row(
         &self,
+        parent: &str,
         agent: &AgentRow,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -744,14 +771,13 @@ impl Shell {
         }
         let kind = agent.kind.clone();
         let title = agent.title.to_string();
+        let parent = parent.to_owned();
         row.cursor_pointer()
             .hover(move |el| el.bg(hover))
             .on_click(cx.listener(move |this, _, _, cx| {
-                let selected = this.state.read(cx).selected_chat.clone();
-                if !matches!(this.route, Route::Chat)
-                    && let Some(chat) = selected
-                {
-                    this.open_chat(chat, cx);
+                let open = this.state.read(cx).selected_chat.as_deref() == Some(parent.as_str());
+                if !open || !matches!(this.route, Route::Chat) {
+                    this.open_chat(parent.clone(), cx);
                 }
                 match &kind {
                     AgentKind::Fleet {
@@ -761,7 +787,7 @@ impl Shell {
                         ..
                     } => this.send_fleet_action(element.clone(), row.clone(), view, cx),
                     AgentKind::Subagent { doc_id, frozen } => this.add_subagent_surface(
-                        this.active_chat.clone(),
+                        parent.clone(),
                         doc_id.clone(),
                         title.clone(),
                         *frozen,
@@ -918,6 +944,27 @@ mod tests {
         assert_eq!(rollup(&[], &[agent], 0), ChatIndicator::Working);
         // Counted, not listed: still working.
         assert_eq!(rollup(&kids, &[], 2), ChatIndicator::Working);
+    }
+
+    #[test]
+    fn synced_sub_agents_become_working_rows_that_open_their_transcript() {
+        let at = DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::minutes(3);
+        let rows = synced_agent_rows(&[zeron_proto::RunningSubagent {
+            doc_id: "chat--sub--t1".into(),
+            title: "audit the auth flow".into(),
+            started_at: at,
+        }]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ChatIndicator::Working);
+        assert_eq!(rows[0].started, Some(at));
+        assert_eq!(rows[0].title.as_ref(), "audit the auth flow");
+        assert_eq!(
+            rows[0].kind,
+            AgentKind::Subagent {
+                doc_id: "chat--sub--t1".into(),
+                frozen: false,
+            }
+        );
     }
 
     #[test]

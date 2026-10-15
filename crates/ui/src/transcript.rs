@@ -10398,65 +10398,9 @@ fn chip_header(
     )
 }
 
-/// Max chars a subagent tab title keeps. The strip chip is fixed-width and
-/// truncates visually, but the derived title also rides drag ghosts and any
-/// future pickers — cap it at the source.
-const SUBAGENT_TITLE_MAX: usize = 40;
-
-/// First line of `text`, trimmed, capped at `max` chars with an ellipsis.
-fn title_line(text: &str, max: usize) -> Option<String> {
-    let line = text.lines().find(|l| !l.trim().is_empty())?.trim();
-    let mut out: String = line.chars().take(max).collect();
-    if line.chars().count() > max {
-        out.push('…');
-    }
-    Some(out)
-}
-
-/// Drop a leading "Agent"/"Task" genus (with its `:` and spacing) from a
-/// spawn-title candidate. Only a real word boundary strips — "Taskmaster"
-/// keeps its name. A bare "Agent"/"Task" strips to "" (no context at all).
-fn strip_spawn_prefix(text: &str) -> &str {
-    let t = text.trim();
-    for prefix in ["agent", "task"] {
-        if t.len() >= prefix.len()
-            && t.is_char_boundary(prefix.len())
-            && t[..prefix.len()].eq_ignore_ascii_case(prefix)
-        {
-            let rest = &t[prefix.len()..];
-            if rest.is_empty() {
-                return "";
-            }
-            if rest.starts_with(':') || rest.starts_with(char::is_whitespace) {
-                return rest.trim_start_matches(':').trim();
-            }
-        }
-    }
-    t
-}
-
-/// Tab title for a spawn chip's subagent surface: the BARE task description
-/// ("verify the marker pipeline"). The chip keeps the tool's fuller name —
-/// a fixed-width tab spent on "Agent: " never shows the task, so the genus
-/// is stripped here and the call input's description/prompt fields back up
-/// a bare name (older docs); "Subagent" only as the last resort.
+/// Tab title for a spawn chip's subagent surface (`ToolCall::subagent_title`).
 pub(crate) fn subagent_tab_title(call: &ToolCall) -> SharedString {
-    let (name, input) = match call {
-        ToolCall::Unknown { name, input } => (name.as_str(), input.as_ref()),
-        ToolCall::Mcp { tool, input, .. } => (tool.as_str(), input.as_ref()),
-        _ => return "Subagent".into(),
-    };
-    let candidates = [
-        Some(name),
-        input.and_then(|i| i.get("description")?.as_str()),
-        input.and_then(|i| i.get("prompt")?.as_str()),
-    ];
-    for text in candidates.into_iter().flatten() {
-        if let Some(title) = title_line(strip_spawn_prefix(text), SUBAGENT_TITLE_MAX) {
-            return title.into();
-        }
-    }
-    "Subagent".into()
+    call.subagent_title().into()
 }
 
 /// Clip one newly appended task row to its committed height. Fade and lift are
@@ -14384,6 +14328,7 @@ mod tests {
                         state.sessions.push(zeron_proto::Session {
                             last_completed_turn: None,
                             running_subagents: 0,
+                            subagents: Vec::new(),
                             chat_id: "chat".into(),
                             device_id: "test".into(),
                             status: zeron_proto::SessionStatus::Working,
@@ -16319,7 +16264,7 @@ mod tests {
             input: None,
         };
         let title = subagent_tab_title(&long);
-        assert_eq!(title.chars().count(), SUBAGENT_TITLE_MAX + 1);
+        assert_eq!(title.chars().count(), zeron_proto::SUBAGENT_TITLE_MAX + 1);
         assert!(title.ends_with('…'));
         // Non-spawn-shaped calls stay generic.
         assert_eq!(

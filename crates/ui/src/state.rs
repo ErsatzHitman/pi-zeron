@@ -2336,6 +2336,16 @@ impl AppState {
         running_subagents(self.session_for(chat_id), now)
     }
 
+    /// Those subagents by name, oldest first (empty from an engine that only
+    /// publishes the count).
+    pub fn running_subagent_list_for(
+        &self,
+        chat_id: &str,
+        now: DateTime<Utc>,
+    ) -> &[zeron_proto::RunningSubagent] {
+        zeron_proto::view::running_subagent_list(self.session_for(chat_id), now)
+    }
+
     /// Staleness-checked status dot for a chat row. A send in flight reads as
     /// Working (see [`Self::display_status_for`]).
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
@@ -4229,6 +4239,7 @@ mod tests {
         Session {
             last_completed_turn: None,
             running_subagents: 0,
+            subagents: Vec::new(),
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
@@ -4474,6 +4485,7 @@ mod tests {
         let mut row = Session {
             last_completed_turn: None,
             running_subagents: 0,
+            subagents: Vec::new(),
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,
@@ -4506,6 +4518,7 @@ mod tests {
         state.sessions = vec![Session {
             last_completed_turn: None,
             running_subagents: 0,
+            subagents: Vec::new(),
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,

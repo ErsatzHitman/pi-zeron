@@ -324,6 +324,21 @@ pub struct Session {
     /// has not opened; read it through `view::running_subagents`.
     #[serde(default)]
     pub running_subagents: u32,
+    /// Those subagents, oldest first, so a sidebar can nest them under a chat
+    /// it has not opened; read it through `view::running_subagent_list`.
+    /// Empty from an engine that predates it.
+    #[serde(default)]
+    pub subagents: Vec<RunningSubagent>,
+}
+
+/// A subagent streaming under a chat, as its session row carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningSubagent {
+    /// Its transcript doc (the spawn chip's ref).
+    pub doc_id: String,
+    pub title: String,
+    pub started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

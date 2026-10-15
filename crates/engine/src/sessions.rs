@@ -1505,21 +1505,22 @@ impl Inner {
         self.set_status_with_completion(chat_id, status, fresh_start, None);
     }
 
-    /// Publish how many subagents of `chat_id` are streaming. A change is
+    /// Publish which subagents of `chat_id` are streaming. A change is
     /// mirrored like any status transition (it doubles as a heartbeat); an
-    /// unchanged count is a no-op, and a chat without a status row has
+    /// unchanged list is a no-op, and a chat without a status row has
     /// nothing to badge yet.
-    fn set_running_subagents(&self, chat_id: &str, running: usize) {
-        let running = u32::try_from(running).unwrap_or(u32::MAX);
+    fn set_running_subagents(&self, chat_id: &str, list: Vec<zeron_proto::RunningSubagent>) {
+        let running = u32::try_from(list.len()).unwrap_or(u32::MAX);
         let session = {
             let mut statuses = lock(&self.statuses);
             let Some(entry) = statuses.get_mut(chat_id) else {
                 return;
             };
-            if entry.running_subagents == running {
+            if entry.running_subagents == running && entry.subagents == list {
                 return;
             }
             entry.running_subagents = running;
+            entry.subagents = list;
             entry.updated_at = Utc::now();
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
@@ -1561,6 +1562,7 @@ impl Inner {
                     started_at: None,
                     updated_at: now,
                     running_subagents: 0,
+                    subagents: Vec::new(),
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -1964,6 +1966,8 @@ thread_local! {
 /// doc Arc pins the doc warm for the LRU while the subagent runs.
 struct SubagentSink {
     doc_id: String,
+    /// Its spawn chip's title, for the session row.
+    title: String,
     doc: crate::doc_host::DocWriter,
     entry_id: String,
     started_at: i64,
@@ -1971,6 +1975,27 @@ struct SubagentSink {
     written: Vec<MessagePart>,
     folded: Vec<MessagePart>,
     dirty: bool,
+}
+
+/// The streaming subagents, oldest first, as the session row carries them.
+fn running_list(
+    subagents: &std::collections::HashMap<String, SubagentSink>,
+) -> Vec<zeron_proto::RunningSubagent> {
+    let mut list: Vec<zeron_proto::RunningSubagent> = subagents
+        .values()
+        .map(|sink| zeron_proto::RunningSubagent {
+            doc_id: sink.doc_id.clone(),
+            title: sink.title.clone(),
+            started_at: chrono::DateTime::<Utc>::from_timestamp_millis(sink.started_at)
+                .unwrap_or_else(Utc::now),
+        })
+        .collect();
+    list.sort_by(|a, b| {
+        a.started_at
+            .cmp(&b.started_at)
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    list
 }
 
 impl SubagentSink {
@@ -2913,10 +2938,20 @@ async fn drive_run(
                     }
                 });
                 if let Some(sub_doc) = opened {
+                    let title = folded
+                        .iter()
+                        .find_map(|part| match part {
+                            MessagePart::Tool { id, call, .. } if id == parent_tool_use_id => {
+                                Some(call.subagent_title())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "Subagent".into());
                     subagents.insert(
                         parent_tool_use_id.clone(),
                         SubagentSink {
                             doc_id: sub_id.clone(),
+                            title,
                             doc: sub_doc,
                             entry_id: new_id(),
                             started_at: now_ms(),
@@ -2926,7 +2961,7 @@ async fn drive_run(
                             dirty: false,
                         },
                     );
-                    inner.set_running_subagents(&chat_id, subagents.len());
+                    inner.set_running_subagents(&chat_id, running_list(&subagents));
                     if !chip_streaming {
                         let _ = doc_ref.update_subagent_chip(
                             parent_tool_use_id,
@@ -2984,7 +3019,7 @@ async fn drive_run(
                         _ => MessageStatus::Complete,
                     };
                     let sink = subagents.remove(parent_tool_use_id).expect("checked");
-                    inner.set_running_subagents(&chat_id, subagents.len());
+                    inner.set_running_subagents(&chat_id, running_list(&subagents));
                     let doc_id = sink.doc_id.clone();
                     // FREEZE: the finished transcript uploads as a static R2
                     // blob (`blob/{chatId}/{subDocId}`) so viewers of
@@ -3466,7 +3501,7 @@ async fn drive_run(
             );
         }
     }
-    inner.set_running_subagents(&chat_id, 0);
+    inner.set_running_subagents(&chat_id, Vec::new());
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own
@@ -4132,6 +4167,7 @@ mod tests {
         let handle = host.open("chat-sub-flush--sub--t1").unwrap();
         let mut sink = SubagentSink {
             doc_id: "chat-sub-flush--sub--t1".into(),
+            title: "Subagent".into(),
             doc: handle.writer(),
             entry_id: "entry-1".into(),
             started_at: 0,
