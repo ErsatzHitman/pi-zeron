@@ -338,33 +338,6 @@ impl Zeron {
         self.call(methods::MUTATE, params).await
     }
 
-    /// Store bytes in this device's uploads folder, through the same chunked
-    /// upload the composer uses, and return the committed path.
-    pub async fn store_upload(&self, file_name: &str, bytes: &[u8]) -> anyhow::Result<String> {
-        /// `% 4 == 0`, so each chunk decodes on its own (the UI's chunk size).
-        const CHUNK_CHARS: usize = 680_000;
-        let upload_id = uuid::Uuid::new_v4().simple().to_string();
-        let data = crate::pages::base64(bytes);
-        for (seq, chunk) in data.as_bytes().chunks(CHUNK_CHARS).enumerate() {
-            let chunk = std::str::from_utf8(chunk)?;
-            self.call(
-                methods::UPLOAD_CHUNK,
-                serde_json::json!({ "uploadId": upload_id, "data": chunk, "seq": seq }),
-            )
-            .await?;
-        }
-        let reply = self
-            .call(
-                methods::UPLOAD_COMMIT,
-                serde_json::json!({ "uploadId": upload_id, "fileName": file_name }),
-            )
-            .await?;
-        reply["path"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("UploadCommit reply missing path"))
-    }
-
     /// Durable command into the chat doc; the host device drains it.
     pub async fn queue_command(
         &self,

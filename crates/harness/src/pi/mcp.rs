@@ -197,7 +197,6 @@ mod tests {
             "\"value\"",
             "`source`",
             "`zeron_show_visual`",
-            "`zeron_html_render`",
         ] {
             assert!(super::VISUALS_PROMPT.contains(needle), "{needle}");
         }

@@ -7,10 +7,6 @@ describe("generated image parts", () => {
   it("preserves only the structured reference through render/doc conversion", () => {
     expect(fromDocParts(toDocParts(toRenderParts([image])))).toEqual([image]);
   });
-  it("keeps a published HTML page as a page", () => {
-    const page = { ...image, id: "h:page", path: "/uploads/abcd1234-page.html", name: "Build times", mimeType: "text/html" };
-    expect(fromDocParts(toDocParts(toRenderParts([page])))).toEqual([page]);
-  });
   it("keeps images atomic through split/join", () => {
     const entry = { id: "a", role: "assistant" as const, deviceId: "owner", createdAt: 1, parts: [image, { ...image, id: "j:image" }] };
     const split = splitMessageEntry(entry, 160);

@@ -17,8 +17,6 @@
 //! originating chat, and a chat can never message itself.
 
 mod jsonrpc;
-mod pages;
-mod preview;
 mod tools;
 mod transcript;
 mod zeron;

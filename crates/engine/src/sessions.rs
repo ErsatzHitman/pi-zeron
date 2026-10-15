@@ -1427,13 +1427,7 @@ impl Inner {
             parents.push(parent_tool_use_id);
             leaf = *event;
         }
-        let events = if let AgentEvent::GeneratedImage {
-            id,
-            path,
-            name,
-            mime_type,
-        } = leaf
-        {
+        let events = if let AgentEvent::GeneratedImage { id, path, name, .. } = leaf {
             let key = std::iter::once(chat_id)
                 .chain(parents.iter().map(String::as_str))
                 .chain(std::iter::once(id.as_str()))
@@ -1454,11 +1448,7 @@ impl Inner {
                 let stable_key = key.clone();
                 tokio::task::spawn_blocking(move || {
                     let path = std::path::Path::new(&path);
-                    // A page `html_render` already stored in the uploads
-                    // folder stays where it is, under the agent's title.
-                    if mime_type == crate::uploads::PAGE_MIME {
-                        uploads.accept_page(path, &name)
-                    } else if shared {
+                    if shared {
                         // Shown under its own file name, never a path.
                         let name = std::path::Path::new(&name)
                             .file_name()
@@ -1495,7 +1485,6 @@ impl Inner {
                         AgentEvent::ToolResult {
                             id: id
                                 .strip_suffix(":image")
-                                .or_else(|| id.strip_suffix(":page"))
                                 .or_else(|| zeron_proto::shared_image_tool(&id))
                                 .unwrap_or(&id)
                                 .into(),

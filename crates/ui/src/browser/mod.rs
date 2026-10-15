@@ -88,11 +88,6 @@ pub struct BrowserSurface {
     address_edited: bool,
     validation: Option<String>,
     remote: bool,
-    /// A page shown inside a reply: no toolbar, never takes focus on its
-    /// own, and leaves the wheel to the transcript unless it scrolls itself.
-    inline: bool,
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    inline_scrolls: bool,
     previews: zeron_proto::PreviewSnapshot,
     previews_loading: bool,
     previews_task: Option<gpui::Task<()>>,
@@ -174,8 +169,6 @@ impl BrowserSurface {
             address_edited: false,
             validation: None,
             remote,
-            inline: false,
-            inline_scrolls: false,
             previews: zeron_proto::PreviewSnapshot::default(),
             previews_loading: true,
             previews_task: None,
@@ -202,39 +195,7 @@ impl BrowserSurface {
         }
     }
 
-    /// A bare page for a reply (see [`crate::visual_pages`]).
-    pub fn new_inline(
-        context: BrowserContext,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut surface = Self::new(context, false, window, cx);
-        surface.inline = true;
-        surface
-    }
-
-    /// An inline page taller than its frame scrolls under the wheel; a page
-    /// that fits leaves the wheel to the transcript.
-    pub fn set_inline_scrolls(&mut self, scrolls: bool) {
-        self.inline_scrolls = scrolls;
-    }
-
-    // macOS hands the wheel to the native view itself.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    fn takes_wheel(&self) -> bool {
-        !self.inline || self.inline_scrolls
-    }
-
     pub fn title(&self) -> gpui::SharedString {
-        // A published page's document title carries its height report.
-        if let Some(title) = self
-            .page
-            .url
-            .as_deref()
-            .and_then(crate::visual_pages::page_title)
-        {
-            return title.into();
-        }
         self.page.label().into()
     }
     pub fn set_remote(&mut self, remote: bool) {
@@ -280,10 +241,6 @@ impl BrowserSurface {
             self.right_occlusion = width;
             cx.notify();
         }
-    }
-
-    pub fn presentation(&self) -> Presentation {
-        self.presentation
     }
 
     pub fn set_presentation(&mut self, presentation: Presentation, cx: &mut Context<Self>) {
@@ -404,10 +361,7 @@ impl BrowserSurface {
             if let Err(error) = result {
                 self.page.error = Some(format!("Could not open this page: {error}"));
             }
-            // A page loading in a reply must not pull focus off the composer.
-            if !self.inline {
-                window.focus(&self.focus, cx);
-            }
+            window.focus(&self.focus, cx);
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {

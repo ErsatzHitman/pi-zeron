@@ -137,55 +137,7 @@ name (default: the local engine's device).
 | `interrupt_chat`   | `QueueCommand` Interrupt                                  |
 | `respond_to_input` | `QueueCommand` RespondInput                               |
 | `archive_chat`     | `Mutate setChatArchived`                                  |
-| `html_render`      | `UploadChunk` + `UploadCommit` (see Pages below)          |
-| `html_preview`     | None: a headless browser on the device (see Pages below)  |
 | `show_visual`      | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |
-
-### Pages
-
-`html_render { html, title }` publishes a self-contained HTML page into the
-calling chat, the way T3 Code's visual replies do. The server inlines local
-images written as absolute paths (`src="/abs/shot.png"`, CSS `url(...)`, JS
-strings; 10 MiB each, 25 MiB per page), stores the page in the device's
-uploads folder, and returns `{page: {path, title}, message}`. The message
-tells the agent not to describe the page in its reply.
-
-For Pi, the normalizer turns a successful `zeron_html_render` result into a
-`GeneratedImage` part with type `text/html`. The engine accepts that path only
-when it sits directly in the uploads folder. The session doc keeps that type
-on read: the transcript decoders (`doc/schema.rs` `image_part`, and
-`edge/src/session-doc/messages.ts`) accept `text/html` beside the raster
-types, and iOS shows the page as a chip.
-
-The transcript embeds the page live in the reply, as T3 Code's sandboxed
-iframe does, but with a native webview: the right pane's `BrowserSurface` in
-an inline mode with no toolbar. The row reads the page from its device
-(`ReadAttachmentChunk`) and serves it from a loopback server in the app
-(`crates/ui/src/visual_pages.rs`) at an unguessable address. An injected
-script reports the page's height through `document.title`, and the frame
-fits it between 80 and 2000px; a taller page scrolls inside, otherwise the
-wheel scrolls the chat. The webview is positioned and clipped by the frame
-that paints its row. A row that scrolled out paints nothing, so the shell
-sweeps every frame and hides the pages no row painted. At most 8 webviews
-live at once; the least recently shown gives its up and remounts when it
-shows again. A link that navigates the page opens outside the reply, as
-does a new-window link, and the caption's arrow opens the page in a
-right-pane browser tab. The page is sent with `Content-Security-Policy: sandbox allow-scripts
-allow-popups; connect-src 'none'; form-action 'none'`, so it runs in an
-opaque origin and cannot call out. Zeron's theme is injected first in
-`<head>` as CSS variables (`--background`, `--foreground`, `--accent`,
-`--chart-1`…`--chart-6`, `--font-sans`, …) the tool description lists.
-Pi's appended visuals prompt tells it when to reach for a page.
-
-`html_preview { html, width?, appearance? }` lets the agent check a page
-before publishing it. It runs a Chromium-family browser found on the device
-(Chrome, Edge or Chromium; `ZERON_PREVIEW_BROWSER` overrides) headless twice:
-once with `--dump-dom` to read the height the page needs and its console
-output from the browser's log, then with `--screenshot` at that height (up
-to 4000px). The PNG returns as an MCP image block; the JSON carries `width`,
-`contentHeight`, `capturedHeight` and `consoleMessages`. The page gets a
-fixed copy of Zeron's default dark or light theme variables. With no
-browser on the device, the tool says so and the agent publishes unchecked.
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

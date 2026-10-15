@@ -770,9 +770,6 @@ pub struct ImportedImage {
 
 const MAX_GENERATED_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
 
-pub use zeron_proto::PAGE_MIME;
-const MAX_PAGE_BYTES: u64 = 25 * 1024 * 1024;
-
 fn raster_signature(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(("png", "image/png"))
@@ -906,31 +903,6 @@ fn open_generated_file(
 }
 
 impl Uploads {
-    /// Accept an HTML page the Zeron MCP server already committed to this
-    /// profile's uploads folder. Anything else, staging included, is refused.
-    pub fn accept_page(&self, source: &Path, name: &str) -> Result<ImportedImage, EngineError> {
-        let invalid = || EngineError::Other("Published page is not in the uploads folder".into());
-        if !source.is_absolute() {
-            return Err(invalid());
-        }
-        let root = self.dir().canonicalize()?;
-        let canonical = source.canonicalize()?;
-        let relative = canonical.strip_prefix(&root).map_err(|_| invalid())?;
-        if relative.components().count() != 1 {
-            return Err(invalid());
-        }
-        let metadata = std::fs::metadata(&canonical)?;
-        if !metadata.is_file() || metadata.len() > MAX_PAGE_BYTES {
-            return Err(invalid());
-        }
-        Ok(ImportedImage {
-            path: source.to_string_lossy().into_owned(),
-            name: name.to_owned(),
-            mime_type: PAGE_MIME.into(),
-            size: metadata.len(),
-        })
-    }
-
     /// Store an agent's `show_visual` script and return its absolute path.
     /// It lives beside other attachments, so clients read it the same way.
     pub fn store_visual(&self, id: &str, script: &str) -> Result<String, EngineError> {
@@ -1087,27 +1059,6 @@ mod generated_image_tests {
     use super::*;
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfixture";
-
-    #[test]
-    fn a_published_page_is_accepted_only_from_the_uploads_folder() {
-        let store = tempfile::tempdir().unwrap();
-        let uploads = Uploads::from_root(store.path());
-        let committed = store.path().join("abcd1234-page.html");
-        std::fs::write(&committed, "<p>hi</p>").unwrap();
-        let page = uploads.accept_page(&committed, "Build times").unwrap();
-        assert_eq!(page.path, committed.to_string_lossy());
-        assert_eq!(page.name, "Build times");
-        assert_eq!(page.mime_type, PAGE_MIME);
-        assert_eq!(page.size, 9);
-
-        let staged = store.path().join("tmp").join("abcd1234");
-        std::fs::create_dir_all(&staged).unwrap();
-        std::fs::write(staged.join("page.html"), "<p>hi</p>").unwrap();
-        assert!(uploads.accept_page(&staged.join("page.html"), "x").is_err());
-        let outside = tempfile::NamedTempFile::new().unwrap();
-        assert!(uploads.accept_page(outside.path(), "x").is_err());
-        assert!(uploads.accept_page(Path::new("page.html"), "x").is_err());
-    }
 
     #[test]
     fn generated_image_formats_are_sniffed_and_replays_are_idempotent() {

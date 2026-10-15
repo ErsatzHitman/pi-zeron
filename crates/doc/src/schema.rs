@@ -315,10 +315,10 @@ fn image_part(
         (Some(path), Some(name), Some(mime_type))
             if !path.is_empty()
                 && !name.is_empty()
-                && (matches!(
+                && matches!(
                     mime_type.as_str(),
                     "image/png" | "image/jpeg" | "image/webp" | "image/gif"
-                ) || mime_type == zeron_proto::PAGE_MIME) =>
+                ) =>
         {
             MessagePart::Image {
                 id,
@@ -1526,8 +1526,6 @@ mod tests {
         for bad in [
             serde_json::json!({"kind":"image", "id":"i"}),
             serde_json::json!({"kind":"image", "id":"i", "path":"/x", "name":"x", "mimeType":"image/svg+xml"}),
-            serde_json::json!({"kind":"image", "id":"i", "path":"", "name":"x", "mimeType":"text/html"}),
-            serde_json::json!({"kind":"image", "id":"i", "path":"/x", "name":"", "mimeType":"text/html"}),
         ] {
             assert!(matches!(
                 from_doc_part(serde_json::from_value(bad.clone()).unwrap()),
@@ -1538,37 +1536,6 @@ mod tests {
                 Some(MessagePart::Error { .. })
             ));
         }
-    }
-
-    #[test]
-    fn a_published_page_reads_back_as_a_page_not_an_error() {
-        let doc = SessionDoc::init("pages").unwrap();
-        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
-        let mut parts = vec![];
-        let event = AgentEvent::GeneratedImage {
-            id: "h:page".into(),
-            path: "/uploads/abcd1234-page.html".into(),
-            name: "Build times".into(),
-            mime_type: zeron_proto::PAGE_MIME.into(),
-        };
-        fold_event_into_parts(&mut parts, &event);
-        writer.sync(&parts).unwrap();
-        let read = doc.read_entries().unwrap();
-        assert!(matches!(
-            &read[0].parts[0],
-            MessagePart::Image { mime_type, .. } if mime_type == "text/html"
-        ));
-        let imported = LoroDoc::new();
-        imported.import(&doc.export_snapshot().unwrap()).unwrap();
-        assert_eq!(
-            SessionDoc::from_doc(imported).read_entries().unwrap()[0].parts,
-            parts
-        );
-        let page = serde_json::json!({"kind":"image", "id":"h", "path":"/uploads/abcd1234-page.html", "name":"Build times", "mimeType":"text/html"});
-        assert!(matches!(
-            salvage_part(&page, "a", 0),
-            Some(MessagePart::Image { .. })
-        ));
     }
 
     #[test]
