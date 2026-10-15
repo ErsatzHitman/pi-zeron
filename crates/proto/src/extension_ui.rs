@@ -51,6 +51,197 @@ impl CompactStatus {
     }
 }
 
+/// The Pi workflows extension's live run state (its `state.ts`): one run's
+/// tasks, attempts, errors, cache hits, checkpoints and recovery actions,
+/// plus runs that stopped and can be resumed. Whole-state per payload.
+pub const WORKFLOW_STATE_CHANNEL: &str = "workflow:state";
+
+/// The element id workflow actions are sent under; the extension routes any
+/// `workflows:*` action to itself, so no element needs to exist.
+pub const WORKFLOW_STATE_ELEMENT: &str = "workflows:state";
+
+/// The [`WORKFLOW_STATE_CHANNEL`] payload. Every field defaults, so an older
+/// or newer extension parses: unknown fields are dropped and unknown task
+/// states read as [`WorkflowTaskState::Other`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowState {
+    pub v: u32,
+    /// Extension clock, unix ms; strictly increasing per Pi process.
+    pub updated_at: u64,
+    /// The tracked run; `None` when only interrupted runs are listed.
+    pub run: Option<WorkflowRun>,
+    pub progress: WorkflowProgress,
+    pub phases: Vec<WorkflowPhase>,
+    pub tasks: Vec<WorkflowTask>,
+    /// Tasks the payload left out (its counts still cover them).
+    pub tasks_truncated: u32,
+    pub checkpoints: Vec<WorkflowCheckpoint>,
+    pub recovery: WorkflowRecovery,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowRun {
+    pub id: String,
+    pub name: String,
+    pub goal: String,
+    /// `running`, `paused`, `completed`, `error`, `aborted` or `interrupted`.
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub started_at: u64,
+    pub ended_at: Option<u64>,
+    pub dry_run: bool,
+    pub resumed: bool,
+    pub phase: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowProgress {
+    pub total: u32,
+    pub done: u32,
+    pub running: u32,
+    pub queued: u32,
+    pub failed: u32,
+    pub cached: u32,
+    pub retrying: u32,
+    pub skipped: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowPhase {
+    pub title: String,
+    /// `pending`, `active` or `done`.
+    pub state: String,
+    pub done: u32,
+    pub total: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowTaskState {
+    #[default]
+    Queued,
+    Running,
+    Retrying,
+    Done,
+    Cached,
+    Failed,
+    Skipped,
+    Aborted,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowTask {
+    pub id: String,
+    pub label: String,
+    pub phase: Option<String>,
+    pub state: WorkflowTaskState,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub depends_on: Vec<String>,
+    /// The dag node the task ran in.
+    pub node: Option<String>,
+    pub cached: bool,
+    /// Original position of a result reused by content on resume.
+    pub reused_from: Option<u32>,
+    pub started_at: Option<u64>,
+    pub ended_at: Option<u64>,
+    /// When a retrying task's next attempt starts.
+    pub next_attempt_at: Option<u64>,
+    pub error: Option<WorkflowTaskError>,
+    pub model: Option<String>,
+    pub tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowTaskError {
+    pub code: String,
+    pub message: String,
+    pub retriable: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowCheckpoint {
+    pub at: u64,
+    /// `phase`, `agent` or `resume`.
+    pub kind: String,
+    pub done_count: u32,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowRecovery {
+    pub resumable: bool,
+    pub reason: Option<String>,
+    /// Results served by content on resume, and positions invalidated.
+    pub reused: u32,
+    pub invalidated: u32,
+    /// Other runs that stopped and can be resumed, newest first.
+    pub interrupted: Vec<WorkflowInterruptedRun>,
+    pub actions: Vec<WorkflowAction>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowInterruptedRun {
+    pub run_id: String,
+    pub name: String,
+    pub status: String,
+    pub ended_at: u64,
+    pub done: u32,
+    pub total: u32,
+    pub reason: Option<String>,
+}
+
+/// An action the extension offers; sent back as an [`ExtensionUiAction`] on
+/// [`WORKFLOW_STATE_ELEMENT`] with `row_id` = `run_id`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowAction {
+    /// `stop`, `pause`, `resume` or `discard`.
+    pub id: String,
+    pub label: String,
+    pub run_id: String,
+    pub confirm: bool,
+}
+
+impl WorkflowState {
+    pub fn of(ui: &ExtensionUiState) -> Option<Self> {
+        serde_json::from_value(ui.channels.get(WORKFLOW_STATE_CHANNEL)?.clone()).ok()
+    }
+
+    /// The run is executing (not paused, not finished).
+    pub fn is_live(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|run| run.ended_at.is_none() && run.status != "paused")
+    }
+
+    /// The action with this id, when the extension offers it.
+    pub fn action(&self, id: &str) -> Option<&WorkflowAction> {
+        self.recovery.actions.iter().find(|a| a.id == id)
+    }
+
+    /// The [`ExtensionUiAction`] that performs `action`.
+    pub fn send(action: &WorkflowAction) -> ExtensionUiAction {
+        ExtensionUiAction {
+            element_id: WORKFLOW_STATE_ELEMENT.into(),
+            action_id: action.id.clone(),
+            value: None,
+            row_id: Some(action.run_id.clone()),
+        }
+    }
+}
+
 /// One chat's live extension UI, as of `revision`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -802,6 +993,62 @@ pub fn section_text(section: &PiUiSection) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn workflow_state_parses_the_extension_payload_and_tolerates_drift() {
+        let mut ui = ExtensionUiState::default();
+        assert_eq!(WorkflowState::of(&ui), None);
+        ui.channels.insert(
+            WORKFLOW_STATE_CHANNEL.into(),
+            json!({
+                "v": 1,
+                "updatedAt": 5,
+                "run": {"id": "wf-1", "name": "review", "goal": "g", "status": "running", "startedAt": 1},
+                "progress": {"total": 3, "done": 1, "running": 1, "retrying": 1},
+                "tasks": [
+                    {"id": "0", "label": "a", "state": "retrying", "attempt": 2, "maxAttempts": 3,
+                     "nextAttemptAt": 9, "error": {"code": "AGENT_RATE_LIMIT", "message": "429", "retriable": true}},
+                    {"id": "node:join", "label": "join", "state": "blocked-on-something-new", "dependsOn": ["a"]},
+                    {"id": "2", "label": "c", "state": "cached", "cached": true, "reusedFrom": 7, "futureField": 1}
+                ],
+                "recovery": {"actions": [{"id": "stop", "label": "Stop", "runId": "wf-1", "confirm": true}]},
+                "somethingNew": {"x": 1}
+            }),
+        );
+        let state = WorkflowState::of(&ui).expect("parses");
+        assert!(state.is_live());
+        assert_eq!(state.tasks[0].state, WorkflowTaskState::Retrying);
+        assert_eq!(
+            state.tasks[0].error.as_ref().unwrap().code,
+            "AGENT_RATE_LIMIT"
+        );
+        assert_eq!(state.tasks[1].state, WorkflowTaskState::Other);
+        assert_eq!(state.tasks[1].depends_on, vec!["a".to_string()]);
+        assert_eq!(state.tasks[2].reused_from, Some(7));
+        let stop = state.action("stop").expect("offered");
+        assert_eq!(
+            WorkflowState::send(stop),
+            ExtensionUiAction {
+                element_id: WORKFLOW_STATE_ELEMENT.into(),
+                action_id: "stop".into(),
+                value: None,
+                row_id: Some("wf-1".into()),
+            }
+        );
+        // Round trip keeps what it understood.
+        let back: WorkflowState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(back, state);
+        // An idle payload (only interrupted runs) is not live.
+        ui.channels.insert(
+            WORKFLOW_STATE_CHANNEL.into(),
+            json!({"v": 1, "run": null, "recovery": {"resumable": true,
+                "interrupted": [{"runId": "wf-0", "name": "old", "status": "interrupted", "endedAt": 3, "done": 2, "total": 5}]}}),
+        );
+        let idle = WorkflowState::of(&ui).unwrap();
+        assert!(!idle.is_live());
+        assert_eq!(idle.recovery.interrupted[0].run_id, "wf-0");
+    }
 
     #[test]
     fn the_fleet_reads_from_the_watched_roster_with_its_start_times() {

@@ -758,6 +758,7 @@ mod tests {
             "session-info-agents-header",
             "session-info-background-header",
             "session-info-compact-header",
+            "session-info-workflow-header",
         ] {
             assert!(cx.debug_bounds(header).is_none(), "{header}");
         }

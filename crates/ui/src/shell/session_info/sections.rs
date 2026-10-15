@@ -22,6 +22,8 @@ pub(super) enum SectionKey {
     Goal,
     Todos,
     Agents,
+    /// A Pi workflow run: live, stopped early, or just finished.
+    Workflow,
     Background,
     /// Auto-compaction near its limit, or running.
     Compact,
@@ -34,6 +36,7 @@ impl SectionKey {
             Self::Goal => "goal",
             Self::Todos => "todos",
             Self::Agents => "agents",
+            Self::Workflow => "workflow",
             Self::Background => "background",
             Self::Compact => "compact",
         }

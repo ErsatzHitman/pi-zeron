@@ -1,9 +1,10 @@
 //! The session panel: where this chat runs and what is working under it, in
 //! one card at the transcript's right. Its essentials (machine, project,
 //! working directory, session, branch and changes) always show. The goal,
-//! the agent's todo list, the sub-agents and sub-sessions, the commands Pi
-//! runs in the background, and Pi's auto-compaction once the context nears
-//! where it compacts each get a section only while active: a
+//! the agent's todo list, the sub-agents and sub-sessions, a Pi workflow
+//! run, the commands Pi runs in the background, and Pi's auto-compaction
+//! once the context nears where it compacts each get a section only while
+//! active: a
 //! section grows in at the bottom when its work starts and folds away when
 //! it ends (see `sections.rs`). A section's header folds it.
 //!
@@ -25,6 +26,7 @@ mod agents;
 mod compact;
 mod sections;
 mod todos;
+mod workflow;
 
 use crate::settings::accounts;
 use crate::todo_panel::{self, FoldSide, TodoPanelState, TodoRow};
@@ -33,8 +35,9 @@ pub(super) use agents::{AgentKind, AgentRow};
 use compact::{CompactMeter, Phase};
 use sections::{ActiveSections, Entry, SectionKey, stack_height};
 use todos::TodoList;
+use workflow::{RunPhase, TaskRow, WorkflowView};
 use zeron_proto::TodoItem;
-use zeron_proto::extension_ui::CompactStatus;
+use zeron_proto::extension_ui::{CompactStatus, WorkflowAction, WorkflowState, WorkflowTaskState};
 
 /// The card's width, its inset from the column's right edge, and the
 /// least gap the reading column keeps from it.
@@ -51,6 +54,7 @@ const TODOS: &str = "todos";
 const AGENTS: &str = "agents";
 const BACKGROUND: &str = "background";
 const COMPACT: &str = "compact";
+const WORKFLOW: &str = "workflow";
 /// The Compaction section's body: the bar line, a gap, the caption line and
 /// its bottom padding.
 const COMPACT_BODY_HEIGHT: f32 = 40.0;
@@ -62,8 +66,12 @@ pub(super) struct SessionPanel {
     folded: HashSet<&'static str>,
     /// Previous agents stays closed until opened.
     previous_open: bool,
-    /// The sub-agent whose Stop asked for a second click.
+    /// The sub-agent whose Stop asked for a second click (also a workflow's
+    /// Stop or Discard, keyed `workflow/<run>/<action>`).
     armed_stop: Option<String>,
+    /// The Workflow section's Queued and Finished groups are revealed.
+    workflow_queued_open: bool,
+    workflow_finished_open: bool,
     /// Every checkout's working-tree totals (`WatchCheckoutDiffs`, patches
     /// dropped), and the device the watch follows.
     diffs: Vec<CheckoutDiff>,
@@ -97,6 +105,7 @@ enum SectionData {
     Agents(AgentList),
     Background(Vec<AgentRow>),
     Compact(CompactMeter),
+    Workflow(WorkflowView),
 }
 
 /// One `WatchCheckoutDiffs` frame: every checkout, or one that changed.
@@ -271,6 +280,22 @@ pub(super) fn sidebar_agents(state: &AppState, chat_id: &str, now: DateTime<Utc>
 }
 
 /// A row's small trailing text.
+/// "+N more" under a Workflow fold that lists only its first rows.
+fn workflow_more_row(key: &'static str, hidden: usize, theme: &Theme) -> Option<AnyElement> {
+    (hidden > 0).then(|| {
+        div()
+            .debug_selector(move || format!("session-info-workflow-{key}-more"))
+            .h(px(22.0))
+            .px(px(33.0))
+            .flex()
+            .items_center()
+            .text_size(crate::typography::ui_rems(11.5))
+            .text_color(theme.text_muted.opacity(0.7))
+            .child(format!("+{hidden} more"))
+            .into_any_element()
+    })
+}
+
 fn trailing_text(text: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div {
     div()
         .flex_none()
@@ -696,6 +721,20 @@ impl Shell {
                 SectionData::Compact(meter),
             ));
         }
+        let workflow = {
+            let state = self.state.read(cx);
+            state
+                .extension_ui
+                .of(&chat.id)
+                .and_then(|ui| WorkflowView::of(ui, now))
+        };
+        if let Some(view) = workflow {
+            active.push((
+                SectionKey::Workflow,
+                view.since(),
+                SectionData::Workflow(view),
+            ));
+        }
         let frame_time = self.render_time.unwrap_or_else(|| self.motion_time());
         let pulse =
             self.session_panel
@@ -948,6 +987,16 @@ impl Shell {
                 self.render_compact(meter, theme, cx),
                 stack_height(0) + popover::MENU_GAP + COMPACT_BODY_HEIGHT,
             ),
+            SectionData::Workflow(view) => {
+                let rows = view.estimated_rows(
+                    self.session_panel.workflow_queued_open,
+                    self.session_panel.workflow_finished_open,
+                );
+                (
+                    self.render_workflow(view, theme, cx),
+                    stack_height(rows) + 16.0,
+                )
+            }
         };
         section_frame(entry.key.id(), t, estimate, entry.measured.clone(), rows)
     }
@@ -1625,6 +1674,517 @@ impl Shell {
             out.push(self.render_agent_row(row, theme, cx));
         }
         out
+    }
+
+    /// Send a workflow action (Pause, Stop, Resume, Discard) to the Pi
+    /// workflows extension of the selected chat.
+    fn send_workflow_action(&mut self, action: &WorkflowAction, cx: &mut Context<Self>) {
+        let request = WorkflowState::send(action);
+        self.state
+            .update(cx, |state, cx| state.extension_ui_action(request, cx));
+    }
+
+    /// A Pi workflow run: its name and goal, a bar toward done, the phase it
+    /// is in, the tasks running, retrying or failed (queued and finished ones
+    /// fold), its last checkpoint, and Resume or Discard when it stopped
+    /// early. Active while the run is (see [`WorkflowView::of`]).
+    fn render_workflow(
+        &mut self,
+        view: &WorkflowView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let tone = match view.phase {
+            RunPhase::Running => theme.accent,
+            RunPhase::Retrying | RunPhase::Paused => theme.warning,
+            RunPhase::Failed | RunPhase::Interrupted => theme.danger,
+            RunPhase::Completed => theme.success,
+            RunPhase::Stopped => theme.text_muted,
+        };
+        let spinner = view.phase.live().then(|| {
+            crate::loaders::mini_glyph_spinner(
+                "session-info-workflow-running",
+                2.0,
+                theme.glyph,
+                cx.entity_id(),
+                cx,
+            )
+            .into_any_element()
+        });
+        let pill = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .children(spinner)
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(6.0))
+                    .rounded_full()
+                    .bg(tone.opacity(0.14))
+                    .text_size(crate::typography::ui_rems(10.5))
+                    .text_color(tone)
+                    .child(view.phase.label()),
+            );
+        let count = (view.total > 0).then(|| format!("· {}/{}", view.done, view.total).into());
+        let mut rows = vec![
+            popover::picker_divider().into_any_element(),
+            self.render_section_header(
+                WORKFLOW,
+                "Workflow",
+                count,
+                Some(pill.into_any_element()),
+                theme,
+                cx,
+            ),
+        ];
+        if !self.session_panel.is_open(WORKFLOW) {
+            return rows;
+        }
+
+        // ── What it is.
+        rows.push(
+            div()
+                .id("session-info-workflow")
+                .debug_selector(|| "session-info-workflow".into())
+                .px(px(9.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .line_height(px(18.0))
+                        .text_color(theme.text)
+                        .child(view.name.clone()),
+                )
+                .when(!view.goal.is_empty(), |block| {
+                    block.child(
+                        div()
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .line_height(px(16.0))
+                            .text_color(theme.text_muted)
+                            .child(view.goal.clone()),
+                    )
+                })
+                .into_any_element(),
+        );
+
+        // ── How far: the bar, the phase, the clock, and Pause / Stop.
+        let fraction = view.fraction();
+        let caption = view.step.as_ref().map(|(title, index, count)| {
+            if *count > 1 && *index > 0 {
+                format!("{title} · {index}/{count}")
+            } else {
+                title.clone()
+            }
+        });
+        let elapsed = view.started.filter(|_| view.phase.live()).map(|started| {
+            elapsed_label(
+                "session-info-workflow-elapsed".into(),
+                started,
+                theme.text_muted,
+            )
+        });
+        let controls: Vec<AnyElement> = [view.pause.as_ref(), view.stop.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|action| self.render_workflow_button(action, false, theme, cx))
+            .collect();
+        rows.push(
+            div()
+                .id("session-info-workflow-progress")
+                .debug_selector(|| "session-info-workflow-progress".into())
+                .px(px(9.0))
+                .pb(px(2.0))
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .h(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(4.0))
+                                .rounded_full()
+                                .overflow_hidden()
+                                .bg(theme.wash(0.08))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui::relative(fraction.max(0.015)))
+                                        .rounded_full()
+                                        .bg(tone.opacity(0.85)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(34.0))
+                                .flex_none()
+                                .text_right()
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_muted)
+                                .child(format!("{}%", (fraction * 100.0).round() as u32)),
+                        ),
+                )
+                .when(
+                    caption.is_some() || elapsed.is_some() || !controls.is_empty(),
+                    |block| {
+                        block.child(
+                            div()
+                                .min_h(px(20.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(11.5))
+                                        .text_color(theme.text_muted)
+                                        .children(caption),
+                                )
+                                .children(elapsed)
+                                .children(controls),
+                        )
+                    },
+                )
+                .into_any_element(),
+        );
+
+        // ── The tasks: live and failed work, then the folds.
+        for row in &view.lead {
+            rows.push(self.render_workflow_task(row, theme, cx));
+        }
+        let queued = view.queued.len() + view.queued_more as usize;
+        if queued > 0 {
+            let open = self.session_panel.workflow_queued_open;
+            rows.push(self.render_workflow_group(
+                "queued",
+                format!("Queued ({queued})"),
+                open,
+                |panel| panel.workflow_queued_open = !panel.workflow_queued_open,
+                theme,
+                cx,
+            ));
+            if open {
+                for row in view.queued.iter().take(workflow::GROUP_ROWS) {
+                    rows.push(self.render_workflow_task(row, theme, cx));
+                }
+                let shown = view.queued.len().min(workflow::GROUP_ROWS);
+                rows.extend(workflow_more_row("queued", queued - shown, theme));
+            }
+        }
+        if !view.finished.is_empty() {
+            let open = self.session_panel.workflow_finished_open;
+            rows.push(self.render_workflow_group(
+                "finished",
+                format!("Finished ({})", view.finished.len()),
+                open,
+                |panel| panel.workflow_finished_open = !panel.workflow_finished_open,
+                theme,
+                cx,
+            ));
+            if open {
+                for row in view.finished.iter().take(workflow::GROUP_ROWS) {
+                    rows.push(self.render_workflow_task(row, theme, cx));
+                }
+                let hidden = view.finished.len().saturating_sub(workflow::GROUP_ROWS);
+                rows.extend(workflow_more_row("finished", hidden, theme));
+            }
+        }
+
+        // ── Its durability: the last checkpoint, results reused on resume.
+        let mut notes: Vec<String> = Vec::new();
+        notes.extend(view.checkpoint.clone());
+        notes.extend(view.reuse.clone());
+        if view.truncated > 0 {
+            notes.push(format!(
+                "{} more task{} not listed",
+                view.truncated,
+                if view.truncated == 1 { "" } else { "s" }
+            ));
+        }
+        if !notes.is_empty() {
+            rows.push(
+                div()
+                    .id("session-info-workflow-notes")
+                    .debug_selector(|| "session-info-workflow-notes".into())
+                    .px(px(9.0))
+                    .pb(px(2.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted.opacity(0.85))
+                    .children(notes.into_iter().map(|note| div().truncate().child(note)))
+                    .into_any_element(),
+            );
+        }
+
+        // ── Recovery: a run that stopped early can pick up where it left off.
+        if let Some(recovery) = &view.recovery {
+            let buttons: Vec<AnyElement> = [
+                recovery.resume.as_ref().map(|a| (a, true)),
+                recovery.discard.as_ref().map(|a| (a, false)),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(action, primary)| self.render_workflow_button(action, primary, theme, cx))
+            .collect();
+            rows.push(
+                div()
+                    .id("session-info-workflow-recovery")
+                    .debug_selector(|| "session-info-workflow-recovery".into())
+                    .mx(px(9.0))
+                    .mb(px(4.0))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(px(6.0))
+                    .bg(theme.wash(0.05))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .line_height(px(16.0))
+                            .text_color(theme.text_muted)
+                            .child(recovery.reason.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .children(buttons),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    /// One workflow task: its state, label, and a timer or what it is
+    /// waiting on; the tooltip has its error and dependencies.
+    fn render_workflow_task(
+        &self,
+        row: &TaskRow,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = SharedString::from(format!("session-info-workflow-task-{}", row.id));
+        let muted = theme.text_muted.opacity(0.7);
+        let glyph: AnyElement = match row.state {
+            WorkflowTaskState::Running => crate::loaders::mini_glyph_spinner(
+                format!("{id}-running"),
+                2.0,
+                theme.glyph,
+                cx.entity_id(),
+                cx,
+            )
+            .into_any_element(),
+            WorkflowTaskState::Retrying => icon(icons::REFRESH)
+                .size(px(13.0))
+                .text_color(theme.warning)
+                .into_any_element(),
+            WorkflowTaskState::Failed => icon(icons::DANGER_TRIANGLE)
+                .size(px(13.0))
+                .text_color(theme.danger)
+                .into_any_element(),
+            WorkflowTaskState::Aborted => icon(icons::STOP)
+                .size(px(11.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
+            WorkflowTaskState::Done | WorkflowTaskState::Cached => icon(icons::CHECK)
+                .size(px(13.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
+            WorkflowTaskState::Skipped => icon(icons::CLOSE_CIRCLE)
+                .size(px(12.0))
+                .text_color(theme.text_faint)
+                .into_any_element(),
+            WorkflowTaskState::Queued | WorkflowTaskState::Other => div()
+                .size(px(5.0))
+                .rounded_full()
+                .bg(theme.text_muted.opacity(0.5))
+                .into_any_element(),
+        };
+        let label_color = match row.state {
+            WorkflowTaskState::Running
+            | WorkflowTaskState::Retrying
+            | WorkflowTaskState::Failed => theme.text,
+            _ => theme.text_muted,
+        };
+        let trailing_color = match row.state {
+            WorkflowTaskState::Retrying => theme.warning,
+            WorkflowTaskState::Failed => theme.danger,
+            _ => muted,
+        };
+        let trailing = match (row.started, &row.trailing) {
+            (Some(started), None) => Some(elapsed_label(format!("{id}-elapsed"), started, muted)),
+            (_, Some(text)) => Some(trailing_text(text.clone(), trailing_color).into_any_element()),
+            (None, None) => None,
+        };
+        let mut element = div()
+            .id(id.clone())
+            .debug_selector({
+                let id = id.clone();
+                move || id.to_string()
+            })
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(AGENT_ROW_HEIGHT))
+            .px(px(9.0))
+            .rounded(px(popover::MENU_ITEM_RADIUS))
+            .text_size(crate::typography::ui_rems(13.0))
+            .text_color(label_color)
+            .child(
+                div()
+                    .size(px(16.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(glyph),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+            .children(trailing);
+        if let Some(detail) = row.detail.clone() {
+            element = element.tooltip(crate::settings::widgets::text_tooltip(detail));
+        }
+        element.into_any_element()
+    }
+
+    /// The Queued or Finished fold, styled like Previous agents.
+    fn render_workflow_group(
+        &self,
+        key: &'static str,
+        label: String,
+        open: bool,
+        toggle: fn(&mut SessionPanel),
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(format!("session-info-workflow-{key}")))
+            .debug_selector(move || format!("session-info-workflow-{key}"))
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(label.clone()))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(AGENT_ROW_HEIGHT))
+            .px(px(9.0))
+            .rounded(px(popover::MENU_ITEM_RADIUS))
+            .cursor_pointer()
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(theme.text_muted)
+            .hover(|style| style.bg(crate::theme::ink(0.05)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle(&mut this.session_panel);
+                cx.notify();
+            }))
+            .child(label)
+            .child(div().flex_1())
+            .child(
+                icon(if open {
+                    icons::ALT_ARROW_DOWN
+                } else {
+                    icons::ALT_ARROW_RIGHT
+                })
+                .size(px(12.0))
+                .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .into_any_element()
+    }
+
+    /// A workflow action button. One the extension marks `confirm` (Stop,
+    /// Discard) asks on the first click and acts on the second.
+    fn render_workflow_button(
+        &self,
+        action: &WorkflowAction,
+        primary: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let armed_key = format!("workflow/{}/{}", action.run_id, action.id);
+        let armed = self.session_panel.armed_stop.as_deref() == Some(armed_key.as_str());
+        let destructive = matches!(action.id.as_str(), "stop" | "discard");
+        let tone = if destructive {
+            theme.danger
+        } else if primary {
+            theme.accent
+        } else {
+            theme.text_muted
+        };
+        let base = match (action.label.trim(), action.id.as_str()) {
+            ("", "stop") => "Stop".to_owned(),
+            ("", "pause") => "Pause".to_owned(),
+            ("", "resume") => "Resume".to_owned(),
+            ("", "discard") => "Discard".to_owned(),
+            ("", other) => other.to_owned(),
+            (label, _) => workflow::clean(label),
+        };
+        let label = SharedString::from(if armed { format!("{base}?") } else { base });
+        let tip = match action.id.as_str() {
+            "stop" if armed => "Click again to stop the workflow",
+            "stop" => "Stop the workflow; it can be resumed later",
+            "pause" => "Let running tasks finish, then pause",
+            "resume" => "Pick up where it left off; finished work is reused",
+            "discard" if armed => "Click again to discard this run",
+            "discard" => "Stop offering to resume this run",
+            _ => "",
+        };
+        let action = action.clone();
+        let element_id = SharedString::from(format!("session-info-workflow-{}", action.id));
+        div()
+            .id(element_id.clone())
+            .debug_selector(move || element_id.to_string())
+            .role(gpui::Role::Button)
+            .aria_label(label.clone())
+            .flex_none()
+            .h(px(20.0))
+            .px(px(7.0))
+            .flex()
+            .items_center()
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .text_size(crate::typography::ui_rems(11.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(tone)
+            .when(primary || armed, |button| button.bg(tone.opacity(0.14)))
+            .hover(|style| style.bg(tone.opacity(0.18)))
+            .when(!tip.is_empty(), |button| {
+                button.tooltip(crate::settings::widgets::text_tooltip(tip))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                let confirmed = !action.confirm
+                    || this.session_panel.armed_stop.as_deref() == Some(armed_key.as_str());
+                if confirmed {
+                    this.session_panel.armed_stop = None;
+                    this.send_workflow_action(&action, cx);
+                } else {
+                    this.session_panel.armed_stop = Some(armed_key.clone());
+                }
+                cx.notify();
+            }))
+            .child(label)
+            .into_any_element()
     }
 
     /// Pi's auto-compaction near its limit, or running: a bar toward where

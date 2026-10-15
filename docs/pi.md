@@ -166,12 +166,13 @@ live state; it never enters the synced chat document.
 | --- | --- |
 | `sheet` (ask-user, decisions, model picker, idle Pi dialogs) | the prompt panel in the composer's place; keyboard picks, Enter submits, Esc cancels |
 | `screen` (btw, subagent viewer, `/usage`, `/workspace`, `/workflow` reports, `/clinepass`, `/llama-models`, `/mcp-servers`) | the prompt panel too, drawn like the question panel: header, the body scrolling under it (btw's thread in the chat's own bubbles), and its form as the panel's input row. The X (or Esc) closes it; Esc stops a streaming btw reply first. More than three actions wrap into a toolbar |
-| `pinned`, `inline` (advisor, Jev and decision cards, bash jobs, subagent fleet, workflows, todo), `setWidget` | the agent's own work: a `pi` tool row in the turn's transcript, like a command or a read (see below). While the element is up, its live controls (Kill a job, Stop or Pause a workflow, Cancel the advisor, Open the web curator) sit at the row's right end; one that asks first takes a second click |
+| `pinned`, `inline` (advisor, Jev and decision cards, bash jobs, subagent fleet, workflow reports, todo), `setWidget` | the agent's own work: a `pi` tool row in the turn's transcript, like a command or a read (see below). While the element is up, its live controls (Kill a job, Stop or Pause a workflow, Cancel the advisor, Open the web curator) sit at the row's right end; one that asks first takes a second click |
 | `status`, `setStatus`, footer channel, plan mode (Plan only; Build is the resting state and shows nothing) | chips in the composer footer (a `setStatus` line repeating an element chip shows once) |
 | `zeron:compact` (Zeron's own channel, not an extension's: the harness publishes whether auto-compaction is on, where Pi compacts and a running compaction) | the session panel's Compaction section, near the limit and while compacting |
 | goal channel (`pi-goal:status`) | the session panel's Goal section: status, objective and progress line. The goal's own status line is not repeated as a chip |
 | subagent fleet (`subagents:fleet`) | also listed in the session panel's Sub-agents section, with a live timer per running job; a row runs View, and its Stop sends Kill after a second click. The engine also mirrors the running jobs onto the chat's session row (from the roster, or from its `piui:subagents:fleet` text mirror while no UI watches the chat), so the sidebar nests them under a session that is not open |
 | background bash (`bash:jobs`, `bash-bg:fleet`) | also listed in the session panel's Background section, with a live timer per running command; its Stop sends Kill after a second click |
+| workflow run state (`workflow:state`, from the `workflows` extension) | the session panel's Workflow section: the run's progress, phase, tasks by state, retries, errors, checkpoints and reused results, with Pause and Stop, and Resume or Discard for a run that stopped early. Actions go back on the `workflows:state` element with the run id as the row. A live run counts once as background work, whether the extension sends this channel, the `workflow:progress` footer line, or both |
 | `notify` (plain) | during a turn, a `pi · notice` row in the transcript; between turns, a toast. Terminal escapes (colours, OSC-8 links) are stripped from notices, statuses, widgets, titles and dialog text |
 | `setTitle` | renames the chat |
 | `set_editor_text` | fills the composer |
@@ -198,10 +199,10 @@ up to 60 lines enter the chat document.
 A dialog Pi raises between turns has no turn to ask in; for a watching UI it
 becomes a `pi:dialog-N` sheet (timeouts honoured), otherwise it is cancelled.
 
-Pi runs once per turn, and its elements go when the process does. What an
-extension sends as the turn settles (a last notice, a title, the composer
-draft) outlives the process instead, and the next run numbers its requests
-after them, so a toast sent at the very end still shows once.
+Pi's elements go when its process does. What an extension sends as the turn
+settles (a last notice, a title, the composer draft) outlives the process
+instead, and a new process numbers its requests after them, so a toast sent at
+the very end still shows once.
 
 An `input` dialog asking for a credential (its title, message or placeholder
 names an API key, password, passphrase, secret, access/auth token or bearer)

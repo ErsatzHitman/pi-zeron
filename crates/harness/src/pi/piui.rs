@@ -775,9 +775,16 @@ impl ExtensionUi {
                 goal["active"] == true
                     && matches!(goal["status"].as_str(), Some("active" | "waiting"))
             });
+        // A workflow run publishes both its footer line and its full state; an
+        // extension that only sends `workflow:state` still counts, once.
+        let workflow_state = self
+            .state
+            .channels
+            .get(zeron_proto::extension_ui::WORKFLOW_STATE_CHANNEL)
+            .is_some_and(|state| state["run"].is_object() && state["run"]["endedAt"].is_null());
         count("subagents:fleet")
             + count("bash-bg:fleet")
-            + count("workflow:progress")
+            + count("workflow:progress").max(usize::from(workflow_state))
             + usize::from(goal)
     }
 }
@@ -1110,6 +1117,23 @@ mod tests {
             2,
             "pi-goal:status",
             json!({"active":true,"status":"waiting"}),
+        ));
+        assert_eq!(ui.background_tasks(), 3);
+        // A live workflow counts once whether it sends one channel or both;
+        // a finished one keeps its state on the channel but is not work.
+        ui.handle(&channel(
+            3,
+            "workflow:state",
+            json!({"v":1,"run":{"id":"wf","status":"running","startedAt":1}}),
+        ));
+        assert_eq!(ui.background_tasks(), 4);
+        ui.handle(&channel(4, "workflow:progress", json!({"active":true})));
+        assert_eq!(ui.background_tasks(), 4);
+        ui.handle(&channel(5, "workflow:progress", json!({"active":false})));
+        ui.handle(&channel(
+            6,
+            "workflow:state",
+            json!({"v":1,"run":{"id":"wf","status":"completed","startedAt":1,"endedAt":2}}),
         ));
         assert_eq!(ui.background_tasks(), 3);
         // Nobody watching: the channels still count.
