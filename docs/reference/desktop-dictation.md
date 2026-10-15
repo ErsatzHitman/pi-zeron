@@ -13,12 +13,13 @@ Dictation is hold to talk: hold the microphone (or Enter/Space while it is focus
 | Model | OpenAI: `gpt-4o-mini-transcribe` (default), `gpt-4o-transcribe`, `whisper-1`. Groq: `whisper-large-v3-turbo` (default), `whisper-large-v3`. |
 | Language | Auto-detect, or a fixed language sent as an ISO-639-1 hint. |
 | Microphone | A connected input; a disconnected selection falls back to the system default. |
+| Live transcription | On by default. While you speak, the recording is cut where you pause and each phrase is transcribed as it ends, so the text appears in the draft phrase by phrase. On release the transcript of the whole recording replaces it (and the trigger phrase applies then). One preview request at a time, at most one every 0.8 s on OpenAI and every 4 s on Groq, whose free tier allows about twenty a minute; a failed preview request ends the preview but never the final transcript. It roughly doubles the audio sent. |
 | Remove filler words | Drops hesitations ("um", "uh"), "like" and "you know" used as fillers, and stutters ("the the"), then repairs punctuation. Rule based, on this device. |
 | Trigger phrase | Default "rewrite this concisely". A dictation that ends with it is rewritten by the provider's chat model (OpenAI `gpt-4o-mini`, Groq `llama-3.3-70b-versatile`). Words after the phrase are extra instructions: "…rewrite this concisely and make it formal". Saying only the phrase inserts nothing; a body under four words is inserted unchanged; a failed rewrite inserts the transcript. Empty turns it off. |
 
 ## Privacy and limits
 
-Audio stays in a bounded, transient buffer on this desktop until release, then goes to the selected provider as one 16 kHz mono WAV over HTTPS. No audio files are written, and nothing is sent to the coding-agent host. Dictated text is an ordinary editable draft. Transcription allows 30 seconds and the rewrite 20; the composer gives up after 60.
+Audio stays in a bounded, transient buffer on this desktop until release, then goes to the selected provider as one 16 kHz mono WAV over HTTPS (with live transcription on, each phrase also goes as it ends). No audio files are written, and nothing is sent to the coding-agent host. Dictated text is an ordinary editable draft. Transcription allows 30 seconds and the rewrite 20; the composer gives up after 60.
 
 ## Implementation
 

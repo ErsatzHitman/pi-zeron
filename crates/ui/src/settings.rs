@@ -839,6 +839,9 @@ pub struct UiSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stt_language: Option<String>,
     pub stt_remove_fillers: bool,
+    /// Dictation shows each phrase as the speaker pauses; the transcript of
+    /// the whole recording replaces it when they stop.
+    pub stt_live: bool,
     /// Ending a dictation with it rewrites the text; empty turns it off.
     pub stt_trigger_phrase: String,
     /// Voice mode's speech-to-text provider. Its key, like OpenRouter's for
@@ -1086,6 +1089,7 @@ impl Default for UiSettings {
             stt_model: None,
             stt_language: None,
             stt_remove_fillers: true,
+            stt_live: true,
             stt_trigger_phrase: zeron_voice::DEFAULT_TRIGGER_PHRASE.to_owned(),
             voice_stt_provider: zeron_voice::call::SttProvider::default(),
             voice_stt_model: None,
@@ -1773,6 +1777,7 @@ impl UiSettings {
             stt_model,
             stt_language,
             stt_remove_fillers,
+            stt_live,
             stt_trigger_phrase,
             voice_stt_provider,
             voice_stt_model,
@@ -2819,6 +2824,7 @@ mod tests {
             stt_model: Some("whisper-large-v3".into()),
             stt_language: Some("hi".into()),
             stt_remove_fillers: false,
+            stt_live: false,
             stt_trigger_phrase: "make it shorter".into(),
             voice_stt_provider: zeron_voice::call::SttProvider::Deepgram,
             voice_stt_model: Some("nova-2".into()),

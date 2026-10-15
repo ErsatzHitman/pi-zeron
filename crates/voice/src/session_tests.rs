@@ -53,6 +53,7 @@ impl Fixture {
             level: level.clone(),
             device: None,
             events: events_tx,
+            preview: None,
         };
         let (load, ready) = mpsc::sync_channel::<Result<()>>(1);
         let (loading, started) = mpsc::sync_channel(1);
@@ -244,6 +245,7 @@ fn stop_before_capture_start_never_opens_the_microphone() {
         level: Arc::new(AtomicU32::new(0)),
         device: None,
         events,
+        preview: None,
     };
     let result = run_job::<FakeCapture, _>(
         &job,
@@ -295,4 +297,69 @@ fn audio_buffer_still_caps_recording_at_sixty_seconds() {
     );
     assert_eq!(audio.samples.lock().unwrap().len(), rate as usize * 60);
     assert!(audio.full.load(Ordering::Acquire));
+}
+
+/// A recording that speaks a phrase and pauses, a tenth of a second at a time.
+struct Speaking {
+    chunks: Vec<Vec<f32>>,
+}
+impl Recording for Speaking {
+    fn ended(&self) -> bool {
+        self.chunks.is_empty()
+    }
+    fn finish(self) -> Result<(Vec<f32>, u32)> {
+        Ok((vec![0.25; 3200], 16_000))
+    }
+    fn take_new(&mut self) -> Vec<f32> {
+        if self.chunks.is_empty() {
+            Vec::new()
+        } else {
+            self.chunks.remove(0)
+        }
+    }
+}
+
+#[test]
+fn the_live_preview_shows_a_phrase_while_recording() {
+    let (events_tx, events) = mpsc::sync_channel(8);
+    let tone: Vec<f32> = (0..1600).map(|i| 0.2 * (i as f32 * 0.05).sin()).collect();
+    let mut chunks = vec![tone; 6];
+    chunks.extend(vec![vec![0.0005; 1600]; 6]);
+    let job = Job {
+        config: Default::default(),
+        stop: Arc::new(AtomicBool::new(false)),
+        cancel: Arc::new(AtomicBool::new(false)),
+        level: Arc::new(AtomicU32::new(0)),
+        device: None,
+        events: events_tx,
+        preview: Some(Preview {
+            transcribe: Arc::new(|samples: Vec<f32>, rate: u32| -> Result<String> {
+                assert_eq!(rate, 16_000);
+                Ok(format!("{} ms", samples.len() / 16))
+            }),
+            gap: Duration::ZERO,
+            open: Arc::new(Mutex::new(true)),
+        }),
+    };
+    let result = run_job(
+        &job,
+        || Ok(Speaking { chunks }),
+        || Ok(|_: Vec<f32>, _: u32| -> Result<String> { Ok("final".into()) }),
+    )
+    .unwrap();
+    assert_eq!(result.as_deref(), Some("final"));
+    let mut seen = Vec::new();
+    while let Ok(event) = events.recv_timeout(WAIT) {
+        let partial = matches!(event, Event::Partial(_));
+        seen.push(format!("{event:?}"));
+        if partial {
+            break;
+        }
+    }
+    // The phrase and the pause that ended it, lead-in and all.
+    assert!(
+        seen.iter()
+            .any(|e| e.starts_with("Partial(\"10") && e.ends_with(" ms\")")),
+        "{seen:?}"
+    );
 }

@@ -64,6 +64,7 @@ pub(crate) fn config(cx: &App) -> Option<Config> {
         language: saved.stt_language.clone(),
         remove_fillers: saved.stt_remove_fillers,
         trigger_phrase: saved.stt_trigger_phrase.clone(),
+        live: saved.stt_live,
     })
 }
 pub(crate) fn card(cx: &mut App) -> Entity<VoiceCard> {
@@ -587,6 +588,39 @@ impl Render for VoiceCard {
                 toggle_fillers(cx);
             });
 
+        let live = saved.stt_live;
+        fn toggle_live(cx: &mut App) {
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.stt_live = !s.stt_live
+            });
+        }
+        let live_switch = widgets::toggle_switch(&theme, live, "voice-live")
+            .id("voice-live")
+            .cursor_pointer()
+            .tab_index(0)
+            .role(gpui::Role::Switch)
+            .aria_label("Live transcription")
+            .aria_toggled(if live {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                toggle_live(cx);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(move |_, event: &gpui::KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    toggle_live(cx);
+                    cx.notify();
+                }
+            }))
+            .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                toggle_live(cx);
+            });
+
         let save_phrase = widgets::text_action(&theme, widgets::ActionTone::Outlined, "Save")
             .id("voice-phrase-save")
             .tab_index(0)
@@ -675,6 +709,17 @@ impl Render for VoiceCard {
                                             "Start dictation",
                                             Some(trigger_meta.into()),
                                             trigger_control,
+                                        ))
+                                        .child(row(
+                                            &theme,
+                                            false,
+                                            "Live transcription",
+                                            Some(
+                                                "Shows each phrase as you pause; the full \
+                                                 transcript replaces it when you stop"
+                                                    .into(),
+                                            ),
+                                            live_switch,
                                         )),
                                 )
                                 .child(

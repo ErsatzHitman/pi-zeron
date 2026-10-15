@@ -11,6 +11,7 @@ use std::sync::{
 pub mod call;
 mod cleanup;
 pub mod cloud;
+mod live;
 mod resample;
 mod trigger;
 
@@ -127,6 +128,8 @@ pub struct Capture {
     stream: Option<cpal::Stream>,
     audio: Arc<Audio>,
     rate: u32,
+    /// How much of the audio the live preview has had.
+    read: usize,
 }
 impl Capture {
     pub fn start(device: Option<&str>, level: Arc<AtomicU32>) -> Result<Self> {
@@ -173,6 +176,7 @@ impl Capture {
             stream: Some(stream),
             audio,
             rate,
+            read: 0,
         })
     }
     pub fn ended(&self) -> bool {
@@ -191,6 +195,8 @@ impl Capture {
 #[derive(Debug)]
 pub enum Event {
     Listening,
+    /// The live preview's text so far, while the recording goes on.
+    Partial(String),
     Finalizing,
     Final(String),
     Failed(String),
@@ -202,12 +208,27 @@ struct Job {
     level: Arc<AtomicU32>,
     device: Option<String>,
     events: std::sync::mpsc::SyncSender<Event>,
+    /// The live preview, when it is on.
+    preview: Option<Preview>,
+}
+struct Preview {
+    transcribe: live::Transcribe,
+    gap: std::time::Duration,
+    /// Closed before the final transcript goes: no preview text after it.
+    open: Arc<Mutex<bool>>,
 }
 // Capture owns its stream on a separate thread. Requests remain serialized on
 // WORKER, including after the user cancels.
 trait Recording {
     fn ended(&self) -> bool;
     fn finish(self) -> Result<(Vec<f32>, u32)>;
+    /// The audio captured since the last call, for the live preview.
+    fn take_new(&mut self) -> Vec<f32> {
+        Vec::new()
+    }
+    fn rate(&self) -> u32 {
+        16_000
+    }
 }
 impl Recording for Capture {
     fn ended(&self) -> bool {
@@ -215,6 +236,22 @@ impl Recording for Capture {
     }
     fn finish(self) -> Result<(Vec<f32>, u32)> {
         self.finish()
+    }
+    fn take_new(&mut self) -> Vec<f32> {
+        // Never wait on the audio callback: skip a turn rather than hold the
+        // lock it would drop a buffer for.
+        let Ok(samples) = self.audio.samples.try_lock() else {
+            return Vec::new();
+        };
+        let fresh = samples
+            .get(self.read..)
+            .map(<[f32]>::to_vec)
+            .unwrap_or_default();
+        self.read = samples.len();
+        fresh
+    }
+    fn rate(&self) -> u32 {
+        self.rate
     }
 }
 
@@ -225,7 +262,7 @@ fn record<C: Recording>(
     if job.cancel.load(Ordering::Acquire) || job.stop.load(Ordering::Acquire) {
         return Ok(None);
     }
-    let capture = start()?;
+    let mut capture = start()?;
     // Stop/cancel may arrive while the audio device is opening.
     if job.cancel.load(Ordering::Acquire) {
         return Ok(None);
@@ -233,14 +270,39 @@ fn record<C: Recording>(
     if !job.stop.load(Ordering::Acquire) {
         let _ = job.events.try_send(Event::Listening);
     }
+    let preview = job.preview.as_ref().map(|preview| {
+        let (events, open) = (job.events.clone(), preview.open.clone());
+        live::start(
+            capture.rate(),
+            preview.gap,
+            preview.transcribe.clone(),
+            move |text| {
+                if *open.lock().unwrap_or_else(|e| e.into_inner()) {
+                    let _ = events.try_send(Event::Partial(text));
+                }
+            },
+        )
+    });
     let started = std::time::Instant::now();
+    let mut fed = started;
     while !job.stop.load(Ordering::Acquire)
         && !job.cancel.load(Ordering::Acquire)
         && !capture.ended()
         && started.elapsed().as_secs() < MAX_SECONDS as u64
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
+        if let Some(preview) = &preview
+            && fed.elapsed() >= live::FEED
+        {
+            fed = std::time::Instant::now();
+            let fresh = capture.take_new();
+            if !fresh.is_empty() {
+                let _ = preview.send(fresh);
+            }
+        }
     }
+    // What is left is the final transcript's.
+    drop(preview);
     if job.cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
@@ -346,13 +408,18 @@ impl Session {
                             "Dictation stopped unexpectedly. Your draft is safe."
                         ))
                     });
+                    if let Some(preview) = &job.preview {
+                        *preview.open.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                    }
+                    // Waits for room behind any preview text: the outcome is
+                    // never dropped. A closed session refuses it at once.
                     match result {
                         Ok(Some(text)) => {
-                            let _ = job.events.try_send(Event::Final(text));
+                            let _ = job.events.send(Event::Final(text));
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            let _ = job.events.try_send(Event::Failed(e.to_string()));
+                            let _ = job.events.send(Event::Failed(e.to_string()));
                         }
                     }
                 }
@@ -363,6 +430,15 @@ impl Session {
         let cancel = Arc::new(AtomicBool::new(false));
         let level = Arc::new(AtomicU32::new(0));
         let (tx, events) = std::sync::mpsc::sync_channel(4);
+        let preview = config.live.then(|| {
+            let gap = config.provider.preview_gap();
+            let config = config.clone();
+            Preview {
+                transcribe: Arc::new(move |samples, rate| cloud::preview(&config, samples, rate)),
+                gap,
+                open: Arc::new(Mutex::new(true)),
+            }
+        });
         if sender
             .try_send((
                 Job {
@@ -372,6 +448,7 @@ impl Session {
                     level: level.clone(),
                     device,
                     events: tx,
+                    preview,
                 },
                 admission,
             ))

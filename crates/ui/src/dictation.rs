@@ -110,6 +110,7 @@ impl Transcriber for Native {
         }
         self.session.as_mut()?.poll().map(|event| match event {
             zeron_voice::Event::Listening => Event::Listening,
+            zeron_voice::Event::Partial(t) => Event::Partial(t),
             zeron_voice::Event::Finalizing => Event::Finalizing,
             zeron_voice::Event::Final(t) => Event::Final(t),
             zeron_voice::Event::Failed(e) => Event::Failed(e),

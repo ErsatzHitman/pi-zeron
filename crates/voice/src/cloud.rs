@@ -1,7 +1,8 @@
 //! Cloud transcription: one recording goes to the provider's OpenAI-compatible
 //! `/audio/transcriptions` endpoint as a 16 kHz WAV. The text then loses its
 //! filler words and, when it ends with the trigger phrase, is rewritten by the
-//! same provider's chat model. Nothing is stored.
+//! same provider's chat model. Nothing is stored. While recording, a live
+//! preview sends each phrase as it ends ([`preview`]).
 use crate::{cleanup, resample, trigger};
 use anyhow::{Result, anyhow, bail};
 use std::time::Duration;
@@ -51,6 +52,15 @@ impl Provider {
             Self::Groq => "https://api.groq.com/openai/v1",
         }
     }
+    /// The shortest wait between live-preview requests. Groq's free tier
+    /// allows about twenty transcriptions a minute, and the final transcript
+    /// needs one of them.
+    pub fn preview_gap(self) -> Duration {
+        match self {
+            Self::OpenAi => Duration::from_millis(800),
+            Self::Groq => Duration::from_secs(4),
+        }
+    }
     fn rewrite_model(self) -> &'static str {
         match self {
             Self::OpenAi => "gpt-4o-mini",
@@ -70,6 +80,8 @@ pub struct Config {
     pub remove_fillers: bool,
     /// Empty turns the trigger phrase off.
     pub trigger_phrase: String,
+    /// Show the text phrase by phrase while recording ([`preview`]).
+    pub live: bool,
 }
 
 impl Config {
@@ -114,6 +126,30 @@ pub fn transcribe(config: &Config, samples: Vec<f32>, rate: u32) -> Result<Strin
                 }
             })
         })
+}
+
+/// A phrase of a recording that is still going on, for the live preview:
+/// the text alone, fillers removed, no trigger phrase acted on. Called only
+/// on the preview thread.
+pub fn preview(config: &Config, samples: Vec<f32>, rate: u32) -> Result<String> {
+    if samples.len() < rate as usize / 5 || config.api_key.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let wav = wav(&resample::for_model(samples, rate)?);
+    let text = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .build()?;
+            request(&client, config, wav).await
+        })?;
+    Ok(if config.remove_fillers {
+        cleanup::clean(&text, config.english())
+    } else {
+        text.trim().to_owned()
+    })
 }
 
 async fn request(client: &reqwest::Client, config: &Config, wav: Vec<u8>) -> Result<String> {
