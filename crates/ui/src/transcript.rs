@@ -3709,7 +3709,7 @@ impl Transcript {
                 let armed_id = button.clone();
                 div()
                     .id(button)
-                    .flex_shrink()
+                    .flex_shrink(1.0)
                     .min_w(px(PI_CONTROL_MIN_WIDTH))
                     .max_w(px(PI_CONTROL_MAX_WIDTH))
                     .h(px(20.0))
