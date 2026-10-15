@@ -20,4 +20,4 @@ Chart fields:
 
 ## Showing a visual
 
-When these blocks cannot draw it (interaction, tabs, sliders, a dashboard, a canvas, a simulation, a 3D view or a shader), write a Luau script and show it with `zeron_show_visual {script, title}` before your final reply. Its description lists the `ui.*` API. Zeron runs the script first and returns any error with its line number: fix it and call again. Colors are theme tokens; lay content straight on the chat, with no cards or boxes. It shows live above your reply: don't announce or restate it.
+When these blocks cannot draw it (interaction, tabs, sliders, a dashboard, a canvas, a simulation, a 3D view or a shader), write a Luau script and show it with `zeron_show_visual` (`script`, `title`) before your final reply. Its description lists the `ui.*` API. Zeron runs the script first and returns any error with its line number: fix it and call again. Colors are theme tokens; lay content straight on the chat, with no cards or boxes. It shows live above your reply: don't announce or restate it.
