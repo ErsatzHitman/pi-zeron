@@ -621,7 +621,12 @@ mod tests {
         );
         assert_eq!(nested.sessions[1].trailing.as_deref(), Some("Parent"));
         let member = agent_list(&state, &row("member"), Utc::now());
-        assert_eq!(member.sessions.len(), 1, "its parent is the orchestrator");
+        let way_up = member
+            .sessions
+            .iter()
+            .filter(|row| matches!(row.kind, AgentKind::Parent { .. }))
+            .count();
+        assert_eq!(way_up, 1, "its parent is the orchestrator");
         assert_eq!(
             member.sessions[0].trailing.as_deref(),
             Some("Orchestrator · you are level 1")
