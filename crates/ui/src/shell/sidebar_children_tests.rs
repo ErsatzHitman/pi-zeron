@@ -212,13 +212,25 @@ fn the_btw_pane_opens_at_the_cards_width_with_its_bar_below(cx: &mut TestAppCont
     });
     cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
     cx.update(|window, cx| window.draw(cx).clear());
+    shell.update(cx, |shell, _| {
+        shell.test_time = Some(std::time::Instant::now())
+    });
     cx.update(|_, cx| shell.update(cx, |shell, cx| shell.open_btw_pane(cx)));
     let reveal = |shell: &Entity<Shell>, cx: &mut VisualTestContext| {
         cx.update(|_, cx| shell.update(cx, |shell, cx| shell.btw_frame(cx).map(|(_, r)| r)))
     };
-    // It eases in: partway at first, then whole.
+    // It eases in: nothing on its first frame, partway halfway through,
+    // then whole.
+    assert_eq!(reveal(&shell, cx), None);
+    shell.update(cx, |shell, _| {
+        *shell.test_time.as_mut().unwrap() +=
+            Duration::from_millis(100).mul_f32(motion::speed_scale());
+    });
     let early = reveal(&shell, cx).expect("the pane is showing");
-    assert!(early < 1.0, "the pane opens animated, got {early}");
+    assert!(
+        early > 0.0 && early < 1.0,
+        "the pane opens animated, got {early}"
+    );
     shell.update(cx, |shell, _| {
         *shell.test_time.as_mut().unwrap() += Duration::from_secs(3);
     });
