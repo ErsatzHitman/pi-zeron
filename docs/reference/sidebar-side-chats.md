@@ -5,7 +5,7 @@ The sidebar's Sessions list nests each session's side chats under it, on the Orc
 ## What nests
 
 - Direct, unarchived children of a listed session: btw and forked side chats, and chats an agent started through the Zeron MCP server.
-- The selected session's sub-agents at work: Pi fleet sub-agents and harness subagents, after its side chats, longest-running first. Only the selected session's roster and transcript are watched, so other rows keep the "● N" pill that counts theirs. A settled sub-agent leaves the list (the session panel keeps it under Previous agents).
+- Sub-agents at work, after the side chats. Under the selected session, one row each: Pi fleet sub-agents and harness subagents, longest-running first. Only the selected session's roster and transcript are watched, so under any other session they show as one "N sub-agents working" row (the synced count the "● N" pill shows); clicking it opens the session, which then lists them. A settled sub-agent leaves the list (the session panel keeps it under Previous agents).
 - Not nested: background bash, grandchildren, children of archived parents, and Orchestrator members (their roots are not listed).
 - Children list in the order they started (id breaks ties), so positions never jump. The session panel's list stays newest-first.
 - The project filter, sort, pins and custom sections apply to the parent only; its children travel with it.
@@ -23,6 +23,7 @@ The sidebar's Sessions list nests each session's side chats under it, on the Orc
 - Click: its parent becomes the open session, from any page, and the child opens beside it in the right pane, its composer focused.
 - Cmd-click (macOS) or Ctrl-click (Windows, Linux): opens the child as the session itself.
 - A sub-agent row has a running glyph (a warning triangle while it asks), a bot icon, its name and a live elapsed time; its roster detail is the tooltip. Click: a Pi sub-agent runs its roster View, a harness subagent opens its transcript tab, as from the session panel. A fleet row without View does nothing.
+- The "N sub-agents working" row has the running glyph, a bot icon and the count; a click opens its session.
 - Double-click renames it in place. Right-click opens the side-chat menu (Open as session, Rename, Delete). Hovering the corner archives it.
 
 ## Keyboard and drag
