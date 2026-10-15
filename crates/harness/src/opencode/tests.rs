@@ -291,6 +291,7 @@ impl TurnWire {
                 description: String::new(),
                 input_hint: None,
                 arguments: vec![],
+                side: false,
             }]),
             initial_native_command_selected: native_command_reply.is_some(),
         }));

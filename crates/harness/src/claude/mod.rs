@@ -414,6 +414,7 @@ fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
                     .filter(|h| !h.is_empty())
                     .map(str::to_owned),
                 arguments: vec![],
+                side: false,
             })
         })
         .collect()

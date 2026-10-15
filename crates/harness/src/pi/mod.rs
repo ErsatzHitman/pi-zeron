@@ -636,6 +636,13 @@ enum Pending {
     /// The command completions asked before that list; the list and the
     /// barrier of the turn (its epoch) are asked once they are in.
     Completions(u64),
+    /// A side command (`/jev off`) sent beside any turn: what it reports
+    /// until Pi answers is a toast. `shown` is [`piui::ExtensionUi::shown`]
+    /// when it was sent.
+    Side {
+        name: String,
+        shown: u64,
+    },
 }
 struct Delivery {
     epoch: u64,
@@ -759,10 +766,50 @@ impl Runner {
             .as_ref()
             .is_some_and(|watched| *watched.borrow())
     }
+    /// Whether a side command is waiting on Pi.
+    fn side_pending(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Side { .. }))
+    }
+    /// Run an extension's command beside the conversation: no turn opens, so
+    /// it never reaches the chat, and its notices are toasts. Pi runs an
+    /// extension command at once, even while the agent works.
+    fn side_command(&mut self, text: &str) -> Result<(), HarnessError> {
+        let text = text.trim();
+        let name = text
+            .strip_prefix('/')
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_default()
+            .to_owned();
+        if !self.extension_commands.contains(&name) {
+            self.ui.toast(
+                format!("/{name} is not an extension command here"),
+                zeron_proto::extension_ui::NoticeLevel::Warning,
+            );
+            return Ok(());
+        }
+        let shown = self.ui.shown();
+        let id = self
+            .process
+            .transport
+            .client
+            .request(json!({"type":"prompt","message":text}))?;
+        self.pending.insert(id, Pending::Side { name, shown });
+        Ok(())
+    }
     fn send_action(
         &mut self,
         action: zeron_proto::extension_ui::ExtensionUiAction,
     ) -> Result<(), HarnessError> {
+        if action.element_id == zeron_proto::SIDE_COMMAND_ELEMENT {
+            let text = action
+                .value
+                .as_ref()
+                .and_then(|value| value["text"].as_str())
+                .unwrap_or_default();
+            return self.side_command(text);
+        }
         if let Some(question) = action
             .element_id
             .strip_prefix(zeron_proto::SECRET_ANSWER_ELEMENT)
@@ -1152,6 +1199,13 @@ impl Runner {
                 tracing::debug!(%error, "Pi refused the completions command");
                 return self.request_settled(*epoch, false);
             }
+            Pending::Side { name, .. } => {
+                self.ui.toast(
+                    format!("/{name} failed: {error}"),
+                    zeron_proto::extension_ui::NoticeLevel::Error,
+                );
+                return Ok(());
+            }
         };
         if epoch != self.epoch || !self.active {
             tracing::debug!(%error, "Pi refused a request of an earlier turn");
@@ -1337,7 +1391,9 @@ impl Runner {
             return Ok(());
         }
         if frame["type"] == "extension_ui_request" {
-            self.ui.set_in_turn(self.active);
+            // A side command's notices are toasts, even during a turn.
+            let side = self.side_pending();
+            self.ui.set_in_turn(self.active && !side);
             match self.ui.handle(&frame) {
                 piui::Handled::Consumed => {
                     self.turn.set_background(self.ui.background_tasks());
@@ -1347,7 +1403,7 @@ impl Runner {
                 // turns it was recorded as a toast (it must not reopen a
                 // completed engine turn).
                 piui::Handled::Notice(message) => {
-                    if self.active {
+                    if self.active && !side {
                         let level = piui::notice_level(&frame);
                         for event in self.rows.notice(&message, level) {
                             self.emit(event).await?;
@@ -1418,6 +1474,11 @@ impl Runner {
                     self.take_commands(&data, announce).await?;
                 }
                 Pending::Completions(epoch) => self.request_settled(epoch, true)?,
+                // A command that showed nothing still says it ran.
+                Pending::Side { name, shown } if self.ui.shown() == shown => self.ui.toast(
+                    format!("Ran /{name}"),
+                    zeron_proto::extension_ui::NoticeLevel::Info,
+                ),
                 Pending::EmptyEntries(epoch, session) if epoch == self.epoch && self.active => {
                     let clean = data["entries"].as_array().is_some_and(|entries| {
                         entries.iter().all(|entry| {

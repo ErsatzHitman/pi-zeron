@@ -1021,6 +1021,7 @@ fn skill_commands(dirs: &[PathBuf]) -> Vec<SlashCommand> {
                 description: first_sentence(&description),
                 input_hint: None,
                 arguments: vec![],
+                side: false,
             });
         }
     }

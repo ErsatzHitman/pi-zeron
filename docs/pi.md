@@ -127,6 +127,14 @@ there after a restart. A workspace no chat has run in yet shows the latest
 list from the same Pi until its first run. Only a Pi with no list anywhere is
 asked once by a no-session process.
 
+An extension's own command (`/jev off`, `/mcp`) is a side
+command: Zeron sends it straight to the chat's running Pi on the
+`pi:side-command` UI action, outside any turn, even while the agent works.
+It never enters the chat or its synced history; what it reports shows as
+toasts (a long report as a report screen), and one that says nothing toasts
+"Ran /name". With no Pi running for the chat yet, it goes as an ordinary
+message, which starts one. Prompt templates and skills are always messages.
+
 Steering queues at a model step boundary and starts immediately when idle.
 When no steering mode is configured, Zeron selects Pi's `all` mode, so messages
 queued before the next model call enter that call together. A mode already set

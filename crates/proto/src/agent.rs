@@ -580,6 +580,12 @@ pub struct SlashCommand {
     /// (Pi's `getArgumentCompletions`: `/goal draft`, `/mcp reconnect <server>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arguments: Vec<ArgumentCompletion>,
+    /// Runs beside the conversation (an extension's own control, such as
+    /// Pi's `/jev off`): sent straight to the live agent on
+    /// [`SIDE_COMMAND_ELEMENT`], never written to the chat, and what it
+    /// reports shows as toasts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub side: bool,
 }
 
 /// One value a slash command accepts as its argument. `value` is the text
@@ -640,6 +646,9 @@ pub struct UserInputAnswer {
 pub const SECRET_ANSWER_SENT: &str = "\u{2063}secret-sent";
 /// Element id prefix of a secret question's direct answer.
 pub const SECRET_ANSWER_ELEMENT: &str = "pi:secret:";
+/// Element id of a [`SlashCommand::side`] command sent to the live agent
+/// (`value: {"text": "/jev off"}`): it never enters the chat's history.
+pub const SIDE_COMMAND_ELEMENT: &str = "pi:side-command";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

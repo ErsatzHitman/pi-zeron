@@ -168,6 +168,9 @@ pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
                 description: string(v, "description").into(),
                 input_hint: None,
                 arguments: arguments(&data[COMPLETIONS_KEY][name]),
+                // An extension's command works the extension, beside the
+                // conversation; templates and skills are prompts.
+                side: v["source"] == "extension",
             })
         })
         .collect();
@@ -186,6 +189,7 @@ pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
                 description: description.into(),
                 input_hint: None,
                 arguments: vec![],
+                side: false,
             });
         }
     }

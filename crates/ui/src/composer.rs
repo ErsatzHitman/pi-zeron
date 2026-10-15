@@ -5930,6 +5930,7 @@ fn with_workspace_commands(
             input_hint: None,
             arguments: vec![],
             workspace_command: Some(command),
+            side: false,
         });
     }
     rows
@@ -5958,6 +5959,19 @@ struct InvocationCandidate {
     /// The command's sub-commands, offered once its name and a space are typed.
     arguments: Vec<ArgumentCompletion>,
     invocation: zeron_proto::invocation::Invocation,
+    /// An extension's own control, run beside the chat
+    /// ([`zeron_proto::SlashCommand::side`]).
+    side: bool,
+}
+
+/// What a draft that is only a side command runs, as the prompt text the
+/// agent takes (`/jev off`).
+fn side_command_for_text(text: &str, rows: &[InvocationCandidate]) -> Option<String> {
+    let prompt = zeron_proto::invocation::invocation_prompt(text);
+    let (name, _) = zeron_proto::invocation::leading_command(&prompt)?;
+    rows.iter()
+        .any(|row| row.side && row.name == name)
+        .then(|| prompt.trim().to_owned())
 }
 
 fn invocation_insertion(
@@ -6088,6 +6102,7 @@ fn invocation_candidates(
             name: c.name.clone(),
             description: c.description,
             invocation: zeron_proto::invocation::Invocation::Command { name: c.name },
+            side: c.side,
         })
         .chain(
             skills
@@ -6108,6 +6123,7 @@ fn invocation_candidates(
                         path: s.path,
                         command: s.command,
                     },
+                    side: false,
                 }),
         )
         .collect()
@@ -9093,6 +9109,18 @@ impl Composer {
         // A lone "/" is a command not picked yet, not a message.
         let no_content = !composer_has_content(&text, attached, comments)
             || (text.trim() == "/" && attached == 0 && comments == 0);
+        // An extension's own control (`/jev off`) runs beside the chat.
+        if !no_content
+            && attached == 0
+            && comments == 0
+            && let Some(command) = self
+                .slash_cache
+                .get(&self.slash.context)
+                .and_then(|rows| side_command_for_text(&text, rows))
+            && self.send_side_command(command, cx)
+        {
+            return;
+        }
         // A key typed into a command is kept in the chat's history; the
         // command can usually ask for it privately instead.
         if !no_content && command_carries_key(&text) && self.key_warned.as_ref() != Some(&text) {
@@ -9120,6 +9148,70 @@ impl Composer {
             // Busy: keep the message queued until the current turn ends.
             SendButtonMode::Queue => self.send(text, true, cx),
         }
+    }
+
+    /// Run a side command on the chat's live agent: it never enters the chat
+    /// and what it reports shows as toasts. With no agent running for the
+    /// chat it goes as an ordinary message, which starts one. False when
+    /// there is no chat to run it in.
+    fn send_side_command(&mut self, command: String, cx: &mut Context<Self>) -> bool {
+        let (engine, chat_id, device) = {
+            let state = self.state.read(cx);
+            let Some(engine) = state.engine().cloned() else {
+                return false;
+            };
+            let Some(chat_id) = state.selected_chat.clone() else {
+                return false;
+            };
+            let device = state
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .map(|chat| chat.device_id.clone());
+            (engine, chat_id, device)
+        };
+        let action = zeron_proto::extension_ui::ExtensionUiAction {
+            element_id: zeron_proto::SIDE_COMMAND_ELEMENT.into(),
+            action_id: "run".into(),
+            value: Some(serde_json::json!({ "text": command.clone() })),
+            row_id: None,
+        };
+        let mut params = serde_json::json!({ "chatId": chat_id.clone(), "action": action });
+        if let Some(device) = device {
+            params["targetDeviceId"] = device.into();
+        }
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&self.current_key);
+        self.reset_slash(None, cx);
+        self.failure = None;
+        self.failure_key = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if engine
+                .client()
+                .call(methods::EXTENSION_UI_ACTION, params)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            this.update(cx, |composer, cx| {
+                let same_chat =
+                    composer.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str());
+                if same_chat && composer.input.read(cx).text().is_empty() {
+                    let queue = composer.button_mode(cx) == SendButtonMode::Queue;
+                    composer.send(command, queue, cx);
+                } else {
+                    crate::toast::error(
+                        cx,
+                        format!("The agent isn't running, so {command} wasn't sent."),
+                    );
+                }
+            })
+            .ok();
+        })
+        .detach();
+        true
     }
 
     /// Cmd/Ctrl+Enter remains an ordinary submit while the composer carries
@@ -13174,6 +13266,32 @@ mod tests {
     }
 
     #[test]
+    fn only_a_draft_that_is_a_side_command_runs_beside_the_chat() {
+        use zeron_proto::invocation::Invocation;
+        let row = |name: &str, side: bool| InvocationCandidate {
+            workspace_command: None,
+            name: name.into(),
+            description: String::new(),
+            input_hint: None,
+            arguments: vec![],
+            invocation: Invocation::Command { name: name.into() },
+            side,
+        };
+        let rows = vec![row("jev", true), row("review", false)];
+        let side = |text: &str| side_command_for_text(text, &rows);
+        assert_eq!(side("/jev off").as_deref(), Some("/jev off"));
+        assert_eq!(side("\n /jev off \n").as_deref(), Some("/jev off"));
+        // A command picked from the popup is a link in the draft.
+        let picked = format!("{} off", Invocation::Command { name: "jev".into() }.link());
+        assert_eq!(side(&picked).as_deref(), Some("/jev off"));
+        // A prompt-like command, prose, and indented code stay messages.
+        assert_eq!(side("/review the diff"), None);
+        assert_eq!(side("please /jev off"), None);
+        assert_eq!(side("    /jev off"), None);
+        assert_eq!(side("/unknown"), None);
+    }
+
+    #[test]
     fn workspace_commands_preserve_native_commands_and_avoid_collisions() {
         let native = invocation_candidates(
             vec![
@@ -13182,12 +13300,14 @@ mod tests {
                     description: "Native model command".into(),
                     input_hint: Some("model id".into()),
                     arguments: vec![],
+                    side: false,
                 },
                 SlashCommand {
                     name: "zeron:model".into(),
                     description: "Plugin command".into(),
                     input_hint: None,
                     arguments: vec![],
+                    side: false,
                 },
             ],
             vec![],
@@ -13324,6 +13444,7 @@ mod tests {
                             arguments: vec![],
                             workspace_command: None,
                             invocation: invocation.clone(),
+                            side: false,
                         }],
                     );
                     composer.refilter_slash(cx);
@@ -15489,6 +15610,7 @@ mod tests {
             description: String::new(),
             input_hint: None,
             arguments: vec![],
+            side: false,
         };
         let skill = zeron_proto::invocation::Skill {
             command: None,
@@ -15594,6 +15716,7 @@ mod tests {
                     description: String::new(),
                     input_hint: None,
                     arguments: vec![],
+                    side: false,
                 })
                 .collect();
             let skills = [
@@ -15639,12 +15762,14 @@ mod tests {
                     description: String::new(),
                     input_hint: None,
                     arguments: vec![],
+                    side: false,
                 },
                 SlashCommand {
                     name: "compact".into(),
                     description: String::new(),
                     input_hint: None,
                     arguments: vec![],
+                    side: false,
                 },
             ];
             let skills = vec![Skill {
@@ -15678,6 +15803,7 @@ mod tests {
             description: "Command".into(),
             input_hint: None,
             arguments: vec![],
+            side: false,
         }];
         let skills = vec![
             Skill {

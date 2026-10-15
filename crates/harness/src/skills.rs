@@ -411,6 +411,7 @@ mod tests {
                 description: String::new(),
                 input_hint: None,
                 arguments: vec![],
+                side: false,
             }])
         };
         let root = Path::new("/workspace");
@@ -530,12 +531,14 @@ mod tests {
                 description: "Review".into(),
                 input_hint: None,
                 arguments: vec![],
+                side: false,
             },
             zeron_proto::SlashCommand {
                 name: "compact".into(),
                 description: String::new(),
                 input_hint: None,
                 arguments: vec![],
+                side: false,
             },
         ];
         let mut skills = vec![];
@@ -567,6 +570,7 @@ mod tests {
                 description: String::new(),
                 input_hint: None,
                 arguments: vec![],
+                side: false,
             };
             attach_advertised_commands(harness, &mut skills, &[command]);
             assert_eq!(skills[0].command.as_ref().unwrap().harness, harness);
@@ -594,6 +598,7 @@ mod tests {
                 description: String::new(),
                 input_hint: None,
                 arguments: vec![],
+                side: false,
             };
             attach_advertised_commands(harness, &mut skills, &[command("compact")]);
             assert!(skills[0].command.is_none(), "{harness:?}");
@@ -621,6 +626,7 @@ mod tests {
             description: String::new(),
             input_hint: None,
             arguments: vec![],
+            side: false,
         })
         .collect::<Vec<_>>();
         let mut skills = vec![];

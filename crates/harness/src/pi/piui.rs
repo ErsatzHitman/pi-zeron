@@ -246,6 +246,25 @@ impl ExtensionUi {
         &self.state
     }
 
+    /// A toast for a watching UI.
+    pub fn toast(&mut self, message: String, level: NoticeLevel) {
+        let seq = self.next_seq();
+        self.state.notices.push(ExtensionNotice {
+            seq,
+            message,
+            level,
+        });
+        let excess = self.state.notices.len().saturating_sub(NOTICE_HISTORY);
+        self.state.notices.drain(..excess);
+        self.publish();
+    }
+
+    /// Counts what has been shown (notices, reports, dialogs and the like):
+    /// a side command that left it unchanged said nothing.
+    pub fn shown(&self) -> u64 {
+        self.seq + self.dialog_seq
+    }
+
     /// Whether a turn is running (see [`Handled::Notice`]).
     pub fn set_in_turn(&mut self, in_turn: bool) {
         self.in_turn = in_turn;
@@ -487,15 +506,7 @@ impl ExtensionUi {
                     self.publish();
                     return Handled::Consumed;
                 }
-                let seq = self.next_seq();
-                self.state.notices.push(ExtensionNotice {
-                    seq,
-                    message: message.clone(),
-                    level,
-                });
-                let excess = self.state.notices.len().saturating_sub(NOTICE_HISTORY);
-                self.state.notices.drain(..excess);
-                self.publish();
+                self.toast(message.clone(), level);
                 Handled::Notice(message)
             }
             "setStatus" => {

@@ -237,6 +237,7 @@ fn main() {
                 &v,
                 json!({"commands":[
                     {"name":"noop","description":"handled","source":"extension","sourceInfo":{"path":"noop.ts"}},
+                    {"name":"noisy","description":"says what it did","source":"extension","sourceInfo":{"path":"noisy.ts"}},
                     {"name":"pi_ui_event","description":"Internal: PIUI events","source":"extension","sourceInfo":{"path":"00-piui.ts"}},
                     {"name":"skill:probe","description":"skill","source":"skill","sourceInfo":{"path":"SKILL.md"}}
                 ]}),
@@ -270,6 +271,16 @@ fn main() {
                     continue;
                 }
                 if text == "/noop" || text == "handled" {
+                    disposition(&v, "handled");
+                    continue;
+                }
+                // An extension command that reports what it did, as Jev's
+                // `/jev off` does.
+                if let Some(args) = text.strip_prefix("/noisy ") {
+                    emit(
+                        json!({"type":"extension_ui_request","id":uuid(),"method":"notify",
+                        "message":format!("noisy: {args}"),"notifyType":"info"}),
+                    );
                     disposition(&v, "handled");
                     continue;
                 }

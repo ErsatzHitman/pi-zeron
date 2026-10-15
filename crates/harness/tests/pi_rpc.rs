@@ -934,6 +934,9 @@ async fn edit_diffs_come_from_pi_edits_array_and_transport_commands_stay_hidden(
         })
         .expect("advertised commands");
     assert!(commands.iter().any(|c| c.name == "noop"));
+    // An extension's command runs beside the chat; a skill is a prompt.
+    assert!(commands.iter().any(|c| c.name == "noop" && c.side));
+    assert!(commands.iter().all(|c| c.name != "skill:probe" || !c.side));
     assert!(commands.iter().all(|c| !c.name.starts_with("pi_ui_")));
 }
 
@@ -1215,6 +1218,68 @@ async fn piui_follows_watchers_flows_while_idle_and_round_trips_actions() {
     assert_eq!(dones, 1);
     let state = wait_ui(&mut ui, "cleared on exit", |s| s.instance.is_none()).await;
     assert!(state.is_empty());
+}
+
+/// A side command (`/jev off`) runs beside the chat: it opens no turn, what
+/// it reports is a toast, and one that says nothing still says it ran.
+#[tokio::test]
+async fn a_side_command_reports_in_toasts_and_never_opens_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, tx, _) = controls();
+    let (port, mut ui) = ui_port(true);
+    c.extension_ui = port;
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "first"), c)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let side = |text: &str| zeron_proto::extension_ui::ExtensionUiAction {
+        element_id: zeron_proto::SIDE_COMMAND_ELEMENT.into(),
+        action_id: "run".into(),
+        value: Some(serde_json::json!({ "text": text })),
+        row_id: None,
+    };
+    let toasted = |message: &'static str| {
+        move |s: &zeron_proto::extension_ui::ExtensionUiState| {
+            s.notices.iter().any(|n| n.message == message)
+        }
+    };
+    ui.actions.send(side("/noisy off")).unwrap();
+    wait_ui(&mut ui, "its report as a toast", toasted("noisy: off")).await;
+    ui.actions.send(side("/noop")).unwrap();
+    wait_ui(&mut ui, "a quiet command says it ran", toasted("Ran /noop")).await;
+    // A skill is a prompt: never run beside the chat.
+    ui.actions.send(side("/skill:probe")).unwrap();
+    wait_ui(
+        &mut ui,
+        "a skill refused",
+        toasted("/skill:probe is not an extension command here"),
+    )
+    .await;
+
+    drop(tx);
+    let rest: Vec<_> = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert!(
+        rest.iter().all(|e| !matches!(
+            e,
+            Ok(AgentEvent::SessionStarted { .. }
+                | AgentEvent::ToolCall { .. }
+                | AgentEvent::TextDelta { .. }
+                | AgentEvent::Done { .. })
+        )),
+        "{rest:?}"
+    );
 }
 
 /// A plain dialog Pi raises between turns has no transcript turn to ask in:
