@@ -1,8 +1,10 @@
 //! Tokens and spend for every Pi provider and model on one device, read by
-//! that device's engine from Pi's session files (`GetUsageReport`).
+//! that device's engine from Pi's session files and usage ledger
+//! (`GetUsageReport`).
 //!
-//! Providers and models are free strings taken from the records: one added
-//! later through `/login` appears the first time it is used.
+//! Providers, models and surfaces are free strings taken from the records:
+//! a provider added later through `/login`, or a new extension that calls a
+//! model, appears the first time it is used.
 use serde::{Deserialize, Serialize};
 
 /// Bucket width of [`UsageReport::series`].
@@ -25,6 +27,9 @@ pub struct UsageQuery {
     pub utc_offset_minutes: i32,
     /// Look for new records now instead of serving the last scan.
     pub refresh: bool,
+    /// Only this surface's requests in `models` and `series`; `surfaces`
+    /// always lists every one.
+    pub surface: Option<String>,
 }
 
 /// Token counts. The total is `input + cache_read + cache_write + output`;
@@ -80,6 +85,47 @@ impl UsageModelRow {
     }
 }
 
+/// One surface over the window: what made the calls. `main` is a Pi
+/// session's own agent, `delegate` a delegated session; `subagent`,
+/// `workflow`, `advisor` and `agent` are child agents; `compaction`,
+/// `branch_summary` and `cache_warm` are Pi's own calls; `ext:<name>` and
+/// names like `jev` are extensions; `core` is anything unattributed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsageSurfaceRow {
+    pub surface: String,
+    pub requests: u64,
+    pub tokens: UsageTokens,
+    pub recorded_usd: f64,
+    pub estimated_usd: f64,
+    pub free_requests: u64,
+    pub unpriced_requests: u64,
+    pub last_used_ms: i64,
+}
+
+impl UsageSurfaceRow {
+    pub fn cost_usd(&self) -> f64 {
+        self.recorded_usd + self.estimated_usd
+    }
+}
+
+/// Where the numbers came from, so the page can say what it cannot see.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsageCoverage {
+    /// When Pi's usage ledger started recording every call, epoch ms. Before
+    /// it, child agents are known only from what their parents logged.
+    pub ledger_from_ms: Option<i64>,
+    /// Ledger calls counted in the window.
+    pub ledger_requests: u64,
+    /// Ledger calls skipped because a session file counts them.
+    pub ledger_duplicates: u64,
+    /// Requests recovered from subagent, advisor and workflow logs.
+    pub backfilled_requests: u64,
+    /// Problems the ledger's writers reported, such as a blind stream hook.
+    pub warnings: Vec<String>,
+}
+
 /// One provider's usage in one bucket.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -111,4 +157,7 @@ pub struct UsageReport {
     pub duplicates: u64,
     /// Earliest record in the window, epoch milliseconds.
     pub first_ms: Option<i64>,
+    /// Every surface in the window, most spend first.
+    pub surfaces: Vec<UsageSurfaceRow>,
+    pub coverage: UsageCoverage,
 }

@@ -147,7 +147,7 @@ impl PiHarness {
         Ok((exe, version))
     }
     async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
-        let mut process = self.spawn(cwd, &["--no-session".into()], None, false)?;
+        let mut process = self.spawn(cwd, &["--no-session".into()], None, false, None)?;
         let (mut tx, rx) = tokio::sync::oneshot::channel();
         let grace = self.kill_grace;
         tokio::spawn(async move {
@@ -174,12 +174,14 @@ impl PiHarness {
             .root()
             .join("commands.json")
     }
+    /// `usage_surface` names the run in Pi's usage ledger.
     fn spawn(
         &self,
         cwd: &Path,
         args: &[String],
         mcp: Option<&zeron_proto::McpServer>,
         guarded: bool,
+        usage_surface: Option<&str>,
     ) -> Result<Process, HarnessError> {
         let (exe, _) = self.verified_executable()?;
         let mut cmd = Command::new(&exe);
@@ -188,6 +190,9 @@ impl PiHarness {
         crate::compose_child_path(&mut cmd, &exe);
         if let Some(dir) = &self.agent_dir {
             cmd.env("PI_CODING_AGENT_DIR", dir);
+        }
+        if let Some(surface) = usage_surface {
+            cmd.env("PI_USAGE_SURFACE", surface);
         }
         cmd.args(["--mode", "rpc", "--no-themes"])
             .args(args)
@@ -458,7 +463,18 @@ impl Harness for PiHarness {
         if let Some(model) = request.model.as_deref().filter(|m| *m != "default") {
             args.extend(["--model".into(), model.into()]);
         }
-        let mut process = self.spawn(Path::new(&request.cwd), &args, None, false)?;
+        // Without extensions, Pi's usage ledger must be loaded by name to
+        // count the title call.
+        if let Some(ledger) = usage_ledger(self.agent_dir.clone()) {
+            args.extend(["-e".into(), ledger.to_string_lossy().into_owned()]);
+        }
+        let mut process = self.spawn(
+            Path::new(&request.cwd),
+            &args,
+            None,
+            false,
+            Some("zeron-titles"),
+        )?;
         let grace = self.kill_grace;
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
@@ -538,7 +554,13 @@ impl Harness for PiHarness {
         if lost_context.is_some() {
             request.resume = None;
         }
-        let process = self.spawn(Path::new(&request.cwd), &args, request.mcp.as_ref(), true)?;
+        let process = self.spawn(
+            Path::new(&request.cwd),
+            &args,
+            request.mcp.as_ref(),
+            true,
+            None,
+        )?;
         let commands_cache = (
             self.commands.clone(),
             self.commands_file(),
@@ -1687,9 +1709,30 @@ async fn load_images(paths: &[String]) -> Value {
     Value::Array(images)
 }
 
+/// Pi's usage-ledger extension, when the agent directory has it.
+fn usage_ledger(agent_dir: Option<PathBuf>) -> Option<PathBuf> {
+    let path = sessions::agent_dir(agent_dir)
+        .join("extensions")
+        .join("00-usage-ledger.ts");
+    path.is_file().then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::load_images;
+    use super::{load_images, usage_ledger};
+
+    #[test]
+    fn the_usage_ledger_is_found_only_where_it_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(usage_ledger(Some(dir.path().into())), None);
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(&extensions).unwrap();
+        std::fs::write(extensions.join("00-usage-ledger.ts"), "").unwrap();
+        assert_eq!(
+            usage_ledger(Some(dir.path().into())),
+            Some(extensions.join("00-usage-ledger.ts"))
+        );
+    }
 
     #[tokio::test]
     async fn unsupported_or_missing_attachments_do_not_fail_the_turn() {

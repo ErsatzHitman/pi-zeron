@@ -242,6 +242,34 @@ freeflow is installed but has no sessions yet. It will appear on first use.
 - **Price changes.** Today's price is used for old estimated rows. Recorded
   rows are never re-priced.
 
+
+## Every surface (v2)
+
+Subagents, workflow agents and the advisor run Pi with `--no-session`, and many extensions (jev, decisions, memory, handoff, goal judge, btw, vision proxy) call models without writing anything. Research on 2026-10-15 found ~$595 of subagent spend on the box that v1 could not see.
+
+- **Pi side:** the `00-usage-ledger.ts` extension in ErsatzHitman/pi appends one JSON line per LLM call to `<agentDir>/usage-ledger/<yyyy-mm>.jsonl`.
+  - It hooks pi-ai's `AssistantMessageEventStream`, with a `message_end` safety net.
+  - Every spawner that uses `--no-extensions` loads it with `-e`.
+  - Calls that bypass pi-ai use `recordUsage()`.
+  - Each line names its `surface`: `main`, `subagent`, `workflow`, `advisor`, `compaction`, `jev`, `ext:<name>`, and so on.
+- **Zeron side:**
+  - The scanner reads ledger files incrementally, like sessions.
+  - A ledger call that a session file also holds is matched on provider, model, message timestamp and tokens, and is counted once (session first).
+  - A cache warm is matched to its `usage` entry within 120 s.
+  - `kept:true` lines (summaries Pi also persisted) are skipped.
+- **Before the ledger (T0, its first `start` marker),** spend is recovered from what parents logged:
+  - the `subagent-result` delivery text (`- Usage: …`, `- Launch model: …`);
+  - advisor `toolResult.details.usage`;
+  - workflow journals (each attempt of each agent that actually ran).
+
+  From T0 on, these are ignored, because the ledger has the calls themselves.
+- **Summaries:** a compaction or branch summary is credited to the model of the session's latest assistant message, since Pi stores its usage without one.
+- **Zeron's own title runs** load the ledger extension by name and are labelled `zeron-titles`.
+- **Not counted:**
+  - non-Pi harness chats, which bill their own accounts;
+  - model calls inside third-party MCP servers;
+  - processes started without the extension by code that skips `withUsageLedger`.
+
 ## Later (not v1)
 
 - **Adapters for spend outside session files**, each a visible toggle:

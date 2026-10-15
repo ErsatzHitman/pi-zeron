@@ -1,12 +1,15 @@
 //! The usage tracker: tokens and spend for every Pi provider and model on
-//! this device, from Pi's session files. Scans run in the background and
-//! only read what was appended since the last one; the index lives in
-//! `<data_dir>/usage/`. See docs/research/usage-tracker.md.
+//! this device, from Pi's session files, its usage ledger (every LLM call a
+//! Pi process made, children and extensions included) and, for the time
+//! before the ledger, what subagents, the advisor and workflows logged.
+//! Scans run in the background and only read what was appended since the
+//! last one; the index lives in `<data_dir>/usage/`. See
+//! docs/research/usage-tracker.md.
 mod price;
 mod report;
 mod scan;
 
-use scan::FileState;
+use scan::{FileKind, FileState};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -21,14 +24,19 @@ const FRESH: Duration = Duration::from_secs(60);
 /// How long the first report waits for the first scan before answering
 /// with what it has.
 const FIRST_SCAN_WAIT: Duration = Duration::from_secs(5);
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 
 /// Where Pi keeps sessions: `PI_CODING_AGENT_SESSION_DIR`, the agent
 /// directory's `sessions`, and a `sessionDir` from its global settings.
+/// The usage ledger is the agent directory's `usage-ledger` unless
+/// `PI_USAGE_LEDGER_DIR` moves it; workflow journals live under
+/// `~/.pi/workflows/projects`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PiDirs {
     pub agent: PathBuf,
     pub sessions: Vec<PathBuf>,
+    pub ledger: PathBuf,
+    pub workflows: PathBuf,
 }
 
 impl PiDirs {
@@ -61,9 +69,31 @@ impl PiDirs {
             }
         }
         Self {
+            ledger: env("PI_USAGE_LEDGER_DIR").unwrap_or_else(|| agent.join("usage-ledger")),
+            workflows: home.join(".pi").join("workflows").join("projects"),
             agent,
             sessions: unique,
         }
+    }
+
+    /// Every file the tracker reads, with how to read it.
+    fn files(&self) -> Vec<(PathBuf, FileKind)> {
+        let mut files: Vec<_> = scan::session_files(&self.sessions)
+            .into_iter()
+            .filter(|path| !path.starts_with(&self.ledger))
+            .map(|path| (path, FileKind::Session))
+            .collect();
+        files.extend(
+            scan::session_files(std::slice::from_ref(&self.ledger))
+                .into_iter()
+                .map(|path| (path, FileKind::Ledger)),
+        );
+        files.extend(
+            scan::journal_files(&self.workflows)
+                .into_iter()
+                .map(|path| (path, FileKind::Journal)),
+        );
+        files
     }
 }
 
@@ -203,10 +233,14 @@ impl UsageTracker {
         let previous = self.state().files.clone();
         let mut files = BTreeMap::new();
         let mut changed = false;
-        for path in scan::session_files(&dirs.sessions) {
+        for (path, kind) in dirs.files() {
             let key = path.to_string_lossy().into_owned();
             let prev = previous.get(&key);
-            match scan::scan_file(&path, prev.map(Arc::as_ref)) {
+            let scanned = match kind {
+                FileKind::Journal => scan::scan_journal(&path, prev.map(Arc::as_ref)),
+                kind => scan::scan_file(&path, prev.map(Arc::as_ref), kind),
+            };
+            match scanned {
                 Ok(Some(file)) => {
                     changed = true;
                     files.insert(key, Arc::new(file));
@@ -284,12 +318,14 @@ impl UsageTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scan::tests::{assistant, header};
+    use scan::tests::{assistant, header, ledger_call};
 
     fn tracker(root: &Path, data: &Path) -> UsageTracker {
         let dirs = PiDirs {
             agent: root.join("agent"),
             sessions: vec![root.join("agent/sessions")],
+            ledger: root.join("agent/usage-ledger"),
+            workflows: root.join("workflows/projects"),
         };
         UsageTracker::with_dirs(data, move || dirs.clone())
     }
@@ -350,9 +386,60 @@ mod tests {
         assert_eq!(report.files, 1);
     }
 
+    #[tokio::test]
+    async fn ledger_calls_and_workflow_journals_are_read_beside_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        write(
+            &root.path().join("agent/sessions/--w--/1_a.jsonl"),
+            &[
+                header("2026-10-01T09:00:00Z"),
+                assistant("a1", "anthropic", "claude-opus-5-5", 1_000, 10, 0.5),
+            ],
+        );
+        // A subagent ran without a session file; only the ledger saw it.
+        write(
+            &root.path().join("agent/usage-ledger/2026-10.jsonl"),
+            &[
+                serde_json::json!({"v":1,"t":"start","ts":1_790_900_000_000_i64,"pid":1})
+                    .to_string(),
+                ledger_call("1-a-1", "main", "anthropic", "claude-opus-5-5", 1_000, 10),
+                ledger_call("2-a-1", "subagent", "openai", "gpt-5.6", 5_000, 30),
+            ],
+        );
+        write(
+            &root.path().join("workflows/projects/w-1/wf_1.json"),
+            &[
+                serde_json::json!({"runId":"wf_1","agents":[{"callId":"wf_1:0",
+                "model":"openai/gpt-5.6","startedAt":"2026-10-01T10:00:00.000Z",
+                "usage":{"input":7,"output":1,"total":8,"cost":0.1,"cacheRead":0,"cacheWrite":0}}]})
+                .to_string(),
+            ],
+        );
+        let report = tracker(root.path(), data.path())
+            .report(UsageQuery::default())
+            .await;
+        let mut surfaces: Vec<_> = report
+            .surfaces
+            .iter()
+            .map(|row| (row.surface.as_str(), row.requests))
+            .collect();
+        surfaces.sort();
+        assert_eq!(surfaces, [("main", 1), ("subagent", 1), ("workflow", 1)]);
+        assert_eq!(report.coverage.ledger_duplicates, 1);
+        // The journal's run came before the ledger began.
+        assert_eq!(report.coverage.ledger_from_ms, Some(1_790_900_000_000));
+        assert_eq!(report.coverage.backfilled_requests, 1);
+        assert_eq!(report.files, 1);
+    }
+
     #[test]
     fn pi_dirs_include_the_agent_dirs_sessions() {
         let dirs = PiDirs::detect();
         assert!(dirs.sessions.contains(&dirs.agent.join("sessions")));
+        if std::env::var_os("PI_USAGE_LEDGER_DIR").is_none() {
+            assert_eq!(dirs.ledger, dirs.agent.join("usage-ledger"));
+        }
+        assert!(dirs.workflows.ends_with("projects"));
     }
 }

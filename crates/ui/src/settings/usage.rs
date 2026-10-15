@@ -1,6 +1,7 @@
-//! Settings → Usage: tokens and spend for every Pi provider and model on the
-//! machine this window is attached to, from its engine (`GetUsageReport`).
-//! Providers come from the records, so one added through `/login` shows up
+//! Settings → Usage: tokens and spend for every Pi provider, model and
+//! surface on the machine this window is attached to, from its engine
+//! (`GetUsageReport`). Providers and surfaces come from the records, so one
+//! added through `/login`, or a new extension that calls a model, shows up
 //! the first time it is used.
 
 use std::{collections::BTreeSet, rc::Rc};
@@ -9,7 +10,7 @@ use chrono::{Local, TimeZone};
 use gpui::{
     AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
-use zeron_proto::usage::{UsageBucket, UsageModelRow, UsageQuery, UsageReport};
+use zeron_proto::usage::{UsageBucket, UsageModelRow, UsageQuery, UsageReport, UsageSurfaceRow};
 use zeron_rpc::{RpcError, methods};
 
 use crate::markdown::chart;
@@ -201,21 +202,74 @@ pub fn providers(report: &UsageReport, metric: Metric) -> Vec<ProviderTotal> {
 
 /// A model's spend as a cell: recorded, `~` estimated, Free, or Unpriced.
 pub fn model_cost_label(row: &UsageModelRow) -> String {
-    let cost = row.cost_usd();
+    cost_label(
+        row.recorded_usd,
+        row.estimated_usd,
+        row.unpriced_requests,
+        row.free_requests,
+    )
+}
+
+/// A surface's spend as a cell, read like a model's.
+pub fn surface_cost_label(row: &UsageSurfaceRow) -> String {
+    cost_label(
+        row.recorded_usd,
+        row.estimated_usd,
+        row.unpriced_requests,
+        row.free_requests,
+    )
+}
+
+fn cost_label(recorded: f64, estimated: f64, unpriced: u64, free: u64) -> String {
+    let cost = recorded + estimated;
     if cost > 0.0 {
         let text = format_usd(cost);
-        if row.recorded_usd > 0.0 {
+        if recorded > 0.0 {
             text
         } else {
             format!("~{text}")
         }
-    } else if row.unpriced_requests > 0 {
+    } else if unpriced > 0 {
         "Unpriced".into()
-    } else if row.free_requests > 0 {
+    } else if free > 0 {
         "Free".into()
     } else {
         "$0".into()
     }
+}
+
+/// How a surface is named on the page. Extensions the page does not know
+/// show under their own name.
+pub fn surface_label(surface: &str) -> String {
+    let known = match surface {
+        "main" => "Pi sessions",
+        "delegate" => "Delegated sessions",
+        "subagent" => "Subagents",
+        "workflow" => "Workflows",
+        "advisor" => "Advisor",
+        "agent" => "Other child agents",
+        "compaction" => "Compaction",
+        "branch_summary" => "Branch summaries",
+        "cache_warm" => "Cache warming",
+        "tool" => "Tool results",
+        "core" => "Other Pi calls",
+        "jev" => "Jev",
+        "decisions" => "Decisions",
+        "memory" => "Memory embeddings",
+        "goal" => "Goal judge",
+        "btw" => "/btw",
+        "vision" => "Vision proxy",
+        "handoff" => "Handoff",
+        "loop" => "Loop",
+        "zeron-titles" => "Zeron titles",
+        _ => {
+            return match surface.strip_prefix("ext:") {
+                Some(name) => format!("{name} extension"),
+                None => surface.to_owned(),
+            };
+        }
+    };
+    known.into()
 }
 
 /// The provider lines over the window: one per top provider, the rest as
@@ -325,6 +379,8 @@ pub struct UsagePage {
     scroll: widgets::PageScroll,
     period: Period,
     metric: Metric,
+    /// Only this surface's models and lines; every surface stays listed.
+    surface: Option<String>,
     status: Status,
     /// A request is in flight; the painted report stays meanwhile.
     loading: bool,
@@ -341,6 +397,7 @@ impl UsagePage {
             scroll: widgets::PageScroll::default(),
             period: Period::Month,
             metric: Metric::Cost,
+            surface: None,
             status: Status::Loading,
             loading: false,
             hidden: BTreeSet::new(),
@@ -372,6 +429,7 @@ impl UsagePage {
             bucket: self.period.bucket(),
             utc_offset_minutes: (offset_ms / 60_000) as i32,
             refresh,
+            surface: self.surface.clone(),
         };
         let params = serde_json::to_value(&query).unwrap_or_default();
         self.loading = true;
@@ -407,6 +465,16 @@ impl UsagePage {
             self.hidden.clear();
             self.load(false, cx);
         }
+    }
+
+    /// Choosing the shown surface again shows every surface.
+    fn toggle_surface(&mut self, surface: &str, cx: &mut Context<Self>) {
+        self.surface = match self.surface.as_deref() {
+            Some(shown) if shown == surface => None,
+            _ => Some(surface.to_owned()),
+        };
+        self.hidden.clear();
+        self.load(false, cx);
     }
 
     fn set_metric(&mut self, metric: Metric, cx: &mut Context<Self>) {
@@ -531,7 +599,8 @@ impl UsagePage {
         };
         let mut out = vec![];
 
-        if report.models.is_empty() {
+        // A surface shown alone keeps its list, to choose another.
+        if report.models.is_empty() && (self.surface.is_none() || report.surfaces.is_empty()) {
             out.push(
                 div()
                     .mt(px(72.0))
@@ -570,6 +639,10 @@ impl UsagePage {
             ),
             Metric::Cost => format!("{} tokens · {requests} requests", format_tokens(tokens)),
             Metric::Tokens => format!("{} · {requests} requests", format_usd(recorded + estimated)),
+        };
+        let breakdown = match &self.surface {
+            Some(surface) => format!("{} only · {breakdown}", surface_label(surface)),
+            None => breakdown,
         };
         out.push(
             div()
@@ -661,6 +734,99 @@ impl UsagePage {
             )
             .into_any_element(),
         );
+
+        // What made the calls; choosing one narrows everything else to it.
+        let surface_total: f64 = report
+            .surfaces
+            .iter()
+            .map(|row| match metric {
+                Metric::Cost => row.cost_usd(),
+                Metric::Tokens => row.tokens.total() as f64,
+            })
+            .sum();
+        let rows: Vec<AnyElement> = report
+            .surfaces
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| {
+                let selected = self.surface.as_deref() == Some(row.surface.as_str());
+                let label = surface_label(&row.surface);
+                let value = match metric {
+                    Metric::Cost => row.cost_usd(),
+                    Metric::Tokens => row.tokens.total() as f64,
+                };
+                let share = if surface_total > 0.0 {
+                    value / surface_total
+                } else {
+                    0.0
+                };
+                let detail = match metric {
+                    Metric::Cost => format!(
+                        "{} tokens · {} requests",
+                        format_tokens(row.tokens.total()),
+                        row.requests
+                    ),
+                    Metric::Tokens => {
+                        format!("{} · {} requests", format_usd(row.cost_usd()), row.requests)
+                    }
+                };
+                let mut meta = vec![SharedString::from(detail).into_any_element()];
+                if selected {
+                    meta.push(SharedString::from("shown alone").into_any_element());
+                }
+                let surface = row.surface.clone();
+                widgets::card_row(theme, ix == 0)
+                    .id(SharedString::from(format!("usage-surface-{}", row.surface)))
+                    .min_h(px(48.0))
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label(SharedString::from(format!("Show only {label}")))
+                    .tab_index(0)
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .when(selected, |el| el.bg(theme.accent.opacity(0.08)))
+                    .on_click(cx.listener(move |page, _, _, cx| page.toggle_surface(&surface, cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.0))
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(theme, label))
+                            .child(widgets::meta_line(theme, meta)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format_share(share))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .min_w(px(72.0))
+                            .text_right()
+                            .text_size(crate::typography::ui_rems(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(match metric {
+                                Metric::Cost => surface_cost_label(row),
+                                Metric::Tokens => format_tokens(row.tokens.total()),
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        if !rows.is_empty() {
+            out.push(
+                widgets::section(
+                    theme,
+                    "Surfaces",
+                    widgets::section_card(theme).mt_0().children(rows),
+                )
+                .into_any_element(),
+            );
+        }
 
         // Over time.
         let chart = chart_for(
@@ -785,8 +951,30 @@ impl UsagePage {
                 crate::state::format_time_ago(at, chrono::Utc::now())
             ));
         }
+        let coverage = &report.coverage;
+        if coverage.backfilled_requests > 0 {
+            parts.push(format!(
+                "{} requests recovered from subagent, advisor and workflow logs",
+                coverage.backfilled_requests
+            ));
+        }
+        let ledger = match coverage
+            .ledger_from_ms
+            .and_then(|at| Local.timestamp_millis_opt(at).single())
+        {
+            Some(from) => format!(
+                "Every Pi call since {} is in Pi's usage ledger, child agents and extensions included; before that, child agents count only where their parent logged them.",
+                from.format("%-d %b %Y")
+            ),
+            None => "Pi's usage ledger is not installed, so child agents count only where their parent logged them.".to_owned(),
+        };
+        let blind = if coverage.warnings.iter().any(|w| w == "stream-hook-blind") {
+            " Some Pi processes could not see calls outside their own agent."
+        } else {
+            ""
+        };
         format!(
-            "{}. ~ marks spend priced here where Pi recorded $0. Subagents and workflows that keep no session file are not counted.",
+            "{}. ~ marks spend priced here where Pi recorded $0. {ledger}{blind}",
             parts.join(" · ")
         )
     }
@@ -880,7 +1068,7 @@ impl Render for UsagePage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_proto::usage::{UsagePoint, UsageTokens};
+    use zeron_proto::usage::{UsageCoverage, UsagePoint, UsageTokens};
 
     fn row(
         provider: &str,
@@ -1049,24 +1237,43 @@ mod tests {
             duplicates: 4,
             scanned_at_ms: Some(now),
             first_ms: Some(now - DAY_MS),
+            surfaces: ["main", "subagent", "ext:handoff", "workflow"]
+                .into_iter()
+                .enumerate()
+                .map(|(ix, surface)| UsageSurfaceRow {
+                    surface: surface.into(),
+                    requests: 2,
+                    recorded_usd: 10.0 / (ix + 1) as f64,
+                    ..Default::default()
+                })
+                .collect(),
             ..Default::default()
         };
         let empty = UsageReport {
             scanning: true,
             ..Default::default()
         };
-        for (status, metric) in [
-            (Status::Loading, Metric::Cost),
-            (Status::Ready(report.clone()), Metric::Cost),
-            (Status::Ready(report), Metric::Tokens),
-            (Status::Ready(empty), Metric::Cost),
-            (Status::Unsupported, Metric::Cost),
-            (Status::Error("engine gone".into()), Metric::Cost),
+        // A surface shown alone that spent nothing in this period.
+        let none_here = UsageReport {
+            models: vec![],
+            ..report.clone()
+        };
+        let subagent = Some("subagent".to_owned());
+        for (status, metric, surface) in [
+            (Status::Loading, Metric::Cost, None),
+            (Status::Ready(report.clone()), Metric::Cost, None),
+            (Status::Ready(report.clone()), Metric::Tokens, None),
+            (Status::Ready(report), Metric::Cost, subagent.clone()),
+            (Status::Ready(none_here), Metric::Cost, subagent),
+            (Status::Ready(empty), Metric::Cost, None),
+            (Status::Unsupported, Metric::Cost, None),
+            (Status::Error("engine gone".into()), Metric::Cost, None),
         ] {
             window
                 .update(cx, |page, _, cx| {
                     page.status = status;
                     page.metric = metric;
+                    page.surface = surface;
                     cx.notify();
                 })
                 .unwrap();
@@ -1085,6 +1292,32 @@ mod tests {
             ),
             "{coverage}"
         );
+        assert!(coverage.contains("ledger is not installed"), "{coverage}");
+        let coverage = UsagePage::coverage(&UsageReport {
+            coverage: UsageCoverage {
+                ledger_from_ms: Some(now),
+                backfilled_requests: 7,
+                warnings: vec!["stream-hook-blind".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(coverage.contains("7 requests recovered"), "{coverage}");
+        assert!(coverage.contains("is in Pi's usage ledger"), "{coverage}");
+        assert!(coverage.contains("could not see"), "{coverage}");
+    }
+
+    #[test]
+    fn surfaces_read_as_what_made_the_calls() {
+        assert_eq!(surface_label("main"), "Pi sessions");
+        assert_eq!(surface_label("subagent"), "Subagents");
+        assert_eq!(surface_label("ext:handoff"), "handoff extension");
+        assert_eq!(surface_label("brand-new"), "brand-new");
+        let row = UsageSurfaceRow {
+            estimated_usd: 0.5,
+            ..Default::default()
+        };
+        assert_eq!(surface_cost_label(&row), "~$0.50");
     }
 
     #[test]
