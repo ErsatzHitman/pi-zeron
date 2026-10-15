@@ -1107,11 +1107,14 @@ fn keys(state: &zeron_proto::extension_ui::ExtensionUiState) -> Vec<String> {
         .map(|e| format!("{}:{}", e["ns"].as_str().unwrap(), e["id"].as_str().unwrap()))
         .collect()
 }
+/// The events the fake Pi logged. A line it is still writing is left for
+/// the next read.
 fn piui_events(dir: &std::path::Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(dir.join("piui-events.jsonl"))
         .unwrap_or_default()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .map(|line| serde_json::from_str(line.trim_end()).unwrap())
         .collect()
 }
 
