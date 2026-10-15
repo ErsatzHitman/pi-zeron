@@ -1,6 +1,8 @@
 // Zeron delete guard. Blocks tool calls that delete files, git refs or remote
 // resources, in every Pi run Zeron starts and every child that inherits it.
-// A guard against mistakes and model-driven deletes, not a sandbox.
+// In a read-only session (`ZERON_READ_ONLY=1`, a delegated chat created with
+// `write: false`) it also blocks every edit, whatever the delete toggle says.
+// A guard against mistakes and model-driven changes, not a sandbox.
 import { readFileSync, statSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, resolve } from "node:path";
@@ -433,14 +435,119 @@ export function guardCompiledChildren(proc = process, cp = createRequire(import.
   return true;
 }
 
+// ---- read-only sessions. Only reading tools, read-only shell commands and
+// tools whose names do not say they change something pass. Children inherit
+// the flag through env, so a subagent of a read-only session is read-only.
+export const readOnlyOn = (env = process.env) => env.ZERON_READ_ONLY === "1";
+const RO_COMMANDS = new Set([...READERS, "find", "fd", "tree", "pwd", "which", "whereis", "where", "printenv", "date",
+  "uname", "du", "df", "sort", "uniq", "cut", "tr", "diff", "cmp", "basename", "dirname", "realpath", "readlink", "nl",
+  "column", "od", "hexdump", "sha256sum", "sha1sum", "md5sum", "b3sum", "true", "false", "test", "[", "cd", "ps", "whoami",
+  "id", "hostname", "ag", "ack", "tokei", "cloc", "get-childitem", "gci", "get-item", "test-path", "resolve-path",
+  "get-location", "measure-object", "sort-object", "select-object", "where-object", "format-table", "format-list",
+  "out-string", "get-command", "get-process", "get-date"]);
+const RO_WRAPPERS = new Set(["xargs", "timeout", "nice", "env", "command", "time", "rtk", "nohup", "stdbuf", "ionice"]);
+const GIT_READ = new Set(["status", "log", "diff", "show", "blame", "annotate", "grep", "ls-files", "ls-tree", "rev-parse",
+  "rev-list", "describe", "shortlog", "cat-file", "whatchanged", "merge-base", "name-rev", "for-each-ref", "show-ref",
+  "show-branch", "count-objects", "cherry", "range-diff", "help", "version"]);
+const GIT_GLOBAL_VALUED = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
+const GIT_LISTING = /^--?(a|r|v|vv|l|list|all|remotes|contains|no-contains|merged|no-merged|sort|format|points-at|show-current|column|no-column|color|no-color|verbose)(=.*)?$/;
+const FIND_WRITES = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"]);
+const RO_TOOL_WRITES = new Set([...WRITE, ...DEL, "edit", "patch", "apply", "replace", "insert", "append", "rename", "commit",
+  "push", "merge", "install", "mkdir", "touch", "copy", "archive", "respond", "interrupt", "steer", "queue", "publish", "post",
+  "put", "schedule", "approve"]);
+const NULL_SINK = /^(\/dev\/null|&[0-9-]|\$null|nul)$/i;
+
+export function gitReadOnly(args) {
+  let k = 0;
+  while (k < args.length && args[k].startsWith("-")) k += GIT_GLOBAL_VALUED.has(args[k]) ? 2 : 1;
+  const sub = args[k], rest = args.slice(k + 1);
+  if (sub === undefined) return true;
+  if (rest.some((a) => /^--output(=|$)/.test(a))) return false;
+  if (GIT_READ.has(sub)) return true;
+  if (sub === "branch" || sub === "tag") return rest.every((a) => GIT_LISTING.test(a));
+  if (sub === "remote") return rest.every((a) => a === "-v" || a === "--verbose") || rest[0] === "show" || rest[0] === "get-url";
+  if (sub === "stash") return rest[0] === "list" || rest[0] === "show";
+  if (sub === "worktree") return rest[0] === "list";
+  if (sub === "reflog") return rest.length === 0 || rest[0] === "show";
+  if (sub === "config")
+    return rest.some((a) => /^(--get|--get-all|--get-regexp|--list|-l)$/.test(a))
+      && !rest.some((a) => /^--(add|unset|unset-all|replace-all|rename-section|remove-section|edit)$/.test(a) || a === "-e");
+  return false;
+}
+
+function roRedirect(words) {                    // `> file` writes; `2>&1`, `>/dev/null` do not
+  for (let k = 0; k < words.length; k++) {
+    const raw = words[k].raw; if (!/^[^'"]*>/.test(raw)) continue;
+    const target = raw.slice(raw.lastIndexOf(">") + 1) || words[k + 1]?.cooked || "";
+    if (!NULL_SINK.test(target)) return hit("ro-redirect", "output redirected into a file");
+  }
+}
+
+function roSegment(words, dialect, depth) {
+  if (depth > 8) return hit("ro-too-deep", "a command too deeply nested to check");
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_]\w*=/.test(words[i].raw)) i++;
+  const head = words[i]; if (!head) return;
+  const redirect = roRedirect(words); if (redirect) return redirect;
+  if (head.dyn) return hit("ro-dynamic", "a command built at run time");
+  const name = nameOf(head), args = words.slice(i + 1), cooked = args.map((a) => a.cooked);
+  if (RO_WRAPPERS.has(name)) {
+    let k = 0;
+    while (k < args.length && (/^-/.test(args[k].cooked) || /^[A-Za-z_]\w*=/.test(args[k].raw) || /^\d+[smhd]?$/.test(args[k].cooked))) k++;
+    return args[k] ? roSegment(args.slice(k), dialect, depth + 1) : undefined;
+  }
+  if (name === "git") return gitReadOnly(cooked) ? undefined : hit("ro-git", "a git command that changes the repository");
+  if (name === "find" && cooked.some((a) => FIND_WRITES.has(a))) return hit("ro-find", "find that deletes, runs commands or writes");
+  if (name === "sort" && cooked.some((a) => /^(-o|--output)/.test(a))) return hit("ro-write", "sort writing a file");
+  if (RO_COMMANDS.has(name)) return;
+  return hit("ro-command", `${name} may change files`);
+}
+
+export function shellWrites(src, dialect = "posix", depth = 0) {
+  if (depth > 8 || src.length > 262144) return hit("ro-too-deep", "input too large or deeply nested to check");
+  const { segs, nested } = split(src, dialect);
+  for (const words of segs) {
+    const r = roSegment(words, dialect, depth);
+    if (r) return { ...r, seg: r.seg ?? words.map((w) => w.raw).join(" ") };
+  }
+  for (const n of nested) { const r = shellWrites(n.src, n.dialect, depth + 1); if (r) return r; }
+}
+
+export function classifyReadOnly({ toolName, input = {}, annotations }) {
+  if (READONLY_TOOLS.has(toolName)) return;
+  if (toolName === "write" || toolName === "edit") return hit("ro-edit", `${toolName} changes files`);
+  if (SHELL_TOOLS.has(toolName)) return shellWrites(String(input.command ?? ""), toolName === "bash" ? "posix" : "ps");
+  if (/(bash|shell|exec|terminal|run_command|powershell|pwsh)/i.test(toolName))
+    return hit("ro-shell", `${toolName} runs commands this guard cannot check`);
+  if (annotations?.readOnlyHint === true) return;
+  if (annotations?.destructiveHint === true) return hit("ro-destructive", `${toolName} is marked destructive`);
+  const verb = nameTokens(toolName).find((t) => RO_TOOL_WRITES.has(t));
+  if (verb) return hit("ro-tool", `${toolName} changes something (${verb})`);
+}
+
+const READ_ONLY_REASON = (h) =>
+  `[zeron:read-only rule=${h.id}] Blocked: ${h.why}${h.seg ? ` (matched: ${h.seg.slice(0, 120)})` : ""}. ` +
+  `This session is read-only: it was started to read, search and report, not to change anything. ` +
+  `Do not retry, rephrase, or get the same effect through another tool, script, interpreter or subagent. ` +
+  `Finish with what reading tells you, and say in your final answer what you would change and where.`;
+
 export default function deleteGuard(pi) {
   inheritIntoChildren();
   guardCompiledChildren();
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
+    const annotationsOf = () => {
+      try { return pi.getAllTools().find((t) => t.name === event.toolName)?.annotations; } catch { return undefined; }
+    };
+    if (readOnlyOn()) {
+      let r;
+      try { r = classifyReadOnly({ toolName: event.toolName, input: event.input ?? {}, annotations: annotationsOf() }); }
+      catch { r = hit("ro-error", "the read-only check could not analyse this call"); }
+      if (r) return { block: true, reason: READ_ONLY_REASON(r) };
+    }
     if (!guardOn()) return;
     let h;
     try {
-      let annotations; try { annotations = pi.getAllTools().find((t) => t.name === event.toolName)?.annotations; } catch { /* name rules still apply */ }
+      const annotations = annotationsOf();     // name rules still apply without it
       h = decide(event, annotations, ctx?.cwd);
     } catch {
       h = SHELL_TOOLS.has(event.toolName) ? hit("guard-error", "the guard could not analyse this command") : undefined;

@@ -83,6 +83,18 @@ its acceptance test, and `pi-delete-guard-child-test.mjs` checks a child
 Pi started the way Pi's launchers start one gets the guard; both run on
 Linux, macOS and Windows CI.
 
+## Read-only sessions
+
+A run with sandbox `read-only` (MCP `create_chat` with `write: false`) gets
+`ZERON_READ_ONLY=1`, and the same guard extension then refuses, whatever the
+delete-guard switch says: `write`, `edit`, tools marked destructive or named
+for a change (`delete`, `create`, `push`, ...), and bash that writes (redirects, `tee`, `sed -i`, package
+installs, git commands other than read-only ones, and any command not on its
+read-only list). Child Pi processes inherit it through the env and the
+preload. A read-only run without the guard extension fails to start rather
+than run writable. `crates/harness/tests/fixtures/pi-read-only-test.mjs` is
+the corpus, run on macOS and Windows CI.
+
 ## Updates
 
 Zeron for Pi updates itself from this fork's GitHub releases

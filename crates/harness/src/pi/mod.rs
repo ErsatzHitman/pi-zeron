@@ -147,7 +147,7 @@ impl PiHarness {
         Ok((exe, version))
     }
     async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
-        let mut process = self.spawn(cwd, &["--no-session".into()], None, false, None)?;
+        let mut process = self.spawn(cwd, &["--no-session".into()], None, false, None, false)?;
         let (mut tx, rx) = tokio::sync::oneshot::channel();
         let grace = self.kill_grace;
         tokio::spawn(async move {
@@ -174,7 +174,8 @@ impl PiHarness {
             .root()
             .join("commands.json")
     }
-    /// `usage_surface` names the run in Pi's usage ledger.
+    /// `usage_surface` names the run in Pi's usage ledger. A `read_only`
+    /// run has the guard block every edit (see `guard.mjs`).
     fn spawn(
         &self,
         cwd: &Path,
@@ -182,6 +183,7 @@ impl PiHarness {
         mcp: Option<&zeron_proto::McpServer>,
         guarded: bool,
         usage_surface: Option<&str>,
+        read_only: bool,
     ) -> Result<Process, HarnessError> {
         let (exe, _) = self.verified_executable()?;
         let mut cmd = Command::new(&exe);
@@ -193,6 +195,18 @@ impl PiHarness {
         }
         if let Some(surface) = usage_surface {
             cmd.env("PI_USAGE_SURFACE", surface);
+        }
+        // Never inherit a stale value; the guard enforces it, so a read-only
+        // run without one would silently write.
+        if read_only {
+            if self.delete_guard.is_none() || !guarded {
+                return Err(HarnessError::Protocol(
+                    "a read-only Pi session needs Zeron's guard extension".into(),
+                ));
+            }
+            cmd.env("ZERON_READ_ONLY", "1");
+        } else {
+            cmd.env_remove("ZERON_READ_ONLY");
         }
         cmd.args(["--mode", "rpc", "--no-themes"])
             .args(args)
@@ -474,6 +488,7 @@ impl Harness for PiHarness {
             None,
             false,
             Some("zeron-titles"),
+            false,
         )?;
         let grace = self.kill_grace;
         let (tx, rx) = mpsc::channel(4);
@@ -560,6 +575,7 @@ impl Harness for PiHarness {
             request.mcp.as_ref(),
             true,
             None,
+            request.sandbox == zeron_proto::SandboxLevel::ReadOnly,
         )?;
         let commands_cache = (
             self.commands.clone(),

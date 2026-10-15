@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use zeron_doc::SessionCommandPayload;
 use zeron_proto::{
     Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
-    Space, UserInputAnswer,
+    Space, UserInputAnswer, WorktreeSpec,
 };
 
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
@@ -119,7 +119,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
+            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness. Select a project and/or device; catalogs are validated on that host. Set write: true for a session that changes code (in a git project it works in its own new worktree on a zeron/<name> branch, so parallel sessions never touch each other's files), false for one that only reads, searches and reports (every edit is blocked; it runs in the project folder). Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -130,9 +130,10 @@ fn catalog() -> Vec<ToolDef> {
                     "harness": { "type": "string", "description": "Harness id (see list_harnesses with the chosen device). Defaults to claude-code when available." },
                     "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default." },
                     "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max)." },
-                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write" },
+                    "write": { "type": "boolean", "default": true, "description": "true: the session may change files, and in a git project gets its own worktree. false: read-only; every edit is blocked." },
+                    "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write", "description": "Usually leave unset and use write. read-only only with write false." },
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
-                    "branch": { "type": "string", "description": "Branch label to record on the chat." },
+                    "branch": { "type": "string", "description": "With write true in a git project: the branch or commit the new worktree starts from (default: the project's current HEAD). Otherwise a branch label to record on the chat." },
                     "cwd": { "type": "string", "description": "Working directory (an existing folder or worktree path). Defaults to the project folder; without a project, a cwd that is a project's folder joins that project." },
                     "prompt": { "type": "string", "description": "First message to send right away." },
                     "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply." },
@@ -518,6 +519,7 @@ struct CreateChatArgs {
     harness: Option<String>,
     model: Option<String>,
     reasoning: Option<String>,
+    write: Option<bool>,
     sandbox: Option<String>,
     title: Option<String>,
     branch: Option<String>,
@@ -994,10 +996,17 @@ impl Tools {
             Some(raw) => Some(parse_enum("reasoning level", raw).map_err(anyhow::Error::msg)?),
             None => None,
         };
+        let write = args.write.unwrap_or(true);
         let sandbox: SandboxLevel = match args.sandbox.as_deref() {
             Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
-            None => SandboxLevel::WorkspaceWrite,
+            None if write => SandboxLevel::WorkspaceWrite,
+            None => SandboxLevel::ReadOnly,
         };
+        anyhow::ensure!(
+            write == (sandbox != SandboxLevel::ReadOnly),
+            "write {write} conflicts with sandbox {}; leave sandbox unset",
+            args.sandbox.as_deref().unwrap_or_default()
+        );
         let config = ChatConfig {
             harness,
             model: args.model.clone(),
@@ -1019,20 +1028,23 @@ impl Tools {
         if let Some(parent) = &parent_chat_id {
             mutate["parentChatId"] = json!(parent);
         }
-        if let Some(branch) = args
-            .branch
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-        {
-            mutate["branch"] = json!(branch);
-        }
         let mut cwd = args
             .cwd
             .as_deref()
             .map(str::trim)
             .filter(|c| !c.is_empty())
             .map(str::to_owned);
+        let branch = args
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty());
+        // A writing session in a git project gets its own worktree, made by
+        // the host on its first run; the branch names where it starts.
+        let worktree = isolation(sandbox, space.as_ref(), cwd.as_deref(), branch);
+        if let Some(branch) = branch.filter(|_| worktree.is_none()) {
+            mutate["branch"] = json!(branch);
+        }
         // A projectless chat runs in its own scratch folder on a host that
         // creates them; naming it here keeps createChat and the first run
         // in agreement.
@@ -1065,6 +1077,11 @@ impl Tools {
                 .await?;
         }
 
+        let workspace = if worktree.is_some() {
+            "a new worktree, created on the first run"
+        } else {
+            "the project folder"
+        };
         let mut result = json!({
             "chatId": chat_id,
             "kind": kind,
@@ -1075,6 +1092,8 @@ impl Tools {
             "reasoning": reasoning,
             "title": args.title,
             "parentChatId": parent_chat_id,
+            "write": write,
+            "workspace": workspace,
         });
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
             // The row may not have folded into WatchChats yet; build the
@@ -1085,7 +1104,7 @@ impl Tools {
                 title: args.title.clone(),
                 archived: false,
                 cwd: cwd.clone(),
-                branch: args.branch.clone(),
+                branch: branch.filter(|_| worktree.is_none()).map(str::to_owned),
                 checkout_id: None,
                 source_context: None,
                 config: Some(config),
@@ -1100,7 +1119,15 @@ impl Tools {
                 room_gen: None,
             };
             let sent = self
-                .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
+                .deliver(
+                    &chat,
+                    space.as_ref(),
+                    &harnesses,
+                    None,
+                    prompt,
+                    "run",
+                    worktree,
+                )
                 .await?;
             result["sent"] = sent;
             let pending = Arc::new(PendingTurn {
@@ -1186,8 +1213,30 @@ impl Tools {
             "chatId": chat.id,
             "title": chat.title,
         });
+        // A delegated writing session still in the project folder (created
+        // without a prompt) gets its worktree on this first run.
+        let worktree = chat
+            .parent_chat_id
+            .as_ref()
+            .and_then(|_| chat.config.as_ref())
+            .and_then(|config| {
+                isolation(
+                    config.sandbox,
+                    space,
+                    chat.cwd.as_deref(),
+                    chat.branch.as_deref(),
+                )
+            });
         result["sent"] = self
-            .deliver(&chat, space, &harnesses, baseline.as_ref(), body, mode)
+            .deliver(
+                &chat,
+                space,
+                &harnesses,
+                baseline.as_ref(),
+                body,
+                mode,
+                worktree,
+            )
             .await?;
         let pending = Arc::new(PendingTurn {
             baseline,
@@ -1345,7 +1394,9 @@ impl Tools {
         )
     }
 
-    /// Pick and perform the delivery the composer would.
+    /// Pick and perform the delivery the composer would. A new run carries
+    /// `worktree`; the host reuses the chat's worktree once it has one.
+    #[allow(clippy::too_many_arguments)]
     async fn deliver(
         &self,
         chat: &Chat,
@@ -1354,6 +1405,7 @@ impl Tools {
         session: Option<&Session>,
         text: String,
         mode: &str,
+        worktree: Option<WorktreeSpec>,
     ) -> anyhow::Result<Value> {
         let harness = chat
             .config
@@ -1402,7 +1454,7 @@ impl Tools {
                     auto_approve: false,
                     resume: None,
                     attachments: Vec::new(),
-                    worktree: None,
+                    worktree,
                 };
                 self.zeron
                     .queue_command(
@@ -1544,6 +1596,27 @@ fn ensure_room_below(chats: &[Chat], parent: &Chat) -> anyhow::Result<()> {
 
 /// The same folder, spelled with either separator, a trailing separator,
 /// or (Windows paths) another case.
+/// The worktree a writing session in a git project's folder runs in: one of
+/// its own, started from `base` (the project's HEAD by default). None for a
+/// read-only session, a non-git project, or a session given another folder
+/// (such as a worktree it already has).
+fn isolation(
+    sandbox: SandboxLevel,
+    space: Option<&Space>,
+    cwd: Option<&str>,
+    base: Option<&str>,
+) -> Option<WorktreeSpec> {
+    let space = space.filter(|s| s.git_detected)?;
+    if sandbox == SandboxLevel::ReadOnly || cwd.is_some_and(|cwd| !same_folder(cwd, &space.path)) {
+        return None;
+    }
+    Some(WorktreeSpec {
+        repo_path: space.path.clone(),
+        base: base.unwrap_or("HEAD").to_owned(),
+        space_id: Some(space.id.clone()),
+    })
+}
+
 fn same_folder(a: &str, b: &str) -> bool {
     let norm = |p: &str| {
         let p = p.trim().replace('\\', "/");
@@ -1937,6 +2010,7 @@ mod tests {
                 Some(&session),
                 "follow up".into(),
                 "auto",
+                None,
             )
             .await
             .unwrap();
@@ -1982,6 +2056,103 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+    }
+
+    #[tokio::test]
+    async fn a_writing_session_gets_its_own_worktree_and_a_reading_one_is_read_only() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let writer = tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "write": true, "branch": "main", "prompt": "fix it" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(writer["write"], true);
+        assert_eq!(
+            writer["workspace"],
+            "a new worktree, created on the first run"
+        );
+        let reader = tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "write": false, "prompt": "find it" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader["workspace"], "the project folder");
+        let err = tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "write": false, "sandbox": "workspace-write" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("conflicts with sandbox"), "{err}");
+
+        let writes = world.writes.lock().unwrap();
+        let runs: Vec<&Value> = writes
+            .iter()
+            .filter(|(method, _)| method == methods::QUEUE_COMMAND)
+            .map(|(_, params)| &params["command"]["request"])
+            .collect();
+        assert_eq!(runs.len(), 2);
+        // The writer starts from the branch it named, in its own checkout.
+        assert_eq!(runs[0]["worktree"]["repoPath"], "/repo/comet");
+        assert_eq!(runs[0]["worktree"]["base"], "main");
+        assert_eq!(runs[0]["worktree"]["spaceId"], "space-1");
+        assert_eq!(runs[0]["sandbox"], "workspace-write");
+        // The reader stays in the project folder and cannot edit.
+        assert!(runs[1].get("worktree").is_none());
+        assert_eq!(runs[1]["sandbox"], "read-only");
+        let created: Vec<&Value> = writes
+            .iter()
+            .filter(|(_, params)| params["op"] == "createChat")
+            .map(|(_, params)| params)
+            .collect();
+        assert!(
+            created[0].get("branch").is_none(),
+            "the host stamps zeron/<name>"
+        );
+        assert_eq!(created[1]["config"]["sandbox"], "read-only");
+    }
+
+    #[test]
+    fn only_a_writing_session_in_a_git_project_folder_is_isolated() {
+        let mut space = Space {
+            id: "s".into(),
+            device_id: "d".into(),
+            path: "/repo".into(),
+            name: None,
+            git_detected: true,
+            git_checked_at: None,
+            checkout_id: None,
+            repository_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let spec = isolation(
+            SandboxLevel::WorkspaceWrite,
+            Some(&space),
+            Some("/repo/"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.base, "HEAD");
+        assert!(isolation(SandboxLevel::ReadOnly, Some(&space), None, None).is_none());
+        // A session given another folder, such as its worktree, stays there.
+        assert!(
+            isolation(
+                SandboxLevel::WorkspaceWrite,
+                Some(&space),
+                Some("/wt/repo-ab12"),
+                None
+            )
+            .is_none()
+        );
+        assert!(isolation(SandboxLevel::WorkspaceWrite, None, None, None).is_none());
+        space.git_detected = false;
+        assert!(isolation(SandboxLevel::WorkspaceWrite, Some(&space), None, None).is_none());
     }
 
     #[tokio::test]

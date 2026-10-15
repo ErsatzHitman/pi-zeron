@@ -61,6 +61,19 @@ that is a project's folder (any separator or trailing slash, any case on a
 Windows drive) joins that project. The sidebar's Orchestrator tab lists these
 trees; the root never shows in Sessions.
 
+### Write access
+
+`create_chat` (and each `create_chats` request) takes `write`, default `true`:
+
+| `write` | Sandbox | Folder |
+| --- | --- | --- |
+| `true` | `workspace-write` | In a git project's folder: a new worktree on a `zeron/<name>` branch, made by the host on the first run and reused after; `branch` names its start (default the project's `HEAD`). Elsewhere, or with a `cwd` outside the project folder: that folder. |
+| `false` | `read-only` | The project folder. For Pi, the guard blocks every edit (see [Pi](pi.md#read-only-sessions)). |
+
+A `sandbox` that disagrees with `write` fails before any writes. The result
+carries `write` and `workspace`. A delegated chat created without a prompt gets
+its worktree on its first `send_message`.
+
 For children, `parent` (id, prefix, or title) overrides the origin (`ZERON_CHAT_ID`).
 `list_chats { parent }` returns children, and chat summaries carry `parentChatId`.
 Rows from older engines read as parentless; a dangling parent id is tolerated.
