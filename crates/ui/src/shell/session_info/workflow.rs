@@ -533,15 +533,26 @@ mod tests {
         assert!((view.fraction() - 2.0 / 6.0).abs() < 1e-6);
     }
 
-    /// Every frame a real run published, then its resume: Pi 1.1.0 on a Linux
-    /// box, the workflows extension, DeepSeek subagents, and one agent on a
-    /// model that does not exist so it retries, fails, and its dependent skips.
+    /// Every frame a real run published, then its resume: Pi on a Linux box,
+    /// the workflows extension, DeepSeek subagents, and one agent on a model
+    /// that does not exist so it retries, fails, and its dependent skips.
     #[test]
     fn a_real_run_and_its_resume_render_frame_by_frame() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        replay_a_real_run(include_str!(
             "../../../tests/fixtures/workflow-live-run.json"
-        ))
-        .unwrap();
+        ));
+    }
+
+    /// The same run captured again on Pi 1.2.0.
+    #[test]
+    fn a_real_run_on_pi_1_2_renders_frame_by_frame() {
+        replay_a_real_run(include_str!(
+            "../../../tests/fixtures/workflow-live-run-pi-1.2.json"
+        ));
+    }
+
+    fn replay_a_real_run(fixture: &str) {
+        let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
         let view_at = |frame: &serde_json::Value| {
             let at = DateTime::from_timestamp_millis(frame["updatedAt"].as_i64().unwrap()).unwrap();
             WorkflowView::of(&ui(frame.clone()), at).expect("every frame of a live run shows")

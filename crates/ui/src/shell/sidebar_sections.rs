@@ -1010,9 +1010,23 @@ mod tests {
     /// in order (see `a_real_run_and_its_resume_render_frame_by_frame`).
     #[gpui::test]
     fn the_session_panel_follows_a_real_workflow_run_frame_by_frame(cx: &mut gpui::TestAppContext) {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/workflow-live-run.json"))
-                .unwrap();
+        follow_a_real_run(
+            cx,
+            include_str!("../../tests/fixtures/workflow-live-run.json"),
+        );
+    }
+
+    /// The same run captured again on Pi 1.2.0.
+    #[gpui::test]
+    fn the_session_panel_follows_a_real_run_on_pi_1_2(cx: &mut gpui::TestAppContext) {
+        follow_a_real_run(
+            cx,
+            include_str!("../../tests/fixtures/workflow-live-run-pi-1.2.json"),
+        );
+    }
+
+    fn follow_a_real_run(cx: &mut gpui::TestAppContext, fixture: &str) {
+        let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let window = test_shell(cx, dir.path());
         window
