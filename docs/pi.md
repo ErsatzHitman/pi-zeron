@@ -167,6 +167,11 @@ Pi's terminal command; RPC mode has none. Zeron's guard extension registers it
 in the session's own Pi (not its sub-agents) and runs `ctx.reload()`, so it
 works like any extension command. The `/` menu lists it before Pi has.
 
+A message sent while Pi works always steers: the chat's host hands every
+queued text row to the running turn at once, in order (there is no setting
+for it). Rows with images, and rows sent while Pi waits on a question, stay
+in the queue for the turn's end; such a row offers Send now (interrupt).
+
 Steering queues at a model step boundary and starts immediately when idle.
 When no steering mode is configured, Zeron selects Pi's `all` mode, so messages
 queued before the next model call enter that call together. A mode already set

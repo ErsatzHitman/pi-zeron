@@ -4,7 +4,8 @@
 //! The rows live on the session doc ([`zeron_doc::QueuedMessage`]), so the phone
 //! shows the same queue and either device can reorder it.
 //!
-//! Text rows steer the live agent; attachment rows offer an explicit interrupt.
+//! The host steers every text row into a running turn on its own; a row that
+//! stays (images, a turn parked on a question) offers Send now (interrupt).
 //! Editing moves the message into the composer while its leased row reserves
 //! its position.
 
@@ -102,7 +103,6 @@ const QUEUE_ICON_SIZE: f32 = 13.0;
 /// The single trailing action a queue row advertises and executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuePrimaryAction {
-    Steer,
     SendNext,
     SendNow,
 }
@@ -110,25 +110,22 @@ enum QueuePrimaryAction {
 impl QueuePrimaryAction {
     fn tooltip(self) -> &'static str {
         match self {
-            Self::Steer => "Steer (keep current work running)",
             Self::SendNext => "Send at the next turn (this agent cannot steer mid-turn)",
             Self::SendNow => "Send now (interrupt)",
         }
     }
 }
 
-/// Text uses the live mailbox, including providers that consume at turn boundaries.
-/// Attachments still require a new request and advertise the interruption.
+/// Queued text steers a steerable turn without being asked, so what a row can
+/// still offer there is an interrupt; turn-boundary agents send it next.
 fn available_queue_primary_action(
     delivery_blocked: bool,
     host_supports_actions: bool,
     has_attachments: bool,
     steers_mid_turn: bool,
 ) -> Option<QueuePrimaryAction> {
-    (!delivery_blocked && host_supports_actions).then_some(if has_attachments {
+    (!delivery_blocked && host_supports_actions).then_some(if has_attachments || steers_mid_turn {
         QueuePrimaryAction::SendNow
-    } else if steers_mid_turn {
-        QueuePrimaryAction::Steer
     } else {
         QueuePrimaryAction::SendNext
     })
@@ -1194,7 +1191,6 @@ impl Composer {
             } else {
                 div()
                     .child(match action {
-                        QueuePrimaryAction::Steer => "Steer",
                         QueuePrimaryAction::SendNext => "Send next",
                         QueuePrimaryAction::SendNow => "Send now",
                     })
@@ -1392,7 +1388,7 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         match action {
-            QueuePrimaryAction::Steer | QueuePrimaryAction::SendNext => self.queue_rpc(
+            QueuePrimaryAction::SendNext => self.queue_rpc(
                 methods::STEER_QUEUED_MESSAGE_NOW,
                 serde_json::json!({ "id": id }),
                 "Couldn't send that message",
@@ -1403,7 +1399,7 @@ impl Composer {
     }
 
     /// Cmd/Ctrl+Enter on an empty composer activates the same action shown on
-    /// the most recently queued row: steer text, or send attachments with an interrupt.
+    /// the most recently queued row: send it next, or now with an interrupt.
     /// An edit/review gate or an old chat host makes it a no-op.
     pub(crate) fn activate_latest_queued(&mut self, cx: &mut Context<Self>) {
         if self.editing_queued.is_some() {
@@ -2066,7 +2062,7 @@ mod tests {
         );
         assert_eq!(
             available_queue_primary_action(false, true, false, true),
-            Some(QueuePrimaryAction::Steer)
+            Some(QueuePrimaryAction::SendNow)
         );
         assert_eq!(
             available_queue_primary_action(true, true, false, true),

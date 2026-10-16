@@ -4092,7 +4092,28 @@ impl DocHost {
             // `AwaitingInput` for idle would send the follow-up as a fresh turn
             // and abandon the question.
             if sessions.turn_in_flight(&handle.chat_id) {
-                return; // All queued messages wait, including rows from older clients.
+                // Every queued text message steers the running turn. Rows
+                // with images, sends held for a new config, and turns parked
+                // on a question wait for the turn to end.
+                let steerable = head.attachments.is_empty()
+                    && !lock(&handle.held_sends).contains_key(&head.id)
+                    && sessions.steers_now(&handle.chat_id);
+                if !steerable {
+                    return;
+                }
+                let Ok(Some(item)) = handle.doc.take_queued(&head.id) else {
+                    return;
+                };
+                lock(&handle.steered_rows).retain(|row| row != &item.id);
+                handle.publish_queue();
+                if let Err(err) = self.dispatch_queued(handle, &item, QueueSend::Steer).await {
+                    // Back at the head; the turn end (or the next change) retries.
+                    tracing::warn!(chat = %handle.chat_id, error = %err, "queued steer failed");
+                    let _ = handle.doc.insert_queued(0, &item);
+                    handle.publish_queue();
+                    return;
+                }
+                continue;
             }
             // A row from another device names its images by `pending://` ref
             // while the bytes chase it over the peer link. Hold it (in order)

@@ -447,6 +447,22 @@ impl SessionsEngine {
             .is_some_and(is_active)
     }
 
+    /// A queued text message can steer the running turn now: it is working
+    /// (not parked on a question, which a steer would abandon), on a runtime
+    /// that takes input mid-turn, with no agent update gating it.
+    pub fn steers_now(&self, chat_id: &str) -> bool {
+        let working = lock(&self.inner.statuses)
+            .get(chat_id)
+            .is_some_and(|session| session.status == SessionStatus::Working);
+        let harness = lock(&self.inner.runs)
+            .get(chat_id)
+            .filter(|h| h.steerable)
+            .map(|h| h.runtime_config.harness_id);
+        working
+            && harness.is_some_and(|harness| self.steers_mid_turn(harness))
+            && !self.live_run_update_pending(chat_id)
+    }
+
     /// Whether the chat's live runtime reports background work (subagents,
     /// background shells) still running — parked or not.
     pub fn holds_background_work(&self, chat_id: &str) -> bool {

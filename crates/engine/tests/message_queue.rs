@@ -756,9 +756,10 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
     core.shutdown().await;
 }
 
-/// Even agents that support mid-turn input deliver queue rows one turn at a time.
+/// Every queued text message steers a steerable turn, whatever policy an
+/// older client sent with it, in order, without starting another turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
+async fn queued_text_steers_a_steerable_turn_whatever_the_policy() {
     let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
     core.doc_host
         .queue_message(CHAT, "opening", Vec::new())
@@ -769,83 +770,50 @@ async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
     )
     .await;
 
-    // Omitted and explicitly false policies from old clients must both wait.
     core.doc_host
         .queue_message(CHAT, "first queued", Vec::new())
         .unwrap();
     core.doc_host
-        .queue_message_with_behavior(CHAT, "second queued", Vec::new(), false)
+        .queue_message_with_behavior(CHAT, "second queued", Vec::new(), true)
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(queue_texts(&core), vec!["first queued", "second queued"]);
-    assert_eq!(user_messages(&core), vec!["opening"]);
-
-    harness.finish.send(()).unwrap();
     wait_for(
-        || user_messages(&core).iter().any(|m| m == "first queued"),
-        "first queued turn",
-    )
-    .await;
-    assert_eq!(queue_texts(&core), vec!["second queued"]);
-    assert!(!user_messages(&core).iter().any(|m| m == "second queued"));
-    harness.finish.send(()).unwrap();
-    wait_for(
-        || user_messages(&core).iter().any(|m| m == "second queued"),
-        "second queued turn",
+        || prompts.lock().unwrap().iter().any(|p| p == "second queued"),
+        "both rows to steer the running turn",
     )
     .await;
     assert!(queue_texts(&core).is_empty());
+    assert_eq!(
+        user_messages(&core),
+        vec!["opening", "first queued", "second queued"]
+    );
+    assert_eq!(harness.requests.lock().unwrap().len(), 1, "no new turn");
     let _ = harness.finish.send(());
     core.shutdown().await;
 }
 
-/// The legacy explicit-steer RPC remains compatible with older clients;
-/// current clients offer only Send now.
+/// A steerable agent parked on a question still holds the row: a steer
+/// would abandon the question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn held_policy_keeps_a_steerable_message_visible_until_steer_now() {
-    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
-    let client = zeron_rpc::memory_client(core.rpc_service());
-
+async fn a_steerable_agent_on_a_question_holds_the_row() {
+    let (core, harness, prompts) = setup_asking(SteeringMode::StepBoundary).await;
     core.doc_host
         .queue_message(CHAT, "opening", Vec::new())
         .expect("queue opening");
     wait_for(
-        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
-        "the first turn to start",
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == zeron_proto::SessionStatus::AwaitingInput)
+        },
+        "the agent to park on its question",
     )
     .await;
-
-    let reply = client
-        .call(
-            zeron_rpc::methods::QUEUE_MESSAGE,
-            serde_json::json!({
-                "chatId": CHAT,
-                "text": "hold this",
-                "holdForTurnEnd": true,
-            }),
-        )
-        .await
-        .expect("queue held message");
-    let id = reply["id"].as_str().expect("queue id").to_string();
+    core.doc_host
+        .queue_message(CHAT, "follow-up", Vec::new())
+        .expect("queue follow-up");
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(queue_texts(&core), vec!["hold this"]);
-    assert!(!user_messages(&core).iter().any(|m| m == "hold this"));
-
-    let reply = client
-        .call(
-            zeron_rpc::methods::STEER_QUEUED_MESSAGE_NOW,
-            serde_json::json!({ "chatId": CHAT, "id": id }),
-        )
-        .await
-        .expect("steer now");
-    assert_eq!(reply["sent"], true);
-    wait_for(
-        || user_messages(&core).iter().any(|m| m == "hold this"),
-        "the held message to steer",
-    )
-    .await;
-    assert!(queue_texts(&core).is_empty());
-
+    assert_eq!(queue_texts(&core), vec!["follow-up"]);
+    assert!(!prompts.lock().unwrap().iter().any(|p| p == "follow-up"));
     let _ = harness.finish.send(());
     core.shutdown().await;
 }
@@ -905,7 +873,8 @@ async fn steer_now_sends_a_turn_boundary_row_next() {
 /// becomes the next turn and unpauses normal queue draining.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_now_starts_the_next_turn_when_the_previous_turn_is_already_idle() {
-    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    // Turn boundary: a steerable turn would take the row before the interrupt.
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
 
     core.doc_host
         .queue_message(CHAT, "opening", Vec::new())
