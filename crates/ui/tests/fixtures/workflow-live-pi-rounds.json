@@ -1,0 +1,1825 @@
+{
+ "source": "Every workflow:state payload a real `pi --mode rpc` published for `/workflow run` of a three-round script (Trace x3, Implement, Verify x2) against a local fake provider.",
+ "run": [
+  {
+   "v": 2,
+   "updatedAt": 1792164717994,
+   "run": null,
+   "progress": {
+    "total": 0,
+    "done": 0,
+    "running": 0,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [],
+   "tasks": [],
+   "tasksTruncated": 0,
+   "checkpoints": [],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": []
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164718117,
+   "run": {
+    "id": "",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "agents": 0,
+    "tokens": 0
+   },
+   "progress": {
+    "total": 0,
+    "done": 0,
+    "running": 0,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [],
+   "tasksTruncated": 0,
+   "checkpoints": [],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": []
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164718272,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 3,
+    "tokens": 0
+   },
+   "progress": {
+    "total": 3,
+    "done": 0,
+    "running": 3,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 0,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "tokens": 0,
+     "agents": 3,
+     "running": 3,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5"
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5"
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164719117,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 3,
+    "tokens": 0
+   },
+   "progress": {
+    "total": 3,
+    "done": 0,
+    "running": 3,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 0,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "tokens": 0,
+     "agents": 3,
+     "running": 3,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5"
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5"
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164719306,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 3,
+    "tokens": 9
+   },
+   "progress": {
+    "total": 3,
+    "done": 1,
+    "running": 2,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 1,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "tokens": 9,
+     "agents": 3,
+     "running": 2,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719282
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5"
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792164719282,
+     "kind": "agent",
+     "doneCount": 1,
+     "label": "trace-1"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164719463,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Implement",
+    "agents": 4,
+    "tokens": 27
+   },
+   "progress": {
+    "total": 4,
+    "done": 3,
+    "running": 1,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 3,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "endedAt": 1792164719435,
+     "tokens": 27,
+     "agents": 3,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "active",
+     "done": 0,
+     "total": 1,
+     "startedAt": 1792164719435,
+     "tokens": 0,
+     "agents": 1,
+     "running": 1,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719282
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719434
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719338
+    },
+    {
+     "id": "3",
+     "label": "implement",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164719436,
+     "model": "opencode-go/claude-haiku-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792164719434,
+     "kind": "agent",
+     "doneCount": 3,
+     "label": "trace-2"
+    },
+    {
+     "at": 1792164719435,
+     "kind": "phase",
+     "doneCount": 3,
+     "label": "Trace"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164720117,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Implement",
+    "agents": 4,
+    "tokens": 27
+   },
+   "progress": {
+    "total": 4,
+    "done": 3,
+    "running": 1,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 3,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "endedAt": 1792164719435,
+     "tokens": 27,
+     "agents": 3,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "active",
+     "done": 0,
+     "total": 1,
+     "startedAt": 1792164719435,
+     "tokens": 0,
+     "agents": 1,
+     "running": 1,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719282
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719434
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719338
+    },
+    {
+     "id": "3",
+     "label": "implement",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164719436,
+     "model": "opencode-go/claude-haiku-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792164719434,
+     "kind": "agent",
+     "doneCount": 3,
+     "label": "trace-2"
+    },
+    {
+     "at": 1792164719435,
+     "kind": "phase",
+     "doneCount": 3,
+     "label": "Trace"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164720386,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Verify",
+    "agents": 6,
+    "tokens": 36
+   },
+   "progress": {
+    "total": 6,
+    "done": 4,
+    "running": 2,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 3,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "endedAt": 1792164719435,
+     "tokens": 27,
+     "agents": 3,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "done",
+     "done": 1,
+     "total": 1,
+     "startedAt": 1792164719435,
+     "endedAt": 1792164720349,
+     "tokens": 9,
+     "agents": 1,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "active",
+     "done": 0,
+     "total": 2,
+     "startedAt": 1792164720349,
+     "tokens": 0,
+     "agents": 2,
+     "running": 2,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719282
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719434
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719338
+    },
+    {
+     "id": "3",
+     "label": "implement",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164719436,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164720349
+    },
+    {
+     "id": "4",
+     "label": "verify-1",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720352,
+     "model": "opencode-go/claude-haiku-5-5"
+    },
+    {
+     "id": "5",
+     "label": "verify-2",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720358,
+     "model": "opencode-go/claude-haiku-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792164719434,
+     "kind": "agent",
+     "doneCount": 3,
+     "label": "trace-2"
+    },
+    {
+     "at": 1792164719435,
+     "kind": "phase",
+     "doneCount": 3,
+     "label": "Trace"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "implement"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Implement"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164721118,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Verify",
+    "agents": 6,
+    "tokens": 36
+   },
+   "progress": {
+    "total": 6,
+    "done": 4,
+    "running": 2,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 3,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "endedAt": 1792164719435,
+     "tokens": 27,
+     "agents": 3,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "done",
+     "done": 1,
+     "total": 1,
+     "startedAt": 1792164719435,
+     "endedAt": 1792164720349,
+     "tokens": 9,
+     "agents": 1,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "active",
+     "done": 0,
+     "total": 2,
+     "startedAt": 1792164720349,
+     "tokens": 0,
+     "agents": 2,
+     "running": 2,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719282
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719434
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719338
+    },
+    {
+     "id": "3",
+     "label": "implement",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164719436,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164720349
+    },
+    {
+     "id": "4",
+     "label": "verify-1",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720352,
+     "model": "opencode-go/claude-haiku-5-5"
+    },
+    {
+     "id": "5",
+     "label": "verify-2",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720358,
+     "model": "opencode-go/claude-haiku-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792164719434,
+     "kind": "agent",
+     "doneCount": 3,
+     "label": "trace-2"
+    },
+    {
+     "at": 1792164719435,
+     "kind": "phase",
+     "doneCount": 3,
+     "label": "Trace"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "implement"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Implement"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164721360,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "running",
+    "startedAt": 1792164718116,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Verify",
+    "agents": 6,
+    "tokens": 45
+   },
+   "progress": {
+    "total": 6,
+    "done": 5,
+    "running": 1,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 3,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "endedAt": 1792164719435,
+     "tokens": 27,
+     "agents": 3,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "done",
+     "done": 1,
+     "total": 1,
+     "startedAt": 1792164719435,
+     "endedAt": 1792164720349,
+     "tokens": 9,
+     "agents": 1,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "active",
+     "done": 1,
+     "total": 2,
+     "startedAt": 1792164720349,
+     "tokens": 9,
+     "agents": 2,
+     "running": 1,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719282
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719434
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719338
+    },
+    {
+     "id": "3",
+     "label": "implement",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164719436,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164720349
+    },
+    {
+     "id": "4",
+     "label": "verify-1",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720352,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164721360
+    },
+    {
+     "id": "5",
+     "label": "verify-2",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720358,
+     "model": "opencode-go/claude-haiku-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792164719434,
+     "kind": "agent",
+     "doneCount": 3,
+     "label": "trace-2"
+    },
+    {
+     "at": 1792164719435,
+     "kind": "phase",
+     "doneCount": 3,
+     "label": "Trace"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "implement"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Implement"
+    },
+    {
+     "at": 1792164721360,
+     "kind": "agent",
+     "doneCount": 5,
+     "label": "verify-1"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "e2e-rounds-mvb4lmp3-t2poqn",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164721427,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "completed",
+    "startedAt": 1792164718116,
+    "endedAt": 1792164721424,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Verify",
+    "agents": 6,
+    "tokens": 54
+   },
+   "progress": {
+    "total": 6,
+    "done": 6,
+    "running": 0,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 3,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "endedAt": 1792164719435,
+     "tokens": 27,
+     "agents": 3,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "done",
+     "done": 1,
+     "total": 1,
+     "startedAt": 1792164719435,
+     "endedAt": 1792164720349,
+     "tokens": 9,
+     "agents": 1,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "done",
+     "done": 2,
+     "total": 2,
+     "startedAt": 1792164720349,
+     "endedAt": 1792164721424,
+     "tokens": 18,
+     "agents": 2,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719282
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719434
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719338
+    },
+    {
+     "id": "3",
+     "label": "implement",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164719436,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164720349
+    },
+    {
+     "id": "4",
+     "label": "verify-1",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720352,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164721360
+    },
+    {
+     "id": "5",
+     "label": "verify-2",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720358,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164721420
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792164719434,
+     "kind": "agent",
+     "doneCount": 3,
+     "label": "trace-2"
+    },
+    {
+     "at": 1792164719435,
+     "kind": "phase",
+     "doneCount": 3,
+     "label": "Trace"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "implement"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Implement"
+    },
+    {
+     "at": 1792164721420,
+     "kind": "agent",
+     "doneCount": 6,
+     "label": "verify-2"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": []
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792164721428,
+   "run": {
+    "id": "e2e-rounds-mvb4lmp3-t2poqn",
+    "name": "e2e-rounds",
+    "goal": "Three sequential rounds with concurrent agents",
+    "status": "completed",
+    "startedAt": 1792164718116,
+    "endedAt": 1792164721424,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Verify",
+    "agents": 6,
+    "tokens": 54
+   },
+   "progress": {
+    "total": 6,
+    "done": 6,
+    "running": 0,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 3,
+     "total": 3,
+     "startedAt": 1792164718125,
+     "endedAt": 1792164719435,
+     "tokens": 27,
+     "agents": 3,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "done",
+     "done": 1,
+     "total": 1,
+     "startedAt": 1792164719435,
+     "endedAt": 1792164720349,
+     "tokens": 9,
+     "agents": 1,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "done",
+     "done": 2,
+     "total": 2,
+     "startedAt": 1792164720349,
+     "endedAt": 1792164721424,
+     "tokens": 18,
+     "agents": 2,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace-1",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718129,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719282
+    },
+    {
+     "id": "1",
+     "label": "trace-2",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719434
+    },
+    {
+     "id": "2",
+     "label": "trace-3",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164718134,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164719338
+    },
+    {
+     "id": "3",
+     "label": "implement",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164719436,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164720349
+    },
+    {
+     "id": "4",
+     "label": "verify-1",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720352,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164721360
+    },
+    {
+     "id": "5",
+     "label": "verify-2",
+     "phase": "Verify",
+     "phaseIndex": 2,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 2,
+     "cached": false,
+     "startedAt": 1792164720358,
+     "model": "opencode-go/claude-haiku-5-5",
+     "tokens": 9,
+     "endedAt": 1792164721420
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792164719434,
+     "kind": "agent",
+     "doneCount": 3,
+     "label": "trace-2"
+    },
+    {
+     "at": 1792164719435,
+     "kind": "phase",
+     "doneCount": 3,
+     "label": "Trace"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "implement"
+    },
+    {
+     "at": 1792164720349,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Implement"
+    },
+    {
+     "at": 1792164721420,
+     "kind": "agent",
+     "doneCount": 6,
+     "label": "verify-2"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": []
+   }
+  }
+ ]
+}

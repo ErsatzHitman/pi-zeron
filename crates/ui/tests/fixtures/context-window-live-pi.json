@@ -1,0 +1,70 @@
+{
+ "source": "The context:window payload the same real Pi run published after its first turn.",
+ "payload": {
+  "v": 1,
+  "at": 1792164718154,
+  "seq": 2,
+  "model": {
+   "provider": "opencode-go",
+   "id": "claude-haiku-5-5"
+  },
+  "window": 1000000,
+  "measured": {
+   "tokens": 9,
+   "source": "provider"
+  },
+  "trailingTokens": 0,
+  "categories": {
+   "systemTools": {
+    "tokens": 578,
+    "count": 6
+   },
+   "mcpTools": {
+    "tokens": 0,
+    "count": 0
+   },
+   "systemPrompt": {
+    "tokens": 565
+   },
+   "skills": {
+    "tokens": 0,
+    "count": 0
+   },
+   "mcpInstructions": {
+    "tokens": 0
+   },
+   "messages": {
+    "tokens": 0
+   },
+   "other": {
+    "tokens": 0
+   }
+  },
+  "deferred": {
+   "systemTools": {
+    "tokens": 401,
+    "count": 5
+   },
+   "mcpTools": {
+    "tokens": 0,
+    "count": 0
+   }
+  },
+  "autocompact": {
+   "enabled": true,
+   "atTokens": 983616,
+   "bufferTokens": 16384,
+   "source": "native"
+  },
+  "mcp": {
+   "total": 0,
+   "servers": [],
+   "top": []
+  },
+  "estimate": {
+   "method": "chars/4",
+   "scale": 0.5,
+   "calibrated": true
+  }
+ }
+}

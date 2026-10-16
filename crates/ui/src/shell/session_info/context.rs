@@ -407,6 +407,29 @@ mod tests {
     }
 
     #[test]
+    fn a_real_pi_breakdown_shows_its_categories_and_deferred_tools() {
+        // The payload a real Pi published after its first turn.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/context-window-live-pi.json"
+        ))
+        .unwrap();
+        let mut ui = zeron_proto::extension_ui::ExtensionUiState::default();
+        ui.channels.insert(
+            zeron_proto::extension_ui::CONTEXT_WINDOW_CHANNEL.into(),
+            fixture["payload"].clone(),
+        );
+        let b = ContextBreakdown::of(&ui).expect("the channel parses");
+        let view = ContextView::of(Some((&b, now())), None, None).unwrap();
+        assert!(view.detailed);
+        assert_eq!(view.of_window(), "9 / 1M");
+        let tokens = |kind: Kind| view.rows.iter().find(|r| r.kind == kind).map(|r| r.tokens);
+        assert_eq!(tokens(Kind::SystemTools), Some(578));
+        assert_eq!(tokens(Kind::SystemPrompt), Some(565));
+        assert_eq!(tokens(Kind::Autocompact), Some(16_384));
+        assert_eq!(view.deferred.iter().map(|r| r.tokens).sum::<u64>(), 401);
+    }
+
+    #[test]
     fn no_window_means_no_section() {
         assert_eq!(ContextView::of(None, None, None), None);
         let none = Some(ContextUsage {

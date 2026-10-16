@@ -1232,6 +1232,71 @@ mod tests {
 
     /// Checks every frame: it shows, each phase's rows are its own, and no
     /// phase ever claims more done than total.
+    #[test]
+    fn a_real_pi_run_replays_round_by_round() {
+        // Every payload a real Pi published for a three-round script.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/workflow-live-pi-rounds.json"
+        ))
+        .unwrap();
+        let views: Vec<WorkflowView> = fixture["run"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|frame| !frame["run"].is_null())
+            .map(|frame| {
+                let at =
+                    DateTime::from_timestamp_millis(frame["updatedAt"].as_i64().unwrap()).unwrap();
+                WorkflowView::of(&ui(frame.clone()), at).expect("a run shows")
+            })
+            .collect();
+        assert!(views.iter().all(|v| v.grouped));
+        // The rounds open one at a time, in order.
+        let mut active: Vec<&str> = views
+            .iter()
+            .filter_map(|v| v.phases.iter().find(|p| p.state == PhaseState::Active))
+            .map(|p| p.title.as_str())
+            .collect();
+        active.dedup();
+        assert_eq!(active, ["Trace", "Implement", "Verify"]);
+        // Trace's three agents ran at once.
+        assert!(views.iter().any(|v| {
+            v.phases[0]
+                .rows
+                .iter()
+                .filter(|r| r.state == WorkflowTaskState::Running)
+                .count()
+                == 3
+        }));
+        let last = views.last().unwrap();
+        assert_eq!(last.phase, RunPhase::Completed);
+        assert_eq!((last.agents, last.tokens), (6, 54));
+        assert_eq!(
+            last.phases
+                .iter()
+                .map(|p| (p.title.as_str(), p.state, p.done, p.total, p.tokens))
+                .collect::<Vec<_>>(),
+            [
+                ("Trace", PhaseState::Done, 3, 3, 27),
+                ("Implement", PhaseState::Done, 1, 1, 9),
+                ("Verify", PhaseState::Done, 2, 2, 18)
+            ]
+        );
+        // Every agent row has its model, tokens and time.
+        let rows: Vec<&TaskRow> = last.phases.iter().flat_map(|p| &p.rows).collect();
+        assert_eq!(rows.len(), 6);
+        for row in rows {
+            assert_eq!(
+                row.model.as_deref().map(short_model).as_deref(),
+                Some("Haiku 5.5"),
+                "{row:?}"
+            );
+            assert_eq!(row.tokens, Some(9));
+            assert!(row.elapsed.is_some(), "{row:?}");
+        }
+        assert!(last.took().is_some());
+    }
+
     fn replay_grouped(fixture: &str) -> Vec<WorkflowView> {
         let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
         fixture["run"]
