@@ -1573,6 +1573,7 @@ fn forwardable(method: &str) -> bool {
             | methods::GET_PI_SETTINGS
             | methods::SET_PI_SETTINGS
             | methods::SET_DELETE_GUARD
+            | methods::SET_YOU_SHOULD_KNOW
             // Live extension UI is held by the chat's host engine.
             | methods::WATCH_EXTENSION_UI
             | methods::EXTENSION_UI_ACTION
@@ -2009,8 +2010,16 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
-            methods::GET_PI_SETTINGS | methods::SET_PI_SETTINGS | methods::SET_DELETE_GUARD => {
-                if method == methods::SET_DELETE_GUARD {
+            methods::GET_PI_SETTINGS
+            | methods::SET_PI_SETTINGS
+            | methods::SET_DELETE_GUARD
+            | methods::SET_YOU_SHOULD_KNOW => {
+                if method == methods::SET_YOU_SHOULD_KNOW {
+                    let p: SetDeleteGuardParams = parse_params(params)?;
+                    self.registry
+                        .set_you_should_know(p.enabled)
+                        .map_err(RpcError::Failed)?;
+                } else if method == methods::SET_DELETE_GUARD {
                     let p: SetDeleteGuardParams = parse_params(params)?;
                     self.registry
                         .set_block_deletes(p.enabled)

@@ -11,6 +11,7 @@ mod rows;
 mod rpc;
 mod sessions;
 mod ui;
+mod ysk;
 
 use crate::{
     Harness, HarnessError, RunControls,
@@ -44,11 +45,13 @@ pub const MIN_PI_VERSION: semver::Version = semver::Version::new(1, 1, 0);
 const VERSION_PROBE: Duration = Duration::from_secs(20);
 
 pub use guard::{DeleteGuard, DeleteGuardSetting};
+pub use ysk::YskSetting;
 
 pub struct PiHarness {
     models_cache: crate::catalog::Catalog,
     executable_setting: Option<ExecutableSetting>,
     delete_guard: Option<DeleteGuardSetting>,
+    you_should_know: Option<YskSetting>,
     workspace_commands: crate::skills::CommandDiscovery,
     commands: commands::Cache,
     session_store: Option<PathBuf>,
@@ -63,6 +66,7 @@ impl Default for PiHarness {
             executable: None,
             executable_setting: None,
             delete_guard: None,
+            you_should_know: None,
             session_store: None,
             agent_dir: None,
             models_cache: Default::default(),
@@ -91,6 +95,12 @@ impl PiHarness {
     /// Unset (tests), runs load no guard.
     pub fn with_delete_guard(mut self, setting: DeleteGuardSetting) -> Self {
         self.delete_guard = Some(setting);
+        self
+    }
+    /// Settings → Pi → You should know, read at each review. Unset, runs
+    /// never review.
+    pub fn with_you_should_know(mut self, setting: YskSetting) -> Self {
+        self.you_should_know = Some(setting);
         self
     }
     pub fn with_session_store(mut self, path: impl Into<PathBuf>) -> Self {
@@ -613,8 +623,26 @@ impl Harness for PiHarness {
         let (tx, rx) = mpsc::channel(256);
         let kill_grace = self.kill_grace;
         let interrupt_grace = self.interrupt_grace;
+        // The reviewer runs the same Pi, with nothing loaded but its prompt.
+        let reviewer = match &self.you_should_know {
+            Some(setting) => Some((
+                setting.clone(),
+                std::sync::Arc::new(PiHarness {
+                    executable: Some(self.resolve_executable()?),
+                    agent_dir: self.agent_dir.clone(),
+                    kill_grace,
+                    ..Default::default()
+                }),
+            )),
+            None => None,
+        };
+        let (ysk_tx, ysk_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut runner = Runner {
+                ysk: ysk::Ysk::default(),
+                reviewer,
+                ysk_tx,
+                ysk_rx,
                 store,
                 interrupted: false,
                 extension_commands: HashSet::new(),
@@ -713,6 +741,8 @@ enum Pending {
     /// The command list again, after a slash command that may change it
     /// (`/reload`, an extension that registers commands).
     Commands,
+    /// The conversation for a You should know review.
+    YskMessages,
     /// The command completions asked before that list; the list and the
     /// barrier of the turn (its epoch) are asked once they are in.
     Completions(u64),
@@ -730,6 +760,11 @@ struct Delivery {
     queued: bool,
 }
 struct Runner {
+    /// You should know: reviews of this chat's turns and the note shown.
+    ysk: ysk::Ysk,
+    reviewer: Option<(YskSetting, std::sync::Arc<PiHarness>)>,
+    ysk_tx: mpsc::UnboundedSender<Option<ysk::Note>>,
+    ysk_rx: mpsc::UnboundedReceiver<Option<ysk::Note>>,
     extension_commands: HashSet<String>,
     /// Every command Pi advertised (extensions, prompt templates, skills).
     /// Each shadows Zeron's built-in mapping of the same name.
@@ -840,6 +875,49 @@ impl Runner {
         }))?;
         Ok(())
     }
+    /// Show (or take away) the You should know note.
+    fn publish_ysk(&mut self) {
+        self.ui.host_element(ysk::KEY, self.ysk.element());
+    }
+    /// A tool step ended: ask for the conversation when a review is due.
+    fn ysk_step(&mut self) -> Result<(), HarnessError> {
+        let on = self.reviewer.as_ref().is_some_and(|(setting, _)| setting());
+        if on && self.ysk.step() {
+            let id = self
+                .process
+                .transport
+                .client
+                .request(json!({"type":"get_messages"}))?;
+            self.pending.insert(id, Pending::YskMessages);
+        }
+        Ok(())
+    }
+    /// Review the conversation beside the turn; the answer comes back on
+    /// `ysk_rx`.
+    fn ysk_review(&mut self, data: &Value) {
+        let Some((_, harness)) = &self.reviewer else {
+            self.ysk.review_failed();
+            return;
+        };
+        let prompt = ysk::request(&data["messages"], self.ysk.known());
+        let harness = harness.clone();
+        let cwd = self.request.cwd.clone();
+        let model = self
+            .live_model
+            .clone()
+            .or_else(|| self.request.model.clone());
+        let tx = self.ysk_tx.clone();
+        tokio::spawn(async move {
+            let note = match ysk::review(harness, cwd, model, prompt).await {
+                Ok(answer) => ysk::parse(&answer),
+                Err(error) => {
+                    tracing::debug!(%error, "You should know review failed");
+                    None
+                }
+            };
+            let _ = tx.send(note);
+        });
+    }
     /// A UI that draws extension elements is watching this chat.
     fn watched(&self) -> bool {
         self.ui_watched
@@ -902,6 +980,17 @@ impl Runner {
             let client = self.process.transport.client.clone();
             if !self.process.dialogs.answer_secret(&client, question, value) {
                 tracing::debug!("secret answer for a question no longer waiting; dropped");
+            }
+            return Ok(());
+        }
+        if action.element_id == ysk::KEY {
+            match self.ysk.action(&action.action_id) {
+                ysk::Effect::Ignored => {}
+                ysk::Effect::Changed => self.publish_ysk(),
+                ysk::Effect::Editor(text) => {
+                    self.publish_ysk();
+                    self.ui.set_editor_text(text);
+                }
             }
             return Ok(());
         }
@@ -986,6 +1075,10 @@ impl Runner {
     }
     fn submit(&mut self, text: String, images: Value, steer: bool) -> Result<(), HarnessError> {
         self.store.mark_submitted(&self.session)?;
+        // An unanswered note goes on the second prompt.
+        if self.ysk.prompt_sent() {
+            self.publish_ysk();
+        }
         let control = self.control_command(&text);
         if control.is_none() && text.trim_start().starts_with('/') {
             self.refresh_commands = true;
@@ -1259,6 +1352,9 @@ impl Runner {
                     }
                 },
                 _=self.turn.stop_requested()=>self.stop_turn()?,
+                Some(note)=self.ysk_rx.recv()=>if self.ysk.answered(note) {
+                    self.publish_ysk();
+                },
             }
         }
     }
@@ -1273,6 +1369,10 @@ impl Runner {
             Pending::EmptyEntries(..) | Pending::EmptyState(..) => return Err(error),
             Pending::Commands => {
                 tracing::debug!(%error, "Pi refused the command list");
+                return Ok(());
+            }
+            Pending::YskMessages => {
+                self.ysk.review_failed();
                 return Ok(());
             }
             Pending::Completions(epoch) => {
@@ -1561,6 +1661,7 @@ impl Runner {
                     self.take_commands(&data, announce).await?;
                 }
                 Pending::Completions(epoch) => self.request_settled(epoch, true)?,
+                Pending::YskMessages => self.ysk_review(&data),
                 Pending::Side { name, shown } => {
                     // It may have changed what Pi offers (`/reload`).
                     let id = self
@@ -1606,6 +1707,10 @@ impl Runner {
         }
         if frame["type"] == "agent_start" {
             self.store.mark_submitted(&self.session)?;
+            self.ysk.turn_started();
+        }
+        if frame["type"] == "tool_execution_end" && self.active {
+            self.ysk_step()?;
         }
         if frame["type"] == "agent_start" && !self.active {
             self.epoch += 1;

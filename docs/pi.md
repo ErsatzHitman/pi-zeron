@@ -375,3 +375,22 @@ such as `piui-idle`, `piui-btw`, `idle-dialog` and `custom` publish sheets,
 trays, screens and custom messages offline. The ignored live test requires an
 installed Pi and uses isolated settings and a local provider; it makes no model
 API requests.
+
+## You should know
+
+Settings → General → Pi → You should know (off by default) adds a second
+pair of eyes to long turns, modeled on Claude Code's "You should know".
+Every 6 tool steps of a turn, Zeron asks the live Pi for the conversation
+(`get_messages`) and hands it to a throwaway reviewer Pi (no session, tools,
+extensions or context files; the chat's model; usage surface `zeron-ysk`)
+whose whole system prompt is `crates/harness/src/pi/ysk.md`. When something
+clears the bar, one note docks above the composer:
+
+- **Heads up**: a decision the agent made without telling you.
+- **You should know**: how something works that matters for the task.
+
+Learn more opens the explanation (then Understood, or Chat in main session,
+which puts the note in the composer); Knew this already silences that topic
+for the chat; Dismiss closes it. A note left unanswered goes away on the
+second prompt, and ignored notes back reviews off (1, 2, 4, up to 16 skipped
+reviews). The agent never waits for a review, and only one runs at a time.

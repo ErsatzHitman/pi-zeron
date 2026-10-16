@@ -80,6 +80,8 @@ pub(super) struct ExtensionUi {
     /// Long between-turn reports (`/lsp`, `/mcp` status), shown as closable
     /// screens: a toast is gone before it is read. `(key, element)`.
     reports: Vec<(String, Value)>,
+    /// Elements Zeron draws itself (the You should know note), by key.
+    host_elements: Vec<(String, Value)>,
     /// A turn is running: its notices become transcript rows, not toasts.
     in_turn: bool,
 }
@@ -290,6 +292,28 @@ impl ExtensionUi {
         self.publish();
     }
 
+    /// An element Zeron draws itself under `key`; `None` takes it away.
+    pub fn host_element(&mut self, key: &str, element: Option<Value>) {
+        let at = self.host_elements.iter().position(|(k, _)| k == key);
+        match (element, at) {
+            (Some(element), Some(at)) if self.host_elements[at].1 == element => return,
+            (Some(element), Some(at)) => self.host_elements[at].1 = element,
+            (Some(element), None) => self.host_elements.push((key.to_owned(), element)),
+            (None, Some(at)) => {
+                self.host_elements.remove(at);
+            }
+            (None, None) => return,
+        }
+        self.publish();
+    }
+
+    /// Put `text` in the composer, as an extension's `set_editor_text` does.
+    pub fn set_editor_text(&mut self, text: String) {
+        let seq = self.next_seq();
+        self.state.editor_text = Some(SequencedText { seq, text });
+        self.publish();
+    }
+
     /// A channel Zeron keeps itself; `None` takes it away.
     pub fn host_channel(&mut self, name: &str, payload: Option<Value>) {
         match payload {
@@ -316,6 +340,11 @@ impl ExtensionUi {
             state
                 .elements
                 .extend(self.reports.iter().map(|(_, element)| element.clone()));
+            state.elements.extend(
+                self.host_elements
+                    .iter()
+                    .map(|(_, element)| element.clone()),
+            );
             sink.send_replace(state);
         }
     }
@@ -608,6 +637,7 @@ impl ExtensionUi {
         self.chunks.clear();
         self.dialogs.clear();
         self.host.clear();
+        self.host_elements.clear();
         self.last_seq = 0;
         self.publish();
     }

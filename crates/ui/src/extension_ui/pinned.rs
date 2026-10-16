@@ -71,6 +71,8 @@ fn tray_icon(element: &PiUiElement) -> &'static str {
         ("advisor-live-panel", _) => icons::MAGIC_STICK_3,
         ("decisions" | "jev", _) => icons::TUNING,
         ("btw", _) => icons::CHAT_ROUND_LINE,
+        // You should know, drawn by Zeron itself.
+        ("zeron", _) => icons::INFO_CIRCLE,
         (_, PiUiKind::Roster) => icons::LIST,
         (_, PiUiKind::Log) => icons::TERMINAL,
         _ => icons::WIDGET,

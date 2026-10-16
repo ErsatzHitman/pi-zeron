@@ -20,6 +20,7 @@ enum Request {
     Get,
     Executable(Option<String>),
     BlockDeletes(bool),
+    YouShouldKnow(bool),
 }
 
 pub struct PiSettingsCard {
@@ -75,6 +76,12 @@ impl PiSettingsCard {
         }
     }
 
+    fn set_you_should_know(&mut self, on: bool, cx: &mut Context<Self>) {
+        if !self.saving {
+            self.call(Request::YouShouldKnow(on), cx);
+        }
+    }
+
     /// `GetPiSettings`, `SetPiSettings` saving the executable, or
     /// `SetDeleteGuard`; each reply is the device's settings plus a fresh
     /// check of the Pi it resolves to.
@@ -83,7 +90,10 @@ impl PiSettingsCard {
             return;
         };
         // Switching the guard keeps an executable typed but not saved yet.
-        let keep_text = matches!(request, Request::BlockDeletes(_));
+        let keep_text = matches!(
+            request,
+            Request::BlockDeletes(_) | Request::YouShouldKnow(_)
+        );
         let (method, params) = match &request {
             Request::Get => (methods::GET_PI_SETTINGS, serde_json::json!({})),
             Request::Executable(executable) => (
@@ -92,6 +102,10 @@ impl PiSettingsCard {
             ),
             Request::BlockDeletes(on) => (
                 methods::SET_DELETE_GUARD,
+                serde_json::json!({ "enabled": on }),
+            ),
+            Request::YouShouldKnow(on) => (
+                methods::SET_YOU_SHOULD_KNOW,
                 serde_json::json!({ "enabled": on }),
             ),
         };
@@ -165,6 +179,7 @@ impl Render for PiSettingsCard {
             .on_click(cx.listener(|card, _, _, cx| card.save(cx)))
             .into_any_element();
         let block_deletes = self.render_block_deletes(&theme, cx);
+        let you_should_know = self.render_you_should_know(&theme, cx);
         widgets::section(
             &theme,
             "Pi",
@@ -205,7 +220,8 @@ impl Render for PiSettingsCard {
                                 .child(save),
                         ),
                 )
-                .child(block_deletes),
+                .child(block_deletes)
+                .child(you_should_know),
         )
     }
 }
@@ -252,6 +268,48 @@ impl PiSettingsCard {
             )
     }
 }
+
+impl PiSettingsCard {
+    /// You should know: off until switched on.
+    fn render_you_should_know(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let on = matches!(&self.settings, Loadable::Ready(s) if s.you_should_know);
+        let inert = self.saving || !matches!(self.settings, Loadable::Ready(_));
+        widgets::card_row(theme, false)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(160.0))
+                    .child(widgets::row_title(theme, "You should know"))
+                    .child(widgets::meta_line(
+                        theme,
+                        vec![div().child(YOU_SHOULD_KNOW_META).into_any_element()],
+                    )),
+            )
+            .child(
+                widgets::toggle_switch(theme, on, "pi-you-should-know")
+                    .id("pi-you-should-know-toggle")
+                    .debug_selector(|| "pi-you-should-know-toggle".into())
+                    .tab_index(0)
+                    .role(gpui::Role::Switch)
+                    .aria_label("You should know")
+                    .aria_toggled(if on {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .when(inert, |el| el.opacity(0.5))
+                    .when(!inert, |el| el.cursor_pointer())
+                    .on_click(cx.listener(move |card, _, _, cx| {
+                        card.set_you_should_know(!on, cx);
+                    })),
+            )
+    }
+}
+
+const YOU_SHOULD_KNOW_META: &str = "Every 6 steps of a long turn, a reviewer reads the chat and \
+     notes a decision the agent made without saying so, or something you should know. \
+     Each review is an extra model call.";
 
 fn block_deletes_meta(forced: bool) -> &'static str {
     if forced {

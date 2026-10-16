@@ -101,6 +101,10 @@ struct HarnessPrefsFile {
     /// on. Running Pis read it live through the delete guard (`guard.mjs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     block_deletes: Option<bool>,
+    /// Settings → General → Pi → You should know; `None` is off. Running
+    /// chats read it at each review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    you_should_know: Option<bool>,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
     #[serde(skip_serializing)]
@@ -127,6 +131,8 @@ pub struct PiSettings {
     pub block_deletes: bool,
     /// `ZERON_BLOCK_DELETES=1` on this engine holds `block_deletes` on.
     pub delete_guard_forced: bool,
+    /// A reviewer reads long turns and notes what the user should know.
+    pub you_should_know: bool,
 }
 
 impl Default for PiSettings {
@@ -139,6 +145,7 @@ impl Default for PiSettings {
             error: None,
             block_deletes: true,
             delete_guard_forced: false,
+            you_should_know: false,
         }
     }
 }
@@ -176,6 +183,7 @@ impl HarnessRegistry {
             error,
             block_deletes: self.block_deletes(),
             delete_guard_forced: delete_guard_forced(),
+            you_should_know: self.you_should_know(),
         }
     }
 }
@@ -221,6 +229,8 @@ pub struct HarnessRegistry {
     update_generation: tokio::sync::watch::Sender<u64>,
     /// Live copy of `prefs.pi_executable`, shared with the Pi harness.
     pi_executable: Arc<Mutex<Option<PathBuf>>>,
+    /// Live copy of `prefs.you_should_know`, shared with the Pi harness.
+    you_should_know: Arc<std::sync::atomic::AtomicBool>,
     /// What the Pi harness hands its delete guard on each run.
     delete_guard: Arc<Mutex<zeron_harness::pi::DeleteGuard>>,
 }
@@ -306,6 +316,7 @@ impl HarnessRegistry {
             pending_updates: Mutex::new(std::collections::HashSet::new()),
             update_generation,
             pi_executable: Arc::new(Mutex::new(None)),
+            you_should_know: Default::default(),
             delete_guard: Arc::new(Mutex::new(zeron_harness::pi::DeleteGuard {
                 enabled: true,
                 forced: delete_guard_forced(),
@@ -325,6 +336,25 @@ impl HarnessRegistry {
         delete_guard_forced() || self.prefs().block_deletes.unwrap_or(true)
     }
 
+    pub fn you_should_know(&self) -> bool {
+        self.prefs().you_should_know.unwrap_or(false)
+    }
+
+    /// Turn You should know on or off; running chats follow at their next
+    /// review.
+    pub fn set_you_should_know(&self, on: bool) -> Result<(), String> {
+        self.prefs().you_should_know = Some(on);
+        self.refresh_delete_guard();
+        self.try_persist_prefs()
+            .map_err(|error| format!("Could not save You should know: {error}"))
+    }
+
+    /// The You should know switch, read by the Pi harness at each review.
+    pub fn you_should_know_setting(&self) -> zeron_harness::pi::YskSetting {
+        let on = self.you_should_know.clone();
+        Arc::new(move || on.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Turn the delete guard on or off. Running Pis follow the saved file,
     /// so a failed save is an error: the switch would show a state they do
     /// not follow.
@@ -336,6 +366,8 @@ impl HarnessRegistry {
     }
 
     fn refresh_delete_guard(&self) {
+        self.you_should_know
+            .store(self.you_should_know(), std::sync::atomic::Ordering::Relaxed);
         let enabled = self.block_deletes();
         let mut guard = self
             .delete_guard
@@ -763,11 +795,13 @@ pub fn default_registry() -> HarnessRegistry {
         {
             let setting = registry.pi_executable_setting();
             let guard = registry.delete_guard_setting();
+            let ysk = registry.you_should_know_setting();
             Box::new(move || {
                 Ok(Arc::new(
                     zeron_harness::PiHarness::new()
                         .with_executable_setting(setting.clone())
-                        .with_delete_guard(guard.clone()),
+                        .with_delete_guard(guard.clone())
+                        .with_you_should_know(ysk.clone()),
                 ) as Arc<dyn Harness>)
             })
         },
