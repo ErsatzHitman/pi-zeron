@@ -2435,7 +2435,10 @@ impl Shell {
             ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
         };
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
-        transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
+        transcript.update(cx, |transcript, _| {
+            transcript.retain_for_route_exit();
+            transcript.set_quote_actions(true);
+        });
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let voice = cx.new(|_| crate::voice::VoiceController::default());
         let voice_footer_orb = cx.new(|_| {
@@ -4361,6 +4364,7 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::SendToBtw { text } => self.send_to_btw(text, cx),
             TranscriptEvent::Rewind {
                 chat_id,
                 message_id,

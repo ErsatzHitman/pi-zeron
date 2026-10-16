@@ -520,6 +520,26 @@ struct AttachmentRow {
 /// What the composer holds that a send could carry. A staged image or diff
 /// comment counts: both synthesize their own prompt body, so either alone is
 /// a legal send — and during a live run has to read as Queue, not Stop.
+/// `text` as a Markdown block quote: every line behind `> ` (a blank line
+/// behind a bare `>`), without the blank lines around it.
+pub(crate) fn quote_block(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    text.trim_matches(|c: char| c == '\n' || c == '\r')
+        .lines()
+        .map(|line| {
+            let line = line.trim_end();
+            if line.is_empty() {
+                ">".to_owned()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
     !text.trim().is_empty() || attachments > 0 || comments > 0
 }
@@ -6836,6 +6856,24 @@ impl Composer {
         )
     }
 
+    /// Put `text` in the input as a Markdown quote, after anything already
+    /// typed, with the caret on a fresh line below it; then focus the input.
+    pub(crate) fn quote_into_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let quote = quote_block(text);
+        if quote.is_empty() {
+            return;
+        }
+        let draft = self.input.read(cx).text().trim_end().to_owned();
+        let text = if draft.is_empty() {
+            format!("{quote}\n\n")
+        } else {
+            format!("{draft}\n\n{quote}\n\n")
+        };
+        self.input.update(cx, |input, cx| input.set_text(text, cx));
+        self.focus_pending = true;
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(crate) fn failure(&self) -> Option<&SharedString> {
         self.failure.as_ref()
@@ -12559,6 +12597,13 @@ mod attachment_chip_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quote_is_a_markdown_block_quote() {
+        assert_eq!(quote_block("one line"), "> one line");
+        assert_eq!(quote_block("\nfirst\n\nsecond  \n"), "> first\n>\n> second");
+        assert_eq!(quote_block(" \n "), "");
+    }
 
     pub(super) fn composer_focus_window(
         cx: &mut gpui::TestAppContext,

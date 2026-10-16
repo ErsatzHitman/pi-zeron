@@ -83,6 +83,7 @@ The Session row's `+` opens a side chat in a small pane: the card's width, besid
 - The pane fits its conversation: a fresh one is its header and prompt bar, and it grows with each reply (a streaming one included) so the whole thread shows without scrolling. Only once it reaches the bottom of the window does the thread scroll, with faded edges. A send reserves no blank space for the reply, unlike the main transcript.
 - A closed pane's side chat is dropped unless it has an unsent draft, as when its tab closes. An untitled one has no row until its first send.
 - Floating the card over a narrow column closes the pane.
+- **Send to /btw**: selecting text in the conversation shows a small bar just above the selection, like Claude Code's "Send to side chat". Its button opens the pane (or brings the open one forward) with the selection quoted in the prompt, after anything already typed there, and the caret below it, ready for the question. Only the main conversation offers it, not a side chat's own transcript or a subagent tab.
 
 Fork chat is gone. The Files panel no longer has Subagents or Chats sections; this section replaces both.
 
@@ -99,7 +100,7 @@ Fork chat is gone. The Files panel no longer has Subagents or Chats sections; th
 
 `shell/sidebar_children.rs` nests side chats under their parent in the sidebar ([sidebar side chats](sidebar-side-chats.md)).
 
-`shell/btw_pane.rs` hosts the btw pane: one at a time, scoped to its conversation, backed by an ordinary side chat (`side_chats.rs`) attached to no right-pane tab. Its transcript runs in fit mode (`Transcript::set_fit_content`: no reply runway, `content_height` for the pane to size to), and its composer hides the model picker (`Composer::set_model_picker_hidden`); `AppState::inherit_side_chat_config` keeps an unsent side chat on its parent's model.
+`shell/btw_pane.rs` hosts the btw pane: one at a time, scoped to its conversation, backed by an ordinary side chat (`side_chats.rs`) attached to no right-pane tab. Its transcript runs in fit mode (`Transcript::set_fit_content`: no reply runway, `content_height` for the pane to size to), and its composer hides the model picker (`Composer::set_model_picker_hidden`); `AppState::inherit_side_chat_config` keeps an unsent side chat on its parent's model. The selection bar is `Transcript::render_quote_bar`, on only for the shell's main transcript (`set_quote_actions`): it places itself from `markdown::render::selection_bounds` and emits `TranscriptEvent::SendToBtw`, which `Shell::send_to_btw` hands to `Composer::quote_into_input`.
 
 `session_info/compact.rs` decides when Compaction shows and what it says, from the Pi harness's `zeron:compact` host channel (`CompactStatus`: on or off, the threshold, a running compaction) and the chat's context usage.
 

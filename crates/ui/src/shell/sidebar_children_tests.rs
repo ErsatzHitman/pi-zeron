@@ -441,3 +441,50 @@ fn the_btw_pane_grows_to_show_a_whole_reply(cx: &mut TestAppContext) {
         "the long reply scrolls: {content} in {room}"
     );
 }
+
+#[gpui::test]
+fn send_to_btw_opens_the_pane_with_the_text_quoted(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    init(cx, dir.path());
+    let config = boot(dir.path());
+    let (shell, cx) = cx.add_window_view(|_, cx| {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.no_project = true;
+            state.selected_chat = Some("a".into());
+            state.chats = vec![chat("a", 1)];
+            state
+        });
+        let mut shell = Shell::new(state, config, cx);
+        shell.debug_gate = Some(GatePhase::Ready);
+        shell.splash = SplashPhase::Gone;
+        shell.active_chat = "a".into();
+        shell.test_time = Some(std::time::Instant::now());
+        shell
+    });
+    cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+    cx.update(|window, cx| window.draw(cx).clear());
+    let prompt = |shell: &Entity<Shell>, cx: &mut VisualTestContext| {
+        shell.read_with(cx, |shell, cx| {
+            let pane = shell.btw.as_ref()?;
+            let tab = shell.side_chats.get(&pane.side_chat)?;
+            Some(tab.composer.read(cx).input.read(cx).text().to_owned())
+        })
+    };
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.send_to_btw("Trailing commas are dropped.\nBy design?", cx)
+        })
+    });
+    assert_eq!(
+        prompt(&shell, cx).as_deref(),
+        Some("> Trailing commas are dropped.\n> By design?\n\n"),
+        "the pane opens with the selection quoted"
+    );
+    // A second quote joins the same side chat's prompt, after the first.
+    cx.update(|_, cx| shell.update(cx, |shell, cx| shell.send_to_btw("Also this.", cx)));
+    assert_eq!(
+        prompt(&shell, cx).as_deref(),
+        Some("> Trailing commas are dropped.\n> By design?\n\n> Also this.\n\n")
+    );
+}

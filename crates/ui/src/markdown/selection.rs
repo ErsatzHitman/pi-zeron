@@ -299,6 +299,26 @@ pub fn wash_range(surface: u64, key: &str) -> Option<Range<usize>> {
         .map(|s| s.range.clone())
 }
 
+/// The settled (not dragging) selection's spans, when it lives on
+/// `surface` and holds any text.
+pub(crate) fn settled_spans(surface: u64) -> Option<Vec<Span>> {
+    let guard = state().lock().unwrap();
+    let sel = guard
+        .as_ref()
+        .filter(|sel| sel.surface == surface && !sel.dragging)?;
+    (!sel.spans.iter().all(|s| s.range.is_empty())).then(|| sel.spans.clone())
+}
+
+/// Drop the selection if it lives on `surface`. True if it did.
+pub(crate) fn clear_surface(surface: u64) -> bool {
+    let mut guard = state().lock().unwrap();
+    if guard.as_ref().is_some_and(|sel| sel.surface == surface) {
+        *guard = None;
+        return true;
+    }
+    false
+}
+
 /// The full selected text (Cmd+C), spans joined in document order.
 pub fn selected_text() -> Option<String> {
     let guard = state().lock().unwrap();
@@ -309,7 +329,7 @@ pub fn selected_text() -> Option<String> {
     Some(join_spans(&sel.spans))
 }
 
-fn join_spans(spans: &[Span]) -> String {
+pub(crate) fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
         .map(|s| &s.text[s.range.clone()])
