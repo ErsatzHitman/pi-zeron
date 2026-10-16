@@ -118,6 +118,26 @@ impl Shell {
         self.show_btw(key, id, cx);
     }
 
+    /// The selection bar's "Send to /btw": the pane opens (or comes forward)
+    /// with `text` quoted in its prompt, ready for the question about it.
+    pub(super) fn send_to_btw(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.open_btw_pane(cx);
+        let key = self.panel_key(cx);
+        let Some(id) = self
+            .btw
+            .as_ref()
+            .filter(|pane| pane.open && pane.key == key)
+            .map(|pane| pane.side_chat)
+        else {
+            return;
+        };
+        if let Some(tab) = self.side_chats.get(&id) {
+            tab.composer
+                .update(cx, |composer, cx| composer.quote_into_input(text, cx));
+        }
+        cx.notify();
+    }
+
     /// Show side chat `id` in the pane of conversation `key`.
     fn show_btw(&mut self, key: String, id: u64, cx: &mut Context<Self>) {
         if let Some(old) = self.btw.take()

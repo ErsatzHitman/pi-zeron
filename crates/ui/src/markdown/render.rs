@@ -1664,6 +1664,32 @@ pub(crate) fn update_drag_at(position: gpui::Point<gpui::Pixels>) -> bool {
     resolve_drag(head)
 }
 
+/// Where the settled selection on `surface` shows: the union of its wash
+/// boxes over the text painted last frame, in window coordinates. `None`
+/// while none of it is on screen.
+pub(crate) fn selection_bounds(surface: u64) -> Option<gpui::Bounds<gpui::Pixels>> {
+    let spans = super::selection::settled_spans(surface)?;
+    REGISTRY.with(|r| {
+        let mut union: Option<gpui::Bounds<gpui::Pixels>> = None;
+        for entry in r.borrow().iter().filter(|e| e.surface == surface) {
+            let Some(span) = spans
+                .iter()
+                .find(|s| s.key.as_str() == entry.key.as_ref() && !s.range.is_empty())
+            else {
+                continue;
+            };
+            let range = entry.offsets.as_ref().map_or_else(
+                || span.range.clone(),
+                |map| map.displayed_range(span.range.clone()),
+            );
+            for rect in range_rects(&entry.layout, &range, 0.0, 0.0) {
+                union = Some(union.map_or(rect, |b| b.union(&rect)));
+            }
+        }
+        union
+    })
+}
+
 /// Register this frame's window-level mouse listeners for one text element's
 /// selection (Zed-markdown mechanics: window-level so a drag keeps tracking
 /// outside the element's bounds; frame-scoped, so paint re-registers).

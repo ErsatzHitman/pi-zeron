@@ -894,6 +894,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn context_menu_cancels_visible_and_pending_hover_tooltips() {
+        let _selection = crate::markdown::selection::test_state_lock();
         let dir = tempfile::tempdir().unwrap();
         test_application().run(move |cx| {
             cx.set_global(Theme::dark());
@@ -1093,6 +1094,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn rendered_truncation_resizes_and_selects_the_original_url() {
+        let _selection = crate::markdown::selection::test_state_lock();
         test_application().run(|cx| {
             cx.set_global(Theme::dark());
             let url = format!("https://example.com/{}", "long-segment-🙂/".repeat(20));
@@ -1199,6 +1201,7 @@ mod rendered_tests {
     fn file_link_menu_offers_local_rows_and_acts_on_the_absolute_path(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _selection = crate::markdown::selection::test_state_lock();
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             cx.set_global(Theme::dark());
@@ -1284,6 +1287,7 @@ mod rendered_tests {
     #[cfg(unix)]
     #[gpui::test]
     fn outside_file_link_menu_keeps_open_in_zeron_and_local_rows(cx: &mut gpui::TestAppContext) {
+        let _selection = crate::markdown::selection::test_state_lock();
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             cx.set_global(Theme::dark());
@@ -1342,6 +1346,7 @@ mod rendered_tests {
     /// link shows only the web rows.
     #[gpui::test]
     fn file_link_menu_hides_system_rows_for_remote_and_web_links(cx: &mut gpui::TestAppContext) {
+        let _selection = crate::markdown::selection::test_state_lock();
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             cx.set_global(Theme::dark());

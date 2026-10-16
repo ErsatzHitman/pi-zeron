@@ -3543,6 +3543,8 @@ pub struct Transcript {
     copied_message_clear: Option<Task<()>>,
     /// The user message whose rewind menu is open.
     rewind_menu: crate::popover::Popup<SharedString>,
+    /// Selected text offers "Send to /btw" (the main conversation only).
+    quote_actions: bool,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it.
@@ -3610,6 +3612,8 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// The selection bar's "Send to /btw": ask about `text` in a side chat.
+    SendToBtw { text: String },
     /// A user message's rewind menu: go back to before that message.
     /// `text` is the message, for the composer once the conversation is back.
     Rewind {
@@ -4056,6 +4060,7 @@ impl Transcript {
             copied_message: None,
             copied_message_clear: None,
             rewind_menu: crate::popover::Popup::default(),
+            quote_actions: false,
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
             attachment_preview_return_focus: None,
@@ -8326,6 +8331,78 @@ impl Transcript {
             .into_any_element()
     }
 
+    /// Let selected text offer "Send to /btw" (the shell's main transcript).
+    pub(crate) fn set_quote_actions(&mut self, on: bool) {
+        self.quote_actions = on;
+    }
+
+    /// The bar over a settled selection: "Send to /btw", like Claude Code's
+    /// "Send to side chat". It floats just above the selected text and goes
+    /// with the selection.
+    fn render_quote_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.quote_actions || self.doc_override.is_some() {
+            return None;
+        }
+        let surface = cx.entity_id().as_u64();
+        let spans = crate::markdown::selection::settled_spans(surface)?;
+        let text = crate::markdown::selection::join_spans(&spans);
+        if text.trim().is_empty() {
+            return None;
+        }
+        let bounds = crate::markdown::render::selection_bounds(surface)?;
+        let popup = Theme::of(cx).for_popup();
+        let fade_key = "send-to-btw-hover";
+        let button = div()
+            .id("send-to-btw")
+            .debug_selector(|| "send-to-btw".into())
+            .role(gpui::Role::Button)
+            .px(px(8.0))
+            .py(px(3.0))
+            .rounded(px(Theme::CONTROL_RADIUS))
+            .cursor_pointer()
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(popup.text)
+            .bg(motion::hover_blend(
+                fade_key,
+                gpui::transparent_black(),
+                crate::theme::ink(0.08),
+            ))
+            .on_hover(motion::hover_listener(fade_key))
+            // The press must not reach the text under the bar, which would
+            // drop the selection before the click lands.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |_, _, window, cx| {
+                cx.stop_propagation();
+                crate::markdown::selection::clear_surface(surface);
+                cx.emit(TranscriptEvent::SendToBtw { text: text.clone() });
+                window.refresh();
+            }))
+            .child(SharedString::from("Send to /btw"));
+        let bar = div()
+            .occlude()
+            .flex()
+            .flex_row()
+            .items_center()
+            .p(px(3.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(popup.border)
+            .bg(crate::popover::surface_bg(&popup))
+            .when(!popup.is_frost(), |el| el.shadow_lg())
+            .child(button);
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(point(bounds.center().x, bounds.top() - px(6.0)))
+                    .anchor(gpui::Anchor::BottomCenter)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(bar),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
+    }
+
     /// Whether this view offers rewind on its user messages (see
     /// [`rewind_offered`]). A subagent tab never does.
     fn rewind_available(&self, cx: &gpui::App) -> bool {
@@ -11082,7 +11159,9 @@ impl Render for Transcript {
             ))
             .child(content)
             .child(rail);
-        let root = root.children(self.render_image_menu(cx));
+        let root = root
+            .children(self.render_image_menu(cx))
+            .children(self.render_quote_bar(cx));
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {
@@ -11118,6 +11197,89 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn selected_reply_text_offers_send_to_btw(cx: &mut gpui::TestAppContext) {
+        let _selection = crate::markdown::selection::test_state_lock();
+        crate::markdown::selection::end_active_drag();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("chat-a".into());
+            state.transcript_replayed = true;
+            state.transcript = vec![assistant(
+                "a1",
+                MessageStatus::Complete,
+                vec![text_part("t0", "The parser drops trailing commas.")],
+            )];
+            state.transcript_revision += 1;
+        });
+        let (transcript, cx) = cx.add_window_view(|_, cx| Transcript::new(state.clone(), cx));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let events = events.clone();
+            cx.subscribe(&transcript, move |_, event: &TranscriptEvent, _| {
+                events.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            transcript.update(cx, |this, cx| {
+                this.sync(cx);
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear());
+        };
+        let select = |cx: &mut gpui::VisualTestContext| {
+            draw(cx);
+            let bounds = render::selection_test_bounds("a1#t0.0:0");
+            let start = bounds.origin + point(px(1.0), px(8.0));
+            cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_move(
+                start + point(px(120.0), px(0.0)),
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_up(
+                start + point(px(120.0), px(0.0)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            draw(cx);
+        };
+
+        // Only a transcript the shell asks for (the main one) offers it.
+        select(cx);
+        assert!(crate::markdown::selection::selected_text().is_some());
+        assert!(cx.debug_bounds("send-to-btw").is_none());
+
+        transcript.update(cx, |this, _| this.set_quote_actions(true));
+        select(cx);
+        let selected = crate::markdown::selection::selected_text().expect("text is selected");
+        let bar = cx
+            .debug_bounds("send-to-btw")
+            .expect("a selection offers Send to /btw");
+        assert!(
+            bar.bottom() <= render::selection_test_bounds("a1#t0.0:0").top() + px(1.0),
+            "the bar floats above the selected text"
+        );
+        cx.simulate_click(bar.center(), gpui::Modifiers::default());
+        match events.borrow().as_slice() {
+            [TranscriptEvent::SendToBtw { text }] => assert_eq!(text, &selected),
+            other => panic!("expected one Send to /btw, got {other:?}"),
+        }
+        assert!(
+            crate::markdown::selection::selected_text().is_none(),
+            "sending drops the selection"
+        );
+        draw(cx);
+        assert!(cx.debug_bounds("send-to-btw").is_none());
+    }
 
     #[test]
     fn rewind_is_offered_only_in_idle_main_pi_sessions() {
@@ -14687,6 +14849,9 @@ mod tests {
 
         #[test]
         fn active_reply_text_selection_survives_streaming_and_completion() {
+            // The selection is process-wide: hold it against the other
+            // selection tests.
+            let _selection = crate::markdown::selection::test_state_lock();
             with_window(|transcript, window, cx| {
                 transcript.update(cx, |this, cx| {
                     feed(this, vec![prompt("prompt")], cx);
