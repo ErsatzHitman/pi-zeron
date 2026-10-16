@@ -3862,6 +3862,11 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_reports_local_assembly_failure_before_returning_a_handle() {
+        // Take the login-shell snapshot now. Otherwise assembly starts it on
+        // a thread, and the shell it spawns holds a copy of every open fd,
+        // the IPC listener included, until its exec closes them: a check
+        // made in that window still finds the port listening.
+        let _ = zeron_harness::shell_env::login_shell_path();
         let dir = tempfile::tempdir().unwrap();
         zeron_engine::EngineProfile::local(dir.path()).unwrap();
         std::fs::create_dir(dir.path().join("profiles")).unwrap();
