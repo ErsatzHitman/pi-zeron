@@ -171,7 +171,7 @@ Installed Pi packages (extensions from `pi install`) are checked for updates
 with Pi's own check, at most twice a day per engine: Zeron sets
 `ZERON_PACKAGE_CHECK=1` on a run, and the guard extension in that session's
 Pi answers once. Any updates show as a toast in that chat, worded like the
-app's update toast ("3 Pi package updates available — … · run `pi update
+app's update toast ("3 Pi package updates available â€” a, b, c Â· run `pi update
 --extensions`"). Zeron never updates the packages itself.
 
 A message sent while Pi works always steers: the chat's host hands every
@@ -273,7 +273,13 @@ Zeron's existing delegation uses a temporary MCP bridge loaded with
 `crates/harness/src/pi/visuals.md`, which describes the charts, diagrams and
 tables Zeron draws ([chat visuals](reference/chat-visuals.md)) and the
 interactive Luau visuals Pi shows with `zeron_show_visual` (see
-[MCP](mcp.md)). An
+[MCP](mcp.md)), and a second one with the capability map
+(`crates/harness/src/pi/capabilities.rs`): what the session is (main chat,
+side chat, orchestrator root or member, and whether it is read-only), its
+parent, the Zeron tools it has and lacks (the board belongs to orchestrator
+trees), and how Zeron behaves around it (steering, Stop, questions and
+secrets, the delete guard, sub-agents, voice). Sub-agents get the same facts
+from the guard's sub-agent note. An
 orchestrator's root chat (the sidebar's Orchestrator tab) runs with its own
 profile instead of the coding one:
 

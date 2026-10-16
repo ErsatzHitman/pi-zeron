@@ -83,7 +83,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_harnesses",
-            description: "Agent harnesses (claude-code, codex, cursor, …) available on the chosen device. Omit device for the local engine.",
+            description: "Agent harnesses available on the chosen device; Zeron runs only Pi. Omit device for the local engine.",
             input_schema: json!({ "type": "object", "properties": { "device": device_schema() } }),
         },
         ToolDef {
@@ -92,7 +92,7 @@ fn catalog() -> Vec<ToolDef> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "harness": { "type": "string", "description": "Harness id, e.g. claude-code or codex." },
+                    "harness": { "type": "string", "description": "Harness id: \"pi\" (the only harness)." },
                     "device": device_schema()
                 },
                 "required": ["harness"]
@@ -127,7 +127,7 @@ fn catalog() -> Vec<ToolDef> {
                     "project": { "type": "string", "description": "Project id, path, or name. Belongs to a specific device; when device is supplied, search only there. Optional." },
                     "device": { "type": "string", "description": "Host device (id or name). With project, it must own that project. Without either, use the local engine." },
                     "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
-                    "harness": { "type": "string", "description": "Harness id (see list_harnesses with the chosen device). Defaults to claude-code when available." },
+                    "harness": { "type": "string", "description": "Harness id; Pi is the only harness, so omit it or pass \"pi\"." },
                     "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default." },
                     "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max)." },
                     "write": { "type": "boolean", "default": true, "description": "true: the session may change files, and in a git project gets its own worktree. false: read-only; every edit is blocked." },
@@ -143,7 +143,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "read_chat",
-            description: "Read a chat's transcript as plain messages (newest window by default). Tool calls are summarized one per line.",
+            description: "Read a chat's transcript as plain messages (newest window by default). Tool calls are summarized one per line; \"pi · …\" rows are Zeron's records of extension UI (advisor, sub-agents, jobs), not calls the chat made, and long rows are truncated.",
             input_schema: chat_key_schema(json!({
                 "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 40, "description": "How many messages, counted from the newest." },
                 "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest messages (paging backwards)." },
@@ -170,7 +170,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "interrupt_chat",
-            description: "Stop the chat's running turn.",
+            description: "Stop the chat's running turn. Only the current turn ends and its queued messages are cleared; its sub-agents and background shells keep running.",
             input_schema: chat_key_schema(json!({})),
         },
         ToolDef {

@@ -78,6 +78,9 @@ const member = {ZERON_PI_MCP: mcp, ZERON_CHAT_TITLE: 'Fix the parser', ZERON_ROO
 assert.equal(subagentNote(member, 0), undefined, 'the session itself');
 assert.match(subagentNote(member, 1), /sub-agent \(level 1\) of the agent in the Zeron session "Fix the parser" \(chat member-1\), at level 2 of the tree of orchestrator chat orchestrator-r\./);
 assert.match(subagentNote({ZERON_PI_MCP: mcp}, 2), /\(level 2\) of the agent in the Zeron session chat member-1\. /);
+assert.match(subagentNote(member, 1), /cannot use the Zeron board/);
+assert.doesNotMatch(subagentNote(member, 1), /read-only/);
+assert.match(subagentNote({...member, ZERON_READ_ONLY: '1'}, 1), /Your session is read-only, so you are too/);
 assert.equal(subagentNote({}, 1), undefined, 'not under Zeron');
 assert.equal(subagentNote({ZERON_PI_MCP: '{'}, 1), undefined);
 assert.equal(piDepth({}, 7), 0, 'the Zeron session itself');

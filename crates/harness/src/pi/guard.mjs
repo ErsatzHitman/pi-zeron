@@ -561,7 +561,10 @@ export function subagentNote(env, depth) {
     : "";
   return `Zeron: you are a sub-agent (level ${depth}) of the agent in the Zeron session ${session}${tree}. ` +
     `Your task is the prompt that agent gave you: report your result to it, not to the user. ` +
-    `You are not a Zeron session yourself.`;
+    `You are not a Zeron session yourself: you cannot use the Zeron board or start or message Zeron sessions, ` +
+    `and your charts, visuals and questions do not reach the user, so return plain text in your final reply.` +
+    (readOnlyOn(env) ? ` Your session is read-only, so you are too: do not edit or write files.` : ``) +
+    ` Zeron may block deletes; if a call is blocked, do not retry it: report what must go.`;
 }
 
 // Zeron asks (`ZERON_PACKAGE_CHECK=1`, at most twice a day) which installed

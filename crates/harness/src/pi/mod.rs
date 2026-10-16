@@ -1,4 +1,5 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
+mod capabilities;
 mod catalog;
 mod commands;
 mod compact;
@@ -226,7 +227,7 @@ impl PiHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let scratch = mcp
-            .map(|config| self::mcp::configure(&mut cmd, config))
+            .map(|config| self::mcp::configure(&mut cmd, config, read_only))
             .transpose()?;
         // Loaded even while the toggle is off, so turning it on reaches a
         // running chat without a restart. Probes and titles run no tools.

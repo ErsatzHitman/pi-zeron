@@ -13,10 +13,11 @@ pub(crate) const VISUALS_PROMPT: &str = include_str!("visuals.md");
 pub(super) fn configure(
     cmd: &mut Command,
     config: &zeron_proto::McpServer,
+    read_only: bool,
 ) -> Result<ScratchDir, HarnessError> {
     let scratch = ScratchDir::new("pi-mcp")?;
     let place = Place::from_env(&config.env);
-    for arg in role_args(&place, scratch.path())? {
+    for arg in role_args(&place, read_only, scratch.path())? {
         cmd.arg(arg);
     }
     cmd.env(
@@ -41,17 +42,29 @@ pub(super) fn configure(
 /// (charts, diagrams, tables). A root swaps Pi's coding prompt for the
 /// orchestrator's and keeps only its own tools: no bash, edits, MCP servers,
 /// skills, prompt templates or context files. A member learns its place in
-/// the tree, and a side chat its parent.
-fn role_args(place: &Place, scratch: &Path) -> Result<Vec<OsString>, HarnessError> {
+/// the tree, and a side chat its parent. Every run gets the capability map
+/// for its surface (see `capabilities.rs`).
+fn role_args(
+    place: &Place,
+    read_only: bool,
+    scratch: &Path,
+) -> Result<Vec<OsString>, HarnessError> {
     let extension = scratch.join("zeron-mcp.mjs");
     std::fs::write(&extension, include_str!("mcp.mjs"))?;
     let visuals = scratch.join("zeron-visuals.md");
     std::fs::write(&visuals, VISUALS_PROMPT)?;
+    let capabilities = scratch.join("zeron-capabilities.md");
+    std::fs::write(
+        &capabilities,
+        super::capabilities::capability_map(place, read_only),
+    )?;
     let mut args: Vec<OsString> = vec![
         "--extension".into(),
         extension.into(),
         "--append-system-prompt".into(),
         visuals.into(),
+        "--append-system-prompt".into(),
+        capabilities.into(),
     ];
     match place.role {
         Role::Chat => {
@@ -108,7 +121,7 @@ mod tests {
 
     fn args_at(place: &Place) -> (crate::scratch::ScratchDir, Vec<String>) {
         let scratch = ScratchDir::new("pi-mcp-test").unwrap();
-        let args = role_args(place, scratch.path())
+        let args = role_args(place, false, scratch.path())
             .unwrap()
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -124,7 +137,16 @@ mod tests {
     #[test]
     fn a_plain_chat_keeps_pi_s_prompt_and_every_tool() {
         let (_scratch, args) = args(Role::Chat);
-        assert_eq!(args.len(), 4, "{args:?}");
+        assert_eq!(args.len(), 6, "{args:?}");
+        let map = args
+            .iter()
+            .find(|arg| arg.ends_with("zeron-capabilities.md"))
+            .expect("the capability map");
+        assert!(
+            std::fs::read_to_string(map)
+                .unwrap()
+                .contains("Zeron main chat")
+        );
         assert!(flag(&args, "--extension").is_some_and(|f| f.ends_with("zeron-mcp.mjs")));
         assert!(
             flag(&args, "--append-system-prompt").is_some_and(|f| f.ends_with("zeron-visuals.md"))
@@ -200,10 +222,18 @@ mod tests {
 
     #[test]
     fn the_prompts_name_only_zeron_tools_that_exist() {
-        let prompts = [
+        let mut prompts = vec![
             orchestrator::ROOT_SYSTEM_PROMPT.to_owned(),
             orchestrator::member_prompt(&at(Role::Member { depth: 1 }, Some("orchestrator-r"))),
         ];
+        for role in [Role::Chat, Role::Root, Role::Member { depth: 1 }] {
+            for read_only in [false, true] {
+                prompts.push(super::super::capabilities::capability_map(
+                    &at(role, Some("parent-1")),
+                    read_only,
+                ));
+            }
+        }
         let known = [
             "whoami",
             "list_projects",
@@ -218,6 +248,7 @@ mod tests {
             "interrupt_chat",
             "board_post",
             "board_read",
+            "show_visual",
         ];
         for prompt in prompts {
             for word in prompt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
