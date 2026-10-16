@@ -1,7 +1,12 @@
 //! Settings → Voice: the speech-to-text provider, its API key, model,
 //! language, microphone, filler-word cleanup and the trigger phrase, then
-//! voice mode's providers ([`voice_mode`]). Keys live in `stt-keys.json`
-//! beside the settings file, never in `ui-settings.json`.
+//! voice mode's providers ([`voice_mode`]).
+//!
+//! Keys come from Settings → API keys first (`zeron_engine::api_keys`, read
+//! fresh per dictation and per call, so switching a key there applies to the
+//! next one), then from `stt-keys.json` beside the settings file, never from
+//! `ui-settings.json`. A key saved on this page is written to both, and
+//! becomes its provider's active key.
 use crate::{
     composer::{ComposerInput, ComposerInputEvent},
     popover,
@@ -40,8 +45,30 @@ struct VoiceGlobal {
 }
 impl Global for VoiceGlobal {}
 pub(crate) fn init(root: PathBuf, cx: &mut App) {
-    let card = cx.new(|cx| VoiceCard::new(root.join(KEYS_FILE), cx));
+    let card = cx.new(|cx| {
+        let mut card = VoiceCard::new(root.join(KEYS_FILE), cx);
+        // Tests never reach the real Pi agent directory; one that needs the
+        // store sets its own.
+        if !cfg!(test) {
+            card.central = Some(zeron_engine::agent_accounts::default_pi_agent_dir());
+        }
+        card
+    });
     cx.set_global(VoiceGlobal { card });
+}
+
+/// A voice key's provider in Settings → API keys: Gemini's key is Google's.
+pub(crate) fn store_name(name: &str) -> &str {
+    match name {
+        "gemini" => "google",
+        other => other,
+    }
+}
+
+/// The key called `name`: Settings → API keys' active key for it, else
+/// the one saved on this page.
+pub(crate) fn key_for(cx: &App, name: &str) -> Option<String> {
+    cx.try_global::<VoiceGlobal>()?.card.read(cx).key(name)
 }
 /// Dictation is on once the selected provider has a key.
 pub(crate) fn enabled(cx: &App) -> bool {
@@ -50,13 +77,7 @@ pub(crate) fn enabled(cx: &App) -> bool {
 /// What the dictation worker needs, or `None` without a key.
 pub(crate) fn config(cx: &App) -> Option<Config> {
     let saved = settings::current(cx);
-    let api_key = cx
-        .try_global::<VoiceGlobal>()?
-        .card
-        .read(cx)
-        .keys
-        .get(saved.stt_provider.key_name())?
-        .clone();
+    let api_key = key_for(cx, saved.stt_provider.key_name())?;
     Some(Config {
         provider: saved.stt_provider,
         api_key,
@@ -99,6 +120,10 @@ pub(crate) struct VoiceCard {
     scroll: widgets::PageScroll,
     keys_path: PathBuf,
     keys: BTreeMap<String, String>,
+    /// The Pi agent directory holding Settings → API keys' store; `None`
+    /// keeps this page's keys to itself (tests).
+    central: Option<PathBuf>,
+    central_reader: std::sync::OnceLock<zeron_engine::api_keys::Reader>,
     key_input: Entity<ComposerInput>,
     phrase_input: Entity<ComposerInput>,
     /// Voice mode's OpenRouter key, and its Deepgram or Mistral key.
@@ -181,6 +206,8 @@ impl VoiceCard {
             scroll: widgets::PageScroll::default(),
             keys: load_keys(&keys_path),
             keys_path,
+            central: None,
+            central_reader: std::sync::OnceLock::new(),
             key_input,
             phrase_input,
             openrouter_input,
@@ -211,6 +238,64 @@ impl VoiceCard {
         self.store_key(name, key, &input, cx);
     }
 
+    /// The key called `name`: the central store's, else this page's.
+    pub(crate) fn key(&self, name: &str) -> Option<String> {
+        self.central
+            .as_ref()
+            .and_then(|dir| {
+                self.central_reader
+                    .get_or_init(|| {
+                        zeron_engine::api_keys::Reader::new(
+                            dir.join(zeron_engine::api_keys::STORE_FILE),
+                        )
+                    })
+                    .key(store_name(name))
+            })
+            .or_else(|| self.keys.get(name).cloned())
+            .filter(|key| !key.trim().is_empty())
+    }
+
+    pub(crate) fn has_key(&self, name: &str) -> bool {
+        self.key(name).is_some()
+    }
+
+    /// Mirror a save or removal into Settings → API keys: a saved key
+    /// becomes its provider's active key; a removed one leaves the store.
+    fn sync_central(&self, name: &str, key: Option<&str>, old: Option<&str>) -> Result<(), String> {
+        use zeron_engine::api_keys::{AddParams, ApiKeys, KeyRef, Store, key_id, sanitize};
+        let Some(dir) = &self.central else {
+            return Ok(());
+        };
+        let keys = ApiKeys::new(dir.clone(), None);
+        let provider = store_name(name).to_owned();
+        let saved = Store::load(&keys.store_path()).map_err(|e| e.to_string())?;
+        let has = |secret: &str| {
+            let id = key_id(&sanitize(secret));
+            saved
+                .providers
+                .get(&provider)
+                .is_some_and(|p| p.keys.iter().any(|k| k.id == id))
+                .then_some(id)
+        };
+        let result = match (key, old) {
+            (Some(key), _) => match has(key) {
+                Some(id) => keys.set_active(KeyRef { provider, id }),
+                None => keys.add(AddParams {
+                    provider,
+                    label: "Voice".into(),
+                    secret: key.to_owned(),
+                    activate: true,
+                }),
+            },
+            (None, Some(old)) => match has(old) {
+                Some(id) => keys.remove(KeyRef { provider, id }),
+                None => return Ok(()),
+            },
+            (None, None) => return Ok(()),
+        };
+        result.map(|_| ()).map_err(|e| e.to_string())
+    }
+
     /// Save or remove the key called `name`, clearing `input` once saved.
     fn store_key(
         &mut self,
@@ -219,6 +304,10 @@ impl VoiceCard {
         input: &Entity<ComposerInput>,
         cx: &mut Context<Self>,
     ) {
+        let old = self.key(name);
+        if let Err(error) = self.sync_central(name, key.as_deref(), old.as_deref()) {
+            self.error = Some(format!("Could not update Settings → API keys: {error}"));
+        }
         let mut keys = self.keys.clone();
         match key {
             Some(key) => keys.insert(name.to_owned(), key),
@@ -429,7 +518,7 @@ impl Render for VoiceCard {
             })
             .render(&self.provider_select, cx);
 
-        let has_key = self.keys.contains_key(provider.key_name());
+        let has_key = self.has_key(provider.key_name());
         let save_key = widgets::text_action(&theme, widgets::ActionTone::Outlined, "Save")
             .id("voice-key-save")
             .tab_index(0)
@@ -767,6 +856,50 @@ mod tests {
             let (options, selected) = card.input_options(Some("coreaudio:gone"));
             assert_eq!((options.len(), selected), (4, 3));
         });
+    }
+    #[gpui::test]
+    fn voice_keys_live_in_settings_api_keys(cx: &mut gpui::TestAppContext) {
+        use zeron_engine::api_keys::{AddParams, ApiKeys, Store};
+        let dir = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        cx.update(|cx| settings::init(settings::UiSettings::default(), dir.path(), cx));
+        let card = cx.update(card);
+        card.update(cx, |card, cx| {
+            card.central = Some(agent.path().to_path_buf());
+            card.key_input
+                .update(cx, |input, cx| input.set_text("sk-voice-one", cx));
+            card.save_key(cx);
+            assert_eq!(card.error, None);
+        });
+        // Saved here, the key is the store's active OpenAI key, and Pi's.
+        let keys = ApiKeys::new(agent.path().to_path_buf(), None);
+        let store = || Store::load(&keys.store_path()).unwrap();
+        assert_eq!(store().key("openai"), Some("sk-voice-one"));
+        let auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(agent.path().join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["openai"]["key"], "sk-voice-one");
+        // A key switched on Settings → API keys is the next dictation's.
+        keys.add(AddParams {
+            provider: "openai".into(),
+            label: "Work".into(),
+            secret: "sk-voice-two".into(),
+            activate: true,
+        })
+        .unwrap();
+        cx.update(|cx| assert_eq!(config(cx).unwrap().api_key, "sk-voice-two"));
+        // Saving a key the store already holds switches to it.
+        card.update(cx, |card, cx| {
+            card.key_input
+                .update(cx, |input, cx| input.set_text("sk-voice-one", cx));
+            card.save_key(cx);
+        });
+        assert_eq!(store().providers["openai"].keys.len(), 2);
+        cx.update(|cx| assert_eq!(config(cx).unwrap().api_key, "sk-voice-one"));
+        // Removing it here removes it there; the other key takes over.
+        card.update(cx, |card, cx| card.set_key(None, cx));
+        assert_eq!(store().key("openai"), Some("sk-voice-two"));
+        cx.update(|cx| assert_eq!(config(cx).unwrap().api_key, "sk-voice-two"));
     }
     #[gpui::test]
     fn dictation_turns_on_with_a_key_for_the_selected_provider(cx: &mut gpui::TestAppContext) {

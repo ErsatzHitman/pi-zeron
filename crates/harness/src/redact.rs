@@ -455,6 +455,11 @@ const SECRET_PREFIXES: &[&str] = &[
     "glpat-",
     "AKIA",
     "ya29.",
+    // NVIDIA, Groq, Google and Hugging Face keys (Settings → API keys).
+    "nvapi-",
+    "gsk_",
+    "AIza",
+    "hf_",
 ];
 
 fn redact_word(word: &str, previous: &str) -> String {

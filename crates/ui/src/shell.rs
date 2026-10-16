@@ -562,17 +562,20 @@ pub enum SettingsSection {
     Archived,
     /// Tokens and spend per Pi provider and model on this machine.
     Usage,
+    /// Every provider API key Zeron and its Pi use.
+    ApiKeys,
 }
 
 impl SettingsSection {
     /// Sections shown in Settings. `Agents` is a legacy Accounts route alias.
-    pub const ALL: [SettingsSection; 11] = [
+    pub const ALL: [SettingsSection; 12] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Voice,
         SettingsSection::Shortcuts,
         SettingsSection::Harnesses,
+        SettingsSection::ApiKeys,
         SettingsSection::Usage,
         SettingsSection::Devices,
         SettingsSection::Files,
@@ -621,6 +624,7 @@ impl SettingsSection {
             SettingsSection::Appshots => "appshots",
             SettingsSection::Archived => "archived",
             SettingsSection::Usage => "usage",
+            SettingsSection::ApiKeys => "api-keys",
         }
     }
 
@@ -639,6 +643,7 @@ impl SettingsSection {
             "appshots" => SettingsSection::Appshots,
             "archived" => SettingsSection::Archived,
             "usage" => SettingsSection::Usage,
+            "api-keys" | "keys" => SettingsSection::ApiKeys,
             _ => return None,
         })
     }
@@ -665,6 +670,7 @@ impl SettingsSection {
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Usage => "Usage",
+            SettingsSection::ApiKeys => "API keys",
         }
     }
 }
@@ -2118,6 +2124,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     usage_page: Option<Entity<UsagePage>>,
+    api_keys_page: Option<Entity<crate::settings::api_keys::ApiKeysPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
@@ -2673,6 +2680,7 @@ impl Shell {
             devices_page: None,
             archived_page: None,
             usage_page: None,
+            api_keys_page: None,
             appearance_page: None,
             files_settings_page: None,
             notifications_page: None,
@@ -5429,6 +5437,12 @@ impl Shell {
         if section == SettingsSection::Usage {
             self.usage_page = None;
         }
+        // Each visit shows the key router's latest health.
+        if section == SettingsSection::ApiKeys
+            && let Some(page) = &self.api_keys_page
+        {
+            page.update(cx, |page, cx| page.refresh(cx));
+        }
         if !matches!(self.route, Route::Settings(_)) {
             self.settings_focus_pending = true;
             self.settings_return_route = self.route;
@@ -5868,6 +5882,18 @@ impl Shell {
                     self.archived_page = Some(cx.new(|cx| ArchivedPage::new(state, cx)));
                 }
                 match &self.archived_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::ApiKeys => {
+                if self.api_keys_page.is_none() {
+                    let state = self.state.clone();
+                    self.api_keys_page = Some(cx.new(|cx| {
+                        crate::settings::api_keys::ApiKeysPage::new(state, cx)
+                    }));
+                }
+                match &self.api_keys_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -8045,6 +8071,7 @@ impl Shell {
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Usage => icons::CHART,
+            SettingsSection::ApiKeys => icons::KEY_MINIMALISTIC,
         };
         settings::widgets::scroll_faded(
             "settings-nav-scroll",
@@ -18780,6 +18807,7 @@ mod settings_modal_regressions {
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/archived", SettingsSection::Archived),
             ("settings/usage", SettingsSection::Usage),
+            ("settings/api-keys", SettingsSection::ApiKeys),
         ] {
             assert_eq!(
                 settings_open_route(route, remembered),

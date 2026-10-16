@@ -131,7 +131,7 @@ pub(crate) fn status_failure(label: &str, status: u16) -> Failure {
     match status {
         401 | 403 => Failure::new(
             true,
-            format!("The {label} API key was rejected. Check it in Settings → Voice."),
+            format!("The {label} API key was rejected. Check it in Settings → API keys."),
         ),
         402 => Failure::new(
             true,

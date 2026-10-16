@@ -106,7 +106,7 @@ pub fn transcribe(config: &Config, samples: Vec<f32>, rate: u32) -> Result<Strin
     }
     let label = config.provider.label();
     if config.api_key.trim().is_empty() {
-        bail!("Add a {label} API key in Settings → Voice.")
+        bail!("Add a {label} API key in Settings → API keys.")
     }
     let wav = wav(&resample::for_model(samples, rate)?);
     tokio::runtime::Builder::new_current_thread()
@@ -188,7 +188,7 @@ async fn request(client: &reqwest::Client, config: &Config, wav: Vec<u8>) -> Res
 
 fn status_message(label: &str, status: u16) -> String {
     match status {
-        401 | 403 => format!("The {label} API key was rejected. Check it in Settings → Voice."),
+        401 | 403 => format!("The {label} API key was rejected. Check it in Settings → API keys."),
         429 => format!("{label} is rate limiting requests. Try again in a moment."),
         413 => "This recording is too large to send.".to_owned(),
         _ => format!("{label} could not transcribe this recording (error {status})."),
@@ -374,7 +374,7 @@ mod tests {
                 .as_deref(),
             Some("Short.")
         );
-        assert!(status_message("Groq", 401).contains("Settings → Voice"));
+        assert!(status_message("Groq", 401).contains("Settings → API keys"));
         assert!(status_message("OpenAI", 429).contains("rate limiting"));
     }
 

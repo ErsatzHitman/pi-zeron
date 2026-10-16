@@ -209,12 +209,12 @@ pub async fn run(
     }
     if config.openrouter_key.trim().is_empty() {
         return Err(CallError::Provider(
-            "Add an OpenRouter API key in Settings → Voice.".into(),
+            "Add an OpenRouter API key in Settings → API keys.".into(),
         ));
     }
     if config.stt.api_key.trim().is_empty() {
         return Err(CallError::Provider(format!(
-            "Add a {} API key in Settings → Voice.",
+            "Add a {} API key in Settings → API keys.",
             config.stt.provider.label()
         )));
     }

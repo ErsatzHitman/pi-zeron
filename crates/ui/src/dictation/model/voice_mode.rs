@@ -33,13 +33,12 @@ pub(super) struct Selects {
 /// What a voice call needs from Settings → Voice, or what to add first.
 pub(crate) fn call_config(cx: &App) -> Result<call::Config, String> {
     let saved = settings::current(cx);
-    let keys = &cx
+    let card = cx
         .try_global::<VoiceGlobal>()
         .ok_or_else(|| "Voice settings are unavailable.".to_owned())?
         .card
-        .read(cx)
-        .keys;
-    let key = |name: &str| keys.get(name).cloned().unwrap_or_default();
+        .read(cx);
+    let key = |name: &str| card.key(name).unwrap_or_default();
     let barge_in = saved.voice_barge_in;
     let end_silence = Duration::from_millis(u64::from(saved.voice_pause_ms.clamp(300, 3000)));
     if saved.voice_processing == call::Processing::Realtime {
@@ -47,7 +46,7 @@ pub(crate) fn call_config(cx: &App) -> Result<call::Config, String> {
         let api_key = key(provider.key_name());
         if api_key.trim().is_empty() {
             return Err(format!(
-                "Add a {} in Settings → Voice.",
+                "Add a {} in Settings → API keys.",
                 provider.key_label()
             ));
         }
@@ -78,13 +77,13 @@ pub(crate) fn call_config(cx: &App) -> Result<call::Config, String> {
     }
     let openrouter_key = key(call::OPENROUTER_KEY);
     if openrouter_key.trim().is_empty() {
-        return Err("Add an OpenRouter API key in Settings → Voice.".into());
+        return Err("Add an OpenRouter API key in Settings → API keys.".into());
     }
     let provider = saved.voice_stt_provider;
     let stt_key = key(provider.key_name());
     if stt_key.trim().is_empty() {
         return Err(format!(
-            "Add a {} API key in Settings → Voice.",
+            "Add a {} API key in Settings → API keys.",
             provider.label()
         ));
     }
@@ -158,7 +157,7 @@ impl VoiceCard {
             .focus_visible(|s| s.border_2().border_color(theme.accent))
             .on_click(cx.listener(move |card, _, _, cx| save(card, cx)))
             .into_any_element();
-        let remove = self.keys.contains_key(name).then(|| {
+        let remove = self.has_key(name).then(|| {
             widgets::text_action(theme, widgets::ActionTone::Quiet, "Remove")
                 .id(remove_id)
                 .tab_index(0)
@@ -271,7 +270,7 @@ impl VoiceCard {
             self.realtime_key_input.clone(),
             cx,
         );
-        let key_meta = match (self.keys.contains_key(name), provider) {
+        let key_meta = match (self.has_key(name), provider) {
             (true, call::RealtimeProvider::OpenAi) => {
                 "Saved on this device, and shared with OpenAI dictation."
             }
@@ -429,7 +428,7 @@ impl VoiceCard {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let provider = saved.voice_stt_provider;
-        let has_openrouter = self.keys.contains_key(call::OPENROUTER_KEY);
+        let has_openrouter = self.has_key(call::OPENROUTER_KEY);
         let openrouter_actions = self.key_actions(
             theme,
             ("voice-mode-openrouter-save", "voice-mode-openrouter-remove"),
@@ -496,7 +495,7 @@ impl VoiceCard {
                 theme,
                 false,
                 &format!("{} API key", provider.label()),
-                if self.keys.contains_key(name) {
+                if self.has_key(name) {
                     "Saved on this device. Paste a new key to replace it.".into_any_element()
                 } else {
                     format!("Add a {} key to transcribe with it.", provider.label())

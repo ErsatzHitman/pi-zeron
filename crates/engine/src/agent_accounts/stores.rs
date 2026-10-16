@@ -553,6 +553,15 @@ fn lock_path(file: &Path) -> PathBuf {
     file.with_file_name(name)
 }
 
+/// [`merge_json_entry`] on Pi's `auth.json`, under its lock directory.
+pub(super) fn merge_pi_auth(
+    file: &Path,
+    key: &str,
+    entry: Option<&serde_json::Value>,
+) -> Result<(), EngineError> {
+    merge_json_entry(file, key, entry, StoreLock::Dir(lock_path(file)))
+}
+
 /// How a JSON credential store is guarded while zeron rewrites one entry.
 pub(super) enum StoreLock {
     /// A `flock`/`LockFileEx` on this sidecar file.

@@ -59,6 +59,17 @@ pub mod methods {
     /// Turn You should know on or off (`{enabled: bool}`); replies like
     /// `GetPiSettings`.
     pub const SET_YOU_SHOULD_KNOW: &str = "SetYouShouldKnow";
+    /// Settings → API keys on this device: every provider with its keys,
+    /// masked (`ApiKeysView`). Never carries a secret.
+    pub const LIST_API_KEYS: &str = "ListApiKeys";
+    /// `{provider, label, secret, activate}`; replies like `ListApiKeys`.
+    pub const ADD_API_KEY: &str = "AddApiKey";
+    /// `{provider, id, label?, secret?, disabled?}`; replies like `ListApiKeys`.
+    pub const UPDATE_API_KEY: &str = "UpdateApiKey";
+    /// `{provider, id}`: the key used from now on; replies like `ListApiKeys`.
+    pub const SET_ACTIVE_API_KEY: &str = "SetActiveApiKey";
+    /// `{provider, id}`; replies like `ListApiKeys`.
+    pub const REMOVE_API_KEY: &str = "RemoveApiKey";
     /// A chat's live extension UI (`ExtensionUiState` frames) on its host
     /// device; while any watcher is connected, Pi's extensions render rich
     /// elements instead of dialogs. Gated by `EXTENSION_UI_V1`.

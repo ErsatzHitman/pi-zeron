@@ -24,7 +24,7 @@ Pi never waits for the voice. Nothing pauses it after a spoken update.
 
 ## Starting a call
 
-When the draft is empty, the composer's send button is the voice orb. Typing, attaching or dictating morphs it back into the send arrow, and clearing the draft brings the orb back. The orb only appears once Settings → Voice has the keys it needs. The sidebar microphone also starts a call.
+When the draft is empty, the composer's send button is the voice orb. Typing, attaching or dictating morphs it back into the send arrow, and clearing the draft brings the orb back. The orb only appears once the keys it needs are set, on Settings → Voice or Settings → API keys. The sidebar microphone also starts a call.
 
 Pressing the orb starts a call and opens the full-window stage. The call keeps running when the user moves to another chat or to Settings. Esc hides the stage; the orb (or the sidebar orb) brings it back. The call ends when the user hangs up, the engine connection is lost, or a provider rejects a key or runs out of credit.
 
@@ -55,7 +55,7 @@ Rows for the other mode are hidden. **Interrupt by speaking** applies to both.
 | Region | Qwen only: International (Singapore, `dashscope-intl.aliyuncs.com`) or China (Beijing, `dashscope.aliyuncs.com`), matching where the key was issued. |
 | Turn-taking | Patient, Balanced (default) or Quick: how long the model waits after a pause before answering. OpenAI: semantic VAD eagerness low, medium or high. Gemini and Qwen: 1.2, 0.8 or 0.5 seconds of silence. |
 
-The microphone is the one chosen for dictation. Keys are stored in `stt-keys.json` in Zeron's data directory, next to the dictation keys and never in `ui-settings.json`. Removing a key hides the orb.
+The microphone is the one chosen for dictation. Keys come from [Settings → API keys](api-keys.md) (Gemini's is the `google` provider there), read when a call starts, with `stt-keys.json` in Zeron's data directory as the fallback. A key saved on this page is added there and made active; neither file is `ui-settings.json`. Removing a key hides the orb.
 
 ## Speaking a prompt
 

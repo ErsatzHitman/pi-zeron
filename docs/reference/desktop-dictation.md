@@ -1,6 +1,6 @@
 # Desktop dictation
 
-Settings → Voice turns on the composer microphone: choose a provider (OpenAI or Groq), paste its API key and press Save. The microphone appears once the selected provider has a key. Zeron ships no speech model and downloads none. Speaking prompts to Pi and hearing its messages read aloud is a separate feature: see [Voice mode](voice-mode.md).
+Settings → Voice turns on the composer microphone: choose a provider (OpenAI or Groq), paste its API key and press Save (or add the key under Settings → API keys). The microphone appears once the selected provider has a key. Zeron ships no speech model and downloads none. Speaking prompts to Pi and hearing its messages read aloud is a separate feature: see [Voice mode](voice-mode.md).
 
 Dictation is hold to talk: hold the microphone (or Enter/Space while it is focused) or the **Hold to dictate** shortcut (default Cmd/Ctrl+D), and release to transcribe. Releasing outside the microphone still counts; for the shortcut, letting go of its key or any of its modifiers ends the hold, since macOS does not deliver key-up for Command chords. A release within 300 ms is treated as a tap and explains hold to talk instead of transcribing. Assistive-technology Click cannot hold, so it starts and then finishes. Recording is limited to one minute. Release sends the recording to the provider and inserts the text into the selected draft range. It never invokes an agent or submits on its own. Explicit Send waits for finalization, then follows the normal Send/Queue path once. If no speech is recognized, the composer explains this and preserves the draft without sending. Esc cancels; cancelling or a failed/timed-out finalization never sends. Microphone permission is requested on first use.
 
@@ -9,7 +9,7 @@ Dictation is hold to talk: hold the microphone (or Enter/Space while it is focus
 | Setting | Effect |
 | --- | --- |
 | Provider | OpenAI (`/v1/audio/transcriptions`) or Groq (`/openai/v1/audio/transcriptions`). |
-| API key | Stored in `stt-keys.json` in Zeron's data directory (owner-only on macOS and Linux), one key per provider. Never written to `ui-settings.json`. |
+| API key | The provider's active key in [Settings → API keys](api-keys.md), read at the start of every dictation, so switching keys there applies to the next one. A key saved here is added there and made active (removing it here removes it there). `stt-keys.json` in Zeron's data directory (owner-only on macOS and Linux) keeps a copy and is the fallback when the store has no key for the provider. Never written to `ui-settings.json`. |
 | Model | OpenAI: `gpt-4o-mini-transcribe` (default), `gpt-4o-transcribe`, `whisper-1`. Groq: `whisper-large-v3-turbo` (default), `whisper-large-v3`. |
 | Language | Auto-detect, or a fixed language sent as an ISO-639-1 hint. |
 | Microphone | A connected input; a disconnected selection falls back to the system default. |

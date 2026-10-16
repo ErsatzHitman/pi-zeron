@@ -56,7 +56,6 @@ const AGENTS: &str = "agents";
 const BACKGROUND: &str = "background";
 const COMPACT: &str = "compact";
 const WORKFLOW: &str = "workflow";
-const CONTEXT: &str = "context";
 /// The Compaction section's body: the bar line, a gap, the caption line and
 /// its bottom padding.
 const COMPACT_BODY_HEIGHT: f32 = 40.0;

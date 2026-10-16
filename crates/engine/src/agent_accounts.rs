@@ -100,6 +100,22 @@ mod provider_tests;
 mod stores;
 mod usage;
 
+/// Pi's agent directory as this device's engine resolves it
+/// (`PI_CODING_AGENT_DIR`, else `~/.pi/agent`).
+pub fn default_pi_agent_dir() -> PathBuf {
+    stores::default_pi_agent_dir()
+}
+
+/// Replace (or with `None` remove) Pi's `auth.json` entry for `provider`,
+/// under Pi's own lock, never over a file that does not parse.
+pub(crate) fn merge_pi_auth_entry(
+    file: &Path,
+    provider: &str,
+    entry: Option<&serde_json::Value>,
+) -> Result<(), EngineError> {
+    stores::merge_pi_auth(file, provider, entry)
+}
+
 // Claude Code's public OAuth client (the one the CLI itself uses for the manual
 // "paste the code" flow — no secret involved, PKCE carries the proof).
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -768,6 +784,21 @@ pub struct AgentAccounts {
 }
 
 impl AgentAccounts {
+    /// The Pi agent directory these accounts manage.
+    pub fn pi_agent_dir(&self) -> PathBuf {
+        self.inner.config.pi_agent_dir.clone()
+    }
+
+    /// Settings → API keys: set or clear one provider's API key in Pi's
+    /// `auth.json` (see [`crate::api_keys`]).
+    pub(crate) fn write_pi_api_key(
+        &self,
+        provider: &str,
+        entry: Option<&serde_json::Value>,
+    ) -> Result<(), EngineError> {
+        self.write_keyed_entry(HarnessId::Pi, provider, entry)
+    }
+
     pub fn new(config: AgentAccountsConfig) -> Self {
         Self::with_endpoints(config, ProbeEndpoints::default(), Default::default())
     }

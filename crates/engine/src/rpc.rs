@@ -2039,6 +2039,43 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&settings)
             }
+            methods::LIST_API_KEYS
+            | methods::ADD_API_KEY
+            | methods::UPDATE_API_KEY
+            | methods::SET_ACTIVE_API_KEY
+            | methods::REMOVE_API_KEY => {
+                use crate::api_keys::{AddParams, ApiKeys, KeyRef, UpdateParams};
+                let keys = ApiKeys::for_accounts(&self.agent_accounts);
+                let fail = |e: crate::EngineError| RpcError::Failed(e.to_string());
+                let view = match method {
+                    methods::ADD_API_KEY => {
+                        let p: AddParams = parse_params(params)?;
+                        tokio::task::spawn_blocking(move || keys.add(p))
+                    }
+                    methods::UPDATE_API_KEY => {
+                        let p: UpdateParams = parse_params(params)?;
+                        tokio::task::spawn_blocking(move || keys.update(p))
+                    }
+                    methods::SET_ACTIVE_API_KEY => {
+                        let p: KeyRef = parse_params(params)?;
+                        tokio::task::spawn_blocking(move || keys.set_active(p))
+                    }
+                    methods::REMOVE_API_KEY => {
+                        let p: KeyRef = parse_params(params)?;
+                        tokio::task::spawn_blocking(move || keys.remove(p))
+                    }
+                    _ => tokio::task::spawn_blocking(move || {
+                        if let Err(error) = keys.import_from_pi() {
+                            tracing::warn!(%error, "api keys: importing Pi's keys failed");
+                        }
+                        Ok(keys.list())
+                    }),
+                }
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(fail)?;
+                RpcReply::value(&view)
+            }
             methods::SET_TITLE_SETTINGS => {
                 let p: crate::registry::TitleSettings = parse_params(params)?;
                 self.registry

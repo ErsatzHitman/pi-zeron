@@ -287,7 +287,7 @@ fn request(rt: &Realtime) -> Result<tungstenite::handshake::client::Request, Cal
 
 fn key_rejected(provider: RealtimeProvider) -> CallError {
     CallError::Provider(format!(
-        "The {} was rejected. Check it in Settings → Voice.",
+        "The {} was rejected. Check it in Settings → API keys.",
         provider.key_label()
     ))
 }
@@ -755,7 +755,7 @@ pub(super) async fn run(
 ) -> Result<(), CallError> {
     if rt.api_key.trim().is_empty() {
         return Err(CallError::Provider(format!(
-            "Add a {} in Settings → Voice.",
+            "Add a {} in Settings → API keys.",
             rt.provider.key_label()
         )));
     }
