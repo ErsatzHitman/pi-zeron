@@ -211,6 +211,13 @@ impl PiHarness {
         // This Pi is the session itself; the guard counts the sub-agents below it.
         cmd.env_remove("ZERON_SUBAGENT_DEPTH")
             .env_remove("ZERON_PI_PID");
+        // The guard checks the installed Pi packages for updates when asked,
+        // at most twice a day across this engine's runs.
+        if guarded && package_check_due() {
+            cmd.env("ZERON_PACKAGE_CHECK", "1");
+        } else {
+            cmd.env_remove("ZERON_PACKAGE_CHECK");
+        }
         cmd.args(["--mode", "rpc", "--no-themes"])
             .args(args)
             .current_dir(cwd)
@@ -663,6 +670,20 @@ impl Harness for PiHarness {
                 .boxed(),
         )
     }
+}
+/// When a run last asked its guard for package updates (unix seconds).
+static PACKAGE_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const PACKAGE_CHECK_EVERY: u64 = 12 * 60 * 60;
+fn package_check_due() -> bool {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let last = PACKAGE_CHECKED.load(Ordering::Relaxed);
+    (last == 0 || now.saturating_sub(last) >= PACKAGE_CHECK_EVERY)
+        && PACKAGE_CHECKED
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
 }
 #[derive(Clone)]
 enum Pending {
@@ -1429,6 +1450,13 @@ impl Runner {
         }
         if let Some(completions) = catalog::completions_notice(&frame) {
             self.completions = completions;
+            return Ok(());
+        }
+        if let Some(toast) = catalog::package_updates_notice(&frame) {
+            if let Some(toast) = toast {
+                self.ui
+                    .toast(toast, zeron_proto::extension_ui::NoticeLevel::Info);
+            }
             return Ok(());
         }
         if frame["type"] == "extension_ui_request" {

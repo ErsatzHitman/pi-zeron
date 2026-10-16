@@ -167,6 +167,13 @@ Pi's terminal command; RPC mode has none. Zeron's guard extension registers it
 in the session's own Pi (not its sub-agents) and runs `ctx.reload()`, so it
 works like any extension command. The `/` menu lists it before Pi has.
 
+Installed Pi packages (extensions from `pi install`) are checked for updates
+with Pi's own check, at most twice a day per engine: Zeron sets
+`ZERON_PACKAGE_CHECK=1` on a run, and the guard extension in that session's
+Pi answers once. Any updates show as a toast in that chat, worded like the
+app's update toast ("3 Pi package updates available — … · run `pi update
+--extensions`"). Zeron never updates the packages itself.
+
 A message sent while Pi works always steers: the chat's host hands every
 queued text row to the running turn at once, in order (there is no setting
 for it). Rows with images, and rows sent while Pi waits on a question, stay

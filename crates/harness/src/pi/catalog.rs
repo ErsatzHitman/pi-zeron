@@ -93,6 +93,42 @@ pub(super) fn completions_notice(frame: &Value) -> Option<Value> {
     let answer: Value = serde_json::from_str(payload).ok()?;
     Some(answer["commands"].clone())
 }
+const PACKAGE_UPDATES_PREFIX: &str = "ZERON-PACKAGE-UPDATES ";
+/// The guard's answer to a package update check (`ZERON_PACKAGE_CHECK`),
+/// when the notify is that answer: the toast to show, if any package has one.
+pub(super) fn package_updates_notice(frame: &Value) -> Option<Option<String>> {
+    if frame["type"] != "extension_ui_request" || frame["method"] != "notify" {
+        return None;
+    }
+    let payload = frame["message"]
+        .as_str()?
+        .strip_prefix(PACKAGE_UPDATES_PREFIX)?;
+    let answer: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    let names: Vec<&str> = answer["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|package| package["name"].as_str())
+        .collect();
+    Some(package_updates_text(&names))
+}
+/// Worded like the app's own update toast.
+fn package_updates_text(names: &[&str]) -> Option<String> {
+    const SHOWN: usize = 4;
+    let first = names.first()?;
+    let hint = "run `pi update --extensions`";
+    if names.len() == 1 {
+        return Some(format!("Pi package update available — {first} · {hint}"));
+    }
+    let mut list = names[..names.len().min(SHOWN)].join(", ");
+    if names.len() > SHOWN {
+        list.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    Some(format!(
+        "{} Pi package updates available — {list} · {hint}",
+        names.len()
+    ))
+}
 /// Ask a Pi that lists the completions command for them; `Null` when it
 /// does not, or it fails to answer. Other frames go to `backlog`.
 pub(super) async fn completions(
@@ -245,6 +281,34 @@ mod tests {
         assert!(listed.iter().all(|c| !c.name.starts_with("pi_ui_")));
         assert!(listed.iter().all(|c| c.name != "claude-refusal-rewind"));
         assert!(listed.iter().any(|c| c.name == "todo"));
+    }
+
+    #[test]
+    fn package_update_answers_become_one_toast() {
+        let notice = |message: &str| {
+            package_updates_notice(&json!({"type":"extension_ui_request",
+                "method":"notify","message":message}))
+        };
+        assert_eq!(notice("Goal paused"), None, "an ordinary notice");
+        assert_eq!(
+            notice(r#"ZERON-PACKAGE-UPDATES {"v":1,"packages":[]}"#),
+            Some(None)
+        );
+        assert_eq!(
+            notice(r#"ZERON-PACKAGE-UPDATES {"v":1,"packages":[{"name":"pi-lsp"}]}"#),
+            Some(Some(
+                "Pi package update available — pi-lsp · run `pi update --extensions`".into()
+            ))
+        );
+        let many = r#"ZERON-PACKAGE-UPDATES {"v":1,"packages":[{"name":"a"},{"name":"b"},
+            {"name":"c"},{"name":"d"},{"name":"e"}]}"#;
+        assert_eq!(
+            notice(many),
+            Some(Some(
+                "5 Pi package updates available — a, b, c, d and 1 more · run `pi update --extensions`"
+                    .into()
+            ))
+        );
     }
 
     #[test]

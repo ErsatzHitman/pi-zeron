@@ -3,9 +3,9 @@
 // In a read-only session (`ZERON_READ_ONLY=1`, a delegated chat created with
 // `write: false`) it also blocks every edit, whatever the delete toggle says.
 // A guard against mistakes and model-driven changes, not a sandbox.
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { basename, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 // ---- on/off: FORCE > live file > spawn snapshot > ON
@@ -564,6 +564,22 @@ export function subagentNote(env, depth) {
     `You are not a Zeron session yourself.`;
 }
 
+// Zeron asks (`ZERON_PACKAGE_CHECK=1`, at most twice a day) which installed
+// Pi packages have updates, with Pi's own check; Zeron turns the answer into
+// a toast. Pi's library is the `index.js` beside the `cli.js` running now.
+export const PACKAGE_UPDATES_PREFIX = "ZERON-PACKAGE-UPDATES ";
+export async function packageUpdates(cwd, cli = process.argv[1]) {
+  const index = join(dirname(realpathSync(cli ?? "")), "index.js");
+  if (!existsSync(index)) return undefined;
+  const pi = await import(pathToFileURL(index).href);
+  if (typeof pi.DefaultPackageManager !== "function") return undefined;
+  const agentDir = pi.getAgentDir();
+  const settingsManager = pi.SettingsManager.create(cwd, agentDir);
+  const manager = new pi.DefaultPackageManager({ cwd, agentDir, settingsManager });
+  const updates = await manager.checkForAvailableUpdates();
+  return updates.map((u) => ({ name: u.displayName, source: u.source, scope: u.scope }));
+}
+
 export const RELOAD_DESCRIPTION = "Reload keybindings, extensions, skills, prompts, themes, and context files";
 
 export default function deleteGuard(pi) {
@@ -603,6 +619,15 @@ export default function deleteGuard(pi) {
     }
     return { systemPrompt: [event.systemPrompt, note].join("\n\n") };
   });
+  if (depth === 0 && process.env.ZERON_PACKAGE_CHECK === "1") {
+    delete process.env.ZERON_PACKAGE_CHECK;     // once: not on a reload, not in children
+    pi.on("session_start", (event, ctx) => {
+      if (event?.reason !== "startup") return;
+      packageUpdates(ctx.cwd).then((packages) => {
+        if (packages?.length) ctx.ui.notify(PACKAGE_UPDATES_PREFIX + JSON.stringify({ v: 1, packages }), "info");
+      }, () => {});
+    });
+  }
   // Pi's /reload lives in its terminal; in RPC mode only an extension's
   // command can run it. The Zeron session gets it, not its sub-agents.
   if (depth === 0 && typeof pi.registerCommand === "function") pi.registerCommand("reload", {
