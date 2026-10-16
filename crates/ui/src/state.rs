@@ -2627,6 +2627,32 @@ impl AppState {
         self.unsaved_side_chat
     }
 
+    /// An unsaved side chat runs its parent's model: until its first send
+    /// mints it, it takes `config` (the parent's, as it is now). Returns
+    /// whether anything changed.
+    pub(crate) fn inherit_side_chat_config(
+        &mut self,
+        config: Option<zeron_proto::ChatConfig>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.side_chat_harness_editable() {
+            return false;
+        }
+        let Some(pending) = self.pending_side_chat.as_mut() else {
+            return false;
+        };
+        if pending.config == config {
+            return false;
+        }
+        pending.config = config.clone();
+        let id = pending.id.clone();
+        if let Some(row) = self.chats.iter_mut().find(|chat| chat.id == id) {
+            row.config = config;
+        }
+        cx.notify();
+        true
+    }
+
     /// The harness can change until the first send snapshots it.
     /// Keep the harness fixed while createChat is in flight, including uploads.
     pub(crate) fn side_chat_harness_editable(&self) -> bool {

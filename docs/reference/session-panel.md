@@ -55,11 +55,12 @@ Pi chats only, from the `workflows` extension's `workflow:state` channel. Shown 
 
 ## btw
 
-The Session row's `+` opens a side chat in a small pane: the card's width, beside the card on its left (in the card's place while the card is away), with its own prompt bar below. It eases in and folds away quickly; it never opens the right pane. While the window has room the transcript shifts further left to clear it, as far as it can without narrowing; past that the pane floats over the transcript.
+The Session row's `+` opens a side chat in a small pane: the card's width, beside the card on its left (in the card's place while the card is away), with its prompt bar inside it at the bottom. It eases in and folds away quickly; it never opens the right pane. While the window has room the transcript shifts further left to clear it, as far as it can without narrowing; past that the pane floats over the transcript.
 
-- Its header shows the side chat's title (a spinner while it works) and three buttons: **Side chats** lists the conversation's side chats, newest activity first (click one to show it in the pane, right-click for the chat menu); **Open as tab** moves the chat to a right-pane tab; **Close**.
+- Its header shows the side chat's title (a spinner while it works) and two buttons: **Side chats** lists the conversation's side chats, newest activity first (click one to show it in the pane, right-click for the chat menu); **Close**. It has no expand button: the pane stays small.
+- The prompt bar has no model picker: the side chat runs its parent's model, following it until its first send.
 - Escape closes it while its agent is idle. A second `+` focuses the open pane.
-- The pane opens at the card's height and keeps it while the card's sections come and go.
+- The pane fits its conversation: a fresh one is its header and prompt bar, and it grows with each reply (a streaming one included) so the whole thread shows without scrolling. Only once it reaches the bottom of the window does the thread scroll, with faded edges. A send reserves no blank space for the reply, unlike the main transcript.
 - A closed pane's side chat is dropped unless it has an unsent draft, as when its tab closes. An untitled one has no row until its first send.
 - Floating the card over a narrow column closes the pane.
 
@@ -78,7 +79,7 @@ Fork chat is gone. The Files panel no longer has Subagents or Chats sections; th
 
 `shell/sidebar_children.rs` nests side chats under their parent in the sidebar ([sidebar side chats](sidebar-side-chats.md)).
 
-`shell/btw_pane.rs` hosts the btw pane: one at a time, scoped to its conversation, backed by an ordinary side chat (`side_chats.rs`) attached to no right-pane tab.
+`shell/btw_pane.rs` hosts the btw pane: one at a time, scoped to its conversation, backed by an ordinary side chat (`side_chats.rs`) attached to no right-pane tab. Its transcript runs in fit mode (`Transcript::set_fit_content`: no reply runway, `content_height` for the pane to size to), and its composer hides the model picker (`Composer::set_model_picker_hidden`); `AppState::inherit_side_chat_config` keeps an unsent side chat on its parent's model.
 
 `session_info/compact.rs` decides when Compaction shows and what it says, from the Pi harness's `zeron:compact` host channel (`CompactStatus`: on or off, the threshold, a running compaction) and the chat's context usage.
 

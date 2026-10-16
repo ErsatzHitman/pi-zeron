@@ -241,7 +241,7 @@ fn clicking_a_nested_subagent_opens_its_session(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_btw_pane_opens_at_the_cards_width_with_its_bar_below(cx: &mut TestAppContext) {
+fn the_btw_pane_opens_at_the_cards_width_with_its_bar_inside(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     init(cx, dir.path());
     let config = boot(dir.path());
@@ -293,11 +293,151 @@ fn the_btw_pane_opens_at_the_cards_width_with_its_bar_below(cx: &mut TestAppCont
     let pane = cx.debug_bounds("session-btw").expect("the btw pane");
     let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
     assert_eq!(f32::from(pane.size.width), session_info::SESSION_CARD_WIDTH);
-    assert_eq!(f32::from(bar.size.width), session_info::SESSION_CARD_WIDTH);
-    assert!(bar.origin.y >= pane.origin.y + pane.size.height);
+    // The prompt bar is inside the pane, at its bottom.
+    assert!(bar.origin.x >= pane.origin.x && bar.right() <= pane.right());
+    assert!(bar.origin.y > pane.origin.y && bar.bottom() <= pane.bottom() + px(0.5));
+    // An empty side chat is its header and prompt bar, not a blank box.
+    assert!(
+        f32::from(pane.size.height) < 160.0,
+        "an empty pane is {:?} tall",
+        pane.size.height
+    );
     // A small pane, not a sidebar: the right pane stays shut.
     assert!(
         cx.debug_bounds("right-panel")
             .is_none_or(|b| f32::from(b.size.width) < 1.0)
+    );
+}
+
+/// A shell with chat "a" open and its btw pane fully revealed.
+fn open_btw<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &std::path::Path,
+) -> (Entity<Shell>, &'a mut VisualTestContext) {
+    init(cx, dir);
+    let config = boot(dir);
+    let (shell, cx) = cx.add_window_view(|_, cx| {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.no_project = true;
+            state.selected_chat = Some("a".into());
+            state.chats = vec![chat("a", 1)];
+            state
+        });
+        let mut shell = Shell::new(state, config, cx);
+        shell.debug_gate = Some(GatePhase::Ready);
+        shell.splash = SplashPhase::Gone;
+        shell.active_chat = "a".into();
+        shell.test_time = Some(std::time::Instant::now());
+        shell
+    });
+    cx.simulate_resize(gpui::size(px(1600.0), px(900.0)));
+    cx.update(|window, cx| window.draw(cx).clear());
+    cx.update(|_, cx| shell.update(cx, |shell, cx| shell.open_btw_pane(cx)));
+    shell.update(cx, |shell, _| {
+        *shell.test_time.as_mut().unwrap() += Duration::from_secs(3);
+    });
+    (shell, cx)
+}
+
+/// Draw until the pane stops asking for frames (it follows its thread's
+/// measured height a frame behind).
+fn settle(cx: &mut VisualTestContext) {
+    for _ in 0..8 {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+            window.simulate_next_frame(cx);
+        });
+    }
+}
+
+#[gpui::test]
+fn the_btw_pane_grows_to_show_a_whole_reply(cx: &mut TestAppContext) {
+    use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+    let dir = tempfile::tempdir().unwrap();
+    let (shell, cx) = open_btw(cx, dir.path());
+    settle(cx);
+    let empty = cx.debug_bounds("session-btw").expect("the btw pane");
+    // No model picker in the pane (the main composer keeps its own): the
+    // side chat runs its parent's model.
+    assert!(
+        cx.debug_bounds("composer-model-picker")
+            .is_none_or(|picker| !empty.intersects(&picker))
+    );
+
+    let (side, transcript) = shell.read_with(cx, |shell, _| {
+        let id = shell.btw.as_ref().unwrap().side_chat;
+        let tab = &shell.side_chats[&id];
+        (tab.state.clone(), tab.transcript.clone())
+    });
+    let entry = |id: &str, role, text: &str| SessionMessageEntry {
+        id: id.into(),
+        role,
+        parts: vec![MessagePart::Text {
+            id: format!("{id}-text"),
+            text: text.into(),
+        }],
+        created_at: 0,
+        device_id: "dev".into(),
+        status: Some(MessageStatus::Complete),
+        continuation_of: None,
+        duration_ms: None,
+    };
+    let reply = (1..=4)
+        .map(|n| format!("Point {n}: the side chat's reply wraps across the narrow pane."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    side.update(cx, |state, cx| {
+        state.transcript_replayed = true;
+        state.transcript = vec![
+            entry("q", MessageRole::User, "What does this function do?"),
+            entry("r", MessageRole::Assistant, &reply),
+        ];
+        state.transcript_revision += 1;
+        cx.notify();
+    });
+    settle(cx);
+
+    let pane = cx.debug_bounds("session-btw").expect("the btw pane");
+    let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
+    let content = transcript.read_with(cx, |transcript, _| transcript.content_height());
+    assert!(content > 150.0, "the reply was laid out: {content}");
+    assert!(pane.size.height > empty.size.height + px(100.0));
+    // The whole thread fits between the header and the bar: nothing to scroll.
+    let room = f32::from(bar.origin.y - pane.origin.y) - 34.0 - 2.0;
+    assert!(content <= room + 1.0, "content {content} in {room}");
+    assert!(transcript.read_with(cx, |transcript, _| transcript.distance_from_bottom()) < 1.0);
+    // Still the bar at the bottom, inside.
+    assert!(bar.bottom() <= pane.bottom() + px(0.5));
+
+    // A thread taller than the window stops the pane at the window's room:
+    // the bar stays on screen and the thread scrolls.
+    let long = (1..=60)
+        .map(|n| format!("Line {n} of a reply far taller than the window."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    side.update(cx, |state, cx| {
+        state.transcript = vec![
+            entry("q", MessageRole::User, "What does this function do?"),
+            entry("r", MessageRole::Assistant, &long),
+        ];
+        state.transcript_revision += 1;
+        cx.notify();
+    });
+    settle(cx);
+    let pane = cx.debug_bounds("session-btw").expect("the btw pane");
+    let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
+    assert!(
+        f32::from(pane.bottom()) <= 900.0,
+        "pane ends at {:?}",
+        pane.bottom()
+    );
+    assert!(bar.bottom() <= pane.bottom() + px(0.5));
+    let content = transcript.read_with(cx, |transcript, _| transcript.content_height());
+    let room = f32::from(bar.origin.y - pane.origin.y) - 34.0 - 2.0;
+    assert!(
+        content > room,
+        "the long reply scrolls: {content} in {room}"
     );
 }

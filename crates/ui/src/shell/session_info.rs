@@ -95,8 +95,6 @@ pub(super) struct SessionPanel {
     pub(super) rename_pin: bool,
     /// The chat whose Compaction section is up, for its hysteresis.
     compact_shown: (String, bool),
-    /// The card's painted height, which the btw pane opens at.
-    card_height: Rc<Cell<f32>>,
 }
 
 /// What a section draws from: moved in each frame, kept by a section
@@ -134,10 +132,6 @@ impl DiffFrame {
 }
 
 impl SessionPanel {
-    pub(super) fn card_height(&self) -> f32 {
-        self.card_height.get()
-    }
-
     fn is_open(&self, section: &'static str) -> bool {
         !self.folded.contains(section)
     }
@@ -850,16 +844,7 @@ impl Shell {
             .bg(popover::surface_bg(&theme))
             .when(!docked && !theme.is_frost(), |card| card.shadow_lg())
             .relative()
-            .child(body)
-            .child({
-                let card_height = self.session_panel.card_height.clone();
-                gpui::canvas(
-                    move |bounds, _, _| card_height.set(f32::from(bounds.size.height)),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0()
-            });
+            .child(body);
 
         // Docked, the card slides in from the right beside the column;
         // floating, it drops in from just above. Either way it is placed from

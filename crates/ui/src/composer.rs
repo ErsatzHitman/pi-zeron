@@ -6339,6 +6339,9 @@ pub struct Composer {
     account_usage: Entity<crate::account_usage::AccountUsage>,
     /// A side chat's composer: its footer keeps only the context ring.
     pub(crate) side_chat: bool,
+    /// No model picker: the chat runs the model it inherited (a btw pane's
+    /// side chat runs its parent's).
+    model_picker_hidden: bool,
     _picker_focus: Subscription,
     _input_events: Subscription,
     _dictation_events: Subscription,
@@ -6611,6 +6614,7 @@ impl Composer {
             _pickers_observe: pickers_observe,
             account_usage,
             side_chat: false,
+            model_picker_hidden: false,
             _picker_focus: picker_focus,
             _input_events: input_events,
             _dictation_events: dictation_events,
@@ -6811,6 +6815,15 @@ impl Composer {
     pub(crate) fn set_side_chat(&mut self, cx: &mut Context<Self>) {
         self.side_chat = true;
         cx.notify();
+    }
+
+    /// Hide the model picker: sends use the chat's own model (see
+    /// [`Self::model_picker_hidden`]).
+    pub(crate) fn set_model_picker_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+        if self.model_picker_hidden != hidden {
+            self.model_picker_hidden = hidden;
+            cx.notify();
+        }
     }
 
     /// Whether the draft holds anything a close would lose: text, staged
@@ -12106,6 +12119,7 @@ impl Render for Composer {
             |width| (width - 2.0 * Theme::SPACE_LG).max(0.0),
         );
         let model_picker = div()
+            .debug_selector(|| "composer-model-picker".into())
             .min_w_0()
             .max_w(px(surface_width * 0.45))
             .relative()
@@ -12153,7 +12167,7 @@ impl Render for Composer {
                 )
             });
         let beneath_voice = 1.0 - voice_t.clamp(0.0, 1.0);
-        let model_picker = model_picker.opacity(beneath_voice);
+        let model_picker = (!self.model_picker_hidden).then(|| model_picker.opacity(beneath_voice));
         let body = if expanded {
             // Expanded: textarea on top (`px-4 pb-1 pt-4`), actions row
             // (8px bottom + 2px top, 32px chips → 42px) ABSOLUTE at the pill's
@@ -12206,7 +12220,7 @@ impl Render for Composer {
                                 .gap(px(ACTION_UTILITY_GAP))
                                 .child(attach),
                         )
-                        .child(model_picker)
+                        .children(model_picker)
                         .child(
                             div()
                                 .flex_none()
@@ -12272,14 +12286,14 @@ impl Render for Composer {
                                 .opacity(beneath_voice)
                                 .child(self.render_input_with_completion()),
                         )
-                        .child(
+                        .children(model_picker.map(|model_picker| {
                             div()
                                 .min_w_0()
                                 .max_w(px(surface_width * 0.45))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(model_picker),
-                        )
+                                .child(model_picker)
+                        }))
                         .child(
                             div()
                                 .flex_none()

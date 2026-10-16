@@ -3517,6 +3517,10 @@ pub struct Transcript {
     /// transcript's bottom (measured last frame): the last row pads past it
     /// so pinned content rests above the glass chrome it scrolls under.
     bottom_clearance: f32,
+    /// Host-driven: the host sizes this transcript to its content (a btw
+    /// pane), so a send reserves no runway for the reply; the view follows
+    /// the tail instead (see [`Self::content_height`]).
+    fit_content: bool,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
@@ -3981,6 +3985,7 @@ impl Transcript {
             selection_scroll_task: None,
             rail_enabled,
             bottom_clearance: 0.0,
+            fit_content: false,
             rail_hover: None,
             hovered_entry: None,
             copied_code: None,
@@ -4049,6 +4054,25 @@ impl Transcript {
             self.list.remeasure();
             cx.notify();
         }
+    }
+
+    /// Host-driven: size to content (see `fit_content`).
+    pub fn set_fit_content(&mut self, fit: bool, cx: &mut Context<Self>) {
+        if self.fit_content != fit {
+            self.fit_content = fit;
+            if fit {
+                self.own_turn = None;
+                self.list.set_tail_reservation(None);
+            }
+            cx.notify();
+        }
+    }
+
+    /// The rows' measured height, the whole conversation: what a host that
+    /// fits the transcript to its content sizes the viewport to. Rows not
+    /// measured yet count their height hints, or nothing.
+    pub fn content_height(&self) -> f32 {
+        f32::from(self.list.offset_for_item(self.list.item_count()))
     }
 
     pub fn set_rail_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -4141,7 +4165,7 @@ impl Transcript {
         {
             self.pending_viewport = None;
             self.list.scroll_to(restored.offset);
-            self.own_turn = restored.own_turn;
+            self.own_turn = restored.own_turn.filter(|_| !self.fit_content);
             self.own_turn_kick = self.own_turn.is_some();
             self.own_turn_last_tick = None;
             if self.own_turn.is_some() {
@@ -4462,6 +4486,13 @@ impl Transcript {
         self.spring_settled_at = None;
         self.spring_kick = false;
         self.scroll_anim = None;
+        if self.fit_content {
+            // The host grows the viewport with the reply: no runway, just
+            // follow the tail.
+            self.own_turn = None;
+            self.engage_pin(cx);
+            return;
+        }
         // A glued offset re-snaps to the end on EVERY layout — the pad would
         // land and the viewport hard-track its bottom in the same frame,
         // skipping the glide entirely (rig-traced). Pin the offset to a
@@ -4614,7 +4645,9 @@ impl Transcript {
     /// Install the reservation before list layout. Its height follows the
     /// current viewport in that same pass, including window resizes.
     fn update_runway_minimum(&mut self, cx: &gpui::App) {
-        if let Some(ix) = self.own_turn_anchor_ix() {
+        if self.fit_content {
+            self.list.set_tail_reservation(None);
+        } else if let Some(ix) = self.own_turn_anchor_ix() {
             // Revealing the prompt adds reading space; only reply growth
             // consumes the runway. Include the same expansion tween in the
             // reservation before layout, including its reverse on Show less.

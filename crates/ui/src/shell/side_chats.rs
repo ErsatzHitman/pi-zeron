@@ -464,7 +464,7 @@ mod tests {
     /// "New side chat" writes nothing: the tab opens on a chat only its
     /// first send mints, and closing it before then leaves nothing behind.
     #[gpui::test]
-    fn btw_opens_in_its_pane_and_hands_over_to_the_sidebar(cx: &mut TestAppContext) {
+    fn btw_opens_in_its_pane_with_its_parents_model(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let window = shell_window(dir.path(), cx);
         window
@@ -473,6 +473,7 @@ mod tests {
                 let main: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
                     "id": "main", "deviceId": "local",
                     "archived": false, "createdAt": Utc::now(),
+                    "config": { "harness": "pi", "model": "parent-model", "sandbox": "workspace-write" },
                 }))
                 .unwrap();
                 shell.state.update(cx, |state, _| {
@@ -483,26 +484,43 @@ mod tests {
                 shell.open_btw_pane(cx);
                 let id = shell.side_chat_seq;
                 assert!(shell.btw_holds(id));
-                assert!(shell.side_chats[&id].state.read(cx).side_chat_unsaved());
+                let side = shell.side_chats[&id].state.clone();
+                assert!(side.read(cx).side_chat_unsaved());
+                let model = |side: &Entity<AppState>, cx: &App| {
+                    side.read(cx)
+                        .selected_chat_row()
+                        .and_then(|chat| chat.config.as_ref()?.model.clone())
+                };
+                assert_eq!(model(&side, cx).as_deref(), Some("parent-model"));
                 // The right pane is left alone.
                 assert!(shell.right_tabs.get(&key).is_none_or(Vec::is_empty));
                 // A second + focuses the pane it has.
                 shell.open_btw_pane(cx);
                 assert_eq!(shell.side_chats.len(), 1);
-                // Open as tab: the same chat becomes a right-pane tab.
-                shell.btw_to_sidebar(cx);
-                assert!(!shell.btw_holds(id));
-                assert_eq!(shell.right_tabs[&key], vec![RightSurface::SideChat(id)]);
+
+                // Until its first send it follows the parent's model.
+                shell.state.update(cx, |state, _| {
+                    state.chats[0].config = Some(
+                        serde_json::from_value(serde_json::json!({
+                            "harness": "pi", "model": "switched", "sandbox": "workspace-write",
+                        }))
+                        .unwrap(),
+                    );
+                });
+                shell.btw_follow_parent_model(id, cx);
+                assert_eq!(model(&side, cx).as_deref(), Some("switched"));
+                assert_eq!(
+                    side.read(cx)
+                        .unsaved_side_chat_create(&side.read(cx).selected_chat.clone().unwrap())
+                        .unwrap()["config"]["model"],
+                    "switched"
+                );
 
                 // Closed with nothing typed, an unsaved side chat goes once
                 // the pane's exit has played.
-                shell.open_btw_pane(cx);
-                let second = shell.side_chat_seq;
-                assert_ne!(second, id);
                 assert!(shell.close_btw_pane(cx));
                 assert_eq!(shell.btw_frame(cx), None);
-                assert!(!shell.side_chats.contains_key(&second));
-                assert!(shell.side_chats.contains_key(&id));
+                assert!(!shell.side_chats.contains_key(&id));
             })
             .unwrap();
     }
