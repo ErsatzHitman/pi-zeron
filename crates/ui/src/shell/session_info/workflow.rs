@@ -7,6 +7,13 @@
 //! just ended (briefly, so its last tick is seen). Tasks group the way the
 //! Sub-agents section does: running, retrying and failed work leads, and
 //! queued and finished work folds.
+//!
+//! A v2 payload (Pi's workflows extension from `WORKFLOW_STATE_VERSION` 2)
+//! groups its tasks by phase instead, the way Claude Code's workflow card
+//! does: any number of phases in the order the script announced them (a
+//! repeated title such as a second Verify is its own phase), each with its
+//! progress dots and a table of its agents: model, tokens and time. A
+//! finished grouped run stays up longer, so its table can be read.
 
 use chrono::{DateTime, Utc};
 use zeron_proto::extension_ui::{
@@ -15,6 +22,10 @@ use zeron_proto::extension_ui::{
 
 /// How long a finished run stays up: long enough to see it end.
 const LINGER_SECS: i64 = 20;
+/// A finished run grouped by phase stays up long enough to read its table.
+const GROUPED_LINGER_SECS: i64 = 600;
+/// Dots a phase draws before they stand for more than one agent each.
+pub(super) const PHASE_DOTS: usize = 24;
 /// A run that failed and cannot be resumed stays longer, so its reason is
 /// read.
 const FAILED_LINGER_SECS: i64 = 120;
@@ -77,6 +88,16 @@ pub(super) struct TaskRow {
     pub trailing: Option<String>,
     /// Tooltip: the error, the dependencies, the model.
     pub detail: Option<String>,
+    /// The model as the payload names it (`provider/id`).
+    pub model: Option<String>,
+    /// Over every attempt.
+    pub tokens: Option<u64>,
+    /// How long a finished agent took; reused results have none.
+    pub elapsed: Option<String>,
+    /// Position in the payload's `phases`.
+    pub phase_index: Option<usize>,
+    /// A place for an agent the run has not named yet.
+    pub placeholder: bool,
 }
 
 impl TaskRow {
@@ -87,6 +108,12 @@ impl TaskRow {
             (Some(start), Some(end)) if end >= start => Some(short_duration(end - start)),
             _ => None,
         };
+        let elapsed = matches!(
+            task.state,
+            WorkflowTaskState::Done | WorkflowTaskState::Failed | WorkflowTaskState::Aborted
+        )
+        .then(|| duration.clone())
+        .flatten();
         let attempts =
             (task.max_attempts > 1).then(|| format!("{}/{}", task.attempt, task.max_attempts));
         let trailing = match task.state {
@@ -155,6 +182,28 @@ impl TaskRow {
             },
             trailing,
             detail: (!detail.is_empty()).then(|| detail.join("\n")),
+            model: task.model.as_deref().map(clean).filter(|m| !m.is_empty()),
+            tokens: task.tokens.filter(|&t| t > 0),
+            elapsed,
+            phase_index: task.phase_index.map(|i| i as usize),
+            placeholder: false,
+        }
+    }
+
+    /// A dim row for an agent the phase expects but cannot name yet.
+    fn placeholder(phase: usize, n: u32) -> Self {
+        Self {
+            id: format!("pending-{phase}-{n}"),
+            label: "agent".into(),
+            state: WorkflowTaskState::Queued,
+            started: None,
+            trailing: None,
+            detail: None,
+            model: None,
+            tokens: None,
+            elapsed: None,
+            phase_index: Some(phase),
+            placeholder: true,
         }
     }
 
@@ -167,6 +216,61 @@ impl TaskRow {
                 | WorkflowTaskState::Aborted
                 | WorkflowTaskState::Other
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PhaseState {
+    Pending,
+    Active,
+    Done,
+    /// The phase a run ended in without completing.
+    Stopped,
+}
+
+impl PhaseState {
+    fn of(state: &str) -> Self {
+        match state {
+            "active" => Self::Active,
+            "done" => Self::Done,
+            "stopped" => Self::Stopped,
+            _ => Self::Pending,
+        }
+    }
+}
+
+/// One dot of a phase's progress strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Dot {
+    Done,
+    Running,
+    Retrying,
+    Failed,
+    Pending,
+}
+
+/// One phase of a grouped run: its header and its agents.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PhaseRow {
+    /// Position in the run, which also keys its fold.
+    pub index: usize,
+    pub title: String,
+    pub state: PhaseState,
+    pub done: u32,
+    pub total: u32,
+    pub dots: Vec<Dot>,
+    pub tokens: u64,
+    /// Running agents first, then in the order they started; placeholders
+    /// last.
+    pub rows: Vec<TaskRow>,
+    /// Agents the payload counted but left out of its rows.
+    pub hidden: u32,
+}
+
+impl PhaseRow {
+    /// Open unless the user folded it: the phase in progress.
+    pub fn opens_by_default(&self) -> bool {
+        self.state == PhaseState::Active
     }
 }
 
@@ -205,6 +309,14 @@ pub(super) struct WorkflowView {
     pub pause: Option<WorkflowAction>,
     pub stop: Option<WorkflowAction>,
     pub recovery: Option<Recovery>,
+    /// The payload groups by phase: draw `phases` instead of `lead`,
+    /// `queued` and `finished`.
+    pub grouped: bool,
+    pub phases: Vec<PhaseRow>,
+    /// Agents admitted, and tokens over all of them.
+    pub agents: u32,
+    pub tokens: u64,
+    pub ended: Option<DateTime<Utc>>,
 }
 
 impl WorkflowView {
@@ -243,6 +355,11 @@ impl WorkflowView {
                     resume: Some(resume),
                     discard: action("discard").filter(|a| a.run_id == latest.run_id),
                 }),
+                grouped: false,
+                phases: Vec::new(),
+                agents: 0,
+                tokens: 0,
+                ended: None,
             });
         };
 
@@ -251,7 +368,9 @@ impl WorkflowView {
         if let Some(ended) = ended
             && !state.recovery.resumable
         {
-            let linger = if phase == RunPhase::Failed {
+            let linger = if state.grouped() {
+                GROUPED_LINGER_SECS
+            } else if phase == RunPhase::Failed {
                 FAILED_LINGER_SECS
             } else {
                 LINGER_SECS
@@ -284,13 +403,25 @@ impl WorkflowView {
         finished.reverse();
 
         let step = run.phase.as_deref().map(|title| {
-            let index = state
-                .phases
-                .iter()
-                .position(|p| p.title == title)
-                .map_or(0, |i| i + 1);
+            // A repeated title names more than one phase: the one in
+            // progress is the last that started.
+            let index = if state.grouped() {
+                state
+                    .phases
+                    .iter()
+                    .rposition(|p| p.title == title && p.state != "pending")
+            } else {
+                None
+            }
+            .or_else(|| state.phases.iter().position(|p| p.title == title))
+            .map_or(0, |i| i + 1);
             (clean(title), index, state.phases.len())
         });
+        let phases = if state.grouped() {
+            phase_rows(state, now)
+        } else {
+            Vec::new()
+        };
         let checkpoint = state.checkpoints.last().and_then(|c| {
             let when = crate::pull_requests::relative_time(at(c.at)?, now);
             Some(match c.kind.as_str() {
@@ -336,7 +467,26 @@ impl WorkflowView {
             pause: if live { action("pause") } else { None },
             stop: if live { action("stop") } else { None },
             recovery,
+            grouped: state.grouped(),
+            phases,
+            agents: if state.grouped() {
+                run.agents
+            } else {
+                state.tasks.len() as u32
+            },
+            // v2 counts every agent, rows the payload dropped included.
+            tokens: if state.grouped() {
+                run.tokens
+            } else {
+                state.tasks.iter().filter_map(|t| t.tokens).sum()
+            },
+            ended,
         })
+    }
+
+    /// How long the run took once it ended, frozen: `33s`, `2m 5s`.
+    pub fn took(&self) -> Option<String> {
+        Some(short_duration(self.ended? - self.started?))
     }
 
     /// The section's seat: when the run started.
@@ -353,6 +503,23 @@ impl WorkflowView {
 
     /// Rows the section draws before its first measurement.
     pub fn estimated_rows(&self, queued_open: bool, finished_open: bool) -> usize {
+        if self.grouped {
+            // Title, totals and "Phases", then each header (two lines) and
+            // the table of each open phase.
+            return 4
+                + self
+                    .phases
+                    .iter()
+                    .map(|p| {
+                        2 + if p.opens_by_default() {
+                            1 + p.rows.len().min(GROUP_ROWS)
+                        } else {
+                            0
+                        }
+                    })
+                    .sum::<usize>()
+                + usize::from(self.recovery.is_some());
+        }
         let groups = usize::from(!self.queued.is_empty() || self.queued_more > 0)
             + usize::from(!self.finished.is_empty());
         let open = |open: bool, rows: usize| if open { rows.min(GROUP_ROWS) } else { 0 };
@@ -362,6 +529,148 @@ impl WorkflowView {
             + open(finished_open, self.finished.len())
             + usize::from(self.recovery.is_some())
     }
+}
+
+/// The phases of a v2 payload with their agents. Headers and dots come from
+/// the phase counts, which cover every agent, so rows the payload left out
+/// never change them.
+fn phase_rows(state: &WorkflowState, now: DateTime<Utc>) -> Vec<PhaseRow> {
+    let last = state.phases.len().saturating_sub(1);
+    let mut rows: Vec<Vec<TaskRow>> = vec![Vec::new(); state.phases.len()];
+    for task in &state.tasks {
+        let row = TaskRow::of(task, now);
+        let index = row
+            .phase_index
+            .filter(|&i| i < state.phases.len())
+            .or_else(|| {
+                let title = task.phase.as_deref()?;
+                state.phases.iter().rposition(|p| p.title == title)
+            })
+            .unwrap_or(last);
+        if let Some(list) = rows.get_mut(index) {
+            list.push(row);
+        }
+    }
+    let ended = state.run.as_ref().is_some_and(|r| r.ended_at.is_some());
+    state
+        .phases
+        .iter()
+        .zip(rows)
+        .enumerate()
+        .map(|(index, (phase, mut rows))| {
+            let state_ = PhaseState::of(&phase.state);
+            // Running work first; otherwise the order agents started in.
+            rows.sort_by_key(|row| {
+                !matches!(
+                    row.state,
+                    WorkflowTaskState::Running | WorkflowTaskState::Retrying
+                )
+            });
+            let total = phase.total.max(phase.done).max(rows.len() as u32);
+            let queued = if state_ == PhaseState::Active && !ended {
+                phase.queued
+            } else {
+                0
+            };
+            let hidden = phase.agents.saturating_sub(rows.len() as u32);
+            for n in 0..queued.min(GROUP_ROWS as u32) {
+                rows.push(TaskRow::placeholder(index, n));
+            }
+            let total = total.max(phase.agents + queued);
+            PhaseRow {
+                index,
+                title: clean_or(&phase.title, "Phase"),
+                state: state_,
+                done: phase.done,
+                total,
+                dots: dots(phase, total),
+                tokens: phase.tokens,
+                rows,
+                hidden,
+            }
+        })
+        .collect()
+}
+
+/// The strip under a phase's title: done, then running, retrying, failed,
+/// then what is still to come. Past [`PHASE_DOTS`] agents a dot stands for
+/// several, rounded so every kind present keeps at least one.
+fn dots(phase: &zeron_proto::extension_ui::WorkflowPhase, total: u32) -> Vec<Dot> {
+    let counted = [
+        (Dot::Done, phase.done),
+        (Dot::Running, phase.running),
+        (Dot::Retrying, phase.retrying),
+        (Dot::Failed, phase.failed + phase.skipped),
+    ];
+    let known: u32 = counted.iter().map(|(_, n)| n).sum();
+    let pending = total.saturating_sub(known);
+    let all = counted
+        .into_iter()
+        .chain(std::iter::once((Dot::Pending, pending)));
+    let total = (known + pending) as usize;
+    if total <= PHASE_DOTS {
+        return all
+            .flat_map(|(dot, n)| std::iter::repeat_n(dot, n as usize))
+            .collect();
+    }
+    let mut out = Vec::with_capacity(PHASE_DOTS);
+    for (dot, n) in all {
+        if n == 0 {
+            continue;
+        }
+        let share = ((n as usize * PHASE_DOTS) / total).max(1);
+        out.extend(std::iter::repeat_n(dot, share));
+    }
+    // Rounding may overshoot: trim from the kind with the most dots.
+    while out.len() > PHASE_DOTS {
+        let most = [
+            Dot::Done,
+            Dot::Pending,
+            Dot::Running,
+            Dot::Failed,
+            Dot::Retrying,
+        ]
+        .into_iter()
+        .max_by_key(|d| out.iter().filter(|x| *x == d).count())
+        .unwrap_or(Dot::Pending);
+        if let Some(i) = out.iter().rposition(|d| *d == most) {
+            out.remove(i);
+        }
+    }
+    out
+}
+
+/// `941`, `86.2k`, `170.8k`, `1.5M`: Pi's `formatTokens`.
+pub(super) fn compact_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// A model id short enough for the table: `anthropic/claude-sonnet-5-5` →
+/// `Sonnet 5.5`; anything else keeps the part after its last `/`.
+pub(super) fn short_model(spec: &str) -> String {
+    let id = spec.rsplit('/').next().unwrap_or(spec);
+    let id = id.split(['@', ':']).next().unwrap_or(id);
+    if let Some(rest) = id.strip_prefix("claude-") {
+        let mut words = rest.split('-');
+        if let Some(family) = words.next() {
+            let version: Vec<&str> = words
+                .take_while(|w| w.chars().all(|c| c.is_ascii_digit()) && w.len() <= 2)
+                .collect();
+            let mut name = family[..1].to_uppercase() + &family[1..];
+            if !version.is_empty() {
+                name.push(' ');
+                name.push_str(&version.join("."));
+            }
+            return name;
+        }
+    }
+    id.to_owned()
 }
 
 fn reason_text(status: &str, reason: Option<&str>) -> String {
@@ -688,5 +997,268 @@ mod tests {
         assert_eq!(clean("a\nb\t\u{7}c"), "a b c");
         assert_eq!(clean("\u{1b}[31mred\u{1b}[0m"), "red");
         assert!(clean(&"x".repeat(1000)).chars().count() <= 301);
+    }
+
+    /// A v2 run as Pi's workflows extension publishes it: Trace, Implement,
+    /// then Verify twice, phase counts that cover rows the payload dropped.
+    fn grouped() -> serde_json::Value {
+        json!({
+            "v": 2,
+            "updatedAt": T0 + 59_000,
+            "run": {"id": "wf-2", "name": "capability-map-trace", "goal": "Trace prompts", "status": "running",
+                    "startedAt": T0, "phase": "Verify", "agents": 9, "tokens": 170_800},
+            "progress": {"total": 10, "done": 6, "running": 2, "queued": 1},
+            "phases": [
+                {"title": "Trace", "state": "done", "done": 4, "total": 4, "agents": 4, "tokens": 120_000,
+                 "startedAt": T0, "endedAt": T0 + 20_000},
+                {"title": "Implement", "state": "done", "done": 2, "total": 2, "agents": 2, "tokens": 40_000},
+                {"title": "Verify", "state": "done", "done": 0, "total": 0},
+                {"title": "Verify", "state": "active", "done": 0, "total": 4, "agents": 2, "running": 2,
+                 "queued": 2, "tokens": 10_800},
+                {"title": "Report", "state": "pending"}
+            ],
+            "tasks": [
+                {"id": "0", "label": "zeron-launch", "state": "done", "phaseIndex": 0, "model": "anthropic/claude-sonnet-5-5",
+                 "tokens": 86_200, "startedAt": T0, "endedAt": T0 + 33_000},
+                {"id": "1", "label": "pi-prompt", "state": "done", "phaseIndex": 0, "model": "anthropic/claude-sonnet-5-5",
+                 "tokens": 75_600, "startedAt": T0, "endedAt": T0 + 33_000},
+                {"id": "6", "label": "check a", "state": "running", "phaseIndex": 3, "model": "openrouter/deepseek-v4.1-flash",
+                 "tokens": 4_000, "startedAt": T0 + 50_000},
+                {"id": "7", "label": "check b", "state": "running", "phase": "Verify", "tokens": 6_800, "startedAt": T0 + 51_000},
+                {"id": "c", "label": "reused one", "state": "cached", "phaseIndex": 1, "reusedFrom": 3,
+                 "startedAt": T0 + 22_000, "endedAt": T0 + 22_000}
+            ],
+            "tasksTruncated": 4,
+            "recovery": {"actions": [{"id": "stop", "label": "Stop", "runId": "wf-2", "confirm": true}]}
+        })
+    }
+
+    #[test]
+    fn a_grouped_run_lists_every_phase_with_its_own_agents() {
+        let view = WorkflowView::of(&ui(grouped()), now()).expect("shown");
+        assert!(view.grouped);
+        assert_eq!((view.agents, view.tokens), (9, 170_800));
+        assert_eq!(
+            view.phases
+                .iter()
+                .map(|p| (p.title.as_str(), p.state, p.done, p.total))
+                .collect::<Vec<_>>(),
+            [
+                ("Trace", PhaseState::Done, 4, 4),
+                ("Implement", PhaseState::Done, 2, 2),
+                ("Verify", PhaseState::Done, 0, 0),
+                ("Verify", PhaseState::Active, 0, 4),
+                ("Report", PhaseState::Pending, 0, 0),
+            ],
+            "a repeated title is its own phase, in announce order"
+        );
+        assert_eq!(
+            view.step,
+            Some(("Verify".into(), 4, 5)),
+            "the step is the Verify in progress, not the first one"
+        );
+        let trace = &view.phases[0];
+        assert_eq!(trace.rows.len(), 2);
+        assert_eq!(trace.hidden, 2, "the counts cover rows the payload dropped");
+        assert_eq!(
+            trace.rows[0].model.as_deref().map(short_model).as_deref(),
+            Some("Sonnet 5.5")
+        );
+        assert_eq!(trace.rows[0].tokens, Some(86_200));
+        assert_eq!(trace.rows[0].elapsed.as_deref(), Some("33s"));
+        assert_eq!(
+            view.phases[1].rows[0].elapsed, None,
+            "a reused result took no time"
+        );
+        let verify = &view.phases[3];
+        assert!(verify.opens_by_default());
+        assert!(!view.phases[0].opens_by_default());
+        assert_eq!(
+            verify
+                .rows
+                .iter()
+                .map(|r| (r.label.as_str(), r.placeholder))
+                .collect::<Vec<_>>(),
+            [
+                ("check a", false),
+                ("check b", false),
+                ("agent", true),
+                ("agent", true)
+            ],
+            "a task with only a title joins the last phase of that name; queued agents are placeholders"
+        );
+        assert!(
+            verify.rows[0].started.is_some(),
+            "a running agent's time ticks"
+        );
+        assert_eq!(
+            verify.dots,
+            [Dot::Running, Dot::Running, Dot::Pending, Dot::Pending]
+        );
+        assert_eq!(trace.dots, [Dot::Done; 4]);
+        assert!(view.stop.is_some());
+        assert_eq!(view.took(), None, "a live run has no frozen time");
+    }
+
+    #[test]
+    fn a_finished_grouped_run_freezes_its_time_and_stays_to_be_read() {
+        let mut payload = grouped();
+        payload["run"]["status"] = json!("completed");
+        payload["run"]["endedAt"] = json!(T0 + 33_000);
+        payload["phases"][3]["state"] = json!("done");
+        let at = |secs: i64| DateTime::from_timestamp_millis(T0 + 33_000 + secs * 1_000).unwrap();
+        let view = WorkflowView::of(&ui(payload.clone()), at(5)).expect("shown");
+        assert_eq!(view.took().as_deref(), Some("33s"));
+        assert!(view.stop.is_none());
+        assert!(
+            view.phases.iter().all(|p| !p.opens_by_default()),
+            "an ended run opens no phase by itself"
+        );
+        assert!(
+            view.phases[3].rows.iter().all(|r| !r.placeholder),
+            "an ended run expects no more agents"
+        );
+        assert!(WorkflowView::of(&ui(payload.clone()), at(300)).is_some());
+        assert!(WorkflowView::of(&ui(payload), at(601)).is_none());
+    }
+
+    #[test]
+    fn a_v1_payload_keeps_the_lead_queued_finished_layout() {
+        let view = WorkflowView::of(&ui(running()), now()).expect("shown");
+        assert!(!view.grouped);
+        assert!(view.phases.is_empty());
+        assert!(!view.lead.is_empty());
+    }
+
+    #[test]
+    fn many_agents_share_dots_and_every_kind_keeps_one() {
+        let phase = zeron_proto::extension_ui::WorkflowPhase {
+            done: 90,
+            running: 3,
+            failed: 1,
+            total: 120,
+            ..Default::default()
+        };
+        let dots = dots(&phase, 120);
+        assert!(dots.len() <= PHASE_DOTS);
+        for kind in [Dot::Done, Dot::Running, Dot::Failed, Dot::Pending] {
+            assert!(dots.contains(&kind), "{kind:?} keeps a dot");
+        }
+        assert!(dots.iter().filter(|d| **d == Dot::Done).count() > 10);
+    }
+
+    #[test]
+    fn tokens_and_models_read_like_claude_codes_table() {
+        assert_eq!(compact_tokens(941), "941");
+        assert_eq!(compact_tokens(1_000), "1.0k");
+        assert_eq!(compact_tokens(86_200), "86.2k");
+        assert_eq!(compact_tokens(170_800), "170.8k");
+        assert_eq!(compact_tokens(1_500_000), "1.5M");
+        assert_eq!(short_model("anthropic/claude-sonnet-5-5"), "Sonnet 5.5");
+        assert_eq!(short_model("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(short_model("claude-haiku-5-5-20260101"), "Haiku 5.5");
+        assert_eq!(
+            short_model("clinepass/cline-pass/deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(short_model("gpt-5.5"), "gpt-5.5");
+    }
+
+    /// Every frame Pi's workflows extension published for a run of Trace (4
+    /// agents at once), Implement (one agent retried after a 429), Verify,
+    /// Verify again and Report, driven through its real state code.
+    #[test]
+    fn a_dynamic_run_renders_phase_by_phase_frame_by_frame() {
+        let views = replay_grouped(include_str!(
+            "../../../tests/fixtures/workflow-dynamic-run.json"
+        ));
+        let last = views.last().unwrap();
+        assert_eq!(last.phase, RunPhase::Completed);
+        assert_eq!((last.agents, last.tokens), (12, 445_085));
+        assert_eq!(
+            last.phases
+                .iter()
+                .map(|p| (p.title.as_str(), p.done, p.total))
+                .collect::<Vec<_>>(),
+            [
+                ("Trace", 4, 4),
+                ("Implement", 2, 2),
+                ("Verify", 3, 3),
+                ("Verify", 2, 2),
+                ("Report", 1, 1)
+            ]
+        );
+        assert!(last.took().is_some());
+        // Mid-run the retried agent's tokens only grow, and a phase waiting
+        // on a slot shows a placeholder for the agent to come.
+        let retried: Vec<u64> = views
+            .iter()
+            .filter_map(|v| {
+                v.phases
+                    .iter()
+                    .flat_map(|p| &p.rows)
+                    .find(|r| r.label == "implement:phase-view")?
+                    .tokens
+            })
+            .collect();
+        assert!(retried.windows(2).all(|w| w[0] <= w[1]), "{retried:?}");
+        assert!(
+            views.iter().any(|v| v
+                .phases
+                .iter()
+                .any(|p| p.rows.iter().any(|r| r.placeholder))),
+            "a queued agent shows as a placeholder"
+        );
+    }
+
+    /// The same script stopped mid-Implement: that phase reads stopped, its
+    /// agents failed, and nothing past it opens or waits.
+    #[test]
+    fn a_stopped_dynamic_run_ends_where_it_stopped() {
+        let views = replay_grouped(include_str!(
+            "../../../tests/fixtures/workflow-dynamic-stopped.json"
+        ));
+        let last = views.last().unwrap();
+        assert_eq!(last.phase, RunPhase::Stopped);
+        assert_eq!(last.phases[1].state, PhaseState::Stopped);
+        assert!(
+            last.phases[2..]
+                .iter()
+                .all(|p| p.state == PhaseState::Pending)
+        );
+        assert!(last.phases.iter().all(|p| !p.opens_by_default()));
+        assert!(last.stop.is_none());
+    }
+
+    /// Checks every frame: it shows, each phase's rows are its own, and no
+    /// phase ever claims more done than total.
+    fn replay_grouped(fixture: &str) -> Vec<WorkflowView> {
+        let fixture: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        fixture["run"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|frame| {
+                let at =
+                    DateTime::from_timestamp_millis(frame["updatedAt"].as_i64().unwrap()).unwrap();
+                let view = WorkflowView::of(&ui(frame.clone()), at).expect("every frame shows");
+                assert!(view.grouped);
+                assert_eq!(view.phases.len(), frame["phases"].as_array().unwrap().len());
+                for phase in &view.phases {
+                    assert!(phase.done <= phase.total, "{phase:?}");
+                    assert!(phase.dots.len() <= PHASE_DOTS);
+                    for row in &phase.rows {
+                        assert_eq!(row.phase_index.unwrap_or(phase.index), phase.index);
+                    }
+                }
+                let active = view
+                    .phases
+                    .iter()
+                    .filter(|p| p.state == PhaseState::Active)
+                    .count();
+                assert!(active <= 1, "one phase at a time");
+                view
+            })
+            .collect()
     }
 }

@@ -94,6 +94,10 @@ pub struct WorkflowRun {
     pub dry_run: bool,
     pub resumed: bool,
     pub phase: Option<String>,
+    /// Agent calls admitted so far, cached ones included (v2).
+    pub agents: u32,
+    /// Tokens over every agent, retries included (v2).
+    pub tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,10 +117,23 @@ pub struct WorkflowProgress {
 #[serde(default, rename_all = "camelCase")]
 pub struct WorkflowPhase {
     pub title: String,
-    /// `pending`, `active` or `done`.
+    /// `pending`, `active`, `done` or `stopped` (the phase a run ended in
+    /// without completing).
     pub state: String,
     pub done: u32,
     pub total: u32,
+    /// From here on v2: one entry per announced phase, a repeated title
+    /// included, so the array position is the phase's index.
+    pub started_at: Option<u64>,
+    pub ended_at: Option<u64>,
+    pub tokens: u64,
+    pub agents: u32,
+    pub running: u32,
+    pub retrying: u32,
+    pub failed: u32,
+    pub skipped: u32,
+    /// Agents known to be coming that have no name yet.
+    pub queued: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +173,11 @@ pub struct WorkflowTask {
     pub next_attempt_at: Option<u64>,
     pub error: Option<WorkflowTaskError>,
     pub model: Option<String>,
+    /// Over every attempt (v2).
     pub tokens: Option<u64>,
+    /// Position in `phases` (v2).
+    pub phase_index: Option<u32>,
+    pub tools: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,7 +237,12 @@ pub struct WorkflowAction {
 
 impl WorkflowState {
     pub fn of(ui: &ExtensionUiState) -> Option<Self> {
-        serde_json::from_value(ui.channels.get(WORKFLOW_STATE_CHANNEL)?.clone()).ok()
+        Self::deserialize(ui.channels.get(WORKFLOW_STATE_CHANNEL)?).ok()
+    }
+
+    /// The payload groups its tasks by phase (v2 and later).
+    pub fn grouped(&self) -> bool {
+        self.v >= 2
     }
 
     /// The run is executing (not paused, not finished).
@@ -589,7 +615,10 @@ impl PiUiField {
         }
     }
     pub fn initial_checked(&self) -> bool {
-        self.value.as_ref().and_then(Value::as_bool).unwrap_or(false)
+        self.value
+            .as_ref()
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -963,9 +992,7 @@ pub fn section_text(section: &PiUiSection) -> Vec<String> {
         PiUiSection::Table { columns, rows, .. } => std::iter::once(columns.join(" | "))
             .chain(rows.iter().map(|row| row.join(" | ")))
             .collect(),
-        PiUiSection::Diff { unified_diff, .. } => {
-            unified_diff.lines().map(str::to_owned).collect()
-        }
+        PiUiSection::Diff { unified_diff, .. } => unified_diff.lines().map(str::to_owned).collect(),
         PiUiSection::Form { fields, .. } => fields
             .iter()
             .map(|field| {
@@ -993,6 +1020,40 @@ pub fn section_text(section: &PiUiSection) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn workflow_state_v2_groups_by_phase_and_v1_reads_ungrouped() {
+        let mut ui = ExtensionUiState::default();
+        ui.channels.insert(
+            WORKFLOW_STATE_CHANNEL.into(),
+            json!({"v": 2, "run": {"id": "r", "agents": 4, "tokens": 170_800},
+                   "phases": [{"title": "Trace", "state": "active", "done": 1, "total": 4,
+                               "running": 3, "queued": 1, "tokens": 9, "agents": 3, "startedAt": 5}],
+                   "tasks": [{"id": "0", "phaseIndex": 0, "tools": 7, "tokens": 9}]}),
+        );
+        let state = WorkflowState::of(&ui).unwrap();
+        assert!(state.grouped());
+        let run = state.run.as_ref().unwrap();
+        assert_eq!((run.agents, run.tokens), (4, 170_800));
+        let phase = &state.phases[0];
+        assert_eq!(
+            (phase.running, phase.queued, phase.agents, phase.started_at),
+            (3, 1, 3, Some(5))
+        );
+        assert_eq!(
+            (state.tasks[0].phase_index, state.tasks[0].tools),
+            (Some(0), Some(7))
+        );
+
+        ui.channels.insert(
+            WORKFLOW_STATE_CHANNEL.into(),
+            json!({"v": 1, "phases": [{"title": "Find"}], "tasks": [{"id": "0"}]}),
+        );
+        let state = WorkflowState::of(&ui).unwrap();
+        assert!(!state.grouped());
+        assert_eq!(state.tasks[0].phase_index, None);
+        assert_eq!(state.phases[0].agents, 0);
+    }
 
     #[test]
     fn workflow_state_parses_the_extension_payload_and_tolerates_drift() {
@@ -1211,7 +1272,10 @@ mod tests {
             el.text_lines(),
             vec!["Background bash · 1 running", "[running] npm test — 3s"]
         );
-        assert_eq!(el.rows[0].actions[0].confirm.as_deref(), Some("Kill this job?"));
+        assert_eq!(
+            el.rows[0].actions[0].confirm.as_deref(),
+            Some("Kill this job?")
+        );
     }
 
     #[test]
@@ -1219,10 +1283,14 @@ mod tests {
         let el = |value: Value| serde_json::from_value::<PiUiElement>(value).unwrap();
         let ask = el(json!({"id":"question","ns":"ask-user","kind":"panel","placement":"sheet"}));
         let btw = el(json!({"id":"thread","ns":"btw","kind":"panel","placement":"screen"}));
-        let advisor = el(json!({"id":"panel","ns":"advisor-live-panel","kind":"panel",
-            "placement":"pinned","sections":[{"kind":"status","text":"failed","tone":"error"}]}));
-        let jobs = el(json!({"id":"jobs","ns":"bash","kind":"roster","placement":"pinned",
-            "rows":[{"id":"j1","label":"npm test","state":"done"}]}));
+        let advisor = el(
+            json!({"id":"panel","ns":"advisor-live-panel","kind":"panel",
+            "placement":"pinned","sections":[{"kind":"status","text":"failed","tone":"error"}]}),
+        );
+        let jobs = el(
+            json!({"id":"jobs","ns":"bash","kind":"roster","placement":"pinned",
+            "rows":[{"id":"j1","label":"npm test","state":"done"}]}),
+        );
         let mode = el(json!({"id":"mode","ns":"plan","kind":"status","placement":"status"}));
         assert!(ask.is_prompt() && btw.is_prompt());
         assert!(!advisor.is_prompt() && !jobs.is_prompt() && !mode.is_prompt());

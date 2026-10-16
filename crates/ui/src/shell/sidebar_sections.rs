@@ -91,7 +91,11 @@ impl Shell {
             true
         } else {
             if !self.state.read(cx).sidebar_preferences.can_edit() {
-                self.show_notice(crate::toast::ToastKind::Error, "Sidebar is still syncing. Try again shortly.", cx);
+                self.show_notice(
+                    crate::toast::ToastKind::Error,
+                    "Sidebar is still syncing. Try again shortly.",
+                    cx,
+                );
                 cx.notify();
                 return false;
             }
@@ -862,6 +866,112 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+    }
+
+    /// A frame of Pi's v2 replay fixture, its clock moved to now.
+    fn dynamic_frame(index: usize) -> serde_json::Value {
+        fn shift(value: &mut serde_json::Value, by: i64) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, field) in map.iter_mut() {
+                        if (key.ends_with("At") || key == "at")
+                            && let Some(ms) = field.as_i64()
+                        {
+                            *field = serde_json::json!(ms + by);
+                        } else {
+                            shift(field, by);
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(|v| shift(v, by)),
+                _ => {}
+            }
+        }
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/workflow-dynamic-run.json"
+        ))
+        .unwrap();
+        let mut frame = fixture["run"][index].clone();
+        let by = chrono::Utc::now().timestamp_millis() - frame["updatedAt"].as_i64().unwrap();
+        shift(&mut frame, by);
+        frame
+    }
+
+    #[gpui::test]
+    fn a_grouped_workflow_draws_its_phases_and_their_agents(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                prepare(shell, cx);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                shell.settings.sidebar_collapsed = true;
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("regular".into()));
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1600.0), px(1400.0)));
+        cx.run_until_parked();
+
+        // Mid-run: Trace and Implement done, the first Verify running two
+        // agents with a third waiting for a slot.
+        set_workflow_state(&window, &mut cx, dynamic_frame(15));
+        let card = cx.debug_bounds("session-info").unwrap();
+        for id in [
+            "session-info-workflow-header",
+            "session-info-workflow-totals",
+            "session-info-workflow-stop",
+            "session-info-workflow-phase-0",
+            "session-info-workflow-phase-0-dots",
+            "session-info-workflow-phase-1",
+            "session-info-workflow-phase-2",
+            "session-info-workflow-phase-2-table",
+            "session-info-workflow-task-6",
+            "session-info-workflow-task-7",
+            "session-info-workflow-task-pending-2-0",
+            "session-info-workflow-phase-3",
+        ] {
+            let bounds = cx.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
+            assert!(card.contains(&bounds.center()), "{id}");
+        }
+        // The v1 layout is not drawn for a grouped run.
+        assert!(cx.debug_bounds("session-info-workflow-progress").is_none());
+        assert!(cx.debug_bounds("session-info-workflow-finished").is_none());
+        // Finished phases are folded; a click opens one, and another closes it.
+        assert!(cx.debug_bounds("session-info-workflow-task-0").is_none());
+        click_on(&mut cx, "session-info-workflow-phase-0");
+        assert!(cx.debug_bounds("session-info-workflow-task-0").is_some());
+        assert!(
+            cx.debug_bounds("session-info-workflow-phase-0-table")
+                .is_some()
+        );
+        click_on(&mut cx, "session-info-workflow-phase-0");
+        assert!(cx.debug_bounds("session-info-workflow-task-0").is_none());
+        // Folding the phase in progress sticks across frames.
+        click_on(&mut cx, "session-info-workflow-phase-2");
+        assert!(cx.debug_bounds("session-info-workflow-task-6").is_none());
+        set_workflow_state(&window, &mut cx, dynamic_frame(16));
+        assert!(cx.debug_bounds("session-info-workflow-task-6").is_none());
+        // The next round of Verify is its own phase, open while it runs.
+        set_workflow_state(&window, &mut cx, dynamic_frame(19));
+        assert!(cx.debug_bounds("session-info-workflow-task-9").is_some());
+        assert!(cx.debug_bounds("session-info-workflow-task-10").is_some());
+        // Stop asks first, as in the ungrouped layout.
+        click_on(&mut cx, "session-info-workflow-stop");
+        assert!(cx.debug_bounds("session-info-workflow-stop").is_some());
+        let armed = window
+            .update(&mut cx, |shell, _, _| shell.session_panel_armed_stop())
+            .unwrap();
+        assert!(armed.is_some_and(|key| key.ends_with("/stop")));
+
+        // Done: no Stop, the time freezes, the table stays to be read.
+        set_workflow_state(&window, &mut cx, dynamic_frame(24));
+        assert!(cx.debug_bounds("session-info-workflow-stop").is_none());
+        assert!(cx.debug_bounds("session-info-workflow-totals").is_some());
+        assert!(cx.debug_bounds("session-info-workflow-phase-4").is_some());
     }
 
     #[gpui::test]

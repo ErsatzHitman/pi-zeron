@@ -53,6 +53,13 @@ Pi chats only, from the `workflows` extension's `workflow:state` channel. Shown 
 - **Durability:** the last checkpoint ("Checkpoint 2m ago · 7 done", "Resumed 10s ago"), how many results a resume reused or found no longer matching, and how many tasks the payload left out.
 - **Recovery:** for a run that stopped early, why it stopped and **Resume** (picks up where it left off; finished work is reused) and **Discard** (stops offering it; asks first). With no run tracked, the newest interrupted run is offered the same way.
 
+A run from a workflows extension that groups by phase (`workflow:state` v2) is drawn the way Claude Code draws a workflow instead of the bar and the Queued and Finished folds:
+
+- **Totals:** "Workflow" with how long it has run (frozen once it ends), the number of agents and their tokens ("4 agents · 170.8k tokens", retries included), and **Pause** and **Stop**.
+- **Phases:** every phase in the order the script started them, any number and any names; a repeated title (a second Verify round) is its own phase, and phases declared but not reached yet follow, dimmed. Each shows its title, `done/total` and a strip of dots: done, running, retrying, failed, and still to come (past 24 agents a dot stands for several).
+- **Agents:** a phase opens to a table of its agents: Agent, Model, Tokens and Time (a live timer while running; "reused" for a result reused from an earlier run). Agents the phase is waiting to start show as dim rows with no model yet. The phase in progress is open; click any phase to open or close it, and that choice lasts for the run.
+- A grouped run that ended stays up for 10 minutes so its table can be read.
+
 ## btw
 
 The Session row's `+` opens a side chat in a small pane: the card's width, beside the card on its left (in the card's place while the card is away), with its prompt bar inside it at the bottom. It eases in and folds away quickly; it never opens the right pane. While the window has room the transcript shifts further left to clear it, as far as it can without narrowing; past that the pane floats over the transcript.

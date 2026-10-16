@@ -1,0 +1,2345 @@
+{
+ "run": [
+  {
+   "v": 2,
+   "updatedAt": 1792155600150,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "agents": 0,
+    "tokens": 0
+   },
+   "progress": {
+    "total": 0,
+    "done": 0,
+    "running": 0,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [],
+   "tasksTruncated": 0,
+   "checkpoints": [],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155601500,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 4,
+    "tokens": 0
+   },
+   "progress": {
+    "total": 4,
+    "done": 0,
+    "running": 4,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 0,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "tokens": 0,
+     "agents": 4,
+     "running": 4,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5"
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5"
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5"
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155606300,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 4,
+    "tokens": 43440
+   },
+   "progress": {
+    "total": 4,
+    "done": 0,
+    "running": 4,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 0,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "tokens": 43440,
+     "agents": 4,
+     "running": 4,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 11240,
+     "tools": 6
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 9870,
+     "tools": 4
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 14020,
+     "tools": 7
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 8310,
+     "tools": 3
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155613500,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 4,
+    "tokens": 111790
+   },
+   "progress": {
+    "total": 4,
+    "done": 0,
+    "running": 4,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 0,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "tokens": 111790,
+     "agents": 4,
+     "running": 4,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 27480,
+     "tools": 14
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 25900,
+     "tools": 11
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 36770,
+     "tools": 18
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 21640,
+     "tools": 9
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155618200,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 4,
+    "tokens": 122524
+   },
+   "progress": {
+    "total": 4,
+    "done": 1,
+    "running": 3,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 1,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "tokens": 122524,
+     "agents": 4,
+     "running": 3,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 25900,
+     "tools": 11
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 36770,
+     "tools": 18
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 21640,
+     "tools": 9
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155618000,
+     "kind": "agent",
+     "doneCount": 1,
+     "label": "trace:proto-contract"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155627200,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 4,
+    "tokens": 153625
+   },
+   "progress": {
+    "total": 4,
+    "done": 3,
+    "running": 1,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 3,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "tokens": 153625,
+     "agents": 4,
+     "running": 1,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 41705,
+     "tools": 16,
+     "endedAt": 1792155623900
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 52066,
+     "tools": 24,
+     "endedAt": 1792155627000
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 21640,
+     "tools": 9
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155627000,
+     "kind": "agent",
+     "doneCount": 3,
+     "label": "trace:pi-publisher"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155633200,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Trace",
+    "agents": 4,
+    "tokens": 170800
+   },
+   "progress": {
+    "total": 4,
+    "done": 4,
+    "running": 0,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "active",
+     "done": 4,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "tokens": 170800,
+     "agents": 4,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 41705,
+     "tools": 16,
+     "endedAt": 1792155623900
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 52066,
+     "tools": 24,
+     "endedAt": 1792155627000
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38815,
+     "tools": 13,
+     "endedAt": 1792155633000
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155633000,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "trace:fixtures"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155634600,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Implement",
+    "agents": 6,
+    "tokens": 170800
+   },
+   "progress": {
+    "total": 6,
+    "done": 4,
+    "running": 2,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 4,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "endedAt": 1792155634000,
+     "tokens": 170800,
+     "agents": 4,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "active",
+     "done": 0,
+     "total": 2,
+     "startedAt": 1792155634000,
+     "tokens": 0,
+     "agents": 2,
+     "running": 2,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 41705,
+     "tools": 16,
+     "endedAt": 1792155623900
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 52066,
+     "tools": 24,
+     "endedAt": 1792155627000
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38815,
+     "tools": 13,
+     "endedAt": 1792155633000
+    },
+    {
+     "id": "4",
+     "label": "implement:proto-v2-fields",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634200,
+     "model": "anthropic/claude-opus-5-5"
+    },
+    {
+     "id": "5",
+     "label": "implement:phase-view",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634350,
+     "model": "anthropic/claude-opus-5-5"
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155633000,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "trace:fixtures"
+    },
+    {
+     "at": 1792155634000,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Trace"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155642500,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Implement",
+    "agents": 6,
+    "tokens": 201270
+   },
+   "progress": {
+    "total": 6,
+    "done": 4,
+    "running": 2,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 4,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "endedAt": 1792155634000,
+     "tokens": 170800,
+     "agents": 4,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "active",
+     "done": 0,
+     "total": 2,
+     "startedAt": 1792155634000,
+     "tokens": 30470,
+     "agents": 2,
+     "running": 2,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 41705,
+     "tools": 16,
+     "endedAt": 1792155623900
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 52066,
+     "tools": 24,
+     "endedAt": 1792155627000
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38815,
+     "tools": 13,
+     "endedAt": 1792155633000
+    },
+    {
+     "id": "4",
+     "label": "implement:proto-v2-fields",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634200,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 18420,
+     "tools": 9
+    },
+    {
+     "id": "5",
+     "label": "implement:phase-view",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634350,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 12050,
+     "tools": 7
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155633000,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "trace:fixtures"
+    },
+    {
+     "at": 1792155634000,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Trace"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155650200,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Implement",
+    "agents": 6,
+    "tokens": 213130
+   },
+   "progress": {
+    "total": 6,
+    "done": 4,
+    "running": 1,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 1,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 4,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "endedAt": 1792155634000,
+     "tokens": 170800,
+     "agents": 4,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "active",
+     "done": 0,
+     "total": 2,
+     "startedAt": 1792155634000,
+     "tokens": 42330,
+     "agents": 2,
+     "running": 1,
+     "retrying": 1,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 41705,
+     "tools": 16,
+     "endedAt": 1792155623900
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 52066,
+     "tools": 24,
+     "endedAt": 1792155627000
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38815,
+     "tools": 13,
+     "endedAt": 1792155633000
+    },
+    {
+     "id": "4",
+     "label": "implement:proto-v2-fields",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634200,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 18420,
+     "tools": 9
+    },
+    {
+     "id": "5",
+     "label": "implement:phase-view",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "retrying",
+     "attempt": 2,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634350,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 23910,
+     "tools": 12,
+     "nextAttemptAt": 1792155658000,
+     "error": {
+      "code": "AGENT_RATE_LIMIT",
+      "message": "429 Too Many Requests: rate limit for claude-opus-5-5 reached, retry after 8s",
+      "retriable": true
+     }
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155633000,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "trace:fixtures"
+    },
+    {
+     "at": 1792155634000,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Trace"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155655200,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Implement",
+    "agents": 6,
+    "tokens": 242090
+   },
+   "progress": {
+    "total": 6,
+    "done": 4,
+    "running": 1,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 1,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 4,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "endedAt": 1792155634000,
+     "tokens": 170800,
+     "agents": 4,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "active",
+     "done": 0,
+     "total": 2,
+     "startedAt": 1792155634000,
+     "tokens": 71290,
+     "agents": 2,
+     "running": 1,
+     "retrying": 1,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 41705,
+     "tools": 16,
+     "endedAt": 1792155623900
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 52066,
+     "tools": 24,
+     "endedAt": 1792155627000
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38815,
+     "tools": 13,
+     "endedAt": 1792155633000
+    },
+    {
+     "id": "4",
+     "label": "implement:proto-v2-fields",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634200,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 47380,
+     "tools": 21
+    },
+    {
+     "id": "5",
+     "label": "implement:phase-view",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "retrying",
+     "attempt": 2,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634350,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 23910,
+     "tools": 12,
+     "nextAttemptAt": 1792155658000,
+     "error": {
+      "code": "AGENT_RATE_LIMIT",
+      "message": "429 Too Many Requests: rate limit for claude-opus-5-5 reached, retry after 8s",
+      "retriable": true
+     }
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155633000,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "trace:fixtures"
+    },
+    {
+     "at": 1792155634000,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Trace"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155661200,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "running",
+    "startedAt": 1792155600000,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Implement",
+    "agents": 6,
+    "tokens": 248210
+   },
+   "progress": {
+    "total": 6,
+    "done": 4,
+    "running": 2,
+    "queued": 0,
+    "failed": 0,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 4,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "endedAt": 1792155634000,
+     "tokens": 170800,
+     "agents": 4,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "active",
+     "done": 0,
+     "total": 2,
+     "startedAt": 1792155634000,
+     "tokens": 77410,
+     "agents": 2,
+     "running": 2,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 41705,
+     "tools": 16,
+     "endedAt": 1792155623900
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 52066,
+     "tools": 24,
+     "endedAt": 1792155627000
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38815,
+     "tools": 13,
+     "endedAt": 1792155633000
+    },
+    {
+     "id": "4",
+     "label": "implement:proto-v2-fields",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634200,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 47380,
+     "tools": 21
+    },
+    {
+     "id": "5",
+     "label": "implement:phase-view",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "running",
+     "attempt": 2,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634350,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 30030,
+     "tools": 3,
+     "nextAttemptAt": 1792155658000,
+     "error": {
+      "code": "AGENT_RATE_LIMIT",
+      "message": "429 Too Many Requests: rate limit for claude-opus-5-5 reached, retry after 8s",
+      "retriable": true
+     }
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155633000,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "trace:fixtures"
+    },
+    {
+     "at": 1792155634000,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Trace"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": [
+     {
+      "id": "pause",
+      "label": "Pause",
+      "runId": "wf-20261016-130000-7f3a"
+     },
+     {
+      "id": "stop",
+      "label": "Stop",
+      "runId": "wf-20261016-130000-7f3a",
+      "confirm": true
+     }
+    ]
+   }
+  },
+  {
+   "v": 2,
+   "updatedAt": 1792155664500,
+   "run": {
+    "id": "wf-20261016-130000-7f3a",
+    "name": "dynamic-review",
+    "goal": "Trace how the session panel draws a workflow run, implement the v2 phase card, verify it twice and report.",
+    "status": "aborted",
+    "statusReason": "Stopped by the user.",
+    "startedAt": 1792155600000,
+    "endedAt": 1792155664400,
+    "dryRun": false,
+    "resumed": false,
+    "phase": "Implement",
+    "agents": 6,
+    "tokens": 259734
+   },
+   "progress": {
+    "total": 6,
+    "done": 4,
+    "running": 0,
+    "queued": 0,
+    "failed": 2,
+    "cached": 0,
+    "retrying": 0,
+    "skipped": 0
+   },
+   "phases": [
+    {
+     "title": "Trace",
+     "state": "done",
+     "done": 4,
+     "total": 4,
+     "startedAt": 1792155600400,
+     "endedAt": 1792155634000,
+     "tokens": 170800,
+     "agents": 4,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Implement",
+     "state": "stopped",
+     "done": 0,
+     "total": 2,
+     "startedAt": 1792155634000,
+     "endedAt": 1792155664400,
+     "tokens": 88934,
+     "agents": 2,
+     "running": 0,
+     "retrying": 0,
+     "failed": 2,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Verify",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    },
+    {
+     "title": "Report",
+     "state": "pending",
+     "done": 0,
+     "total": 0,
+     "tokens": 0,
+     "agents": 0,
+     "running": 0,
+     "retrying": 0,
+     "failed": 0,
+     "skipped": 0,
+     "queued": 0
+    }
+   ],
+   "tasks": [
+    {
+     "id": "0",
+     "label": "trace:proto-contract",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600600,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38214,
+     "tools": 19,
+     "endedAt": 1792155618000
+    },
+    {
+     "id": "1",
+     "label": "trace:session-panel",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600780,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 41705,
+     "tools": 16,
+     "endedAt": 1792155623900
+    },
+    {
+     "id": "2",
+     "label": "trace:pi-publisher",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155600960,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 52066,
+     "tools": 24,
+     "endedAt": 1792155627000
+    },
+    {
+     "id": "3",
+     "label": "trace:fixtures",
+     "phase": "Trace",
+     "phaseIndex": 0,
+     "state": "done",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155601140,
+     "model": "anthropic/claude-sonnet-5-5",
+     "tokens": 38815,
+     "tools": 13,
+     "endedAt": 1792155633000
+    },
+    {
+     "id": "4",
+     "label": "implement:proto-v2-fields",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "aborted",
+     "attempt": 1,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634200,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 58904,
+     "tools": 26,
+     "endedAt": 1792155664100,
+     "error": {
+      "code": "AGENT_ABORTED",
+      "message": "aborted",
+      "retriable": false
+     }
+    },
+    {
+     "id": "5",
+     "label": "implement:phase-view",
+     "phase": "Implement",
+     "phaseIndex": 1,
+     "state": "aborted",
+     "attempt": 2,
+     "maxAttempts": 3,
+     "cached": false,
+     "startedAt": 1792155634350,
+     "model": "anthropic/claude-opus-5-5",
+     "tokens": 30030,
+     "tools": 3,
+     "error": {
+      "code": "AGENT_ABORTED",
+      "message": "aborted",
+      "retriable": false
+     },
+     "endedAt": 1792155664150
+    }
+   ],
+   "tasksTruncated": 0,
+   "checkpoints": [
+    {
+     "at": 1792155633000,
+     "kind": "agent",
+     "doneCount": 4,
+     "label": "trace:fixtures"
+    },
+    {
+     "at": 1792155634000,
+     "kind": "phase",
+     "doneCount": 4,
+     "label": "Trace"
+    }
+   ],
+   "recovery": {
+    "resumable": false,
+    "reused": 0,
+    "invalidated": 0,
+    "interrupted": [],
+    "actions": []
+   }
+  }
+ ]
+}

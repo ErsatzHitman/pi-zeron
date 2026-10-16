@@ -72,6 +72,9 @@ pub(super) struct SessionPanel {
     /// The Workflow section's Queued and Finished groups are revealed.
     workflow_queued_open: bool,
     workflow_finished_open: bool,
+    /// A grouped run's phases the user opened or closed, by run and phase
+    /// index; the rest follow their default (the phase in progress open).
+    workflow_phase_open: std::collections::HashMap<(String, usize), bool>,
     /// Every checkout's working-tree totals (`WatchCheckoutDiffs`, patches
     /// dropped), and the device the watch follows.
     diffs: Vec<CheckoutDiff>,
@@ -300,6 +303,14 @@ fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+#[cfg(test)]
+impl Shell {
+    /// The Stop (or Discard) waiting for its second click.
+    pub(super) fn session_panel_armed_stop(&self) -> Option<String> {
+        self.session_panel.armed_stop.clone()
+    }
+}
+
 /// The selected chat's sub-agents at work (the Pi fleet's and a harness's),
 /// for the sidebar to nest under its row. Only the selected chat's roster
 /// and transcript are watched, so other rows keep their "● N" pill.
@@ -315,8 +326,43 @@ pub(super) fn sidebar_agents(state: &AppState, chat_id: &str, now: DateTime<Utc>
 }
 
 /// A row's small trailing text.
+/// The agents table's columns, right of the agent's name.
+const WORKFLOW_MODEL_COL: f32 = 70.0;
+const WORKFLOW_TOKENS_COL: f32 = 42.0;
+const WORKFLOW_TIME_COL: f32 = 40.0;
+
+/// The muted header over an open phase's agents.
+fn workflow_table_header(phase: usize, theme: &Theme) -> AnyElement {
+    let col = |width: f32, text: &'static str| {
+        div()
+            .w(px(width))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .child(text)
+    };
+    div()
+        .debug_selector(move || format!("session-info-workflow-phase-{phase}-table"))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .h(px(20.0))
+        .px(px(9.0))
+        .text_size(crate::typography::ui_rems(10.5))
+        .text_color(theme.text_muted.opacity(0.7))
+        .child(div().w(px(14.0)).flex_none())
+        .child(div().flex_1().child("Agent"))
+        .child(col(WORKFLOW_MODEL_COL, "Model").justify_start())
+        .child(col(WORKFLOW_TOKENS_COL, "Tokens"))
+        .child(col(WORKFLOW_TIME_COL, "Time"))
+        .into_any_element()
+}
+
 /// "+N more" under a Workflow fold that lists only its first rows.
-fn workflow_more_row(key: &'static str, hidden: usize, theme: &Theme) -> Option<AnyElement> {
+fn workflow_more_row(key: impl Into<String>, hidden: usize, theme: &Theme) -> Option<AnyElement> {
+    let key = key.into();
     (hidden > 0).then(|| {
         div()
             .debug_selector(move || format!("session-info-workflow-{key}-more"))
@@ -1817,6 +1863,12 @@ impl Shell {
                 .into_any_element(),
         );
 
+        if view.grouped {
+            self.render_workflow_phases(view, &mut rows, theme, cx);
+            self.render_workflow_footer(view, &mut rows, theme, cx);
+            return rows;
+        }
+
         // ── How far: the bar, the phase, the clock, and Pause / Stop.
         let fraction = view.fraction();
         let caption = view.step.as_ref().map(|(title, index, count)| {
@@ -1951,6 +2003,18 @@ impl Shell {
             }
         }
 
+        self.render_workflow_footer(view, &mut rows, theme, cx);
+        rows
+    }
+
+    /// A workflow's notes and its Resume or Discard, under its tasks.
+    fn render_workflow_footer(
+        &mut self,
+        view: &WorkflowView,
+        rows: &mut Vec<AnyElement>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) {
         // ── Its durability: the last checkpoint, results reused on resume.
         let mut notes: Vec<String> = Vec::new();
         notes.extend(view.checkpoint.clone());
@@ -2020,7 +2084,335 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        rows
+    }
+
+    /// A run grouped by phase, as Claude Code draws a workflow: how long it
+    /// has run, its agents and tokens, then each phase with its progress
+    /// dots and, opened, a table of its agents (model, tokens, time).
+    fn render_workflow_phases(
+        &mut self,
+        view: &WorkflowView,
+        rows: &mut Vec<AnyElement>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) {
+        let muted = theme.text_muted;
+        let clock: AnyElement = match (view.took(), view.started) {
+            (Some(took), _) => trailing_text(took, muted).into_any_element(),
+            (None, Some(started)) if view.phase.live() => {
+                elapsed_label("session-info-workflow-elapsed".into(), started, muted)
+            }
+            _ => div().into_any_element(),
+        };
+        let mut totals = vec![format!(
+            "{} agent{}",
+            view.agents,
+            if view.agents == 1 { "" } else { "s" }
+        )];
+        if view.tokens > 0 {
+            totals.push(format!("{} tokens", workflow::compact_tokens(view.tokens)));
+        }
+        let controls: Vec<AnyElement> = [view.pause.as_ref(), view.stop.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|action| self.render_workflow_button(action, false, theme, cx))
+            .collect();
+        rows.push(
+            div()
+                .id("session-info-workflow-totals")
+                .debug_selector(|| "session-info-workflow-totals".into())
+                .px(px(9.0))
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .min_h(px(20.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(muted)
+                        .child("Workflow")
+                        .child(clock)
+                        .child(div().flex_1())
+                        .children(controls),
+                )
+                .child(
+                    div()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(muted)
+                        .child(totals.join(" · ")),
+                )
+                .into_any_element(),
+        );
+        if view.phases.is_empty() {
+            return;
+        }
+        rows.push(
+            div()
+                .px(px(9.0))
+                .pt(px(6.0))
+                .text_size(crate::typography::ui_rems(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child("Phases")
+                .into_any_element(),
+        );
+        for phase in &view.phases {
+            let key = (view.run_id.clone(), phase.index);
+            let open = self
+                .session_panel
+                .workflow_phase_open
+                .get(&key)
+                .copied()
+                .unwrap_or_else(|| phase.opens_by_default());
+            let header = self.render_workflow_phase(phase, key, open, theme, cx);
+            rows.push(header);
+            if !open {
+                continue;
+            }
+            rows.push(workflow_table_header(phase.index, theme));
+            for row in phase.rows.iter().take(workflow::GROUP_ROWS) {
+                let element = self.render_workflow_agent(row, theme, cx);
+                rows.push(self.arriving(WORKFLOW, &row.id, element));
+            }
+            let hidden =
+                phase.rows.len().saturating_sub(workflow::GROUP_ROWS) + phase.hidden as usize;
+            if hidden > 0 {
+                rows.extend(workflow_more_row(
+                    format!("phase-{}", phase.index),
+                    hidden,
+                    theme,
+                ));
+            }
+        }
+    }
+
+    /// A phase's header: its title, `done/total` and a chevron, over its
+    /// dots. A click opens or closes its table.
+    fn render_workflow_phase(
+        &self,
+        phase: &workflow::PhaseRow,
+        key: (String, usize),
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = SharedString::from(format!("session-info-workflow-phase-{}", phase.index));
+        let dots_id = format!("session-info-workflow-phase-{}-dots", phase.index);
+        let title_color = match phase.state {
+            workflow::PhaseState::Pending => theme.text_muted,
+            _ => theme.text,
+        };
+        let dot = |kind: workflow::Dot| {
+            let d = div().size(px(6.0)).rounded_full().flex_none();
+            match kind {
+                workflow::Dot::Done => d.bg(theme.accent),
+                workflow::Dot::Running => d.bg(theme.accent.opacity(0.55)),
+                workflow::Dot::Retrying => d.bg(theme.warning),
+                workflow::Dot::Failed => d.bg(theme.danger),
+                workflow::Dot::Pending => d.border_1().border_color(theme.text_muted.opacity(0.45)),
+            }
+        };
+        let label = SharedString::from(format!("{} {}/{}", phase.title, phase.done, phase.total));
+        div()
+            .id(id.clone())
+            .debug_selector({
+                let id = id.clone();
+                move || id.to_string()
+            })
+            .role(gpui::Role::Button)
+            .aria_label(label)
+            .mx(px(4.0))
+            .px(px(5.0))
+            .py(px(4.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .rounded(px(popover::MENU_ITEM_RADIUS))
+            .bg(theme.wash(0.04))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.06)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.session_panel
+                    .workflow_phase_open
+                    .insert(key.clone(), !open);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .h(px(18.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_color(title_color)
+                            .child(phase.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text_muted)
+                            .child(format!("{}/{}", phase.done, phase.total)),
+                    )
+                    .child(
+                        icon(if open {
+                            icons::ALT_ARROW_DOWN
+                        } else {
+                            icons::ALT_ARROW_RIGHT
+                        })
+                        .size(px(12.0))
+                        .text_color(theme.text_muted.opacity(0.7)),
+                    ),
+            )
+            .when(!phase.dots.is_empty(), |header| {
+                header.child(
+                    div()
+                        .debug_selector(move || dots_id.clone())
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(3.0))
+                        .children(phase.dots.iter().map(|d| dot(*d))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One agent of an open phase: its state and label, then its model,
+    /// tokens and time in the table's columns. A placeholder (an agent the
+    /// run has not named yet) leaves the columns empty.
+    fn render_workflow_agent(
+        &self,
+        row: &TaskRow,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = SharedString::from(format!("session-info-workflow-task-{}", row.id));
+        let muted = theme.text_muted.opacity(0.75);
+        let glyph: AnyElement = match row.state {
+            WorkflowTaskState::Running => crate::loaders::mini_glyph_spinner(
+                format!("{id}-running"),
+                2.0,
+                theme.glyph,
+                cx.entity_id(),
+                cx,
+            )
+            .into_any_element(),
+            WorkflowTaskState::Retrying => icon(icons::REFRESH)
+                .size(px(12.0))
+                .text_color(theme.warning)
+                .into_any_element(),
+            WorkflowTaskState::Failed => icon(icons::DANGER_TRIANGLE)
+                .size(px(12.0))
+                .text_color(theme.danger)
+                .into_any_element(),
+            WorkflowTaskState::Aborted => icon(icons::STOP)
+                .size(px(10.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
+            WorkflowTaskState::Done | WorkflowTaskState::Cached => icon(icons::CHECK)
+                .size(px(12.0))
+                .text_color(theme.text_muted)
+                .into_any_element(),
+            WorkflowTaskState::Skipped => icon(icons::CLOSE_CIRCLE)
+                .size(px(11.0))
+                .text_color(theme.text_faint)
+                .into_any_element(),
+            WorkflowTaskState::Queued | WorkflowTaskState::Other => div()
+                .size(px(5.0))
+                .rounded_full()
+                .bg(theme.text_muted.opacity(0.45))
+                .into_any_element(),
+        };
+        let label_color = if row.placeholder {
+            theme.text_muted.opacity(0.6)
+        } else {
+            match row.state {
+                WorkflowTaskState::Running
+                | WorkflowTaskState::Retrying
+                | WorkflowTaskState::Failed => theme.text,
+                _ => theme.text_muted,
+            }
+        };
+        let time: Option<AnyElement> = if row.placeholder {
+            None
+        } else {
+            match (row.started, &row.elapsed, &row.trailing) {
+                (Some(started), _, None) => {
+                    Some(elapsed_label(format!("{id}-elapsed"), started, muted))
+                }
+                (_, Some(took), _) => Some(trailing_text(took.clone(), muted).into_any_element()),
+                (_, None, Some(text)) => {
+                    let color = match row.state {
+                        WorkflowTaskState::Retrying => theme.warning,
+                        WorkflowTaskState::Failed => theme.danger,
+                        _ => muted,
+                    };
+                    Some(trailing_text(text.clone(), color).into_any_element())
+                }
+                _ => None,
+            }
+        };
+        let cell = |width: f32| {
+            div()
+                .w(px(width))
+                .flex_none()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .overflow_hidden()
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(muted)
+        };
+        let mut element = div()
+            .id(id.clone())
+            .debug_selector({
+                let id = id.clone();
+                move || id.to_string()
+            })
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(24.0))
+            .px(px(9.0))
+            .rounded(px(popover::MENU_ITEM_RADIUS))
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(label_color)
+            .child(
+                div()
+                    .size(px(14.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(glyph),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+            .child(
+                cell(WORKFLOW_MODEL_COL).justify_start().child(
+                    div()
+                        .truncate()
+                        .children(row.model.as_deref().map(workflow::short_model)),
+                ),
+            )
+            .child(cell(WORKFLOW_TOKENS_COL).children(row.tokens.map(workflow::compact_tokens)))
+            .child(cell(WORKFLOW_TIME_COL).children(time));
+        if let Some(detail) = row.detail.clone() {
+            element = element.tooltip(crate::settings::widgets::text_tooltip(detail));
+        }
+        element.into_any_element()
     }
 
     /// One workflow task: its state, label, and a timer or what it is
@@ -2190,7 +2582,7 @@ impl Shell {
         let label = SharedString::from(if armed { format!("{base}?") } else { base });
         let tip = match action.id.as_str() {
             "stop" if armed => "Click again to stop the workflow",
-            "stop" => "Stop the workflow; it can be resumed later",
+            "stop" => "Stop the workflow; a stopped run is final",
             "pause" => "Let running tasks finish, then pause",
             "resume" => "Pick up where it left off; finished work is reused",
             "discard" if armed => "Click again to discard this run",
