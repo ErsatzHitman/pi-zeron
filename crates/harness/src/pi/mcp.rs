@@ -13,11 +13,10 @@ pub(crate) const VISUALS_PROMPT: &str = include_str!("visuals.md");
 pub(super) fn configure(
     cmd: &mut Command,
     config: &zeron_proto::McpServer,
-    read_only: bool,
 ) -> Result<ScratchDir, HarnessError> {
     let scratch = ScratchDir::new("pi-mcp")?;
     let place = Place::from_env(&config.env);
-    for arg in role_args(&place, read_only, scratch.path())? {
+    for arg in role_args(&place, scratch.path())? {
         cmd.arg(arg);
     }
     cmd.env(
@@ -41,39 +40,26 @@ pub(super) fn configure(
 /// Every run loads the Zeron tools and learns the visuals Zeron draws
 /// (charts, diagrams, tables). A root swaps Pi's coding prompt for the
 /// orchestrator's and keeps only its own tools: no bash, edits, MCP servers,
-/// skills, prompt templates or context files. A member learns its place in
-/// the tree, and a side chat its parent. Every run gets the capability map
-/// for its surface (see `capabilities.rs`).
-fn role_args(
-    place: &Place,
-    read_only: bool,
-    scratch: &Path,
-) -> Result<Vec<OsString>, HarnessError> {
+/// skills, prompt templates or context files. A member gets the tree's
+/// working rules.
+///
+/// Where a run sits (its chat, parent, tree, read-only) is not written into
+/// the prompt here: Zeron publishes it as env ([`Place::env`],
+/// `ZERON_READ_ONLY`) and the Pi harness says it, with the rest of the
+/// session's capability map, on every surface including the Pis it starts.
+fn role_args(place: &Place, scratch: &Path) -> Result<Vec<OsString>, HarnessError> {
     let extension = scratch.join("zeron-mcp.mjs");
     std::fs::write(&extension, include_str!("mcp.mjs"))?;
     let visuals = scratch.join("zeron-visuals.md");
     std::fs::write(&visuals, VISUALS_PROMPT)?;
-    let capabilities = scratch.join("zeron-capabilities.md");
-    std::fs::write(
-        &capabilities,
-        super::capabilities::capability_map(place, read_only),
-    )?;
     let mut args: Vec<OsString> = vec![
         "--extension".into(),
         extension.into(),
         "--append-system-prompt".into(),
         visuals.into(),
-        "--append-system-prompt".into(),
-        capabilities.into(),
     ];
     match place.role {
-        Role::Chat => {
-            if let Some(brief) = place.brief() {
-                let prompt = scratch.join("zeron-place.md");
-                std::fs::write(&prompt, brief)?;
-                args.extend(["--append-system-prompt".into(), prompt.into()]);
-            }
-        }
+        Role::Chat => {}
         Role::Root => {
             let prompt = scratch.join("zeron-orchestrator.md");
             std::fs::write(&prompt, orchestrator::ROOT_SYSTEM_PROMPT)?;
@@ -121,7 +107,7 @@ mod tests {
 
     fn args_at(place: &Place) -> (crate::scratch::ScratchDir, Vec<String>) {
         let scratch = ScratchDir::new("pi-mcp-test").unwrap();
-        let args = role_args(place, false, scratch.path())
+        let args = role_args(place, scratch.path())
             .unwrap()
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -137,16 +123,7 @@ mod tests {
     #[test]
     fn a_plain_chat_keeps_pi_s_prompt_and_every_tool() {
         let (_scratch, args) = args(Role::Chat);
-        assert_eq!(args.len(), 6, "{args:?}");
-        let map = args
-            .iter()
-            .find(|arg| arg.ends_with("zeron-capabilities.md"))
-            .expect("the capability map");
-        assert!(
-            std::fs::read_to_string(map)
-                .unwrap()
-                .contains("Zeron main chat")
-        );
+        assert_eq!(args.len(), 4, "{args:?}");
         assert!(flag(&args, "--extension").is_some_and(|f| f.ends_with("zeron-mcp.mjs")));
         assert!(
             flag(&args, "--append-system-prompt").is_some_and(|f| f.ends_with("zeron-visuals.md"))
@@ -189,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn a_member_learns_its_place_in_the_tree() {
+    fn a_member_gets_the_tree_s_working_rules() {
         let (_scratch, args) = args(Role::Member { depth: 2 });
         let member = args
             .iter()
@@ -197,43 +174,35 @@ mod tests {
             .expect("the member prompt");
         let member = std::fs::read_to_string(member).unwrap();
         assert!(member.contains("You are 2 levels below the root"));
-        assert!(member.contains(
-            "Your place: you are the session \"Fix the parser\" (chat chat-1), at level 2 of \
-             the tree of orchestrator chat orchestrator-r. Your parent, who started you, is the \
-             session \"Plan\" (chat parent-1)."
-        ));
         assert!(member.contains("zeron_board_read"));
+        // Its place rides the env; the Pi harness says it.
+        assert!(!member.contains("Fix the parser"));
         assert!(!args.iter().any(|arg| arg == "--tools"));
     }
 
     #[test]
-    fn a_side_chat_learns_its_parent() {
+    fn a_side_chat_s_place_rides_the_env_not_a_prompt_file() {
         let (_scratch, args) = args_at(&at(Role::Chat, Some("parent-1")));
-        let place = args
-            .iter()
-            .find(|arg| arg.ends_with("zeron-place.md"))
-            .expect("the side chat's place");
-        assert!(
-            std::fs::read_to_string(place)
-                .unwrap()
-                .contains("of \"Plan\" (chat parent-1), outside any orchestrator's tree")
+        assert_eq!(args.len(), 4, "{args:?}");
+        let place = Place::from_env(
+            &at(Role::Chat, Some("parent-1"))
+                .env()
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .chain([("ZERON_CHAT_ID".to_owned(), "chat-1".to_owned())])
+                .collect(),
         );
+        assert_eq!(place.parent_id.as_deref(), Some("parent-1"));
+        assert_eq!(place.parent_title.as_deref(), Some("Plan"));
     }
 
     #[test]
     fn the_prompts_name_only_zeron_tools_that_exist() {
-        let mut prompts = vec![
+        let prompts = [
             orchestrator::ROOT_SYSTEM_PROMPT.to_owned(),
             orchestrator::member_prompt(&at(Role::Member { depth: 1 }, Some("orchestrator-r"))),
+            VISUALS_PROMPT.to_owned(),
         ];
-        for role in [Role::Chat, Role::Root, Role::Member { depth: 1 }] {
-            for read_only in [false, true] {
-                prompts.push(super::super::capabilities::capability_map(
-                    &at(role, Some("parent-1")),
-                    read_only,
-                ));
-            }
-        }
         let known = [
             "whoami",
             "list_projects",

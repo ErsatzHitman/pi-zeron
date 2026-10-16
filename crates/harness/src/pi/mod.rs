@@ -1,5 +1,4 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
-mod capabilities;
 mod catalog;
 mod commands;
 mod compact;
@@ -219,9 +218,12 @@ impl PiHarness {
         } else {
             cmd.env_remove("ZERON_READ_ONLY");
         }
-        // This Pi is the session itself; the guard counts the sub-agents below it.
+        // This Pi is the session itself: the guard counts the Pis below it, and
+        // the Pi harness's own claim (`PI_ZERON_SESSION_PID`, which tells the
+        // session from the Pis it starts) must be made afresh by this process.
         cmd.env_remove("ZERON_SUBAGENT_DEPTH")
-            .env_remove("ZERON_PI_PID");
+            .env_remove("ZERON_PI_PID")
+            .env_remove("PI_ZERON_SESSION_PID");
         // The guard checks the installed Pi packages for updates when asked,
         // at most twice a day across this engine's runs.
         if guarded && package_check_due() {
@@ -237,7 +239,7 @@ impl PiHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let scratch = mcp
-            .map(|config| self::mcp::configure(&mut cmd, config, read_only))
+            .map(|config| self::mcp::configure(&mut cmd, config))
             .transpose()?;
         // Loaded even while the toggle is off, so turning it on reaches a
         // running chat without a restart. Probes and titles run no tools.

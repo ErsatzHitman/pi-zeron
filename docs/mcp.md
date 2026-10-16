@@ -23,16 +23,16 @@ originating chat in the environment:
 | `ZERON_DEVICE_ID` | That chat's host device.                                      |
 | `ZERON_ROLE`      | `orchestrator` for a root, `member` inside a tree, else unset. |
 | `ZERON_TREE_DEPTH` | A member's level below its root.                             |
-| `ZERON_CHAT_TITLE` | The chat's title: its task's label (tree chats and side chats). |
+| `ZERON_CHAT_TITLE` | The chat's title (a tree chat's task label), when it has one. |
 | `ZERON_PARENT_CHAT_ID`, `ZERON_PARENT_TITLE` | The chat that started it.   |
 | `ZERON_ROOT_CHAT_ID` | Its orchestrator root (its own id, for a root).             |
 
 These come from `zeron_proto::orchestrator::Place`, computed by the host from
 the chat and its ancestors on every run. Pi gets them in its process env too
-(sub-agents inherit them), plus a prompt paragraph naming its task, parent and
-orchestrator; `whoami` returns them as `place` (role, level, task, parent,
-orchestrator, brief) for any harness. Titles are one line of at most 120
-characters.
+(sub-agents inherit them), with `ZERON_READ_ONLY=1` for a read-only run; the Pi
+harness turns them into the session's capability map (see [Pi](pi.md)).
+`whoami` returns them as `place` (role, level, task, parent, orchestrator,
+brief) for any harness. Titles are one line of at most 120 characters.
 
 When `ZERON_CHAT_ID` is set, every `send_message` is prefixed with a
 `[Message from Zeron chat <title> (<id8>) …]` line so the receiving agent and the

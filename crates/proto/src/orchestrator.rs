@@ -141,12 +141,9 @@ impl Place {
     }
 
     /// The process env that carries this place ([`Role::env`] plus ids and
-    /// titles). Empty for a plain top-level chat.
+    /// titles). A plain top-level chat carries only its title, if it has one.
     pub fn env(&self) -> Vec<(&'static str, String)> {
         let mut env = self.role.env();
-        if self.role == Role::Chat && self.parent_id.is_none() {
-            return env;
-        }
         let optional = [
             (ENV_CHAT_TITLE, &self.title),
             (ENV_PARENT_CHAT_ID, &self.parent_id),
@@ -186,8 +183,9 @@ impl Place {
         }
     }
 
-    /// One paragraph telling the run where it is, for its prompt. `None` for
-    /// a root (its own prompt says) and a plain top-level chat.
+    /// One paragraph saying where the run is, for `zeron_whoami`. `None` for a
+    /// root and a plain top-level chat. The run's prompt does not carry it:
+    /// the Pi harness says the place from [`Place::env`].
     pub fn brief(&self) -> Option<String> {
         let me = match &self.title {
             Some(title) => format!("\"{title}\" (chat {})", self.chat_id),
@@ -250,12 +248,12 @@ pub fn member_prompt(place: &Place) -> String {
         "Start a sub-session with zeron_create_chat only for an independent task in a \
          different folder, or when parallel work clearly pays."
     };
-    // The place last: titles in it are the user's and agents' text.
+    // The place itself (titles, parent, tree) rides the env (`Place::env`);
+    // the Pi harness says it in the session's capability map.
     MEMBER_PROMPT
         .replace("{sessions}", sessions)
         .replace("{depth}", &depth.to_string())
         .replace("{max}", &MAX_DEPTH.to_string())
-        .replace("{place}", &place.brief().unwrap_or_default())
 }
 
 pub fn is_root_chat(chat_id: &str) -> bool {
@@ -433,10 +431,14 @@ mod tests {
                 .iter()
                 .any(|(k, v)| *k == ENV_PARENT_CHAT_ID && v == "plain")
         );
-        assert!(Place::of(&chats, "plain").env().is_empty());
+        // A plain chat carries only its title, for the harness to name it.
+        assert_eq!(
+            Place::of(&chats, "plain").env(),
+            vec![(ENV_CHAT_TITLE, "Notes".to_owned())]
+        );
         assert_eq!(Place::of(&chats, "plain").brief(), None);
         // The env carries it whole to the MCP server and the Pi process.
-        for id in [root.as_str(), "child", "grandchild", "side"] {
+        for id in [root.as_str(), "child", "grandchild", "plain", "side"] {
             let place = Place::of(&chats, id);
             let mut env: std::collections::BTreeMap<String, String> = place
                 .env()
@@ -466,7 +468,10 @@ mod tests {
             root_id: Some("orchestrator-r".into()),
         };
         let member = member_prompt(&at(2));
-        assert!(member.contains("Your place: you are the session \"Task\" (chat c), at level 2"));
+        assert!(
+            !member.contains("Task"),
+            "the place rides the env: {member}"
+        );
         assert!(member.contains("You are 2 levels below the root; the limit is 4."));
         assert!(member.contains("zeron_create_chat only for an independent task"));
         assert!(!member.contains('{'), "{member}");

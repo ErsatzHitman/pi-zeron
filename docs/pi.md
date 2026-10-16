@@ -273,13 +273,20 @@ Zeron's existing delegation uses a temporary MCP bridge loaded with
 `crates/harness/src/pi/visuals.md`, which describes the charts, diagrams and
 tables Zeron draws ([chat visuals](reference/chat-visuals.md)) and the
 interactive Luau visuals Pi shows with `zeron_show_visual` (see
-[MCP](mcp.md)), and a second one with the capability map
-(`crates/harness/src/pi/capabilities.rs`): what the session is (main chat,
-side chat, orchestrator root or member, and whether it is read-only), its
-parent, the Zeron tools it has and lacks (the board belongs to orchestrator
-trees), and how Zeron behaves around it (steering, Stop, questions and
-secrets, the delete guard, sub-agents, voice). Sub-agents get the same facts
-from the guard's sub-agent note. An
+[MCP](mcp.md)).
+
+What a session is and what it can do is the harness's to say, not Zeron's:
+Zeron publishes where a run sits as env (`ZERON_PI_MCP` with the chat id,
+`ZERON_ROLE`, `ZERON_TREE_DEPTH`, `ZERON_CHAT_TITLE`, `ZERON_PARENT_CHAT_ID`,
+`ZERON_PARENT_TITLE`, `ZERON_ROOT_CHAT_ID`, `ZERON_READ_ONLY`), and the Pi
+harness renders it in the session's capability map, gated on the tools the
+session really has: main chat, side chat, orchestrator root or member, its
+parent and tree, read-only, and how Zeron behaves around it (steering, Stop,
+dialogs, voice, delegate and sub-agents). Pi's own sub-agents, workflow agents
+and advisor are told by Pi whose Zeron chat they work for. To tell the session
+from the Pis it starts (which inherit the env), the harness claims the session
+by pid in `PI_ZERON_SESSION_PID`, which Zeron clears on every run along with the
+guard's `ZERON_PI_PID` and `ZERON_SUBAGENT_DEPTH`. An
 orchestrator's root chat (the sidebar's Orchestrator tab) runs with its own
 profile instead of the coding one:
 
@@ -294,7 +301,7 @@ profile instead of the coding one:
 
 A session in an orchestrator's tree keeps Pi's coding prompt and every tool,
 and also gets `crates/proto/src/orchestrator_member.md`: report in the final
-reply, and the tree's depth limit. The engine marks each run with
+reply, the tree's depth limit and the board. The engine marks each run with
 `ZERON_ROLE` (`orchestrator` or `member`, unset for a plain chat) and, for a
 member, `ZERON_TREE_DEPTH`, in both the Zeron MCP server's env and Pi's own,
 so extensions can change their behaviour too. The user's pi-herdr-delegate

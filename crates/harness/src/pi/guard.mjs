@@ -536,35 +536,17 @@ const READ_ONLY_REASON = (h) =>
   `Do not retry, rephrase, or get the same effect through another tool, script, interpreter or subagent. ` +
   `Finish with what reading tells you, and say in your final answer what you would change and where.`;
 
-// ---- sub-agents: a Pi started by a Pi Zeron runs (a sub-agent) is not a
-// Zeron session; tell it whose it is. Each guarded Pi records its pid and its
+// ---- the Pis below the session: each guarded Pi records its pid and its
 // level below the Zeron session (`ZERON_PI_PID`, `ZERON_SUBAGENT_DEPTH`) for
 // the Pis it starts; Zeron clears both on every run it starts. Keyed by pid,
 // so Pi re-running this factory in the same process (a reload, a new
-// session) keeps its level.
+// session) keeps its level. Only the session itself (level 0) registers
+// /reload and runs the package check. What a sub-agent is told about its
+// place is the Pi harness's to say (Zeron publishes the facts as env).
 export function piDepth(env, pid) {
   const level = Number(env.ZERON_SUBAGENT_DEPTH) || 0;
   if (!env.ZERON_PI_PID) return 0;
   return env.ZERON_PI_PID === String(pid) ? level : level + 1;
-}
-
-export function subagentNote(env, depth) {
-  if (!(depth >= 1)) return undefined;
-  let chat;
-  try { chat = JSON.parse(env.ZERON_PI_MCP ?? "{}")?.env?.ZERON_CHAT_ID; } catch { return undefined; }
-  if (!chat) return undefined;
-  const session = env.ZERON_CHAT_TITLE ? `"${env.ZERON_CHAT_TITLE}" (chat ${chat})` : `chat ${chat}`;
-  const tree = env.ZERON_ROOT_CHAT_ID
-    ? env.ZERON_ROOT_CHAT_ID === chat
-      ? ", the orchestrator of its tree"
-      : `, at level ${env.ZERON_TREE_DEPTH ?? "?"} of the tree of orchestrator chat ${env.ZERON_ROOT_CHAT_ID}`
-    : "";
-  return `Zeron: you are a sub-agent (level ${depth}) of the agent in the Zeron session ${session}${tree}. ` +
-    `Your task is the prompt that agent gave you: report your result to it, not to the user. ` +
-    `You are not a Zeron session yourself: you cannot use the Zeron board or start or message Zeron sessions, ` +
-    `and your charts, visuals and questions do not reach the user, so return plain text in your final reply.` +
-    (readOnlyOn(env) ? ` Your session is read-only, so you are too: do not edit or write files.` : ``) +
-    ` Zeron may block deletes; if a call is blocked, do not retry it: report what must go.`;
 }
 
 // Zeron asks (`ZERON_PACKAGE_CHECK=1`, at most twice a day) which installed
@@ -591,7 +573,6 @@ export default function deleteGuard(pi) {
   const depth = piDepth(process.env, process.pid);
   process.env.ZERON_PI_PID = String(process.pid);          // for the Pis this one starts
   process.env.ZERON_SUBAGENT_DEPTH = String(depth);
-  const note = subagentNote(process.env, depth);
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
     const annotationsOf = () => {
       try { return pi.getAllTools().find((t) => t.name === event.toolName)?.annotations; } catch { return undefined; }
@@ -611,16 +592,6 @@ export default function deleteGuard(pi) {
       h = SHELL_TOOLS.has(event.toolName) ? hit("guard-error", "the guard could not analyse this command") : undefined;
     }
     if (h) return { block: true, reason: REASON(h) };
-  });
-  // A prompt section of its own, so other extensions' sections still apply;
-  // an older Pi without sections gets it appended.
-  if (note) pi.on("before_agent_start", (event) => {
-    const sections = event.systemPromptOptions?.sections;
-    if (sections && typeof sections === "object") {
-      sections.zeron_subagent = note;
-      return undefined;
-    }
-    return { systemPrompt: [event.systemPrompt, note].join("\n\n") };
   });
   if (depth === 0 && process.env.ZERON_PACKAGE_CHECK === "1") {
     delete process.env.ZERON_PACKAGE_CHECK;     // once: not on a reload, not in children
