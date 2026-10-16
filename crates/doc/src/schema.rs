@@ -655,6 +655,65 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// What the harness's own session calls a user message (Pi:
+    /// `ts:<message timestamp>`), recorded when the message reached it, so
+    /// the conversation can be rewound to it there.
+    pub fn harness_ref(&self, message_id: &str) -> Option<String> {
+        match self.doc.get_map("harnessRefs").get(message_id) {
+            Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn set_harness_ref(&self, message_id: &str, harness_ref: &str) -> Result<(), DocError> {
+        if self.harness_ref(message_id).as_deref() != Some(harness_ref) {
+            self.doc
+                .get_map("harnessRefs")
+                .insert(message_id, harness_ref)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    /// Delete the entry `message_id` and every entry after it, with their
+    /// harness refs (a rewind). Returns how many entries went: 0 when no
+    /// entry has that id.
+    pub fn truncate_from(&self, message_id: &str) -> Result<usize, DocError> {
+        let messages = self.doc.get_list("messages");
+        let mut start = None;
+        let mut gone = Vec::new();
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id = match map.get("id") {
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => s.to_string(),
+                _ => String::new(),
+            };
+            if start.is_none() && id == message_id {
+                start = Some(i);
+            }
+            if start.is_some() {
+                gone.push(id);
+            }
+        }
+        let Some(start) = start else {
+            return Ok(0);
+        };
+        let count = messages.len() - start;
+        messages.delete(start, count)?;
+        let refs = self.doc.get_map("harnessRefs");
+        for id in gone {
+            if refs.get(&id).is_some() {
+                refs.delete(&id)?;
+            }
+        }
+        self.doc.commit();
+        Ok(count)
+    }
+
     /// Append an error part to an existing entry (crash recovery: the aborted
     /// entry must SAY why it ended — "Run interrupted by engine restart…" —
     /// not just truncate silently). Returns `false` when no entry matches.
@@ -1604,6 +1663,34 @@ mod tests {
             continuation_of: None,
             duration_ms: None,
         }
+    }
+
+    #[test]
+    fn a_rewind_cuts_the_transcript_from_a_message_with_its_refs() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        for id in ["u1", "a1", "u2", "a2", "u3"] {
+            doc.push_message(&user_entry(id, id)).unwrap();
+        }
+        doc.set_harness_ref("u1", "ts:1").unwrap();
+        doc.set_harness_ref("u2", "ts:2").unwrap();
+        assert_eq!(doc.harness_ref("u2").as_deref(), Some("ts:2"));
+        assert_eq!(doc.truncate_from("nope").unwrap(), 0);
+        assert_eq!(doc.truncate_from("u2").unwrap(), 3);
+        let ids: Vec<String> = doc
+            .read_entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["u1", "a1"]);
+        assert_eq!(doc.harness_ref("u1").as_deref(), Some("ts:1"));
+        assert_eq!(doc.harness_ref("u2"), None);
+        // Another device sees the same cut.
+        let peer = SessionDoc::from_doc(loro::LoroDoc::new());
+        peer.doc()
+            .import(&doc.doc().export(loro::ExportMode::Snapshot).unwrap())
+            .unwrap();
+        assert_eq!(peer.read_entries().unwrap().len(), 2);
     }
 
     #[test]

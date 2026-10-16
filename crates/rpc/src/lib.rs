@@ -76,6 +76,9 @@ pub mod methods {
     pub const WATCH_EXTENSION_UI: &str = "WatchExtensionUi";
     /// `{chatId, action: ExtensionUiAction}`: act on a live extension element.
     pub const EXTENSION_UI_ACTION: &str = "ExtensionUiAction";
+    /// Rewind a main Pi chat to one of its user messages (code,
+    /// conversation, or both). Runs on the chat's host.
+    pub const REWIND_CHAT: &str = "RewindChat";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";

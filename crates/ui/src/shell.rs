@@ -4361,7 +4361,78 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::Rewind {
+                chat_id,
+                message_id,
+                choice,
+                text,
+            } => self.rewind_chat(
+                chat_id.clone(),
+                message_id.clone(),
+                *choice,
+                text.clone(),
+                cx,
+            ),
         }
+    }
+
+    /// Rewind a main Pi session to before one of its user messages (the
+    /// engine's `RewindChat`, run on the chat's host). Once the conversation
+    /// is back, the message returns to the input box, after any draft.
+    fn rewind_chat(
+        &mut self,
+        chat_id: String,
+        message_id: String,
+        choice: transcript::RewindChoice,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let (engine, device) = {
+            let state = self.state.read(cx);
+            let device = state
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .map(|chat| chat.device_id.clone());
+            (state.engine().cloned(), device)
+        };
+        let Some(engine) = engine else {
+            crate::toast::error(cx, "Engine not connected");
+            return;
+        };
+        let mut params = serde_json::json!({
+            "chatId": chat_id.clone(),
+            "messageId": message_id,
+            "mode": choice.wire(),
+        });
+        if let Some(device) = device {
+            params["targetDeviceId"] = device.into();
+        }
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::REWIND_CHAT, params).await;
+            this.update(cx, |shell, cx| match result {
+                Ok(outcome) => {
+                    let conversation = outcome["conversation"] == true;
+                    if conversation && !text.trim().is_empty() {
+                        shell.state.update(cx, |state, cx| {
+                            if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                                state.extension_ui.editor_text = Some(text);
+                                cx.notify();
+                            }
+                        });
+                    }
+                    let message = rewind_summary(choice, &outcome);
+                    if outcome["failed"].as_array().is_some_and(|f| !f.is_empty()) {
+                        crate::toast::error(cx, message);
+                    } else {
+                        crate::toast::success(cx, message);
+                    }
+                }
+                Err(err) => crate::toast::error(cx, format!("Rewind failed: {err}")),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// A spawn chip's "Open subagent": focus the existing tab for that doc,
@@ -14566,9 +14637,62 @@ impl Render for Shell {
     }
 }
 
+/// The toast after a rewind: what came back, from the engine's outcome.
+fn rewind_summary(choice: transcript::RewindChoice, outcome: &serde_json::Value) -> String {
+    let count = |key: &str| outcome[key].as_u64().unwrap_or(0);
+    let files = count("restored") + count("deleted");
+    let failed = outcome["failed"].as_array().map_or(0, Vec::len);
+    let mut parts = Vec::new();
+    if outcome["conversation"] == true {
+        parts.push("Conversation rewound".to_owned());
+    }
+    if choice != transcript::RewindChoice::Conversation {
+        parts.push(match files {
+            0 => "no file changes to restore".to_owned(),
+            1 => "1 file restored".to_owned(),
+            n => format!("{n} files restored"),
+        });
+    }
+    if failed > 0 {
+        parts.push(format!(
+            "{failed} file{} could not be restored",
+            if failed == 1 { "" } else { "s" }
+        ));
+    }
+    let mut message = parts.join(", ");
+    if let Some(first) = message.get(..1) {
+        message = first.to_uppercase() + &message[1..];
+    }
+    message + "."
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rewind_toast_says_what_came_back() {
+        use transcript::RewindChoice::{Both, Code, Conversation};
+        let toast = |choice, conversation: bool, restored: u64, failed: &[&str]| {
+            let outcome = serde_json::json!({
+                "conversation": conversation,
+                "restored": restored,
+                "deleted": u64::from(restored > 1),
+                "failed": failed,
+            });
+            rewind_summary(choice, &outcome)
+        };
+        assert_eq!(
+            toast(Both, true, 2, &[]),
+            "Conversation rewound, 3 files restored."
+        );
+        assert_eq!(toast(Conversation, true, 0, &[]), "Conversation rewound.");
+        assert_eq!(toast(Code, false, 0, &[]), "No file changes to restore.");
+        assert_eq!(
+            toast(Code, false, 1, &["/r/a"]),
+            "1 file restored, 1 file could not be restored."
+        );
+    }
 
     pub(super) fn chat_with_path(
         cwd: Option<&str>,

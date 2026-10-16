@@ -758,6 +758,8 @@ enum Pending {
 }
 struct Delivery {
     epoch: u64,
+    /// The Zeron message, for [`AgentEvent::UserMessageDelivered`].
+    message_id: Option<String>,
     // Queue acceptance permits sending the next steer, but is not consumption.
     queued: bool,
 }
@@ -1329,6 +1331,7 @@ impl Runner {
                         self.submit(steer.prompt.clone(), images, true)?;
                         self.deliveries.push_back(Delivery {
                             epoch: self.epoch,
+                            message_id: steer.message_id.clone(),
                             queued: false,
                         });
                     }
@@ -1572,6 +1575,19 @@ impl Runner {
             self.completions = completions;
             return Ok(());
         }
+        // The rewind command's answer is for the host, which waits on it.
+        if frame["type"] == "extension_ui_request"
+            && frame["method"] == "notify"
+            && let Some(answer) = frame["message"]
+                .as_str()
+                .and_then(|m| m.strip_prefix("ZERON-REWIND "))
+        {
+            if let Ok(answer) = serde_json::from_str::<Value>(answer) {
+                self.ui
+                    .host_channel(zeron_proto::REWIND_CHANNEL, Some(answer));
+            }
+            return Ok(());
+        }
         if let Some(toast) = catalog::package_updates_notice(&frame) {
             if let Some(toast) = toast {
                 self.ui
@@ -1732,10 +1748,27 @@ impl Runner {
             self.record_ui().await?;
         }
         if frame["type"] == "message_start" && frame["message"]["role"] == "user" {
+            // Pi keeps the message's timestamp in its session entry: that is
+            // how a rewind finds it again.
+            let delivered = frame["message"]["timestamp"].as_i64().map(|ts| {
+                let message_id = if self.initial_pending {
+                    None
+                } else {
+                    self.deliveries.front().and_then(|d| d.message_id.clone())
+                };
+                (self.initial_pending || message_id.is_some(), message_id, ts)
+            });
             if self.initial_pending {
                 self.initial_pending = false;
             } else {
                 self.confirm_delivery().await?;
+            }
+            if let Some((true, message_id, ts)) = delivered {
+                self.emit(AgentEvent::UserMessageDelivered {
+                    message_id,
+                    harness_ref: format!("ts:{ts}"),
+                })
+                .await?;
             }
         }
         // An extension switched the model (a refusal's fallback): the turn

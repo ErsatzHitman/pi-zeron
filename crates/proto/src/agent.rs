@@ -675,6 +675,13 @@ pub const SECRET_ANSWER_ELEMENT: &str = "pi:secret:";
 /// Element id of a [`SlashCommand::side`] command sent to the live agent
 /// (`value: {"text": "/jev off"}`): it never enters the chat's history.
 pub const SIDE_COMMAND_ELEMENT: &str = "pi:side-command";
+/// The Pi command that rewinds code and/or conversation to a user message
+/// (Pi's `zeron-rewind` extension), sent as a side command:
+/// `/pi_ui_rewind <harness ref> <both|conversation|code> <nonce>`.
+pub const REWIND_COMMAND: &str = "pi_ui_rewind";
+/// Host channel carrying the rewind command's last answer
+/// (`{"v":1,"ok":..,"nonce":..,"conversation":..,"restored":n,...}`).
+pub const REWIND_CHANNEL: &str = "zeron:rewind";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -784,6 +791,15 @@ pub enum AgentEvent {
     Steered {
         assistant_message_id: Option<String>,
         next_assistant_message_id: Option<String>,
+    },
+    /// A user message reached the harness's own session, which names it
+    /// `harness_ref` (Pi: `ts:<message timestamp>`), so it can be rewound
+    /// there. `message_id` is the Zeron message; `None` is the prompt the
+    /// run started with.
+    #[serde(rename_all = "camelCase")]
+    UserMessageDelivered {
+        message_id: Option<String>,
+        harness_ref: String,
     },
     #[serde(rename_all = "camelCase")]
     Done {

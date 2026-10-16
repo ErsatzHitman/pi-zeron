@@ -3541,6 +3541,8 @@ pub struct Transcript {
     /// Entry whose hover action is showing transient copied-check feedback.
     copied_message: Option<SharedString>,
     copied_message_clear: Option<Task<()>>,
+    /// The user message whose rewind menu is open.
+    rewind_menu: crate::popover::Popup<SharedString>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it.
@@ -3608,9 +3610,69 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// A user message's rewind menu: go back to before that message.
+    /// `text` is the message, for the composer once the conversation is back.
+    Rewind {
+        chat_id: String,
+        message_id: String,
+        choice: RewindChoice,
+        text: String,
+    },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
+
+/// What a rewind puts back, as the user picks it from a message's menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindChoice {
+    Both,
+    Conversation,
+    Code,
+}
+
+impl RewindChoice {
+    pub const ALL: [Self; 3] = [Self::Both, Self::Conversation, Self::Code];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Both => "Restore code and conversation",
+            Self::Conversation => "Restore conversation",
+            Self::Code => "Restore code",
+        }
+    }
+
+    /// The engine's `RewindChat` mode.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Conversation => "conversation",
+            Self::Code => "code",
+        }
+    }
+
+    pub fn restores_conversation(self) -> bool {
+        self != Self::Code
+    }
+}
+
+/// Whether a chat's user messages offer rewind: only a normal main session
+/// (not a side chat, a chat an agent or orchestrator started, or an
+/// orchestrator) running Pi, and only while no turn runs.
+pub(crate) fn rewind_offered(
+    chat: Option<&zeron_proto::Chat>,
+    indicator: crate::state::Indicator,
+) -> bool {
+    chat.is_some_and(|chat| {
+        chat.is_top_level()
+            && chat
+                .config
+                .as_ref()
+                .is_some_and(|c| c.harness == zeron_proto::HarnessId::Pi)
+    }) && !matches!(
+        indicator,
+        crate::state::Indicator::Working | crate::state::Indicator::AwaitingInput
+    )
+}
 
 impl Transcript {
     pub(crate) fn set_workspace_link_handler(&mut self, handler: render::LinkUi) {
@@ -3993,6 +4055,7 @@ impl Transcript {
             code_fences: HashMap::new(),
             copied_message: None,
             copied_message_clear: None,
+            rewind_menu: crate::popover::Popup::default(),
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
             attachment_preview_return_focus: None,
@@ -5156,6 +5219,7 @@ impl Transcript {
             self.highlights.entries.clear();
             self.copied_message = None;
             self.copied_message_clear = None;
+            self.rewind_menu = crate::popover::Popup::default();
             self.list.reset(0);
             self.pending_viewport = None;
             self.viewport_generation = self.viewport_generation.wrapping_add(1);
@@ -8062,13 +8126,20 @@ impl Transcript {
         // User entries align end (under the bubble), assistant entries start.
         // Both read timestamp first, then the copy action.
         let is_user_row = matches!(row.kind, RowKind::User { .. });
-        let hovered = self
-            .hovered_entry
-            .as_ref()
-            .is_some_and(|(_, entry)| entry == &row.entry_id);
+        let rewind_open = self.rewind_menu.get() == Some(&row.entry_id);
+        let hovered = rewind_open
+            || self
+                .hovered_entry
+                .as_ref()
+                .is_some_and(|(_, entry)| entry == &row.entry_id);
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
         let copy_entry_id = row.entry_id.clone();
+        let rewind = (hovered
+            && matches!(row.kind, RowKind::User { pending: false, .. })
+            && row.timestamp.is_some()
+            && self.rewind_available(cx))
+        .then(|| self.render_rewind_button(&row.entry_id, row.copy_text.clone(), &theme, cx));
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
                 .text_size(crate::typography::ui_rems(12.0))
@@ -8112,7 +8183,7 @@ impl Transcript {
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM));
-            let metadata = metadata.child(timestamp).children(copy);
+            let metadata = metadata.child(timestamp).children(copy).children(rewind);
             div()
                 .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
                 .pt(px(Theme::SPACE_SM))
@@ -8253,6 +8324,133 @@ impl Transcript {
                 .inset_0(),
             )
             .into_any_element()
+    }
+
+    /// Whether this view offers rewind on its user messages (see
+    /// [`rewind_offered`]). A subagent tab never does.
+    fn rewind_available(&self, cx: &gpui::App) -> bool {
+        if self.doc_override.is_some() {
+            return false;
+        }
+        let Some(chat_id) = self.chat_id.as_deref() else {
+            return false;
+        };
+        let state = self.state.read(cx);
+        rewind_offered(
+            state.chats.iter().find(|chat| chat.id == chat_id),
+            state.indicator_for(chat_id, chrono::Utc::now()),
+        )
+    }
+
+    /// The hover strip's rewind action: an icon that opens a three-item menu
+    /// (code and conversation, conversation, code).
+    fn render_rewind_button(
+        &self,
+        entry_id: &SharedString,
+        text: Option<SharedString>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fade_key = format!("rewind-message-hover-{entry_id}");
+        let open = self.rewind_menu.get() == Some(entry_id);
+        let press_id = entry_id.clone();
+        let toggle_id = entry_id.clone();
+        let mut button = div()
+            .id(SharedString::from(format!("rewind-message-{entry_id}")))
+            .debug_selector({
+                let selector = format!("rewind-message-{entry_id}");
+                move || selector
+            })
+            .size(px(Theme::SPACE_MD * 2.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(Theme::CONTROL_RADIUS))
+            .cursor_pointer()
+            .bg(if open {
+                crate::theme::ink(0.08)
+            } else {
+                motion::hover_blend(
+                    &fade_key,
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.08),
+                )
+            })
+            .on_hover(motion::hover_listener(fade_key))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    this.rewind_menu
+                        .note_trigger_press_matching(|open| *open == press_id);
+                }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if this.rewind_menu.take_press_was_open() {
+                    this.close_rewind_menu(cx);
+                } else {
+                    this.rewind_menu.open(toggle_id.clone());
+                    cx.notify();
+                }
+            }))
+            .when(!open, |el| {
+                el.tooltip(crate::settings::widgets::text_tooltip("Rewind to here"))
+            })
+            .child(
+                crate::icons::icon(crate::icons::RESTART)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            );
+        if open {
+            let popup = Theme::of(cx).for_popup();
+            let mut menu = crate::popover::popover_card(&popup)
+                .w(px(232.0))
+                .flex()
+                .flex_col()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_rewind_menu(cx)));
+            for (ix, choice) in RewindChoice::ALL.into_iter().enumerate() {
+                let message_id = entry_id.to_string();
+                let text = text.as_ref().map(|t| t.to_string()).unwrap_or_default();
+                menu = menu.child(
+                    crate::popover::menu_row(
+                        &popup,
+                        false,
+                        format!("rewind-menu-{}-{entry_id}", choice.wire()),
+                    )
+                    .id(("rewind-menu", ix))
+                    .debug_selector(move || format!("rewind-menu-{}", choice.wire()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.close_rewind_menu(cx);
+                        let Some(chat_id) = this.chat_id.clone() else {
+                            return;
+                        };
+                        cx.emit(TranscriptEvent::Rewind {
+                            chat_id,
+                            message_id: message_id.clone(),
+                            choice,
+                            text: text.clone(),
+                        });
+                    }))
+                    .child(SharedString::from(choice.label())),
+                );
+            }
+            button = button
+                .relative()
+                .child(crate::popover::anchored_menu_below_end(
+                    format!("rewind-menu-{entry_id}"),
+                    menu.into_any_element(),
+                    self.rewind_menu.closing_since(),
+                ));
+        }
+        button.into_any_element()
+    }
+
+    fn close_rewind_menu(&mut self, cx: &mut Context<Self>) {
+        if self.rewind_menu.begin_close() {
+            crate::popover::reap_popup(cx, |this: &mut Self| &mut this.rewind_menu);
+        }
+        cx.notify();
     }
 
     fn copy_message(&mut self, entry_id: SharedString, text: SharedString, cx: &mut Context<Self>) {
@@ -10920,6 +11118,126 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewind_is_offered_only_in_idle_main_pi_sessions() {
+        use crate::state::Indicator;
+        let chat = |harness: zeron_proto::HarnessId| -> zeron_proto::Chat {
+            serde_json::from_value(serde_json::json!({
+                "id": "chat-1", "deviceId": "dev", "title": null, "archived": false,
+                "cwd": null, "branch": null, "checkoutId": null,
+                "config": {"harness": harness, "model": null, "reasoning": null, "sandbox": "workspace-write"},
+                "lastMessagePreview": null, "lastMessageAt": null,
+                "createdAt": "2026-10-16T00:00:00Z",
+            }))
+            .unwrap()
+        };
+        let pi = chat(zeron_proto::HarnessId::Pi);
+        assert!(rewind_offered(Some(&pi), Indicator::None));
+        assert!(rewind_offered(Some(&pi), Indicator::Errored));
+        assert!(!rewind_offered(Some(&pi), Indicator::Working));
+        assert!(!rewind_offered(Some(&pi), Indicator::AwaitingInput));
+        assert!(!rewind_offered(None, Indicator::None));
+        let other = chat(zeron_proto::HarnessId::ClaudeCode);
+        assert!(!rewind_offered(Some(&other), Indicator::None));
+        // Side chats and chats an agent or orchestrator started.
+        let mut child = pi.clone();
+        child.parent_chat_id = Some("parent".into());
+        assert!(!rewind_offered(Some(&child), Indicator::None));
+        let mut root = pi.clone();
+        root.id = format!("{}1", zeron_proto::orchestrator::ROOT_CHAT_PREFIX);
+        assert!(!rewind_offered(Some(&root), Indicator::None));
+    }
+
+    #[gpui::test]
+    fn a_user_message_offers_rewind_from_its_hover_row(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "chat-a", "deviceId": "dev", "title": null, "archived": false,
+            "cwd": null, "branch": null, "checkoutId": null,
+            "config": {"harness": "pi", "model": null, "reasoning": null, "sandbox": "workspace-write"},
+            "lastMessagePreview": null, "lastMessageAt": null,
+            "createdAt": "2026-10-16T00:00:00Z",
+        }))
+        .unwrap();
+        let mut message = assistant(
+            "u1",
+            MessageStatus::Complete,
+            vec![text_part("t0", "fix the parser")],
+        );
+        message.role = MessageRole::User;
+        message.status = None;
+        message.created_at = 1_792_000_000_000;
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.chats = vec![chat];
+            state.selected_chat = Some("chat-a".into());
+            state.transcript_replayed = true;
+            state.transcript = vec![message];
+            state.transcript_revision += 1;
+        });
+        let (transcript, cx) = cx.add_window_view(|_, cx| Transcript::new(state.clone(), cx));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let events = events.clone();
+            cx.subscribe(&transcript, move |_, event: &TranscriptEvent, _| {
+                events.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        let hover = |cx: &mut gpui::VisualTestContext| {
+            transcript.update(cx, |this, cx| {
+                this.sync(cx);
+                let row = this.rows.iter().find(|r| r.entry_id == "u1").unwrap();
+                this.hovered_entry = Some((row.id.clone(), row.entry_id.clone()));
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear());
+        };
+        hover(cx);
+        let button = cx
+            .debug_bounds("rewind-message-u1")
+            .expect("a main Pi session offers rewind")
+            .center();
+        cx.simulate_click(button, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        let code = cx
+            .debug_bounds("rewind-menu-code")
+            .expect("the menu lists what to restore")
+            .center();
+        assert!(cx.debug_bounds("rewind-menu-both").is_some());
+        assert!(cx.debug_bounds("rewind-menu-conversation").is_some());
+        cx.simulate_click(code, gpui::Modifiers::default());
+        let events = events.borrow().clone();
+        match events.as_slice() {
+            [
+                TranscriptEvent::Rewind {
+                    chat_id,
+                    message_id,
+                    choice,
+                    text,
+                },
+            ] => {
+                assert_eq!(chat_id, "chat-a");
+                assert_eq!(message_id, "u1");
+                assert_eq!(*choice, RewindChoice::Code);
+                assert_eq!(text, "fix the parser");
+            }
+            other => panic!("expected one rewind, got {other:?}"),
+        }
+
+        // A side chat, or one an agent started, never offers it.
+        state.update(cx, |state, _| {
+            state.chats[0].parent_chat_id = Some("parent".into())
+        });
+        hover(cx);
+        assert!(cx.debug_bounds("rewind-message-u1").is_none());
+    }
 
     #[test]
     fn agent_and_board_messages_show_who_sent_them() {

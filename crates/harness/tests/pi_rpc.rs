@@ -286,6 +286,53 @@ async fn idle_mailbox_starts_another_turn_without_restarting_process() {
 }
 
 #[tokio::test]
+async fn each_delivered_user_message_is_named_for_a_rewind() {
+    // The run's own prompt has no Zeron id here (the host knows it); each
+    // warm prompt carries its id. Pi names both by their timestamp.
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "first"), c)
+        .await
+        .unwrap();
+    let mut sender = Some(tx);
+    let mut delivered = vec![];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::Done { .. } => {
+                    if let Some(tx) = sender.take() {
+                        tx.send(SteerMessage {
+                            prompt: "second".into(),
+                            message_id: Some("zeron-2".into()),
+                            attachments: Vec::new(),
+                            config: None,
+                        })
+                        .await
+                        .unwrap();
+                    }
+                }
+                AgentEvent::UserMessageDelivered {
+                    message_id,
+                    harness_ref,
+                } => delivered.push((message_id, harness_ref)),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(delivered.len(), 2, "{delivered:?}");
+    assert_eq!(delivered[0].0, None);
+    assert_eq!(delivered[1].0.as_deref(), Some("zeron-2"));
+    for (_, harness_ref) in &delivered {
+        assert!(harness_ref.starts_with("ts:"), "{harness_ref}");
+    }
+    assert_ne!(delivered[0].1, delivered[1].1);
+}
+
+#[tokio::test]
 async fn a_refused_prompt_ends_its_turn_and_keeps_the_pi_process() {
     let dir = tempfile::tempdir().unwrap();
     let (c, tx, _) = controls();

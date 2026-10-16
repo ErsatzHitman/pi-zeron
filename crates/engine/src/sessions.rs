@@ -3406,6 +3406,21 @@ async fn drive_run(
                 continue;
             }
         }
+        // Where the harness keeps each user message, for a rewind. Never a
+        // turn boundary.
+        if let AgentEvent::UserMessageDelivered {
+            message_id,
+            harness_ref,
+        } = &event
+        {
+            let message_id = message_id
+                .as_deref()
+                .unwrap_or(&resume_state.user_message_id);
+            if let Err(err) = doc_ref.set_harness_ref(message_id, harness_ref) {
+                tracing::warn!(%chat_id, error = %err, "harness ref write failed");
+            }
+            continue;
+        }
         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {

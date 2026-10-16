@@ -1577,6 +1577,8 @@ fn forwardable(method: &str) -> bool {
             // Live extension UI is held by the chat's host engine.
             | methods::WATCH_EXTENSION_UI
             | methods::EXTENSION_UI_ACTION
+            // Pi's session and its file snapshots live on the host.
+            | methods::REWIND_CHAT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
@@ -2367,6 +2369,14 @@ impl RpcService for EngineRpc {
                 let p: ChatParams = parse_params(params)?;
                 let (rx, guard) = self.sessions.watch_extension_ui(&p.chat_id);
                 Ok(RpcReply::Stream(extension_ui_stream(rx, guard)))
+            }
+            methods::REWIND_CHAT => {
+                let p: crate::rewind::RewindParams = parse_params(params)?;
+                let outcome =
+                    crate::rewind::rewind(&self.workspace, &self.sessions, &self.doc_host, p)
+                        .await
+                        .map_err(RpcError::Failed)?;
+                RpcReply::value(&outcome)
             }
             methods::EXTENSION_UI_ACTION => {
                 let p: ExtensionUiActionParams = parse_params(params)?;
@@ -4649,6 +4659,7 @@ mod tests {
         assert!(forwardable(methods::WATCH_EXTENSION_UI));
         assert!(is_stream_method(methods::WATCH_EXTENSION_UI));
         assert!(forwardable(methods::EXTENSION_UI_ACTION));
+        assert!(forwardable(methods::REWIND_CHAT));
         assert!(!is_stream_method(methods::EXTENSION_UI_ACTION));
         assert!(forwardable(methods::CHECK_HARNESS_UPDATES));
         assert!(forwardable(methods::GET_USAGE_REPORT));

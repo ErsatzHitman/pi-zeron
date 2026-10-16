@@ -8,6 +8,11 @@ use std::{
     },
     time::Duration,
 };
+/// A user message's `timestamp`, as Pi stamps it: unique per message.
+fn stamp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_790_000_000_000);
+    NEXT.fetch_add(1, Ordering::SeqCst)
+}
 fn emit(v: Value) {
     let mut out = std::io::stdout().lock();
     writeln!(out, "{v}").unwrap();
@@ -349,7 +354,7 @@ fn main() {
                 disposition(&v, "started");
                 emit(json!({"type":"agent_start"}));
                 emit(
-                    json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":text}]}}),
+                    json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":text}],"timestamp":stamp()}}),
                 );
                 let active = active.clone();
                 let abort = abort.clone();
@@ -445,7 +450,7 @@ fn main() {
                                 let next = queued.pop_front().unwrap();
                                 queue_update(&queued);
                                 emit(
-                                    json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":next}]}}),
+                                    json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":next}],"timestamp":stamp()}}),
                                 );
                                 batch.push(next);
                             }
@@ -498,7 +503,7 @@ fn main() {
             "steer" => {
                 response(&v, json!({}));
                 emit(
-                    json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":v["message"]}]}}),
+                    json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":v["message"]}],"timestamp":stamp()}}),
                 );
             }
             "clear_queue" => {

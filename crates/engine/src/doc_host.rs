@@ -864,6 +864,20 @@ impl ChatDocHandle {
         })
     }
 
+    /// A rewind: delete the user message `message_id` and everything after
+    /// it, then show the shorter transcript. Only while no turn streams:
+    /// streaming writers address entries by position. Returns how many
+    /// entries went (0: no such message).
+    pub(crate) fn rewind_to(&self, message_id: &str) -> Result<usize, DocError> {
+        let removed = self.import_transcript(|| self.doc.truncate_from(message_id))?;
+        if removed > 0 {
+            // The measured context described the conversation that is gone.
+            self.doc.clear_context_usage()?;
+            self.publish_messages();
+        }
+        Ok(removed)
+    }
+
     /// Recovery sweep: settle this device's running subagent chips (including
     /// chips in completed parent turns), then stamp abandoned `streaming`
     /// entries `aborted`, appending
