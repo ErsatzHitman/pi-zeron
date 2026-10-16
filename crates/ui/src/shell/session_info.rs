@@ -24,6 +24,7 @@ use zeron_proto::{Chat, ChatIndicator, CheckoutDiff};
 
 mod agents;
 mod compact;
+mod context;
 mod sections;
 mod todos;
 mod workflow;
@@ -55,6 +56,7 @@ const AGENTS: &str = "agents";
 const BACKGROUND: &str = "background";
 const COMPACT: &str = "compact";
 const WORKFLOW: &str = "workflow";
+const CONTEXT: &str = "context";
 /// The Compaction section's body: the bar line, a gap, the caption line and
 /// its bottom padding.
 const COMPACT_BODY_HEIGHT: f32 = 40.0;
@@ -98,6 +100,16 @@ pub(super) struct SessionPanel {
     pub(super) rename_pin: bool,
     /// The chat whose Compaction section is up, for its hysteresis.
     compact_shown: (String, bool),
+    /// The Context section is open (it starts folded, as a one-line meter),
+    /// and its MCP tools list.
+    context_open: bool,
+    context_mcp_open: bool,
+    /// Each chat's last context breakdown and when it changed, so a chat
+    /// whose Pi is not running keeps its last known split.
+    context_seen: std::collections::HashMap<
+        String,
+        (zeron_proto::extension_ui::ContextBreakdown, DateTime<Utc>),
+    >,
 }
 
 /// What a section draws from: moved in each frame, kept by a section
@@ -793,6 +805,34 @@ impl Shell {
                 state.context_usage,
             )
         };
+        let context = {
+            let live = self
+                .state
+                .read(cx)
+                .extension_ui
+                .of(&chat.id)
+                .and_then(zeron_proto::extension_ui::ContextBreakdown::of);
+            let seen = &mut self.session_panel.context_seen;
+            if let Some(live) = live {
+                // Pi republishes after a reset with a fresh seq; only a
+                // changed split moves "Last updated".
+                let changed = seen.get(&chat.id).is_none_or(|(old, _)| {
+                    let mut old = old.clone();
+                    old.seq = live.seq;
+                    old != live
+                });
+                if changed {
+                    seen.insert(chat.id.clone(), (live, now));
+                } else if let Some(entry) = seen.get_mut(&chat.id) {
+                    entry.0.seq = live.seq;
+                }
+            }
+            let breakdown = seen.get(&chat.id).map(|(b, at)| (b, *at));
+            context::ContextView::of(breakdown, usage, compact.as_ref())
+        };
+        let context_rows = context.map(|view| {
+            self.render_context(&view, status == ChatIndicator::Working, now, &theme, cx)
+        });
         let shown = matches!(&self.session_panel.compact_shown, (id, true) if *id == chat.id);
         let meter = CompactMeter::of(compact.as_ref(), usage, shown);
         self.session_panel.compact_shown = (chat.id.clone(), meter.is_some());
@@ -865,6 +905,17 @@ impl Shell {
                 body.child(popover::picker_divider())
                     .children(branch_row)
                     .children(changes_row)
+            })
+            .when_some(context_rows, |body, rows| {
+                // Like the sections: bleed through the inset for the divider.
+                body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(popover::MENU_GAP))
+                        .mx(px(-popover::CARD_INSET))
+                        .children(rows),
+                )
             })
             .when(!sections.is_empty(), |body| {
                 // The body's gap already spaces the column and each section
@@ -2084,6 +2135,302 @@ impl Shell {
                     .into_any_element(),
             );
         }
+    }
+
+    /// The Context section: always there for a chat with a context window.
+    /// Folded, it is one line: its percent and a ring. Open, it is Claude
+    /// Code's /context: used of the window, a bar split by what fills it,
+    /// a row per part with its tokens and share, deferred tools, the MCP
+    /// tools by server, and when the split last changed.
+    fn render_context(
+        &mut self,
+        view: &context::ContextView,
+        working: bool,
+        now: DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let open = self.session_panel.context_open;
+        let fraction = view.fraction() as f32;
+        let tone = if fraction >= 0.9 {
+            theme.danger
+        } else if fraction >= 0.75 {
+            theme.warning
+        } else {
+            theme.accent
+        };
+        let header = div()
+            .id("session-info-context-header")
+            .debug_selector(|| "session-info-context-header".into())
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(format!("Context, {}", view.headline())))
+            .mx(px(popover::CARD_INSET))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(SECTION_HEADER_HEIGHT))
+            .px(px(8.0))
+            .cursor_pointer()
+            .rounded(px(popover::MENU_ITEM_RADIUS))
+            .hover(|style| style.bg(crate::theme::ink(0.04)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.session_panel.context_open = !this.session_panel.context_open;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(10.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(popover::tracked_upper("Context"))),
+            )
+            .child(
+                icon(if open {
+                    icons::ALT_ARROW_DOWN
+                } else {
+                    icons::ALT_ARROW_RIGHT
+                })
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(div().flex_1())
+            .child(trailing_text(view.short(), theme.text_muted))
+            .child(crate::context_usage::ring(fraction, tone, theme))
+            .into_any_element();
+        let mut rows = vec![popover::picker_divider().into_any_element(), header];
+        if !open {
+            return rows;
+        }
+
+        let swatch = |kind: context::Kind| -> gpui::Hsla {
+            use context::Kind::*;
+            match kind {
+                SystemTools => theme.accent,
+                McpTools => theme.warning,
+                SystemPrompt => theme.success,
+                Used => tone,
+                Messages => theme.text_muted.opacity(0.85),
+                Skills => theme.text_muted.opacity(0.7),
+                McpInstructions => theme.text_muted.opacity(0.6),
+                Other => theme.text_muted.opacity(0.5),
+                SinceUpdate => theme.text_muted.opacity(0.45),
+                Autocompact => theme.text_faint.opacity(0.9),
+                Free | DeferredMcp | DeferredSystem => theme.text_faint.opacity(0.45),
+            }
+        };
+        let row = |r: &context::Row, dim: bool| {
+            let kind = r.kind;
+            let label = match r.count {
+                Some(n) if n > 0 && matches!(kind, context::Kind::Skills) => {
+                    format!("{} ({n})", kind.label())
+                }
+                _ => kind.label().to_owned(),
+            };
+            let text = if dim { theme.text_muted } else { theme.text };
+            div()
+                .id(SharedString::from(format!(
+                    "session-info-context-row-{kind:?}"
+                )))
+                .debug_selector(move || format!("session-info-context-row-{kind:?}"))
+                .h(px(22.0))
+                .px(px(9.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(text)
+                .tooltip(crate::settings::widgets::text_tooltip(kind.about()))
+                .child(
+                    div()
+                        .size(px(9.0))
+                        .flex_none()
+                        .rounded(px(2.0))
+                        .bg(swatch(kind)),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(label))
+                .child(
+                    div()
+                        .w(px(52.0))
+                        .flex_none()
+                        .flex()
+                        .justify_end()
+                        .text_color(theme.text_muted)
+                        .child(context::tokens(r.tokens)),
+                )
+                .child(
+                    div()
+                        .w(px(44.0))
+                        .flex_none()
+                        .flex()
+                        .justify_end()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if dim { theme.text_muted } else { theme.text })
+                        .child(r.percent.map_or_else(|| "—".to_owned(), context::percent)),
+                )
+                .into_any_element()
+        };
+
+        let mut block = div()
+            .id("session-info-context")
+            .debug_selector(|| "session-info-context".into())
+            .mx(px(popover::CARD_INSET))
+            .pb(px(4.0))
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .child(
+                div()
+                    .px(px(9.0))
+                    .h(px(20.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .text_size(crate::typography::ui_rems(12.5))
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(view.headline()),
+                    )
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text_muted)
+                            .child(view.of_window()),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "session-info-context-bar".into())
+                    .mx(px(9.0))
+                    .my(px(4.0))
+                    .h(px(5.0))
+                    .rounded_full()
+                    .overflow_hidden()
+                    .bg(theme.wash(0.08))
+                    .flex()
+                    .flex_row()
+                    .gap(px(1.0))
+                    .children(view.segments().into_iter().map(|(kind, share)| {
+                        div()
+                            .h_full()
+                            .min_w(px(2.0))
+                            .w(gpui::relative(share))
+                            .bg(swatch(kind))
+                    })),
+            );
+        for r in &view.rows {
+            block = block.child(row(r, matches!(r.kind, context::Kind::Free)));
+        }
+        if !view.deferred.is_empty() {
+            block = block.child(div().h(px(6.0)));
+            for r in &view.deferred {
+                block = block.child(row(r, true));
+            }
+        }
+        if view.mcp_total > 0 {
+            let mcp_open = self.session_panel.context_mcp_open;
+            block = block.child(
+                div()
+                    .id("session-info-context-mcp")
+                    .debug_selector(|| "session-info-context-mcp".into())
+                    .role(gpui::Role::Button)
+                    .aria_label("MCP tools")
+                    .mt(px(4.0))
+                    .h(px(22.0))
+                    .px(px(9.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(popover::MENU_ITEM_RADIUS))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::ink(0.04)))
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(theme.text)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.session_panel.context_mcp_open = !this.session_panel.context_mcp_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        icon(if mcp_open {
+                            icons::ALT_ARROW_DOWN
+                        } else {
+                            icons::ALT_ARROW_RIGHT
+                        })
+                        .size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.7)),
+                    )
+                    .child(div().flex_1().child("MCP tools"))
+                    .child(trailing_text(view.mcp_total.to_string(), theme.text_muted)),
+            );
+            if mcp_open {
+                for server in view.mcp_servers.iter().take(workflow::GROUP_ROWS) {
+                    let name = workflow::clean(&server.name);
+                    let selector = format!("session-info-context-mcp-{name}");
+                    let sent = if server.declared > 0 {
+                        format!("{} of {} sent", server.declared, server.count)
+                    } else {
+                        format!("{} deferred", server.count)
+                    };
+                    block = block.child(
+                        div()
+                            .debug_selector(move || selector.clone())
+                            .h(px(22.0))
+                            .pl(px(26.0))
+                            .pr(px(9.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .text_color(theme.text_muted)
+                            .child(div().flex_1().min_w_0().truncate().child(name))
+                            .child(div().flex_none().child(sent))
+                            .child(
+                                div()
+                                    .w(px(44.0))
+                                    .flex_none()
+                                    .flex()
+                                    .justify_end()
+                                    .child(context::tokens(server.tokens)),
+                            ),
+                    );
+                }
+                let hidden = view.mcp_servers.len().saturating_sub(workflow::GROUP_ROWS);
+                if let Some(more) = workflow_more_row("context-mcp", hidden, theme) {
+                    block = block.child(more);
+                }
+            }
+        }
+        let mut footer = Vec::new();
+        footer.extend(view.updated_label(now));
+        if !view.detailed {
+            footer.push("The split appears once Pi's context-window extension reports.".into());
+        } else if working {
+            footer.push("Refreshes when this turn ends.".into());
+        }
+        if view.detailed && view.estimated {
+            footer.push("Parts are estimated; the total is the provider's count.".into());
+        }
+        if !footer.is_empty() {
+            block = block.child(
+                div()
+                    .debug_selector(|| "session-info-context-footer".into())
+                    .px(px(9.0))
+                    .pt(px(6.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.85))
+                    .child(footer.join(" ")),
+            );
+        }
+        rows.push(block.into_any_element());
+        rows
     }
 
     /// A run grouped by phase, as Claude Code draws a workflow: how long it

@@ -19,6 +19,7 @@ A setting saved by an older build that hid the panel is ignored.
 | Session | The agent's mark and the chat's title. While the agent works it shows a spinner and a live timer; "Needs input" while it waits on the user; "Error" after a failure; otherwise the model. Its `+` button, "btw", starts a side chat |
 | Branch | The conversation's branch |
 | Changes | The working tree's `+added −removed` line totals ("None" when clean). Clicking it opens the chat's diff tab, or a new one if none is open |
+| Context | Any chat whose agent reports a context window. See below |
 | Goal | Only while pi-goal has an active goal: its status (Running, Waiting, Paused, Blocked, Budget reached), the objective and its progress line. It replaces the line that used to run beside the transcript and the goal chip in the composer footer |
 | Todo | Only while the agent has a checklist with work left: one row per item (done, in progress with a spinner while the turn runs, pending), and the header counts `done/total`. A list the agent has finished shows only until its turn ends. Lists over six items fold to the current item and its neighbours, with "N earlier" and "N later" rows. Read-only; it mirrors the composer's checklist tray |
 | Sub-agents | See below |
@@ -26,7 +27,7 @@ A setting saved by an older build that hid the panel is ignored.
 | Workflow | See below |
 | Background | Only while one of Pi's background bash commands runs (the `bash-background` extension moves a command there after 20 seconds): one row per command with a live timer. A Stop button sits at its right end; the first click asks, and the second sends Kill |
 
-The essentials, from Machine to Changes, always show. Goal, Todo, Sub-agents, Workflow, Background and Compaction appear only while active: nothing running means no sections. They have no fixed order. A section that becomes active grows in at the bottom, and one whose work ends folds away while the others close up; the card does not reorder what is already showing. Sections already active when a chat opens appear at once, ordered by when their work started. A section's header folds it, and a fold lasts for the app run.
+The essentials, from Machine to Changes, always show, and so does Context under them whenever the chat has a context window. Goal, Todo, Sub-agents, Workflow, Background and Compaction appear only while active: nothing running means none of those sections. They have no fixed order. A section that becomes active grows in at the bottom, and one whose work ends folds away while the others close up; the card does not reorder what is already showing. Sections already active when a chat opens appear at once, ordered by when their work started. A section's header folds it, and a fold lasts for the app run.
 
 ## Sub-agents
 
@@ -42,6 +43,18 @@ Shown while a sub-agent or side chat runs, or when the chat has a parent (the Pa
 3. **Previous agents (N):** finished and failed sub-agents. This group is closed until opened.
 
 The sidebar nests the same side chats under their parent session ([sidebar side chats](sidebar-side-chats.md)).
+
+## Context
+
+Under Changes, for any chat whose agent reports a context window. Folded (the default) it is one line: **Context**, its percent and a ring, like the composer footer's. Click it to open the breakdown, Claude Code's `/context`:
+
+- **Used of the window:** "7% used" and "71.3k / 1M", then a bar split by what fills it, in each part's colour, with the autocompact buffer at its end.
+- **One row per part,** with its tokens and share of the window: System tools, MCP tools, System prompt, Messages, Skills, MCP server instructions, Since last update (tokens the provider has not counted yet, estimated), Autocompact buffer (kept free because Pi compacts before the window fills) and Free space. Hover a row for what it counts.
+- **Deferred tools:** MCP tools and system tools the model is not sent until it looks them up, listed dimmer with no share, since they take no room.
+- **MCP tools (N):** opens to each MCP server with how many of its tools the model is sent and their size.
+- **When it last changed:** "Last updated just now", and while the agent works, that it refreshes when the turn ends.
+
+The total and the window are the chat's own (the footer ring's numbers), so the two always agree; right after a compaction, Pi's estimate of what is left stands in. The split comes from Pi's `context-window` extension (`context:window` channel) and updates live as Pi publishes it, at each turn, reply, compaction, model change and MCP change, with no reload. The parts are estimated (characters ÷ 4); Messages takes whatever the measured total leaves, so the rows add up to the headline. Without the extension (or another harness) the section shows Used, the autocompact buffer when Zeron knows it, and Free space. A chat whose Pi is not running keeps its last split for the app run, with its age.
 
 ## Workflow
 
@@ -90,7 +103,7 @@ Fork chat is gone. The Files panel no longer has Subagents or Chats sections; th
 
 `session_info/compact.rs` decides when Compaction shows and what it says, from the Pi harness's `zeron:compact` host channel (`CompactStatus`: on or off, the threshold, a running compaction) and the chat's context usage.
 
-`session_info/workflow.rs` (pure) decides when Workflow shows and builds its rows from the `workflow:state` payload (`WorkflowState` in `zeron_proto::extension_ui`); `Shell::render_workflow` draws it, and its actions are sent with `WorkflowState::send`.
+`session_info/context.rs` (pure) builds the Context rows from the chat's `ContextUsage`, the `zeron:compact` status and the `context:window` payload (`ContextBreakdown` in `zeron_proto::extension_ui`); `Shell::render_context` draws it. `session_info/workflow.rs` (pure) decides when Workflow shows and builds its rows from the `workflow:state` payload (`WorkflowState` in `zeron_proto::extension_ui`); `Shell::render_workflow` draws it, and its actions are sent with `WorkflowState::send`.
 
 `session_info/agents.rs` builds the Sub-agents rows from `AppState`, and decides when Sub-agents and Background are active:
 

@@ -868,6 +868,121 @@ mod tests {
         cx.run_until_parked();
     }
 
+    #[gpui::test]
+    fn the_context_section_folds_to_a_meter_and_opens_to_its_breakdown(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                prepare(shell, cx);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                shell.settings.sidebar_collapsed = true;
+                shell.state.update(cx, |state, _| {
+                    state.selected_chat = Some("regular".into());
+                    state.context_usage = Some(zeron_proto::ContextUsage {
+                        tokens: Some(69_300),
+                        window: Some(1_000_000),
+                    });
+                });
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1600.0), px(1400.0)));
+        cx.run_until_parked();
+
+        // Before Pi's extension reports: folded, with the meter only.
+        let card = cx.debug_bounds("session-info").unwrap();
+        let header = cx
+            .debug_bounds("session-info-context-header")
+            .expect("always there");
+        assert!(card.contains(&header.center()));
+        assert!(
+            cx.debug_bounds("session-info-context").is_none(),
+            "starts folded"
+        );
+        click_on(&mut cx, "session-info-context-header");
+        assert!(cx.debug_bounds("session-info-context-row-Used").is_some());
+        assert!(cx.debug_bounds("session-info-context-row-Free").is_some());
+        assert!(
+            cx.debug_bounds("session-info-context-row-SystemTools")
+                .is_none()
+        );
+
+        // The extension's split arrives live, no reopening.
+        let split = |seq: u64, trailing: u64| {
+            json!({"v": 1, "seq": seq, "window": 1_000_000,
+                   "measured": {"tokens": 69_300, "source": "provider"}, "trailingTokens": trailing,
+                   "categories": {"systemTools": {"tokens": 24_500, "count": 11},
+                                  "mcpTools": {"tokens": 18_400, "count": 20},
+                                  "systemPrompt": {"tokens": 11_500}, "skills": {"tokens": 4_600, "count": 31},
+                                  "mcpInstructions": {"tokens": 1_400}},
+                   "deferred": {"mcpTools": {"tokens": 72_000, "count": 124}},
+                   "autocompact": {"enabled": true, "atTokens": 967_000, "bufferTokens": 33_000},
+                   "mcp": {"total": 144, "servers": [{"name": "dev", "count": 144, "tokens": 90_400, "declared": 20}]},
+                   "estimate": {"method": "chars/4", "scale": 1.0}})
+        };
+        let publish = |cx: &mut gpui::VisualTestContext, payload: serde_json::Value| {
+            window
+                .update(cx, |shell, _, cx| {
+                    shell.state.update(cx, |state, cx| {
+                        state.extension_ui.chat = Some("regular".into());
+                        state.extension_ui.state.channels.insert(
+                            zeron_proto::extension_ui::CONTEXT_WINDOW_CHANNEL.into(),
+                            payload,
+                        );
+                        cx.notify();
+                    });
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+        publish(&mut cx, split(1, 2_000));
+        for id in [
+            "session-info-context-bar",
+            "session-info-context-row-SystemTools",
+            "session-info-context-row-McpTools",
+            "session-info-context-row-SystemPrompt",
+            "session-info-context-row-Messages",
+            "session-info-context-row-Skills",
+            "session-info-context-row-McpInstructions",
+            "session-info-context-row-SinceUpdate",
+            "session-info-context-row-Autocompact",
+            "session-info-context-row-Free",
+            "session-info-context-row-DeferredMcp",
+            "session-info-context-mcp",
+            "session-info-context-footer",
+        ] {
+            let card = cx.debug_bounds("session-info").unwrap();
+            let bounds = cx
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert!(card.contains(&bounds.center()), "{id}");
+        }
+        assert!(cx.debug_bounds("session-info-context-row-Used").is_none());
+        // The MCP tools list opens per server.
+        assert!(cx.debug_bounds("session-info-context-mcp-dev").is_none());
+        click_on(&mut cx, "session-info-context-mcp");
+        assert!(cx.debug_bounds("session-info-context-mcp-dev").is_some());
+        // A new reading moves the rows without reopening anything.
+        publish(&mut cx, split(2, 0));
+        assert!(
+            cx.debug_bounds("session-info-context-row-SinceUpdate")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("session-info-context-row-Messages")
+                .is_some()
+        );
+        // Folding keeps the meter.
+        click_on(&mut cx, "session-info-context-header");
+        assert!(cx.debug_bounds("session-info-context").is_none());
+        assert!(cx.debug_bounds("session-info-context-header").is_some());
+    }
+
     /// A frame of Pi's v2 replay fixture, its clock moved to now.
     fn dynamic_frame(index: usize) -> serde_json::Value {
         fn shift(value: &mut serde_json::Value, by: i64) {

@@ -51,6 +51,141 @@ impl CompactStatus {
     }
 }
 
+/// The Pi context-window extension's breakdown of the context window: what
+/// the provider measured, and how the model's view splits into tools, the
+/// system prompt, skills, MCP server instructions and messages (estimated,
+/// chars/4), with deferred tools beside it and where Pi auto-compacts.
+/// Whole-state per payload; republished after every Pi session reset.
+pub const CONTEXT_WINDOW_CHANNEL: &str = "context:window";
+
+/// The [`CONTEXT_WINDOW_CHANNEL`] payload. Every field defaults.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextBreakdown {
+    pub v: u32,
+    /// Increments on each publish (the extension dedupes unchanged ones).
+    pub seq: u64,
+    pub model: ContextModel,
+    pub window: u64,
+    pub measured: ContextMeasured,
+    /// Estimated tokens added since the provider last measured.
+    pub trailing_tokens: u64,
+    pub categories: ContextCategories,
+    pub deferred: ContextDeferred,
+    pub autocompact: Option<ContextAutocompact>,
+    pub mcp: ContextMcp,
+    pub estimate: ContextEstimate,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextModel {
+    pub provider: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextMeasured {
+    /// `None` right after a compaction, until the next reply.
+    pub tokens: Option<u64>,
+    /// `provider`, `compaction` or `estimate`.
+    pub source: String,
+}
+
+/// One row of the breakdown: tokens, and how many items when they count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextCategory {
+    pub tokens: u64,
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextCategories {
+    pub system_tools: ContextCategory,
+    pub mcp_tools: ContextCategory,
+    pub system_prompt: ContextCategory,
+    pub skills: ContextCategory,
+    pub mcp_instructions: ContextCategory,
+    pub messages: ContextCategory,
+    /// Prompt text no other row claims (a prompt an extension forced).
+    pub other: ContextCategory,
+}
+
+/// Tools the model is not sent until it asks for them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextDeferred {
+    pub system_tools: ContextCategory,
+    pub mcp_tools: ContextCategory,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextAutocompact {
+    pub enabled: bool,
+    /// Context size at which Pi compacts.
+    pub at_tokens: u64,
+    /// The window above that point.
+    pub buffer_tokens: u64,
+    /// `native` or `pi-compact-pct`.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextMcp {
+    /// MCP tools registered, deferred ones included.
+    pub total: u32,
+    pub servers: Vec<ContextMcpServer>,
+    /// The largest tools only.
+    pub top: Vec<ContextMcpTool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextMcpServer {
+    pub name: String,
+    pub count: u32,
+    pub tokens: u64,
+    /// Of `count`, how many the model is sent.
+    pub declared: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextMcpTool {
+    pub name: String,
+    pub server: String,
+    pub tokens: u64,
+    pub declared: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextEstimate {
+    pub method: String,
+    pub scale: f64,
+    pub calibrated: bool,
+}
+
+impl ContextBreakdown {
+    /// The selected chat's breakdown; `None` without one or with no window.
+    pub fn of(ui: &ExtensionUiState) -> Option<Self> {
+        Self::deserialize(ui.channels.get(CONTEXT_WINDOW_CHANNEL)?)
+            .ok()
+            .filter(|b| b.window > 0)
+    }
+
+    /// The context in use as Pi counts it: measured, plus what was added
+    /// since.
+    pub fn used(&self) -> Option<u64> {
+        Some(self.measured.tokens? + self.trailing_tokens)
+    }
+}
+
 /// The Pi workflows extension's live run state (its `state.ts`): one run's
 /// tasks, attempts, errors, cache hits, checkpoints and recovery actions,
 /// plus runs that stopped and can be resumed. Whole-state per payload.
@@ -1020,6 +1155,40 @@ pub fn section_text(section: &PiUiSection) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn context_breakdown_parses_the_extension_payload() {
+        let mut ui = ExtensionUiState::default();
+        assert_eq!(ContextBreakdown::of(&ui), None);
+        ui.channels.insert(
+            CONTEXT_WINDOW_CHANNEL.into(),
+            json!({"v": 1, "seq": 3, "window": 1_000_000, "future": true,
+                   "measured": {"tokens": 69_300, "source": "provider"}, "trailingTokens": 2_000,
+                   "categories": {"systemTools": {"tokens": 24_500, "count": 11}, "messages": {"tokens": 8_900}},
+                   "deferred": {"mcpTools": {"tokens": 72_000, "count": 124}},
+                   "autocompact": {"enabled": true, "atTokens": 967_000, "bufferTokens": 33_000, "source": "native"},
+                   "mcp": {"total": 144, "servers": [{"name": "dev", "count": 20, "tokens": 6_100, "declared": 3}]},
+                   "estimate": {"method": "chars/4", "scale": 1.07, "calibrated": true}}),
+        );
+        let b = ContextBreakdown::of(&ui).unwrap();
+        assert_eq!(b.used(), Some(71_300));
+        assert_eq!(b.categories.system_tools.count, Some(11));
+        assert_eq!(b.categories.skills, ContextCategory::default());
+        assert_eq!(b.deferred.mcp_tools.tokens, 72_000);
+        assert_eq!(b.autocompact.unwrap().buffer_tokens, 33_000);
+        assert_eq!(b.mcp.servers[0].declared, 3);
+        ui.channels.insert(CONTEXT_WINDOW_CHANNEL.into(), json!({}));
+        assert_eq!(
+            ContextBreakdown::of(&ui),
+            None,
+            "no window: nothing to draw"
+        );
+        ui.channels.insert(
+            CONTEXT_WINDOW_CHANNEL.into(),
+            json!({"window": 10, "measured": {"tokens": null, "source": "compaction"}}),
+        );
+        assert_eq!(ContextBreakdown::of(&ui).unwrap().used(), None);
+    }
 
     #[test]
     fn workflow_state_v2_groups_by_phase_and_v1_reads_ungrouped() {
