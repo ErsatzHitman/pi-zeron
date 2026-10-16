@@ -51,7 +51,7 @@ pub(crate) fn capability_map(place: &Place, read_only: bool) -> String {
             format!(
                 "You are a side chat (\"btw\") {me} of the chat {parent}, outside any orchestrator's tree. The user opened you beside that chat."
             ),
-            "Pi's coding tools; zeron_* to read and message chats (zeron_read_chat and zeron_send_message reach your parent), zeron_whoami, zeron_show_visual.",
+            "Pi's coding tools; zeron_* to read and message chats (zeron_read_chat and zeron_send_message reach your parent; its conversation up to your opening is already in your context), zeron_whoami, zeron_show_visual.",
             "zeron_create_chat (side chats cannot start chats; ask your parent) and the board (it belongs to orchestrator trees).",
         ),
         (Role::Chat, None) => (
