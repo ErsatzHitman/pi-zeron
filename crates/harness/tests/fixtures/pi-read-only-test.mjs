@@ -107,6 +107,17 @@ assert.equal(start({systemPrompt: 'BASE', systemPromptOptions: options}), undefi
 assert.match(options.sections.zeron_subagent, /^Zeron: you are a sub-agent \(level 1\)/);
 assert.match(start({systemPrompt: 'BASE'}).systemPrompt, /^BASE\n\nZeron: you are a sub-agent \(level 1\)/, 'an older Pi');
 assert.ok(!handlers.some(([event]) => event === 'before_agent_start'), 'the session itself gets none');
+// /reload: the Zeron session gets the command, its sub-agents do not.
+const commands = (load) => { const out = []; load({on: () => {}, getAllTools: () => [], registerCommand: (name, options) => out.push([name, options])}); return out; };
+delete process.env.ZERON_PI_PID;
+const session = commands(guard.default);
+assert.deepEqual(session.map(([name]) => name), ['reload']);
+let reloaded = 0;
+await session[0][1].handler('', {reload: async () => { reloaded += 1; }});
+assert.equal(reloaded, 1);
+assert.deepEqual(commands(guard.default).map(([name]) => name), ['reload'], 'a reload keeps it');
+process.env.ZERON_PI_PID = String(process.pid + 1);
+assert.deepEqual(commands(guard.default), [], 'a sub-agent');
 for (const [key, value] of Object.entries(priorSub)) {
   if (value === undefined) delete process.env[key]; else process.env[key] = value;
 }

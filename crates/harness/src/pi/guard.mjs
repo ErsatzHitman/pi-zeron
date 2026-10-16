@@ -564,6 +564,8 @@ export function subagentNote(env, depth) {
     `You are not a Zeron session yourself.`;
 }
 
+export const RELOAD_DESCRIPTION = "Reload keybindings, extensions, skills, prompts, themes, and context files";
+
 export default function deleteGuard(pi) {
   inheritIntoChildren();
   guardCompiledChildren();
@@ -600,6 +602,12 @@ export default function deleteGuard(pi) {
       return undefined;
     }
     return { systemPrompt: [event.systemPrompt, note].join("\n\n") };
+  });
+  // Pi's /reload lives in its terminal; in RPC mode only an extension's
+  // command can run it. The Zeron session gets it, not its sub-agents.
+  if (depth === 0 && typeof pi.registerCommand === "function") pi.registerCommand("reload", {
+    description: RELOAD_DESCRIPTION,
+    handler: async (_args, ctx) => { await ctx.reload(); },
   });
   // The user's own `!cmd` (user_bash) is deliberately not hooked.
 }

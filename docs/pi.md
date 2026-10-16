@@ -160,6 +160,12 @@ It never enters the chat or its synced history; what it reports shows as
 toasts (a long report as a report screen), and one that says nothing toasts
 "Ran /name". With no Pi running for the chat yet, it goes as an ordinary
 message, which starts one. Prompt templates and skills are always messages.
+After a side command the list is fetched again.
+
+`/reload` (keybindings, extensions, skills, prompts, themes, context files) is
+Pi's terminal command; RPC mode has none. Zeron's guard extension registers it
+in the session's own Pi (not its sub-agents) and runs `ctx.reload()`, so it
+works like any extension command. The `/` menu lists it before Pi has.
 
 Steering queues at a model step boundary and starts immediately when idle.
 When no steering mode is configured, Zeron selects Pi's `all` mode, so messages

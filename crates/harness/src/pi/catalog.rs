@@ -182,6 +182,11 @@ pub(super) fn commands(data: &Value) -> Vec<SlashCommand> {
         ("autocompact", "Toggle automatic compaction"),
         ("steering", "Steering queue mode"),
         ("follow-up", "Follow-up queue mode"),
+        // Zeron's guard extension runs it; listed before Pi's first answer.
+        (
+            "reload",
+            "Reload keybindings, extensions, skills, prompts, themes, and context files",
+        ),
     ] {
         if !commands.iter().any(|c| c.name == name) {
             commands.push(SlashCommand {
@@ -240,6 +245,26 @@ mod tests {
         assert!(listed.iter().all(|c| !c.name.starts_with("pi_ui_")));
         assert!(listed.iter().all(|c| c.name != "claude-refusal-rewind"));
         assert!(listed.iter().any(|c| c.name == "todo"));
+    }
+
+    #[test]
+    fn reload_is_listed_and_the_guard_command_runs_it() {
+        let reload = |listed: Vec<SlashCommand>| listed.into_iter().find(|c| c.name == "reload");
+        let before = reload(commands(&json!({"commands":[]}))).unwrap();
+        assert!(
+            !before.side,
+            "sent as a prompt, which the guard's command answers"
+        );
+        let guarded = reload(commands(&json!({"commands":[
+            {"name":"reload","description":"Reload","source":"extension"},
+        ]})))
+        .unwrap();
+        assert!(guarded.side);
+        assert_eq!(
+            builtin("/reload", true),
+            None,
+            "no RPC command: Pi's extension runs it"
+        );
     }
 
     #[test]

@@ -1515,11 +1515,22 @@ impl Runner {
                     self.take_commands(&data, announce).await?;
                 }
                 Pending::Completions(epoch) => self.request_settled(epoch, true)?,
-                // A command that showed nothing still says it ran.
-                Pending::Side { name, shown } if self.ui.shown() == shown => self.ui.toast(
-                    format!("Ran /{name}"),
-                    zeron_proto::extension_ui::NoticeLevel::Info,
-                ),
+                Pending::Side { name, shown } => {
+                    // It may have changed what Pi offers (`/reload`).
+                    let id = self
+                        .process
+                        .transport
+                        .client
+                        .request(json!({"type":"get_commands"}))?;
+                    self.pending.insert(id, Pending::Commands);
+                    // A command that showed nothing still says it ran.
+                    if self.ui.shown() == shown {
+                        self.ui.toast(
+                            format!("Ran /{name}"),
+                            zeron_proto::extension_ui::NoticeLevel::Info,
+                        );
+                    }
+                }
                 Pending::EmptyEntries(epoch, session) if epoch == self.epoch && self.active => {
                     let clean = data["entries"].as_array().is_some_and(|entries| {
                         entries.iter().all(|entry| {
