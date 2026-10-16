@@ -562,8 +562,25 @@ impl Harness for PiHarness {
         let mut request = request;
         let store = sessions::Store::new(self.session_store.clone(), self.agent_dir.clone());
         let mut lost_context = None;
-        let args = match &request.resume {
-            Some(id) => match store.resume_args(id, Path::new(&request.cwd)) {
+        // A side chat's first run forks its parent's session: a new session
+        // file holding the parent's conversation; the parent's stays as is.
+        // The id is for this process's arguments only, not the MCP server.
+        let fork = request
+            .mcp
+            .as_mut()
+            .and_then(|mcp| mcp.env.remove(zeron_proto::orchestrator::ENV_FORK_SESSION))
+            .filter(|id| !id.is_empty() && request.resume.is_none());
+        let args = match (&request.resume, &fork) {
+            (None, Some(parent)) => match store.resolve(parent, Path::new(&request.cwd)) {
+                Ok(file) => vec!["--fork".into(), file.display().to_string()],
+                Err(error) => {
+                    lost_context = Some(format!(
+                        "Pi could not fork the parent chat's session {parent}; this side chat starts without its context: {error}"
+                    ));
+                    vec![]
+                }
+            },
+            (Some(id), _) => match store.resume_args(id, Path::new(&request.cwd)) {
                 Ok(args) => args,
                 // Like every other harness, a session that can no longer be
                 // reopened starts fresh with a visible notice. Failing instead
@@ -575,7 +592,7 @@ impl Harness for PiHarness {
                     vec![]
                 }
             },
-            None => vec![],
+            (None, None) => vec![],
         };
         if lost_context.is_some() {
             request.resume = None;

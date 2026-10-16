@@ -136,6 +136,20 @@ the copy lists as a sibling. The session panel's **Sub-agents** section
 lists a chat's parent, its children (forks and `kind: "side"` spawns), its
 spawn chips and Pi's sub-agent fleet, and opens each in the right pane.
 
+A side chat created on a parent with `createChat` + `parentChatId` (the btw
+pane, or `create_chat` outside an orchestrator tree) starts as a fork too, so
+it never has to read the parent to catch up. On its first run the host saves
+the fork in the side chat's doc (`forkParent`: parent id, title, cwd, the
+parent's last completed reply, its provider session). A Pi side chat of a Pi
+parent on the same device gets `ZERON_FORK_SESSION` on the run's MCP env, and
+the Pi harness starts with `--fork <parent session file>`: a new session file
+with the parent's whole context, with the parent's file left as it is. If Pi
+can't resolve that file, the run starts fresh with a visible notice. Any other
+harness, or a later fresh session, gets the parent's transcript up to the
+saved reply (newest first, within about 60k characters, each tool output cut
+to 2k) at the front of its first prompt. The parent's later turns never reach
+it. Members of an orchestrator tree still get only their task.
+
 ## Tools
 
 Chats are referenced by full id, a unique id prefix, or an exact title.

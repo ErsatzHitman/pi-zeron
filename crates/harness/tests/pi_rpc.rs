@@ -1483,3 +1483,89 @@ async fn plain_extension_ui_requests_become_live_state() {
     assert!(state.widgets.is_empty());
     assert_eq!(state.editor_text.as_ref().unwrap().text, "rewritten prompt");
 }
+
+/// A side chat's first run with its parent's session to fork.
+fn fork_request(cwd: &std::path::Path, parent: &str) -> RunRequest {
+    let mut req = request(cwd, "args");
+    req.mcp = Some(zeron_proto::McpServer {
+        name: "zeron".into(),
+        command: "zeron".into(),
+        args: vec!["mcp".into()],
+        env: [(
+            zeron_proto::orchestrator::ENV_FORK_SESSION.to_owned(),
+            parent.to_owned(),
+        )]
+        .into(),
+    });
+    req
+}
+
+async fn run_events(harness: PiHarness, req: RunRequest) -> Vec<AgentEvent> {
+    let (c, tx, _) = controls();
+    drop(tx);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        harness
+            .run(req, c)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_side_chat_forks_its_parent_s_pi_session_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = dir.path().join("agent");
+    let project = agent.join("sessions").join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let parent = project.join("parent.jsonl");
+    let header = "{\"type\":\"session\",\"id\":\"parent-session\"}\n";
+    std::fs::write(&parent, header).unwrap();
+    let events = run_events(
+        harness()
+            .with_agent_dir(agent)
+            .with_session_store(dir.path().join("index")),
+        fork_request(dir.path(), "parent-session"),
+    )
+    .await;
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let file = parent.canonicalize().unwrap();
+    assert!(
+        text.contains(&format!("--fork {}", file.display())),
+        "{text}"
+    );
+    assert!(!text.contains("--session"), "{text}");
+    // The parent's file is a source only: never written.
+    assert_eq!(std::fs::read_to_string(&parent).unwrap(), header);
+}
+
+#[tokio::test]
+async fn an_unforkable_parent_session_starts_the_side_chat_fresh_with_a_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = run_events(
+        harness()
+            .with_agent_dir(dir.path().join("agent"))
+            .with_session_store(dir.path().join("index")),
+        fork_request(dir.path(), "gone-session"),
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Error { message }
+            if message.contains("gone-session") && message.contains("without its context"))),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done { status: DoneStatus::Completed, .. })
+    ));
+}

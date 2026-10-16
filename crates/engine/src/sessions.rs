@@ -985,6 +985,7 @@ impl SessionsEngine {
             prompt,
             None,
             ProviderSession::Continued(session.as_deref()),
+            None,
         )
     }
 
@@ -1912,6 +1913,64 @@ impl Inner {
 
 // ── run task ────────────────────────────────────────────────────────────────
 
+/// A side chat's fork of its parent, fixed at its first run and kept in its
+/// doc (`forkParent`): the parent's conversation up to then is its starting
+/// context, and nothing the parent does later reaches it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkParent {
+    chat_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    /// The parent's last completed reply at the fork; `None` = it had none.
+    #[serde(default)]
+    upto: Option<String>,
+    #[serde(default)]
+    harness: Option<HarnessId>,
+    /// The parent's provider session then, when it lives on this device:
+    /// a harness that can fork sessions (Pi `--fork`) starts from it.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// The parent's transcript a side chat carries in its first prompt, most
+/// recent first within this many characters.
+const FORK_HISTORY_BUDGET: usize = 60_000;
+/// One tool output in a carried transcript, at most.
+const FORK_TOOL_OUTPUT: usize = 2_000;
+
+/// One transcript entry as carried history: its text and tool calls.
+fn history_item(entry: &SessionMessageEntry) -> Option<serde_json::Value> {
+    let text = entry
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text, .. } => Some(text.clone()),
+            MessagePart::Tool { call, output, .. } => {
+                let mut output = output.clone().unwrap_or_default();
+                if output.len() > FORK_TOOL_OUTPUT {
+                    let mut end = FORK_TOOL_OUTPUT;
+                    while !output.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    output.truncate(end);
+                    output.push_str(" [...]");
+                }
+                Some(format!(
+                    "Tool: {}\n{}",
+                    serde_json::to_string(call).unwrap_or_default(),
+                    output
+                ))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then(|| serde_json::json!({ "role": entry.role, "text": text }))
+}
+
 /// Which provider session a side chat's prompt goes to.
 #[derive(Clone, Copy)]
 enum ProviderSession<'a> {
@@ -1935,6 +1994,9 @@ impl Inner {
     /// whole transcript (`current` excluded); a continued one only the fork's
     /// copied history before the seam, until that went out to that session.
     /// Native commands are never wrapped: providers route a leading `/name`.
+    /// A fresh session of a side chat that `fork`s its parent also gets the
+    /// parent's conversation up to the fork, ahead of its own.
+    #[allow(clippy::too_many_arguments)]
     fn fork_history_prompt(
         &self,
         chat_id: &str,
@@ -1943,6 +2005,7 @@ impl Inner {
         prompt: &str,
         current: Option<&str>,
         provider: ProviderSession<'_>,
+        fork: Option<&ForkParent>,
     ) -> Option<String> {
         if native_command(prompt, harness_id)
             || !self
@@ -1973,28 +2036,11 @@ impl Inner {
                 })?
             }
         };
-        let history: Vec<_> = entries[..end]
-            .iter()
-            .map(|entry| {
-                let text = entry
-                    .parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        zeron_doc::MessagePart::Text { text, .. } => Some(text.clone()),
-                        zeron_doc::MessagePart::Tool { call, output, .. } => Some(format!(
-                            "Tool: {}\n{}",
-                            serde_json::to_string(call).unwrap_or_default(),
-                            output.clone().unwrap_or_default()
-                        )),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                (entry.role, text)
-            })
-            .filter(|(_, text)| !text.is_empty())
-            .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
-            .collect();
+        let mut history = match (provider, fork) {
+            (ProviderSession::Fresh, Some(fork)) => self.parent_history(fork),
+            _ => Vec::new(),
+        };
+        history.extend(entries[..end].iter().filter_map(history_item));
         (!history.is_empty()).then(|| {
             format!(
                 "Continue this side conversation using the following prior conversation as context.\n<conversation>\n{}\n</conversation>\n\n{}",
@@ -2002,6 +2048,123 @@ impl Inner {
                 prompt
             )
         })
+    }
+
+    /// The parent's conversation up to the fork, as carried history: a
+    /// line naming the parent, then its most recent messages that fit.
+    fn parent_history(&self, fork: &ForkParent) -> Vec<serde_json::Value> {
+        let parent = match &fork.title {
+            Some(title) => format!("\"{title}\" (chat {})", fork.chat_id),
+            None => format!("chat {}", fork.chat_id),
+        };
+        let mut header = format!(
+            "The conversation of the parent chat {parent} up to when this side chat was opened"
+        );
+        if let Some(cwd) = &fork.cwd {
+            header.push_str(&format!(", in {cwd}"));
+        }
+        let entries = fork
+            .upto
+            .as_deref()
+            .and_then(|upto| {
+                let entries = self
+                    .doc_host()?
+                    .open(&fork.chat_id)
+                    .ok()?
+                    .doc()
+                    .read_entries()
+                    .ok()?;
+                let end = entries.iter().position(|entry| entry.id == upto)?;
+                Some(entries[..=end].to_vec())
+            })
+            .unwrap_or_default();
+        let mut items: Vec<_> = entries.iter().filter_map(history_item).collect();
+        if items.is_empty() {
+            return items;
+        }
+        let mut used = 0;
+        let mut keep = items.len();
+        for (at, item) in items.iter().enumerate().rev() {
+            let len = item["text"].as_str().map_or(0, str::len);
+            if used + len > FORK_HISTORY_BUDGET {
+                break;
+            }
+            used += len;
+            keep = at;
+        }
+        if keep > 0 {
+            header.push_str(&format!(
+                "; its {keep} earliest messages are left out for length"
+            ));
+        }
+        header.push('.');
+        items.drain(..keep);
+        let mut history = vec![serde_json::json!({ "role": "system", "text": header })];
+        history.extend(items);
+        history
+    }
+
+    /// The fork a side chat starts from: recorded in its doc at its first
+    /// run, read back after. `None` for every chat that is not a side chat
+    /// outside an orchestrator's tree (members get their task, not their
+    /// parent's conversation), and for one forked by copying (its doc holds
+    /// the history already). `true` when this call recorded it: only that
+    /// first run may fork the parent's live session, which has moved on
+    /// since.
+    fn fork_parent(&self, chat_id: &str, doc: &SessionDoc) -> Option<(ForkParent, bool)> {
+        if let Some(record) = doc.fork_parent() {
+            return serde_json::from_str(&record).ok().map(|fork| (fork, false));
+        }
+        let lineage = self.lineage(chat_id);
+        let place = zeron_proto::orchestrator::Place::of(&lineage, chat_id);
+        if place.role != zeron_proto::orchestrator::Role::Chat {
+            return None;
+        }
+        let parent = lineage
+            .iter()
+            .find(|chat| Some(&chat.id) == place.parent_id.as_ref())?;
+        let entries = doc.read_entries().unwrap_or_default();
+        if entries.iter().any(|entry| {
+            entry
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Fork { .. }))
+        }) {
+            return None;
+        }
+        let upto = self
+            .doc_host()
+            .and_then(|host| host.open(&parent.id).ok())
+            .and_then(|handle| handle.doc().read_entries().ok())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|entry| {
+                        entry.role == MessageRole::Assistant
+                            && entry.status == Some(MessageStatus::Complete)
+                    })
+                    .map(|entry| entry.id.clone())
+            });
+        let session = (parent.device_id == self.device_id)
+            .then(|| {
+                lock(&self.harness_sessions)
+                    .get(&parent.id)
+                    .map(|known| known.session_id.clone())
+                    .or_else(|| parent.harness_session_id.clone())
+            })
+            .flatten()
+            .filter(|id| !id.is_empty());
+        let fork = ForkParent {
+            chat_id: parent.id.clone(),
+            title: parent.title.clone(),
+            cwd: parent.cwd.clone(),
+            upto,
+            harness: parent.config.as_ref().map(|config| config.harness),
+            session,
+        };
+        let _ = doc.set_fork_parent(&serde_json::to_string(&fork).ok()?);
+        Some((fork, true))
     }
 }
 
@@ -2471,6 +2634,27 @@ async fn drive_run(
     if request.mcp.is_none() {
         request.mcp = inner.zeron_mcp(&chat_id);
     }
+    // A side chat starts as a fork of its parent. Pi forks the parent's own
+    // session (its whole context, tools included); anything else carries
+    // the parent's transcript up to the fork in the first prompt.
+    let fork = if request.resume.is_none() && !resume_state.idle {
+        inner.fork_parent(&chat_id, &doc)
+    } else {
+        None
+    };
+    let mut native_fork = false;
+    if let Some((fork, true)) = &fork
+        && harness_id == HarnessId::Pi
+        && fork.harness == Some(HarnessId::Pi)
+        && let Some(session) = fork.session.clone()
+        && let Some(mcp) = request.mcp.as_mut()
+    {
+        mcp.env.insert(
+            zeron_proto::orchestrator::ENV_FORK_SESSION.to_owned(),
+            session,
+        );
+        native_fork = true;
+    }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
     // the event loop) can take ownership.
@@ -2493,6 +2677,7 @@ async fn drive_run(
             &request.prompt,
             Some(&resume_state.user_message_id),
             provider,
+            fork.as_ref().map(|(fork, _)| fork).filter(|_| !native_fork),
         )
     {
         request.prompt = prompt;

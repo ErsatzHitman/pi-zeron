@@ -33,6 +33,10 @@ pub const PLACE_ENV: [&str; 6] = [
     ENV_PARENT_TITLE,
     ENV_ROOT_CHAT_ID,
 ];
+/// On a side chat's first run: its parent's harness-native session, which
+/// the harness forks (Pi `--fork`) so the side chat starts with the
+/// parent's context. Rides the Zeron MCP server's env like the place.
+pub const ENV_FORK_SESSION: &str = "ZERON_FORK_SESSION";
 /// Titles go into env and prompts as one short line.
 const MAX_LABEL_CHARS: usize = 120;
 
@@ -201,7 +205,10 @@ impl Place {
             Role::Chat => parent.map(|parent| {
                 format!(
                     "You are a side chat ({me}) of {parent}, outside any orchestrator's tree. \
-                     Your task is your first message."
+                     You start as a fork of it: its conversation up to the moment you were \
+                     opened is already in your context, so do not call zeron_read_chat or \
+                     zeron_list_chats to catch up (read the parent only for what it did \
+                     after). Your task is your first message."
                 )
             }),
             Role::Member { depth } => {
@@ -419,6 +426,8 @@ mod tests {
                 .unwrap()
                 .contains("side chat (chat side) of \"Notes\"")
         );
+        // It starts as a fork: no reading the parent to catch up.
+        assert!(side.brief().unwrap().contains("already in your context"));
         assert!(
             side.env()
                 .iter()

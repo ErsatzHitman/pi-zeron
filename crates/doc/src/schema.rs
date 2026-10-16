@@ -413,6 +413,24 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// A side chat's fork of its parent, fixed at its first run (the
+    /// engine's JSON record: which chat, up to which entry, which provider
+    /// session), so the parent's later turns never reach it.
+    pub fn fork_parent(&self) -> Option<String> {
+        match self.doc.get_map("meta").get("forkParent") {
+            Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn set_fork_parent(&self, record: &str) -> Result<(), DocError> {
+        if self.fork_parent().as_deref() != Some(record) {
+            self.doc.get_map("meta").insert("forkParent", record)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
     pub fn chat_id(&self) -> Option<String> {
         match self.doc.get_map("meta").get("chatId") {
             Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),

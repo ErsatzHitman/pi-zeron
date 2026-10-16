@@ -871,3 +871,225 @@ async fn orphaned_history_steer_still_owes_the_history() {
     );
     core.shutdown().await;
 }
+
+/// A side chat opened on a chat (btw, or an agent's `create_chat` side
+/// chat) starts as a fork of it: its first run carries the parent's
+/// conversation up to the parent's last completed reply, and nothing the
+/// parent says afterwards ever reaches it.
+#[tokio::test]
+async fn a_new_side_chat_starts_with_its_parent_s_conversation_frozen_at_its_first_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(Capture(requests.clone())));
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None).unwrap();
+    for (id, parent) in [("main", None), ("btw", Some("main"))] {
+        core.workspace
+            .create_chat_with_parent(
+                id,
+                None,
+                Some(&core.device_id),
+                None,
+                Some("/tmp".into()),
+                parent.map(str::to_owned),
+            )
+            .unwrap();
+    }
+    core.workspace
+        .rename_chat("main", "Main conversation")
+        .unwrap();
+    let source = core.doc_host.open("main").unwrap();
+    for (id, role, text, status) in [
+        (
+            "u1",
+            MessageRole::User,
+            "Remember PINEAPPLE",
+            MessageStatus::Complete,
+        ),
+        (
+            "a1",
+            MessageRole::Assistant,
+            "I remember PINEAPPLE",
+            MessageStatus::Complete,
+        ),
+        (
+            "u2",
+            MessageRole::User,
+            "unfinished turn",
+            MessageStatus::Complete,
+        ),
+        (
+            "a2",
+            MessageRole::Assistant,
+            "still streaming",
+            MessageStatus::Streaming,
+        ),
+    ] {
+        source
+            .doc()
+            .push_message(&message(id, role, text, status))
+            .unwrap();
+    }
+    let request = side_turn(&core, &requests, "btw", "What should I remember?", "b1").await;
+    assert!(request.prompt.contains("PINEAPPLE"), "{}", request.prompt);
+    assert!(
+        request
+            .prompt
+            .contains("Main conversation\\\" (chat main) up to when this side chat was opened"),
+        "{}",
+        request.prompt
+    );
+    assert!(
+        !request.prompt.contains("unfinished turn"),
+        "{}",
+        request.prompt
+    );
+    assert!(request.prompt.ends_with("What should I remember?"));
+    // The fork is recorded in the side chat's doc, up to the parent's last
+    // completed reply; the parent's own doc is untouched.
+    let side = core.doc_host.open("btw").unwrap();
+    let record: serde_json::Value =
+        serde_json::from_str(&side.doc().fork_parent().expect("the fork is recorded")).unwrap();
+    assert_eq!(record["chatId"], "main");
+    assert_eq!(record["upto"], "a1");
+    assert_eq!(source.doc().read_entries().unwrap().len(), 4);
+    assert_eq!(source.doc().fork_parent(), None);
+    // The parent moves on; the side chat never hears of it.
+    for (id, role, text) in [
+        ("u3", MessageRole::User, "LATER secret"),
+        ("a3", MessageRole::Assistant, "LATER answer"),
+    ] {
+        source
+            .doc()
+            .push_message(&message(id, role, text, MessageStatus::Complete))
+            .unwrap();
+    }
+    let request = side_turn(&core, &requests, "btw", "Anything new?", "b2").await;
+    assert!(!request.prompt.contains("LATER"), "{}", request.prompt);
+    core.shutdown().await;
+}
+
+/// Records each run's request under a harness id of its choosing.
+struct CaptureAs(HarnessId, Arc<Mutex<Vec<RunRequest>>>);
+#[async_trait]
+impl Harness for CaptureAs {
+    fn id(&self) -> HarnessId {
+        self.0
+    }
+    fn display_name(&self) -> &str {
+        "CaptureAs"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        _: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.1.lock().unwrap().push(request);
+        Ok(futures::stream::iter(vec![
+            Ok(AgentEvent::TextDelta {
+                text: "Side answer".into(),
+            }),
+            Ok(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("side-pi-session".into()),
+            }),
+        ])
+        .boxed())
+    }
+}
+
+/// A Pi side chat of a Pi chat forks the parent's own Pi session (its whole
+/// context, tool results included) instead of carrying a transcript.
+#[tokio::test]
+async fn a_pi_side_chat_forks_its_parent_s_pi_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(CaptureAs(HarnessId::Pi, requests.clone())));
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Pi, None).unwrap();
+    let config = zeron_proto::ChatConfig {
+        harness: HarnessId::Pi,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+    };
+    for (id, parent) in [("main", None), ("btw", Some("main"))] {
+        core.workspace
+            .create_chat_with_parent(
+                id,
+                None,
+                Some(&core.device_id),
+                Some(config.clone()),
+                Some("/tmp".into()),
+                parent.map(str::to_owned),
+            )
+            .unwrap();
+    }
+    core.workspace
+        .set_chat_harness_session("main", "parent-pi-session", "/tmp");
+    let source = core.doc_host.open("main").unwrap();
+    for (id, role, text) in [
+        ("u1", MessageRole::User, "Remember PINEAPPLE"),
+        ("a1", MessageRole::Assistant, "I remember PINEAPPLE"),
+    ] {
+        source
+            .doc()
+            .push_message(&message(id, role, text, MessageStatus::Complete))
+            .unwrap();
+    }
+    core.sessions.set_ipc_port(27699);
+    core.sessions
+        .dispatch(
+            "btw",
+            HarnessId::Pi,
+            RunRequest {
+                mcp: None,
+                prompt: "What should I remember?".into(),
+                harness: Some(HarnessId::Pi),
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: "/tmp".into(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: true,
+                resume: None,
+                attachments: vec![],
+                worktree: None,
+            },
+            Some("b1".into()),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while requests.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let request = requests.lock().unwrap()[0].clone();
+    let mcp = request.mcp.expect("the run carries the zeron MCP server");
+    assert_eq!(
+        mcp.env[zeron_proto::orchestrator::ENV_FORK_SESSION],
+        "parent-pi-session"
+    );
+    // Pi holds the parent's context itself: no transcript in the prompt.
+    assert_eq!(request.prompt, "What should I remember?");
+    assert_eq!(request.resume, None);
+    core.shutdown().await;
+}
