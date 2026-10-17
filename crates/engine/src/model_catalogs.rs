@@ -79,12 +79,13 @@ pub(crate) async fn list_with_lease(
     root: &Path,
     harness: Arc<dyn Harness>,
     force: bool,
+    wait: bool,
     lease: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
 ) -> Result<Vec<Model>, HarnessError> {
     let root = root.to_path_buf();
     tokio::spawn(async move {
         let _lease = lease.clone();
-        list_inner(&root, harness, force, lease).await
+        list_inner(&root, harness, force, wait, lease).await
     })
     .await
     .map_err(|error| HarnessError::Protocol(format!("model discovery task failed: {error}")))?
@@ -96,13 +97,16 @@ async fn list(
     harness: Arc<dyn Harness>,
     force: bool,
 ) -> Result<Vec<Model>, HarnessError> {
-    list_with_lease(root, harness, force, None).await
+    list_with_lease(root, harness, force, false, None).await
 }
 
+/// With a disk catalog the answer is that catalog unless the refresh lands
+/// within 100 ms; `wait` waits for the refresh instead.
 async fn list_inner(
     root: &Path,
     harness: Arc<dyn Harness>,
     force: bool,
+    wait: bool,
     lease: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
 ) -> Result<Vec<Model>, HarnessError> {
     let Some(context) = harness.model_context().map_err(|error| {
@@ -153,7 +157,7 @@ async fn list_inner(
             result
         }
     });
-    let result = if disk.is_some() {
+    let result = if disk.is_some() && !wait {
         tokio::time::timeout(Duration::from_millis(100), &mut refresh)
             .await
             .ok()
@@ -312,7 +316,7 @@ mod tests {
         probe.delay.store(true, SeqCst);
         let gate = Arc::new(tokio::sync::RwLock::new(()));
         let lease = Arc::new(gate.clone().read_owned().await);
-        list_with_lease(dir.path(), probe, true, Some(lease))
+        list_with_lease(dir.path(), probe, true, false, Some(lease))
             .await
             .unwrap();
         assert!(
@@ -334,7 +338,7 @@ mod tests {
         let lease = Arc::new(gate.clone().read_owned().await);
         let task = tokio::spawn({
             let probe = probe.clone();
-            async move { list_with_lease(&root, probe, true, Some(lease)).await }
+            async move { list_with_lease(&root, probe, true, false, Some(lease)).await }
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !probe.forced.load(SeqCst) {
@@ -430,6 +434,22 @@ mod tests {
         probe.delay.store(true, SeqCst);
         assert_eq!(list(dir.path(), probe, false).await.unwrap(), old);
         tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(read(&path, &context), Some(models()));
+    }
+    #[tokio::test]
+    async fn a_waiting_request_answers_with_the_slow_live_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new();
+        let context = probe.model_context().unwrap().unwrap();
+        let path = location(dir.path(), probe.as_ref(), &context);
+        let mut old = models();
+        old[0].id = "old-live".into();
+        save(&path, &context, &old).unwrap();
+        probe.delay.store(true, SeqCst);
+        let fresh = list_with_lease(dir.path(), probe, false, true, None)
+            .await
+            .unwrap();
+        assert_eq!(fresh, models(), "not the disk catalog");
         assert_eq!(read(&path, &context), Some(models()));
     }
     #[tokio::test]

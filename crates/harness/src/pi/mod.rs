@@ -48,6 +48,9 @@ pub use ysk::YskSetting;
 
 pub struct PiHarness {
     models_cache: crate::catalog::Catalog,
+    /// Set by the first model probe, which forces every provider's catalog
+    /// to refresh from the network: new models show up each time Zeron opens.
+    catalog_forced: std::sync::atomic::AtomicBool,
     executable_setting: Option<ExecutableSetting>,
     delete_guard: Option<DeleteGuardSetting>,
     you_should_know: Option<YskSetting>,
@@ -69,6 +72,7 @@ impl Default for PiHarness {
             session_store: None,
             agent_dir: None,
             models_cache: Default::default(),
+            catalog_forced: Default::default(),
             workspace_commands: Default::default(),
             commands: Default::default(),
             interrupt_grace: Duration::from_secs(2),
@@ -156,14 +160,32 @@ impl PiHarness {
         check_version(&exe, &version)?;
         Ok((exe, version))
     }
-    async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
-        let mut process = self.spawn(cwd, &["--no-session".into()], None, false, None, false)?;
+    /// `models`: `Some(force)` reads the model catalog, refreshing it first
+    /// (from the network, past Pi's freshness window when `force`); `None`
+    /// reads the commands.
+    async fn probe(&self, cwd: &Path, models: Option<bool>) -> Result<Value, HarnessError> {
+        let mut args = vec!["--no-session".to_string()];
+        // Probes never load the guard, so the refresh extension rides alone.
+        let refresh = match (models, &self.delete_guard) {
+            (Some(force), Some(setting)) => match catalog::install_refresh(&setting().dir) {
+                Ok(path) => {
+                    args.extend(["--extension".into(), path.to_string_lossy().into_owned()]);
+                    Some(force)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Could not install the catalog refresh; reading the stored catalog");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let mut process = self.spawn(cwd, &args, None, false, None, false)?;
         let (mut tx, rx) = tokio::sync::oneshot::channel();
         let grace = self.kill_grace;
         tokio::spawn(async move {
             let result = tokio::select! {
                 result=tokio::time::timeout(Duration::from_secs(60),async {
-                    if models {Ok(serde_json::to_value(catalog::models(&mut process).await?).unwrap())}
+                    if models.is_some() {Ok(serde_json::to_value(catalog::models(&mut process, refresh).await?).unwrap())}
                     else {
                         let mut data = process.query(json!({"type":"get_commands"}),&mut vec![]).await?;
                         data[catalog::COMPLETIONS_KEY] = catalog::completions(&mut process, &data, &mut vec![]).await;
@@ -428,7 +450,12 @@ impl Harness for PiHarness {
                 Duration::from_secs(65),
                 || Ok(self.model_context()?.expect("Pi model context").key()),
                 || async {
-                    let value = self.probe(&std::env::current_dir()?, true).await?;
+                    let first = !self
+                        .catalog_forced
+                        .swap(true, std::sync::atomic::Ordering::Relaxed);
+                    let value = self
+                        .probe(&std::env::current_dir()?, Some(force || first))
+                        .await?;
                     serde_json::from_value(value).map_err(|e| HarnessError::Protocol(e.to_string()))
                 },
             )
@@ -451,7 +478,7 @@ impl Harness for PiHarness {
         let commands = self
             .workspace_commands
             .get(cwd, async {
-                Ok(catalog::commands(&self.probe(cwd, false).await?))
+                Ok(catalog::commands(&self.probe(cwd, None).await?))
             })
             .await?;
         self.commands.store(&file, &key, commands.clone());

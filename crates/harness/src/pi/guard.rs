@@ -102,7 +102,7 @@ fn preload_source(guard: &DeleteGuard, ext: &Path) -> String {
 
 /// Content-addressed and never pruned: a long-lived Pi from before an
 /// upgrade still hands the old path to its children.
-fn install_file(dir: &Path, stem: &str, source: &str) -> std::io::Result<PathBuf> {
+pub(super) fn install_file(dir: &Path, stem: &str, source: &str) -> std::io::Result<PathBuf> {
     let path = dir.join(format!("{stem}-{:016x}.mjs", fnv1a(source)));
     if holds(&path, source) {
         return Ok(path);

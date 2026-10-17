@@ -1827,6 +1827,31 @@ impl Pickers {
                 pickers.land_model_reload(harness, loaded, cx);
             })
             .ok();
+            // That answer can be the disk catalog while the live refresh (a
+            // provider's new models) is still running: wait for the refresh
+            // once and land it too. A failure keeps the rows just landed.
+            if let Some(object) = params.as_object_mut() {
+                object.insert("force".into(), false.into());
+                object.insert("wait".into(), true.into());
+            }
+            let Ok(value) = engine.client().call(methods::LIST_MODELS, params).await else {
+                return;
+            };
+            let Ok(models) = serde_json::from_value::<Vec<Model>>(value) else {
+                return;
+            };
+            this.update(cx, |pickers, cx| {
+                if pickers.target_generation == generation
+                    && matches!(pickers.models.get(&harness), Some(Loadable::Ready(_)))
+                {
+                    pickers.apply_model_catalog(
+                        harness,
+                        Loadable::Ready(normalize_model_rows(harness, models)),
+                        cx,
+                    );
+                }
+            })
+            .ok();
         })
         .detach();
     }

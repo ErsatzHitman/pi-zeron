@@ -142,7 +142,16 @@ completion.
 Models and supported thinking levels come from native RPC discovery. The
 Thinking option can disable reasoning. Unsupported saved effort levels are
 clamped to a supported lower level. Discovery uses a temporary no-session
-process; model switches do not persist global defaults. Commands, prompt
+process; model switches do not persist global defaults.
+
+That process loads Zeron's `catalog-refresh.mjs` and, before reading the
+list, refreshes every provider's catalog (the pi.dev catalog for built-ins,
+an extension provider's own discovery). Pi's RPC mode would otherwise answer
+from the stored catalog while its own refresh runs in the background, so a
+model a provider added reached the picker a start late. The first discovery
+after Zeron opens forces the refresh past Pi's 4-hour freshness window, as
+does a picker open. The picker shows the saved catalog at once, then swaps in
+the refreshed one (`ListModels` with `wait`). Commands, prompt
 templates and skills are discovered in the workspace; a command Pi advertises
 shadows Zeron's built-in mapping of the same name. Pi controls
 project-extension trust.

@@ -99,6 +99,10 @@ struct ListModelsParams {
     harness: HarnessId,
     #[serde(default)]
     force: bool,
+    /// Answer with the live refresh rather than the disk catalog, however
+    /// long the refresh takes (the picker's follow-up after a fast answer).
+    #[serde(default)]
+    wait: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2261,6 +2265,7 @@ impl RpcService for EngineRpc {
                     self.repos.data_dir(),
                     harness,
                     p.force,
+                    p.wait,
                     Some(lease),
                 )
                 .await

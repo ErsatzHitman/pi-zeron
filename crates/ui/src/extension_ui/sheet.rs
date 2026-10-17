@@ -83,7 +83,6 @@ pub(crate) fn header_label(ns: &str) -> &str {
     match ns {
         "ask-user" => "Question",
         "subagents" => "Subagent question",
-        "model-select" => "Models",
         "pi" => "Pi",
         other => other,
     }
@@ -1020,10 +1019,10 @@ mod tests {
             "actions":[{"id":"cancel","label":"Cancel"}]}),
         );
         assert_eq!(primary_action(&sheet_form(&confirm).1).unwrap().id, "yes");
-        // ask_user and the model picker put their answer on the element:
-        // it still sends the form; dismissals stay dismissals.
+        // ask_user and pickers put their answer on the element: it still
+        // sends the form; dismissals stay dismissals.
         let picker = element(
-            json!({"id":"picker","ns":"model-select","kind":"panel","placement":"sheet",
+            json!({"id":"picker","ns":"picker","kind":"panel","placement":"sheet",
             "sections":[{"kind":"form","id":"models","fields":[{"id":"models","kind":"multiselect"}]}],
             "actions":[{"id":"save","label":"Save","variant":"primary"},
                        {"id":"skip","label":"Skip"},{"id":"cancel","label":"Cancel"}]}),

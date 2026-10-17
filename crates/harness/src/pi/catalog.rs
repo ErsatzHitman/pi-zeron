@@ -13,8 +13,60 @@ pub(super) fn levels(data: &Value) -> Vec<ReasoningLevel> {
         .filter_map(|v| serde_json::from_value(v.clone()).ok())
         .collect()
 }
-pub(super) async fn models(process: &mut Process) -> Result<Vec<Model>, HarnessError> {
+/// The probe-only extension (`catalog-refresh.mjs`) that refreshes every
+/// provider's catalog before the probe reads it.
+const REFRESH_SOURCE: &str = include_str!("catalog-refresh.mjs");
+const REFRESH_COMMAND: &str = "pi_ui_refresh_models";
+/// Above the extension's own 20 s, so its timeout answers first.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+/// Installed beside the delete guard, content-addressed the same way.
+pub(super) fn install_refresh(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    super::guard::install_file(dir, "zeron-catalog-refresh", REFRESH_SOURCE)
+}
+pub(super) fn refresh_prompt(force: bool) -> Value {
+    let args = if force { " force" } else { "" };
+    json!({"type":"prompt","message":format!("/{REFRESH_COMMAND}{args}")})
+}
+/// Run the refresh when this Pi lists the command: an unknown `/command`
+/// would go to the model as a prompt. A failed or slow refresh leaves the
+/// stored catalog, which the probe then reads as before.
+async fn refresh(process: &mut Process, force: bool, backlog: &mut Vec<Value>) {
+    let commands = match process.query(json!({"type":"get_commands"}), backlog).await {
+        Ok(commands) => commands,
+        Err(error) => {
+            return tracing::debug!(%error, "Pi listed no commands; catalog not refreshed");
+        }
+    };
+    let listed = commands["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| c["name"] == REFRESH_COMMAND);
+    if !listed {
+        return;
+    }
+    match tokio::time::timeout(
+        REFRESH_TIMEOUT,
+        process.query(refresh_prompt(force), backlog),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::debug!(%error, "Pi refused the catalog refresh"),
+        Err(_) => tracing::debug!("Pi's catalog refresh timed out"),
+    }
+}
+/// `refresh`: refresh the catalogs first (`Some(force)`), when this Pi
+/// loaded the refresh extension.
+pub(super) async fn models(
+    process: &mut Process,
+    refresh_first: Option<bool>,
+) -> Result<Vec<Model>, HarnessError> {
     let mut backlog = vec![];
+    if let Some(force) = refresh_first {
+        refresh(process, force, &mut backlog).await;
+        backlog.clear();
+    }
     let data = process
         .query(json!({"type":"get_available_models"}), &mut backlog)
         .await?;
@@ -270,6 +322,34 @@ fn is_queue_mode(mode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_catalog_refresh_is_a_hidden_extension_command() {
+        assert_eq!(
+            refresh_prompt(true),
+            json!({"type":"prompt","message":"/pi_ui_refresh_models force"})
+        );
+        assert_eq!(
+            refresh_prompt(false),
+            json!({"type":"prompt","message":"/pi_ui_refresh_models"})
+        );
+        assert!(REFRESH_SOURCE.contains(&format!("\"{REFRESH_COMMAND}\"")));
+        let listed = commands(&json!({"commands":[
+            {"name":REFRESH_COMMAND,"description":"Refresh","source":"extension"},
+        ]}));
+        assert!(
+            listed.iter().all(|c| c.name != REFRESH_COMMAND),
+            "never in the palette"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = install_refresh(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), REFRESH_SOURCE);
+        assert_eq!(
+            install_refresh(dir.path()).unwrap(),
+            path,
+            "content-addressed"
+        );
+    }
 
     #[test]
     fn piui_transport_commands_are_hidden_from_the_palette() {

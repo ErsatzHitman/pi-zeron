@@ -100,6 +100,15 @@ extension answers with one notify `ZERON-COMPLETIONS {v:1, commands:{name:
 `getArgumentCompletions`), which never reaches the transcript; it rides each
 `SlashCommand.arguments`. Without the extension commands have no arguments.
 
+Catalog refresh (`catalog.rs`, `catalog-refresh.mjs`): only the model
+discovery process loads the extension. When `get_commands` lists
+`pi_ui_refresh_models`, the driver sends the prompt `/pi_ui_refresh_models`
+(`/pi_ui_refresh_models force` on Zeron's first discovery or a forced one)
+before `get_available_models`. The handler awaits
+`modelRegistry.refresh({allowNetwork, force})` (20 s cap; no network under
+`PI_OFFLINE`) and Pi acknowledges `handled` once it returns. A failed or slow
+refresh leaves the stored catalog.
+
 PIUI (extension UI, `piui.rs`; spec: the user's `~/.pi/agent/extensions/PIUI.md`)
 
 Transport: extensions publish `notify` messages whose text is `PIUI ` + JSON
