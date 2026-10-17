@@ -288,16 +288,7 @@ fn the_btw_pane_opens_at_the_bottom_left_with_its_bar_inside(cx: &mut TestAppCon
         *shell.test_time.as_mut().unwrap() += Duration::from_secs(3);
     });
     assert_eq!(reveal(&shell, cx), Some(1.0));
-    cx.update(|window, cx| {
-        window.refresh();
-        window.draw(cx).clear();
-    });
-    for _ in 0..2 {
-        cx.update(|window, cx| {
-            window.refresh();
-            window.draw(cx).clear();
-        });
-    }
+    settle(cx);
     let pane = cx.debug_bounds("session-btw").expect("the btw pane");
     let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
     // Its own fixed size, in the window's bottom-left corner.
