@@ -69,7 +69,7 @@ async fn crash_guard_parent_role() {
         .unwrap();
     while let Some(event) = stream.next().await {
         if matches!(event.unwrap(), AgentEvent::TextDelta { text } if text == "tree ready") {
-            let _keep = tx;
+            let _keep = &tx;
             // SAFETY: deliberately dies without unwinding or running Drop.
             unsafe { libc::raise(libc::SIGKILL) };
         }
