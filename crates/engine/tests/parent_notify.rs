@@ -90,6 +90,7 @@ impl Harness for Capture {
                     result: None,
                     error: None,
                     session_id: Some("sess".into()),
+                    class: None,
                 }),
             ])
             .boxed()),

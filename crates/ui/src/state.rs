@@ -4583,6 +4583,7 @@ mod tests {
             last_completed_turn: None,
             retry: None,
             running_subagents: 0,
+            queue_position: 0,
             subagents: Vec::new(),
             chat_id: "chat".into(),
             device_id: "host".into(),

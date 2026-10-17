@@ -2926,6 +2926,7 @@ mod tests {
             started_at: None,
             updated_at: chrono::Utc::now(),
             last_completed_turn: None,
+            retry: None,
             running_subagents: 0,
             queue_position: 2,
             subagents: Vec::new(),

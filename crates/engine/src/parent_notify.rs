@@ -706,6 +706,7 @@ mod tests {
                     MessagePart::Error {
                         id: "e".into(),
                         message: "boom".into(),
+                        class: None,
                     },
                 ],
             ),
