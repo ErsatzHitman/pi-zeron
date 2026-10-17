@@ -227,6 +227,16 @@ impl EngineCore {
     ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
+        // We hold the single-instance lock, so any marked Pi whose engine is
+        // gone belongs to a crashed predecessor. Reap before recovery
+        // re-dispatches the interrupted turn onto the same Pi session file.
+        let reaped = zeron_harness::process::reap_orphans();
+        if reaped > 0 {
+            tracing::warn!(
+                reaped,
+                "killed orphaned Pi processes left by a previous engine"
+            );
+        }
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Providers) rides the

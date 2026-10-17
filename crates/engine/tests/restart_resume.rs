@@ -429,6 +429,84 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
     core.shutdown().await;
 }
 
+/// Launch reaps Pi processes a killed engine left behind (marked with a dead
+/// engine's identity) before recovery runs, and touches nothing else.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn launch_reaps_orphans_of_a_dead_engine_but_spares_live_and_unmarked() {
+    use std::process::{Child, Command, Stdio};
+
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn sleeper(env: Option<(String, String)>) -> Reap {
+        let mut command = Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some((pid, start)) = &env {
+            command
+                .env("ZERON_ENGINE_PID", pid)
+                .env("ZERON_ENGINE_START", start);
+        }
+        let child = Reap(command.spawn().unwrap());
+        // The new environment is visible only once the child has exec'd.
+        for _ in 0..300 {
+            let environ =
+                std::fs::read(format!("/proc/{}/environ", child.0.id())).unwrap_or_default();
+            if env.is_none() || String::from_utf8_lossy(&environ).contains("ZERON_ENGINE_PID") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child
+    }
+    fn starttime(pid: u32) -> String {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        stat[stat.rfind(')').unwrap() + 1..]
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .to_string()
+    }
+
+    let mut dead = Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+    // A second, still running "engine" whose children must be left alone.
+    let other_engine = sleeper(None);
+    let other_pid = other_engine.0.id();
+
+    let mut orphan = sleeper(Some((dead_pid.to_string(), "1".into())));
+    let mut live = sleeper(Some((other_pid.to_string(), starttime(other_pid))));
+    let mut unmarked = sleeper(None);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            session_id: "hs".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    assert!(
+        orphan.0.try_wait().unwrap().is_some(),
+        "orphan of a dead engine must be dead once assemble returns"
+    );
+    assert!(live.0.try_wait().unwrap().is_none());
+    assert!(unmarked.0.try_wait().unwrap().is_none());
+    core.shutdown().await;
+}
+
 /// A harness whose stream stays OPEN after each turn's Done, serving follow-up
 /// turns from the steering mailbox — the persistent-session shape (codex; and
 /// claude's stream-json stdin). Counts `run()` calls to prove the engine

@@ -63,23 +63,23 @@ pub(crate) async fn descendants(root: u32) -> Vec<i32> {
     found
 }
 
+/// A group leader's whole group (its own children included); anything else
+/// by pid.
+#[cfg(unix)]
+pub(crate) fn signal_target_for(pid: i32) -> i32 {
+    // SAFETY: getpgid only inspects; a vanished pid returns -1.
+    if unsafe { libc::getpgid(pid) } == pid {
+        -pid
+    } else {
+        pid
+    }
+}
+
 /// Terminate `pids` and the process groups they lead: SIGTERM, then SIGKILL
 /// whatever is still running after `grace`.
 #[cfg(unix)]
 pub(crate) async fn terminate_tree(pids: &[i32], grace: std::time::Duration) {
-    // A group leader's whole group (its own children included); anything
-    // else by pid.
-    let targets: Vec<i32> = pids
-        .iter()
-        .map(|&pid| {
-            // SAFETY: getpgid only inspects; a vanished pid returns -1.
-            if unsafe { libc::getpgid(pid) } == pid {
-                -pid
-            } else {
-                pid
-            }
-        })
-        .collect();
+    let targets: Vec<i32> = pids.iter().map(|&pid| signal_target_for(pid)).collect();
     let alive = |target: i32| unsafe { libc::kill(target, 0) } == 0;
     for &target in &targets {
         crate::send_signal(&target, crate::Signal::Term);
@@ -172,4 +172,9 @@ mod tests {
     }
 }
 
+pub(crate) mod orphans;
 pub(crate) mod owned;
+pub use orphans::reap_orphans;
+#[cfg(unix)]
+#[doc(hidden)]
+pub use orphans::reap_orphans_with;
