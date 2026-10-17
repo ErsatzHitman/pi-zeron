@@ -11719,8 +11719,9 @@ impl Render for Composer {
                 route_snap,
             )
         };
-        // A minimal bar stays on its one line.
-        let expanded = self.expanded_mode && !self.minimal;
+        // A minimal bar grows to more lines like any other (without the
+        // attachment button).
+        let expanded = self.expanded_mode;
 
         let failure = self.visible_failure();
         // Composer honesty: when the target's delivery path is degraded, say
@@ -12319,7 +12320,7 @@ impl Render for Composer {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
-                                .child(attach),
+                                .when(!self.minimal, |el| el.child(attach)),
                         )
                         .children(model_picker)
                         .child(

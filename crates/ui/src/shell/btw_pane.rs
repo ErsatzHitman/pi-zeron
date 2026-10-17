@@ -1,14 +1,13 @@
-//! btw: a side chat in a small pane beside the session panel, the card's
-//! width, with its prompt bar inside it at the bottom. The Session row's `+`
-//! opens it. It floats at the card's left (in the card's place while the
-//! card is away) and never opens the right pane. It grows with the
-//! conversation, up to the room the window has, so a reply shows whole
-//! without scrolling while it fits. It runs its parent's model (no picker).
-//! The history button lists the conversation's side chats, so settled ones
-//! stay one click away. Like Claude Code's side chat, it is a bare one-line
-//! prompt (no attachments or microphone) and shows only the answers: while
-//! a reply works, its trailer ("Puzzling…") stands in for the thinking and
-//! tool rows. It is at least as tall as the session card beside it.
+//! btw: a side chat in a small floating pane. The Session row's `+` opens
+//! it at the window's bottom left; its header drags it anywhere, over the
+//! sidebar, the transcript and the panes alike, and it stays where it was
+//! left for the next side chat. It is a fixed size: the thread scrolls
+//! inside it. It runs its parent's model (no picker). The history button
+//! lists the conversation's side chats, so settled ones stay one click away.
+//! Like Claude Code's side chat, its prompt has no attachments or
+//! microphone (it grows to more lines as it fills) and it shows only the
+//! answers: while a reply works, its trailer ("Puzzling…") stands in for
+//! the thinking and tool rows.
 
 use super::*;
 
@@ -17,25 +16,34 @@ use std::rc::Rc;
 
 use zeron_proto::ChatIndicator;
 
-use super::session_info::{SESSION_CARD_INSET, SESSION_CARD_WIDTH};
-
-/// The room between the pane and the card.
-pub(super) const BTW_GAP: f32 = 8.0;
+/// The pane's size, unless the window is smaller.
+pub(super) const BTW_WIDTH: f32 = 360.0;
+pub(super) const BTW_HEIGHT: f32 = 460.0;
+/// Its room from the window's edges where it opens, and the least it keeps
+/// once dragged.
+const BTW_MARGIN: f32 = 12.0;
 const HEADER_HEIGHT: f32 = 34.0;
 /// The composer's own side padding. The bar's host bleeds through it, so
 /// the prompt pill sits [`BAR_INSET`] in from the pane's edges.
 const COMPOSER_PAD: f32 = 16.0;
 const BAR_INSET: f32 = 8.0;
-/// The thread's room when the window has hardly any: it scrolls then.
-const MIN_BODY: f32 = 80.0;
-/// The side-chat list's room.
-const HISTORY_HEIGHT: f32 = 240.0;
 
-/// The thread's height this frame: its content, up to the room the window
-/// leaves under `max_height` once the header and the prompt bar (`chrome`)
-/// are placed.
-fn body_height(content: f32, max_height: f32, chrome: f32) -> f32 {
-    content.max(0.0).min((max_height - chrome).max(MIN_BODY))
+/// The pane's size in a `viewport`-sized window: its own, or the window's
+/// room inside the margins.
+fn pane_size(viewport: (f32, f32)) -> (f32, f32) {
+    (
+        BTW_WIDTH.min(viewport.0 - 2.0 * BTW_MARGIN).max(0.0),
+        BTW_HEIGHT.min(viewport.1 - 2.0 * BTW_MARGIN).max(0.0),
+    )
+}
+
+/// Where a `size`d pane's top left sits: where it was dragged to, else the
+/// bottom left, kept whole inside the window's margins.
+fn pane_origin(dragged: Option<(f32, f32)>, size: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
+    let right = (viewport.0 - size.0 - BTW_MARGIN).max(BTW_MARGIN);
+    let bottom = (viewport.1 - size.1 - BTW_MARGIN).max(BTW_MARGIN);
+    let (x, y) = dragged.unwrap_or((BTW_MARGIN, bottom));
+    (x.clamp(BTW_MARGIN, right), y.clamp(BTW_MARGIN, bottom))
 }
 
 pub(super) struct BtwPane {
@@ -48,10 +56,8 @@ pub(super) struct BtwPane {
     history_open: bool,
     /// The bar's painted height, for the room left to the thread.
     bar_height: Rc<Cell<f32>>,
-    /// The thread content height the pane was last sized to: a frame that
-    /// measures another one asks for the next frame, so the pane follows
-    /// a streaming reply and settles on its last line.
-    fitted: Rc<Cell<f32>>,
+    /// While the header is held: the press's offset into the pane.
+    grab: Option<(f32, f32)>,
 }
 
 /// A fresh side chat off `parent`. Nothing is written until its first send
@@ -156,7 +162,7 @@ impl Shell {
             open: true,
             history_open: false,
             bar_height: Rc::new(Cell::new(0.0)),
-            fitted: Rc::new(Cell::new(0.0)),
+            grab: None,
         });
         self.focus_btw(id, cx);
     }
@@ -295,16 +301,13 @@ impl Shell {
         (reveal > 0.001).then_some((id, reveal))
     }
 
-    /// The pane, its prompt bar inside it, placed from the main column's
-    /// right edge at the card's left; `card_reveal` is the card's reveal, so
-    /// while the card is away the pane takes its place. `max_height` is the
-    /// room above the window's bottom chrome.
+    /// The pane, its prompt bar inside it, floating over the window at its
+    /// bottom left or where its header was dragged to.
     pub(super) fn render_btw_pane(
         &mut self,
         id: u64,
         reveal: f32,
-        card_reveal: f32,
-        max_height: f32,
+        viewport: gpui::Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let tab = self.side_chats.get(&id)?;
@@ -313,13 +316,11 @@ impl Shell {
             tab.transcript.clone(),
             tab.composer.clone(),
         );
-        let (history_open, bar_height, fitted) = self.btw.as_ref().map(|pane| {
-            (
-                pane.history_open,
-                pane.bar_height.clone(),
-                pane.fitted.clone(),
-            )
-        })?;
+        let (history_open, bar_height) = self
+            .btw
+            .as_ref()
+            .map(|pane| (pane.history_open, pane.bar_height.clone()))?;
+        let dragged = self.btw_dragged;
         let theme = Theme::of(cx).for_popup();
         self.btw_follow_parent_model(id, cx);
         let (chat, status) = {
@@ -328,6 +329,9 @@ impl Shell {
             let status = state.display_status_for(&chat, Utc::now());
             (chat, status)
         };
+        let window = (f32::from(viewport.width), f32::from(viewport.height));
+        let (width, height) = pane_size(window);
+        let (x, y) = pane_origin(dragged, (width, height), window);
         // A pane-sized thread: narrow gutters, nothing above it to clear, and
         // sized to its content rather than holding a runway for the reply.
         transcript.update(cx, |transcript, cx| {
@@ -338,29 +342,16 @@ impl Shell {
             // Its answers only: "Puzzling…" stands in for the work.
             transcript.set_answers_only(true, cx);
         });
-        let bar_width = SESSION_CARD_WIDTH - 2.0 * (BAR_INSET - COMPOSER_PAD);
+        let bar_width = width - 2.0 * (BAR_INSET - COMPOSER_PAD);
         composer.update(cx, |composer, cx| {
             composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
             composer.set_available_width(bar_width, cx);
             composer.set_model_picker_hidden(true, cx);
             composer.set_minimal(true, cx);
         });
-        let bar_h = match bar_height.get() {
-            height if height > 0.0 => height,
-            _ => 64.0,
-        };
-        // The card's borders, the header, and the bar with its inset below.
-        let chrome = 2.0 + HEADER_HEIGHT + bar_h + BAR_INSET;
+        // The thread's room as the last frame measured the bar.
+        let body_h = height - 2.0 - HEADER_HEIGHT - bar_height.get().max(48.0) - BAR_INSET;
         let content = transcript.read(cx).content_height();
-        fitted.set(content);
-        // As tall as the session card beside it, at least.
-        // Measured inside the card's 1px border.
-        let card_h = self.session_card_height.get() + 2.0;
-        let body_h = if history_open {
-            body_height(HISTORY_HEIGHT, max_height, chrome)
-        } else {
-            body_height(content.max(card_h - chrome), max_height, chrome)
-        };
         let working = status == ChatIndicator::Working;
 
         let glyph = if working {
@@ -384,7 +375,11 @@ impl Shell {
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| "btw".into())
             .into();
+        // The header drags the pane: a press keeps its offset into the pane,
+        // and the window-wide listeners below move it until the release.
         let header = div()
+            .id("session-btw-header")
+            .debug_selector(|| "session-btw-header".into())
             .flex_none()
             .h(px(HEADER_HEIGHT))
             .flex()
@@ -393,9 +388,20 @@ impl Shell {
             .gap(px(4.0))
             .pl(px(12.0))
             .pr(px(6.0))
-            .when(body_h > 0.0, |header| {
-                header.border_b_1().border_color(theme.border)
-            })
+            .border_b_1()
+            .border_color(theme.border)
+            .cursor_grab()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                    if let Some(pane) = this.btw.as_mut() {
+                        pane.grab = Some((
+                            f32::from(event.position.x) - x,
+                            f32::from(event.position.y) - y,
+                        ));
+                    }
+                }),
+            )
             .child(
                 div()
                     .size(px(16.0))
@@ -438,6 +444,47 @@ impl Shell {
                     }),
                 ),
             );
+        let drag = {
+            let shell = cx.entity().downgrade();
+            gpui::canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    let moving = shell.clone();
+                    window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                        if phase != gpui::DispatchPhase::Bubble {
+                            return;
+                        }
+                        let _ = moving.update(cx, |this, cx| {
+                            let Some((dx, dy)) = this.btw.as_ref().and_then(|pane| pane.grab)
+                            else {
+                                return;
+                            };
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                this.btw_dragged = Some((
+                                    f32::from(event.position.x) - dx,
+                                    f32::from(event.position.y) - dy,
+                                ));
+                            } else if let Some(pane) = this.btw.as_mut() {
+                                pane.grab = None;
+                            }
+                            cx.notify();
+                        });
+                    });
+                    let release = shell.clone();
+                    window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, _, cx| {
+                        if phase == gpui::DispatchPhase::Bubble {
+                            let _ = release.update(cx, |this, _| {
+                                if let Some(pane) = this.btw.as_mut() {
+                                    pane.grab = None;
+                                }
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_0()
+        };
 
         let body = if history_open {
             self.render_btw_history(&chat, &theme, cx)
@@ -468,7 +515,8 @@ impl Shell {
                     .text_color(theme.text_faint)
                     .child(SharedString::from(
                         "Ask about this session without touching the main thread. \
-                         It sees the session so far, and nothing here is added to it.",
+                         It sees the session so far, can read files and search the web, \
+                         and nothing here is added to it.",
                     ))
             });
             div()
@@ -485,28 +533,6 @@ impl Shell {
                 .into_any_element()
         };
 
-        // A frame whose layout measured the thread or the bar at another size
-        // than this render used asks for the next one, so the pane grows with
-        // a streaming reply and settles on its last line.
-        let probe = {
-            let transcript = transcript.clone();
-            let bar_height = bar_height.clone();
-            let card_height = self.session_card_height.clone();
-            gpui::canvas(
-                move |_, window, cx| {
-                    let content = transcript.read(cx).content_height();
-                    if (content - fitted.get()).abs() > 0.5
-                        || (bar_height.get() - bar_h).abs() > 0.5
-                        || (card_height.get() + 2.0 - card_h).abs() > 0.5
-                    {
-                        window.request_animation_frame();
-                    }
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_0()
-        };
         // The bar trails the pane by a beat.
         let bar_t = ((reveal - 0.25) / 0.75).clamp(0.0, 1.0);
         let bar = div()
@@ -535,8 +561,10 @@ impl Shell {
                     .child(composer),
             );
 
+        // A fixed size: the thread takes what the header and the bar leave.
         let card = div()
-            .w(px(SESSION_CARD_WIDTH))
+            .w(px(width))
+            .h(px(height))
             .rounded(px(popover::CARD_RADIUS))
             .overflow_hidden()
             .border_1()
@@ -547,10 +575,9 @@ impl Shell {
             .flex()
             .flex_col()
             .child(header)
-            .child(div().flex_none().h(px(body_h)).min_h_0().child(body))
+            .child(div().flex_1().min_h_0().child(body))
             .child(bar)
-            // Last, so it reads what this frame's layout measured.
-            .child(probe);
+            .child(drag);
         let pane = div()
             .id("session-btw")
             .debug_selector(|| "session-btw".into())
@@ -568,14 +595,12 @@ impl Shell {
                 card,
             ));
 
-        let right =
-            SESSION_CARD_INSET + (SESSION_CARD_WIDTH + BTW_GAP) * card_reveal.clamp(0.0, 1.0);
         Some(
             div()
                 .absolute()
-                .top(px(Theme::TITLEBAR_HEIGHT + 12.0 - 6.0 * (1.0 - reveal)))
-                .right(px(right))
-                .w(px(SESSION_CARD_WIDTH))
+                .left(px(x))
+                .top(px(y + 6.0 * (1.0 - reveal)))
+                .w(px(width))
                 .child(pane)
                 .into_any_element(),
         )
@@ -696,13 +721,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_thread_takes_its_content_up_to_the_room_left() {
-        // A fresh pane is its header and prompt bar.
-        assert_eq!(body_height(0.0, 900.0, 120.0), 0.0);
-        // A reply shows whole while it fits...
-        assert_eq!(body_height(360.0, 900.0, 120.0), 360.0);
-        // ...and scrolls only once the window runs out.
-        assert_eq!(body_height(2000.0, 900.0, 120.0), 780.0);
-        assert_eq!(body_height(2000.0, 150.0, 120.0), MIN_BODY);
+    fn it_opens_at_the_bottom_left_and_stays_on_screen_where_dragged() {
+        let window = (1600.0, 900.0);
+        let size = pane_size(window);
+        assert_eq!(size, (BTW_WIDTH, BTW_HEIGHT));
+        assert_eq!(
+            pane_origin(None, size, window),
+            (BTW_MARGIN, 900.0 - BTW_HEIGHT - BTW_MARGIN)
+        );
+        assert_eq!(
+            pane_origin(Some((700.0, 200.0)), size, window),
+            (700.0, 200.0)
+        );
+        // Dragged past an edge, it stops inside the margins.
+        assert_eq!(
+            pane_origin(Some((-50.0, 2000.0)), size, window),
+            (BTW_MARGIN, 900.0 - BTW_HEIGHT - BTW_MARGIN)
+        );
+        assert_eq!(
+            pane_origin(Some((5000.0, -9.0)), size, window),
+            (1600.0 - BTW_WIDTH - BTW_MARGIN, BTW_MARGIN)
+        );
+        // A small window shrinks it to its room.
+        assert_eq!(pane_size((300.0, 400.0)), (276.0, 376.0));
     }
 }

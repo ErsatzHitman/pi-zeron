@@ -2091,6 +2091,9 @@ pub struct Shell {
     btw: Option<btw_pane::BtwPane>,
     btw_tween: Option<WidthTween>,
     btw_shown: bool,
+    /// Where the btw pane's header dragged it (its top left, window px): the
+    /// next one opens there too.
+    btw_dragged: Option<(f32, f32)>,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
@@ -2203,8 +2206,6 @@ pub struct Shell {
     orchestrator_task: Option<Task<()>>,
     orchestrator_settings: Option<orchestrator_settings::OrchestratorSettingsDialog>,
     orchestrator_projects: orchestrator_settings::OrchestratorProjects,
-    /// The session card's painted height, which the btw pane matches.
-    session_card_height: std::rc::Rc<std::cell::Cell<f32>>,
     /// In-flight reorder for the pinned section only.
     pinned_session_drag: Option<PinnedSessionDragState>,
     pinned_session_drag_generation: u64,
@@ -2661,6 +2662,7 @@ impl Shell {
             btw: None,
             btw_tween: None,
             btw_shown: false,
+            btw_dragged: None,
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
@@ -2738,7 +2740,6 @@ impl Shell {
             orchestrator_task: None,
             orchestrator_settings: None,
             orchestrator_projects: Default::default(),
-            session_card_height: Default::default(),
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
             sidebar_session_transfer: None,
@@ -11659,9 +11660,6 @@ impl Shell {
             self.viewport_height - Theme::TITLEBAR_HEIGHT - self.bottom_stack.get() - 24.0;
         let session_card =
             self.render_session_info(session_docked, session_reveal, session_max_height, cx);
-        let btw_pane = self.btw_frame(cx).and_then(|(id, reveal)| {
-            self.render_btw_pane(id, reveal, session_reveal, session_max_height, cx)
-        });
         self.chat_dropzone("chat-dropzone", self.composer.clone(), cx)
             .debug_selector(|| "chat-dropzone".into())
             .track_focus(&self.navigation_focus.main)
@@ -11726,7 +11724,6 @@ impl Shell {
                 },
             )
             .children(session_card)
-            .children(btw_pane)
             .when_some(harness_update_card, |column, chip| {
                 // Home notices stay anchored to the window bottom, behind the
                 // dock. Clip paint and hitboxes at the same measured terminal
@@ -14469,6 +14466,9 @@ impl Render for Shell {
                 };
                 let files_panel = self.render_files_panel(window, cx);
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
+                let btw_pane = self.btw_frame(cx).and_then(|(id, reveal)| {
+                    self.render_btw_pane(id, reveal, window.viewport_size(), cx)
+                });
                 // Full-window voice stage: above the page chrome, below dialogs.
                 let voice_stage = self.render_voice_stage(window, cx);
                 let under_stage = self.voice_stage_underlay_opacity(cx);
@@ -14592,6 +14592,9 @@ impl Render for Shell {
                     .children(voice_stage)
                     .child(self.render_titlebar_cluster(cx))
                     .children(self.render_sidebar_options_titlebar(cx))
+                    // The btw pane floats over the whole page, under its
+                    // menus and dialogs.
+                    .children(btw_pane)
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))

@@ -243,7 +243,7 @@ fn clicking_a_nested_subagent_opens_its_session(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_btw_pane_opens_at_the_cards_width_with_its_bar_inside(cx: &mut TestAppContext) {
+fn the_btw_pane_opens_at_the_bottom_left_with_its_bar_inside(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     init(cx, dir.path());
     let config = boot(dir.path());
@@ -292,14 +292,6 @@ fn the_btw_pane_opens_at_the_cards_width_with_its_bar_inside(cx: &mut TestAppCon
         window.refresh();
         window.draw(cx).clear();
     });
-    let pane = cx.debug_bounds("session-btw").expect("the btw pane");
-    let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
-    assert_eq!(f32::from(pane.size.width), session_info::SESSION_CARD_WIDTH);
-    // The prompt bar is inside the pane, at its bottom.
-    assert!(bar.origin.x >= pane.origin.x && bar.right() <= pane.right());
-    assert!(bar.origin.y > pane.origin.y && bar.bottom() <= pane.bottom() + px(0.5));
-    // As tall as the session card beside it, with a bare one-line prompt
-    // (the pane sizes to what the last frame measured).
     for _ in 0..2 {
         cx.update(|window, cx| {
             window.refresh();
@@ -308,14 +300,14 @@ fn the_btw_pane_opens_at_the_cards_width_with_its_bar_inside(cx: &mut TestAppCon
     }
     let pane = cx.debug_bounds("session-btw").expect("the btw pane");
     let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
-    let card = cx.debug_bounds("session-info").expect("the session card");
-    assert!(
-        (f32::from(pane.size.height) - f32::from(card.size.height)).abs() <= 1.0,
-        "the pane is {:?} tall, the card {:?}, the bar {:?}",
-        pane.size.height,
-        card.size.height,
-        bar.size.height
-    );
+    // Its own fixed size, in the window's bottom-left corner.
+    assert_eq!(f32::from(pane.size.width), btw_pane::BTW_WIDTH);
+    assert!((f32::from(pane.size.height) - btw_pane::BTW_HEIGHT).abs() <= 1.0);
+    assert_eq!(f32::from(pane.origin.x), 12.0);
+    assert!((f32::from(pane.bottom()) - (900.0 - 12.0)).abs() <= 1.0);
+    // The prompt bar is inside the pane, at its bottom, on one line.
+    assert!(bar.origin.x >= pane.origin.x && bar.right() <= pane.right());
+    assert!(bar.origin.y > pane.origin.y && bar.bottom() <= pane.bottom() + px(0.5));
     assert!(
         f32::from(bar.size.height) < 64.0,
         "the prompt bar is {:?} tall",
@@ -372,7 +364,7 @@ fn settle(cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
-fn the_btw_pane_grows_to_show_a_whole_reply(cx: &mut TestAppContext) {
+fn the_btw_pane_keeps_its_size_and_scrolls_a_long_reply(cx: &mut TestAppContext) {
     use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
     let dir = tempfile::tempdir().unwrap();
     let (shell, cx) = open_btw(cx, dir.path());
@@ -403,40 +395,12 @@ fn the_btw_pane_grows_to_show_a_whole_reply(cx: &mut TestAppContext) {
         continuation_of: None,
         duration_ms: None,
     };
-    let reply = (1..=4)
-        .map(|n| format!("Point {n}: the side chat's reply wraps across the narrow pane."))
+    let long = (1..=60)
+        .map(|n| format!("Line {n} of a reply far taller than the pane."))
         .collect::<Vec<_>>()
         .join("\n\n");
     side.update(cx, |state, cx| {
         state.transcript_replayed = true;
-        state.transcript = vec![
-            entry("q", MessageRole::User, "What does this function do?"),
-            entry("r", MessageRole::Assistant, &reply),
-        ];
-        state.transcript_revision += 1;
-        cx.notify();
-    });
-    settle(cx);
-
-    let pane = cx.debug_bounds("session-btw").expect("the btw pane");
-    let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
-    let content = transcript.read_with(cx, |transcript, _| transcript.content_height());
-    assert!(content > 150.0, "the reply was laid out: {content}");
-    assert!(pane.size.height > empty.size.height + px(100.0));
-    // The whole thread fits between the header and the bar: nothing to scroll.
-    let room = f32::from(bar.origin.y - pane.origin.y) - 34.0 - 2.0;
-    assert!(content <= room + 1.0, "content {content} in {room}");
-    assert!(transcript.read_with(cx, |transcript, _| transcript.distance_from_bottom()) < 1.0);
-    // Still the bar at the bottom, inside.
-    assert!(bar.bottom() <= pane.bottom() + px(0.5));
-
-    // A thread taller than the window stops the pane at the window's room:
-    // the bar stays on screen and the thread scrolls.
-    let long = (1..=60)
-        .map(|n| format!("Line {n} of a reply far taller than the window."))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    side.update(cx, |state, cx| {
         state.transcript = vec![
             entry("q", MessageRole::User, "What does this function do?"),
             entry("r", MessageRole::Assistant, &long),
@@ -445,13 +409,10 @@ fn the_btw_pane_grows_to_show_a_whole_reply(cx: &mut TestAppContext) {
         cx.notify();
     });
     settle(cx);
+    // The same pane: the reply scrolls inside it, the bar stays at its bottom.
     let pane = cx.debug_bounds("session-btw").expect("the btw pane");
     let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
-    assert!(
-        f32::from(pane.bottom()) <= 900.0,
-        "pane ends at {:?}",
-        pane.bottom()
-    );
+    assert_eq!(pane, empty);
     assert!(bar.bottom() <= pane.bottom() + px(0.5));
     let content = transcript.read_with(cx, |transcript, _| transcript.content_height());
     let room = f32::from(bar.origin.y - pane.origin.y) - 34.0 - 2.0;
@@ -459,6 +420,92 @@ fn the_btw_pane_grows_to_show_a_whole_reply(cx: &mut TestAppContext) {
         content > room,
         "the long reply scrolls: {content} in {room}"
     );
+
+    // A prompt of several lines grows the bar, inside the pane, instead of
+    // clipping all but its first.
+    let one_line = bar.size.height;
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.send_to_btw(
+                "First line.
+Second line.
+Third line.",
+                cx,
+            )
+        })
+    });
+    settle(cx);
+    let pane = cx.debug_bounds("session-btw").expect("the btw pane");
+    let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
+    assert!(
+        bar.size.height > one_line + px(30.0),
+        "the bar grew from {one_line:?} to {:?}",
+        bar.size.height
+    );
+    assert!(bar.origin.y > pane.origin.y && bar.bottom() <= pane.bottom() + px(0.5));
+}
+
+#[gpui::test]
+fn the_btw_pane_drags_by_its_header_and_stays_in_the_window(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (shell, cx) = open_btw(cx, dir.path());
+    settle(cx);
+    let before = cx.debug_bounds("session-btw").expect("the btw pane");
+    let start = cx
+        .debug_bounds("session-btw-header")
+        .expect("its header")
+        .center();
+    let drag = |cx: &mut VisualTestContext, to: gpui::Point<Pixels>| {
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+        settle(cx);
+    };
+    drag(cx, start + gpui::point(px(600.0), px(-300.0)));
+    let after = cx.debug_bounds("session-btw").expect("the btw pane");
+    assert_eq!(
+        after.origin,
+        before.origin + gpui::point(px(600.0), px(-300.0))
+    );
+    assert_eq!(after.size, before.size);
+    // Flung past the window's corner, it stops inside it.
+    let start = cx
+        .debug_bounds("session-btw-header")
+        .expect("its header")
+        .center();
+    cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_move(
+        gpui::point(px(5000.0), px(-500.0)),
+        Some(MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        gpui::point(px(5000.0), px(-500.0)),
+        MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    settle(cx);
+    let flung = cx.debug_bounds("session-btw").expect("the btw pane");
+    assert_eq!(f32::from(flung.right()), 1600.0 - 12.0);
+    assert_eq!(f32::from(flung.origin.y), 12.0);
+    // Closed and opened again, it comes back where it was left.
+    cx.update(|_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.close_btw_pane(cx);
+        })
+    });
+    shell.update(cx, |shell, _| {
+        *shell.test_time.as_mut().unwrap() += Duration::from_secs(3);
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("session-btw").is_none());
+    cx.update(|_, cx| shell.update(cx, |shell, cx| shell.open_btw_pane(cx)));
+    shell.update(cx, |shell, _| {
+        *shell.test_time.as_mut().unwrap() += Duration::from_secs(3);
+    });
+    settle(cx);
+    let reopened = cx.debug_bounds("session-btw").expect("the btw pane");
+    assert_eq!(reopened.origin, flung.origin);
 }
 
 #[gpui::test]

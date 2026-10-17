@@ -10,6 +10,17 @@ use crate::{HarnessError, process::Command, scratch::ScratchDir};
 /// Appended to every Pi chat's system prompt.
 pub(crate) const VISUALS_PROMPT: &str = include_str!("visuals.md");
 
+/// A btw side chat's tools (Pi `--tools`): it answers questions about the
+/// session it forked from, so it reads files and the web and changes
+/// nothing. An `mcp__` entry makes Pi's allowlist cover MCP tools too, so
+/// Zeron's and every other server's are left out.
+pub(crate) const BTW_TOOLS: &str =
+    "read,grep,find,ls,mcp__firecrawl__firecrawl_search,mcp__firecrawl__firecrawl_scrape";
+const BTW_PROMPT: &str = "This is a btw side chat: the user is asking about the conversation \
+above without interrupting it. Answer from that conversation. You can read files (read, grep, \
+find, ls) and search or fetch the web (firecrawl), and nothing else: you cannot run commands, \
+edit files, or start agents or sessions, and nothing you do here reaches the main conversation.\n";
+
 pub(super) fn configure(
     cmd: &mut Command,
     config: &zeron_proto::McpServer,
@@ -81,6 +92,15 @@ fn role_args(
         "--append-system-prompt".into(),
         visuals.into(),
     ];
+    // A btw side chat only asks, wherever it sits: no role prompt, project
+    // or tools beyond its own.
+    if place.chat_id.starts_with(zeron_proto::BTW_CHAT_PREFIX) {
+        let prompt = scratch.join("zeron-btw.md");
+        std::fs::write(&prompt, BTW_PROMPT)?;
+        args.extend(["--append-system-prompt".into(), prompt.into()]);
+        args.extend(["--tools".into(), BTW_TOOLS.into()]);
+        return Ok(args);
+    }
     match place.role {
         Role::Chat => {}
         Role::Root => {
@@ -158,6 +178,30 @@ mod tests {
         );
         for absent in ["--system-prompt", "--tools", "--no-mcp"] {
             assert!(!args.iter().any(|arg| arg == absent), "{absent}");
+        }
+    }
+
+    #[test]
+    fn a_btw_side_chat_only_reads_files_and_the_web() {
+        for role in [Role::Chat, Role::Member { depth: 2 }] {
+            let mut place = at(role, Some("parent-1"));
+            place.chat_id = format!("{}side-1", zeron_proto::BTW_CHAT_PREFIX);
+            let (_scratch, args) = args_at(&place);
+            let tools: Vec<&str> = flag(&args, "--tools").unwrap().split(',').collect();
+            assert_eq!(
+                tools,
+                [
+                    "read",
+                    "grep",
+                    "find",
+                    "ls",
+                    "mcp__firecrawl__firecrawl_search",
+                    "mcp__firecrawl__firecrawl_scrape"
+                ]
+            );
+            assert!(args.iter().any(|arg| arg.ends_with("zeron-btw.md")));
+            assert!(!args.iter().any(|arg| arg.ends_with("zeron-member.md")));
+            assert!(!args.iter().any(|arg| arg == "--system-prompt"));
         }
     }
 

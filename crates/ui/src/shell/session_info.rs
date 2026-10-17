@@ -216,20 +216,6 @@ pub(super) fn session_card_reserve(main: f32, transcript: f32) -> Option<f32> {
     (main - reserve - 2.0 * TRANSCRIPT_GUTTER >= transcript - 0.5).then_some(reserve)
 }
 
-/// [`session_card_reserve`] with `beside` px more at the card's left (the
-/// btw pane): the transcript shifts further left for it, as far as it can
-/// without narrowing. `None` only when the card itself does not fit.
-pub(super) fn session_card_reserve_beside(main: f32, transcript: f32, beside: f32) -> Option<f32> {
-    let card = session_card_reserve(main, transcript)?;
-    let left = main - SESSION_CARD_WIDTH - SESSION_CARD_INSET - beside;
-    let wanted = (main + transcript - 2.0 * (left - SESSION_CARD_GAP)).max(0.0);
-    Some(
-        wanted
-            .min(main - 2.0 * TRANSCRIPT_GUTTER - transcript)
-            .max(card),
-    )
-}
-
 /// A section clipped to `t` of its height and faded with it. A probe records
 /// the content's painted height; until the first one, `estimate` stands in.
 fn section_frame(
@@ -473,13 +459,7 @@ impl Shell {
             - self.right_visible_width(cx)
             - self.files_visible_width(cx))
         .max(0.0);
-        // The btw pane, easing in beside the card, wants room too.
-        let btw = self.eval_tween(self.btw_tween, if self.btw_shown { 1.0 } else { 0.0 });
-        session_card_reserve_beside(
-            main,
-            crate::settings::transcript_width(cx),
-            (SESSION_CARD_WIDTH + super::btw_pane::BTW_GAP) * btw,
-        )
+        session_card_reserve(main, crate::settings::transcript_width(cx))
     }
 
     /// Whether the card fits beside the transcript without narrowing it.
@@ -513,10 +493,6 @@ impl Shell {
             .unwrap_or(self.session_info_shown);
         if self.session_info_fits(cx) {
             return;
-        }
-        // The floating card has no room beside it for the btw pane.
-        if show {
-            self.close_btw_pane(cx);
         }
         self.session_info_overlay = show;
         cx.notify();
@@ -977,17 +953,7 @@ impl Shell {
             .bg(popover::surface_bg(&theme))
             .when(!docked && !theme.is_frost(), |card| card.shadow_lg())
             .relative()
-            .child(body)
-            // The btw pane beside it matches its height.
-            .child({
-                let measured = self.session_card_height.clone();
-                gpui::canvas(
-                    move |bounds, _, _| measured.set(f32::from(bounds.size.height)),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0()
-            });
+            .child(body);
 
         // Docked, the card slides in from the right beside the column;
         // floating, it drops in from just above. Either way it is placed from
@@ -1270,10 +1236,14 @@ impl Shell {
         let now = Utc::now();
         for group in &view.groups {
             rows.push(
-                info_row(theme, row_glyph(icons::FOLDER, theme), group.label.clone().into())
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .text_color(theme.text_muted)
-                    .into_any_element(),
+                info_row(
+                    theme,
+                    row_glyph(icons::FOLDER, theme),
+                    group.label.clone().into(),
+                )
+                .text_size(crate::typography::ui_rems(11.5))
+                .text_color(theme.text_muted)
+                .into_any_element(),
             );
             for entry in &group.entries {
                 let (kind, tone) = match entry.kind {
@@ -1286,7 +1256,10 @@ impl Shell {
                     .unwrap_or_default();
                 let (text, cut) = board::preview(&entry.text);
                 let post = div()
-                    .id(SharedString::from(format!("session-info-board-{}", entry.id)))
+                    .id(SharedString::from(format!(
+                        "session-info-board-{}",
+                        entry.id
+                    )))
                     .px(px(9.0))
                     .py(px(3.0))
                     .flex()
@@ -3339,26 +3312,6 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_btw_pane_shifts_the_transcript_as_far_as_it_can() {
-        let beside = SESSION_CARD_WIDTH + super::super::btw_pane::BTW_GAP;
-        // Wide: the column moves left just enough to clear the pane too.
-        let reserve = session_card_reserve_beside(1600.0, 736.0, beside).unwrap();
-        let pane_left = 1600.0 - SESSION_CARD_WIDTH - SESSION_CARD_INSET - beside;
-        assert!(((1600.0 - reserve) / 2.0 + 368.0 - (pane_left - SESSION_CARD_GAP)).abs() < 0.01);
-        // Tighter: it stops where the column would narrow, and the pane
-        // overlaps the transcript instead.
-        let main = 1200.0;
-        let reserve = session_card_reserve_beside(main, 736.0, beside).unwrap();
-        assert!((reserve - (main - 2.0 * TRANSCRIPT_GUTTER - 736.0)).abs() < 0.01);
-        // Nothing beside: the card's own reserve.
-        assert_eq!(
-            session_card_reserve_beside(main, 736.0, 0.0),
-            session_card_reserve(main, 736.0)
-        );
-        assert_eq!(session_card_reserve_beside(800.0, 736.0, beside), None);
-    }
 
     #[test]
     fn a_wide_column_keeps_the_transcript_centered_beside_the_card() {

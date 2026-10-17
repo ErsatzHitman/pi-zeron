@@ -75,14 +75,15 @@ A run from a workflows extension that groups by phase (`workflow:state` v2) is d
 
 ## btw
 
-The Session row's `+` opens a side chat in a small pane: the card's width, beside the card on its left (in the card's place while the card is away), with its prompt bar inside it at the bottom. It eases in and folds away quickly; it never opens the right pane. While the window has room the transcript shifts further left to clear it, as far as it can without narrowing; past that the pane floats over the transcript.
+The Session row's `+` opens a side chat in a small floating pane (360 × 460, smaller only in a smaller window) at the window's bottom left, with its prompt bar inside it at the bottom. It floats over everything (sidebar, transcript, panes), under menus and dialogs. Drag its header to move it anywhere in the window; it stays inside the window's edges, and the next side chat opens where the last one was left. It eases in and folds away quickly; it never opens the right pane or moves the transcript.
 
 - Its header shows the side chat's title (a spinner while it works) and two buttons: **Side chats** lists the conversation's side chats, newest activity first (click one to show it in the pane, right-click for the chat menu); **Close**. It has no expand button: the pane stays small.
 - The prompt bar has no model picker: the side chat runs its parent's model, following it until its first send.
 - Escape closes it while its agent is idle. A second `+` focuses the open pane.
-- The pane fits its conversation: a fresh one is its header and prompt bar, and it grows with each reply (a streaming one included) so the whole thread shows without scrolling. Only once it reaches the bottom of the window does the thread scroll, with faded edges. A send reserves no blank space for the reply, unlike the main transcript.
+- The pane keeps its size: the thread scrolls inside it, with faded edges once it does. A send reserves no blank space for the reply, unlike the main transcript.
+- The prompt bar grows to more lines as the prompt does (no attachment button or microphone).
+- The side chat sees its parent's conversation so far (a fork of its Pi session) and has only `read`, `grep`, `find`, `ls` and Firecrawl's search and fetch: no commands, edits, agents or sessions, and nothing it does reaches the main conversation.
 - A closed pane's side chat is dropped unless it has an unsent draft, as when its tab closes. An untitled one has no row until its first send.
-- Floating the card over a narrow column closes the pane.
 - **Send to /btw**: selecting text in the conversation shows a small bar just above the selection, like Claude Code's "Send to side chat". Its button opens the pane (or brings the open one forward) with the selection quoted in the prompt, after anything already typed there, and the caret below it, ready for the question. Only the main conversation offers it, not a side chat's own transcript or a subagent tab.
 
 Fork chat is gone. The Files panel no longer has Subagents or Chats sections; this section replaces both.
