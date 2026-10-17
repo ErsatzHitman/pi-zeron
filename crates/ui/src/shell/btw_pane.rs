@@ -117,7 +117,9 @@ impl Shell {
             self.show_side_chat_error("Start a conversation before creating a side chat.", cx);
             return;
         };
-        let id = self.build_side_chat_tab(forked_child(&parent), true, cx);
+        let mut chat = forked_child(&parent);
+        chat.id = format!("{}{}", zeron_proto::BTW_CHAT_PREFIX, chat.id);
+        let id = self.build_side_chat_tab(chat, true, cx);
         self.show_btw(key, id, cx);
     }
 

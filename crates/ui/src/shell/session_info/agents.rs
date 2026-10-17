@@ -391,12 +391,15 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
 }
 
 /// The live (unarchived) children of `chat_id`, most recent activity first —
-/// the same order the sidebar's Sessions list keeps.
+/// the same order the sidebar's Sessions list keeps. A btw question is the
+/// user's own aside, not work under the chat: it stays in its pane.
 fn child_chat_rows(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<AgentRow> {
     let mut rows: Vec<(DateTime<Utc>, AgentRow)> = state
         .chats
         .iter()
-        .filter(|chat| !chat.archived && chat.parent_chat_id.as_deref() == Some(chat_id))
+        .filter(|chat| {
+            !chat.archived && !chat.is_btw() && chat.parent_chat_id.as_deref() == Some(chat_id)
+        })
         .map(|chat| {
             let activity = chat.last_message_at.unwrap_or(chat.created_at);
             let row = AgentRow {
@@ -581,10 +584,12 @@ mod tests {
             chat("a", Some("main"), 5),
             titled,
             chat("unrelated", Some("elsewhere"), 2),
+            chat("btw-question", Some("main"), 1),
             archived,
         ]);
         let main = state.chats.iter().find(|c| c.id == "main").unwrap().clone();
         let list = agent_list(&state, &main, Utc::now());
+        // The btw question stays in its pane: no row, nothing working.
         assert_eq!(
             list.sessions.iter().map(AgentRow::key).collect::<Vec<_>>(),
             ["parent-root", "chat-a", "chat-b"]
