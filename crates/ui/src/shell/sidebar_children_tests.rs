@@ -52,6 +52,7 @@ fn working(
         status: zeron_proto::SessionStatus::Working,
         started_at: Some(Utc::now()),
         updated_at: Utc::now(),
+        retry: None,
         running_subagents: count,
         subagents,
     }

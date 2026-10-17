@@ -8351,23 +8351,38 @@ impl Shell {
                 state.send_undelivered(&id, now),
             )
         };
+        // The provider failed and Pi is retrying on its own: still Working,
+        // but the row says so (and tints warning) instead of looking healthy.
+        let retry_label = (status == zeron_proto::ChatIndicator::Working
+            && !queued
+            && !undelivered)
+            .then(|| {
+                let now = Utc::now();
+                self.state
+                    .read(cx)
+                    .retrying_for(&id, now)
+                    .map(|retry| zeron_proto::view::retry_label(&retry, now))
+            })
+            .flatten();
         let status_color = if undelivered {
             theme.danger
-        } else if queued {
+        } else if queued || retry_label.is_some() {
             theme.warning
         } else {
             spaces::status_dot_color(status, theme)
         };
-        let status_label: Option<&'static str> = if undelivered {
-            Some("Failed")
+        let status_label: Option<SharedString> = if undelivered {
+            Some("Failed".into())
         } else if queued {
-            Some("Queued")
+            Some("Queued".into())
         } else {
             match status {
-                zeron_proto::ChatIndicator::Working => Some("Working"),
-                zeron_proto::ChatIndicator::AwaitingInput => Some("Needs input"),
-                zeron_proto::ChatIndicator::Errored => Some("Failed"),
-                zeron_proto::ChatIndicator::Completed => Some("Done"),
+                zeron_proto::ChatIndicator::Working => {
+                    Some(retry_label.map_or_else(|| "Working".into(), SharedString::from))
+                }
+                zeron_proto::ChatIndicator::AwaitingInput => Some("Needs input".into()),
+                zeron_proto::ChatIndicator::Errored => Some("Failed".into()),
+                zeron_proto::ChatIndicator::Completed => Some("Done".into()),
                 zeron_proto::ChatIndicator::Idle => None,
             }
         };
@@ -8427,7 +8442,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .aria_label(status_label.unwrap_or("Idle"))
+                .aria_label(status_label.clone().unwrap_or_else(|| "Idle".into()))
                 .child(glyph)
                 .into_any_element()
         });
@@ -8495,7 +8510,7 @@ impl Shell {
                 div().into_any_element()
             }
         } else {
-            match status_label {
+            match status_label.clone() {
                 Some(label) => {
                     // Glyph slot: Working wears the preset's animated pixel
                     // glyph beside its label, Done wears the check, and the
@@ -8550,7 +8565,7 @@ impl Shell {
                                         .text_size(crate::typography::ui_rems(10.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(status_color)
-                                        .child(SharedString::from(label)),
+                                        .child(label),
                                 ),
                         )
                         .into_any_element()
@@ -8581,16 +8596,16 @@ impl Shell {
                     move || format!("{row_id}-corner")
                 })
                 .aria_label(if corner_hovered {
-                    if archived { "Unarchive" } else { "Archive" }
+                    SharedString::from(if archived { "Unarchive" } else { "Archive" })
                 } else {
                     if compact {
-                        if remote {
+                        SharedString::from(if remote {
                             "Remote session"
                         } else {
                             "Session actions"
-                        }
+                        })
                     } else {
-                        status_label.unwrap_or("Idle")
+                        status_label.clone().unwrap_or_else(|| "Idle".into())
                     }
                 })
                 .when(compact, |el| el.w(px(18.0)).justify_center())
@@ -15053,6 +15068,7 @@ mod tests {
             status,
             started_at: Some(updated_at),
             updated_at,
+            retry: None,
             running_subagents: 0,
             subagents: Vec::new(),
         }

@@ -329,6 +329,28 @@ pub struct Session {
     /// Empty from an engine that predates it.
     #[serde(default)]
     pub subagents: Vec<RunningSubagent>,
+    /// The provider failed and the harness (Pi) is retrying on its own. The
+    /// status stays `Working` through it; read it through `view::retrying`,
+    /// which also gates on freshness. `None` from an engine that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryState>,
+}
+
+/// A harness's automatic retry after a provider failure, as the session row
+/// carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryState {
+    /// 1-based attempt about to run.
+    pub attempt: u32,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    /// Engine-clock time the next attempt starts; `None` when unknown.
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    /// The provider's error text, capped. Untrusted data.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// A subagent at work under a chat, as its session row carries it: a
@@ -1526,6 +1548,30 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn session_retry_is_additive_and_round_trips_camel_case() {
+        let old: Session = serde_json::from_value(serde_json::json!({
+            "chatId": "c", "deviceId": "d", "status": "working",
+            "startedAt": null, "updatedAt": "2026-09-03T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(old.retry, None, "an engine that predates retry");
+        assert!(
+            serde_json::to_value(&old).unwrap().get("retry").is_none(),
+            "no retry stays off the wire"
+        );
+        let mut row = old;
+        row.retry = Some(RetryState {
+            attempt: 2,
+            max_attempts: Some(10),
+            next_attempt_at: None,
+            error: Some("429".into()),
+        });
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["retry"]["maxAttempts"], 10);
+        assert_eq!(serde_json::from_value::<Session>(json).unwrap(), row);
+    }
 
     #[test]
     fn outside_workspace_reads_round_trip_without_breaking_older_reasons() {

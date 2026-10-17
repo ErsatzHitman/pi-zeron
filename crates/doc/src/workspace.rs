@@ -492,6 +492,16 @@ impl WorkspaceDoc {
             "subagents",
             serde_json::to_string(&session.subagents)?.as_str(),
         )?;
+        set_opt_str(
+            &row,
+            "retry",
+            session
+                .retry
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                .as_deref(),
+        )?;
         self.doc.commit();
         Ok(())
     }
@@ -789,6 +799,9 @@ pub(crate) struct RawSession {
     /// `Session::subagents` as JSON text.
     #[serde(default)]
     subagents: Option<String>,
+    /// `Session::retry` as JSON text.
+    #[serde(default)]
+    retry: Option<String>,
 }
 
 impl From<RawSession> for Session {
@@ -805,6 +818,7 @@ impl From<RawSession> for Session {
                 .subagents
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_default(),
+            retry: raw.retry.and_then(|json| serde_json::from_str(&json).ok()),
         }
     }
 }
@@ -912,6 +926,7 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            retry: None,
             running_subagents: 0,
             subagents: Vec::new(),
         }
@@ -1025,6 +1040,19 @@ mod tests {
                 fleet_row: Some("j1".into()),
             },
         ];
+        ws.upsert_session(&busy).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![busy.clone()]);
+
+        // A retry rides the row, and clearing it removes it.
+        busy.retry = Some(zeron_proto::RetryState {
+            attempt: 2,
+            max_attempts: Some(10),
+            next_attempt_at: Some(ts(6_000)),
+            error: Some("429 rate limited".into()),
+        });
+        ws.upsert_session(&busy).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![busy.clone()]);
+        busy.retry = None;
         ws.upsert_session(&busy).unwrap();
         assert_eq!(ws.read_sessions().unwrap(), vec![busy]);
         ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))

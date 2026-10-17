@@ -1525,6 +1525,17 @@ impl RegistryDoc {
                 "subagents",
                 json!(serde_json::to_string(&session.subagents)?),
             ),
+            // Null when unset, so a cleared retry replaces the old value.
+            (
+                "retry",
+                json!(
+                    session
+                        .retry
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?
+                ),
+            ),
         ]);
         self.write(KIND_SESSIONS, &session.chat_id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1706,6 +1717,16 @@ impl RegistryDoc {
                     (
                         "subagents",
                         json!(serde_json::to_string(&session.subagents)?),
+                    ),
+                    (
+                        "retry",
+                        json!(
+                            session
+                                .retry
+                                .as_ref()
+                                .map(serde_json::to_string)
+                                .transpose()?
+                        ),
                     ),
                 ]),
             );

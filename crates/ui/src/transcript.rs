@@ -14928,6 +14928,7 @@ mod tests {
                     this.state.update(cx, |state, _| {
                         state.sessions.push(zeron_proto::Session {
                             last_completed_turn: None,
+                            retry: None,
                             running_subagents: 0,
                             subagents: Vec::new(),
                             chat_id: "chat".into(),

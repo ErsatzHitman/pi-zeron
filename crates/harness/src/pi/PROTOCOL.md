@@ -18,7 +18,9 @@ the Delete guard section of `docs/pi.md` for its env.
 (`started` | `queued` | `handled`). Normal runs finish at `agent_settled`
 (which carries `aborted`), not `agent_end`; a final error message determines
 the terminal status after retries (`auto_retry_start`/`auto_retry_end` frame
-them). Extension commands and input handlers acknowledge `handled` without a
+them; the runner also emits `AgentEvent::Retrying`, which the engine
+publishes as the `retry` field of the session row while its status stays
+Working). Extension commands and input handlers acknowledge `handled` without a
 run; their handler is awaited before the ACK, so dialogs or a run it starts
 precede it on stdout.
 

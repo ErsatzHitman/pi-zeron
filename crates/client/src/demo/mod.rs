@@ -448,6 +448,7 @@ impl DemoHost {
         let _ = client.registry_write(|doc| {
             doc.upsert_session(&Session {
                 last_completed_turn: completed.map(str::to_owned),
+                retry: None,
                 running_subagents: 0,
                 subagents: Vec::new(),
                 chat_id: chat_id.to_owned(),

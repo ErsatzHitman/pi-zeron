@@ -1633,6 +1633,33 @@ impl Inner {
         }
     }
 
+    /// Publish (or clear) the harness's automatic retry on `chat_id`'s
+    /// session row. The status stays Working; a retry only rides a Working
+    /// row, so a late frame never marks a settled chat as retrying. Mirrored
+    /// like any status change; an unchanged value is a no-op.
+    fn set_retry(&self, chat_id: &str, retry: Option<zeron_proto::RetryState>) {
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            let retry = retry.filter(|_| entry.status == SessionStatus::Working);
+            if entry.retry == retry {
+                return;
+            }
+            entry.retry = retry;
+            entry.updated_at = Utc::now();
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
     fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.runs)
             .get(chat_id)
@@ -1661,6 +1688,7 @@ impl Inner {
                     status,
                     started_at: None,
                     updated_at: now,
+                    retry: None,
                     running_subagents: 0,
                     subagents: Vec::new(),
                 });
@@ -1679,6 +1707,9 @@ impl Inner {
             }
             entry.status = status;
             entry.updated_at = now;
+            if status != SessionStatus::Working || fresh_start {
+                entry.retry = None;
+            }
             match status {
                 SessionStatus::Working if fresh_start || !was_active => {
                     entry.started_at = Some(now);
@@ -3442,6 +3473,31 @@ async fn drive_run(
             }
             continue;
         }
+        // The harness retrying a failed request rides the session row (the
+        // status stays Working). Never a doc part or a turn boundary.
+        if let AgentEvent::Retrying {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error,
+            active,
+        } = &event
+        {
+            inner.set_retry(
+                &chat_id,
+                active.then(|| zeron_proto::RetryState {
+                    attempt: *attempt,
+                    max_attempts: *max_attempts,
+                    next_attempt_at: delay_ms.and_then(|ms| {
+                        i64::try_from(ms)
+                            .ok()
+                            .map(|ms| Utc::now() + chrono::Duration::milliseconds(ms))
+                    }),
+                    error: error.clone(),
+                }),
+            );
+            continue;
+        }
         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
@@ -3873,6 +3929,7 @@ async fn drive_run(
         }
     }
     inner.set_running_subagents(&chat_id, Vec::new());
+    inner.set_retry(&chat_id, None);
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own
