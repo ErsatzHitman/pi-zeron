@@ -2274,18 +2274,6 @@ impl AppState {
         }
     }
 
-    /// The new-session screen's recent folders, newest first, the picked
-    /// project kept; empty until spaces and chats have synced.
-    pub fn recent_projects(&self, limit: usize) -> Vec<zeron_proto::view::RecentProject> {
-        if !(self.spaces_synced && self.chats_synced) {
-            return Vec::new();
-        }
-        let pinned = self
-            .selected_space_row()
-            .map(zeron_proto::view::project_key);
-        zeron_proto::view::recent_projects(&self.spaces, &self.chats, pinned.as_deref(), limit)
-    }
-
     /// Every project — one per repository across devices — as its checkouts
     /// in [`Self::project_members`] order (this device's first), ordered by
     /// the project's name.
@@ -4283,32 +4271,6 @@ mod tests {
             repository_id: None,
             created_at: base + TimeDelta::minutes(created_min),
         }
-    }
-
-    #[test]
-    fn recent_projects_wait_for_sync_and_keep_the_picked_project() {
-        let mut state = AppState::new();
-        state.spaces = (0..4)
-            .map(|ix| space(&format!("s{ix}"), "dev", &format!("/p{ix}"), ix))
-            .collect();
-        state.chats = vec![chat("c", 0, Some(60))];
-        state.chats[0].space_id = Some("s0".into());
-        state.selected_space = Some("s1".into());
-        assert!(state.recent_projects(2).is_empty());
-        state.spaces_synced = true;
-        assert!(state.recent_projects(2).is_empty());
-        state.chats_synced = true;
-        let keys = |state: &AppState| -> Vec<String> {
-            state
-                .recent_projects(2)
-                .into_iter()
-                .map(|row| row.key)
-                .collect()
-        };
-        // s0 has the chat; s3 is the newest checkout, cut for the pick.
-        assert_eq!(keys(&state), ["s0", "s1"]);
-        state.no_project = true;
-        assert_eq!(keys(&state), ["s0", "s3"]);
     }
 
     fn session(
