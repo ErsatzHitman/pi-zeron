@@ -460,6 +460,38 @@ fn unresolved(store_key: &str, upstream: Upstream) -> Detected {
     }
 }
 
+/// The name of a Pi `/login` provider zeron doesn't manage, by its
+/// `auth.json` key; an unknown key (a gateway's) is shown as it is.
+pub(super) fn pi_login_name(store_key: &str) -> &str {
+    match store_key {
+        "openai" => "ChatGPT",
+        "kimi-coding" => "Kimi Code",
+        "openrouter" => "OpenRouter",
+        "xai" => "xAI",
+        "meta" => "Meta",
+        other => other,
+    }
+}
+
+/// A live Pi login zeron can't identify or switch: one per provider key.
+fn other_login(store_key: &str) -> Detected {
+    let name = pi_login_name(store_key);
+    Detected {
+        account_key: format!("{store_key}:unidentified"),
+        profile: SlotProfile {
+            email: format!("{name} account"),
+            display_name: None,
+            organization: None,
+            plan: Some(name.to_string()),
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: None,
+        claude_config: None,
+        store_key: Some(store_key.to_string()),
+        identity_known: false,
+    }
+}
+
 // ── locks ───────────────────────────────────────────────────────────────────
 
 const LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -889,6 +921,18 @@ impl AgentAccounts {
             {
                 Some(detected) => resolved.push(detected),
                 None => unidentified.push(unresolved(store_key, upstream)),
+            }
+        }
+        // Pi's /login signs in to more providers than zeron can identify or
+        // switch (Kimi, OpenRouter, xAI, Meta, ChatGPT for `openai`, gateway
+        // logins). Each is still a live login: listed, active, unswitchable.
+        if harness == HarnessId::Pi
+            && let Some(entries) = store.as_object()
+        {
+            for (store_key, entry) in entries {
+                if upstream_of(harness, store_key).is_none() && oauth_entry(entry) {
+                    unidentified.push(other_login(store_key));
+                }
             }
         }
         (resolved, unidentified)

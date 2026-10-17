@@ -16,13 +16,20 @@ pub(super) fn configure(
 ) -> Result<ScratchDir, HarnessError> {
     let scratch = ScratchDir::new("pi-mcp")?;
     let place = Place::from_env(&config.env);
-    for arg in role_args(&place, scratch.path())? {
+    // The project section is for this Pi's prompt, not the MCP server's env.
+    let mut config = config.clone();
+    let project = config
+        .env
+        .remove(orchestrator::ENV_PROJECT_PROMPT)
+        .filter(|prompt| !prompt.trim().is_empty());
+    for arg in role_args(&place, project.as_deref(), scratch.path())? {
         cmd.arg(arg);
     }
     cmd.env(
         "ZERON_PI_MCP",
-        serde_json::to_string(config).expect("serializable MCP config"),
+        serde_json::to_string(&config).expect("serializable MCP config"),
     );
+    cmd.env_remove(orchestrator::ENV_PROJECT_PROMPT);
     // Extensions and sub-agents read the place too; a run never inherits a
     // stale one.
     for key in orchestrator::PLACE_ENV {
@@ -47,7 +54,14 @@ pub(super) fn configure(
 /// the prompt here: Zeron publishes it as env ([`Place::env`],
 /// `ZERON_READ_ONLY`) and the Pi harness says it, with the rest of the
 /// session's capability map, on every surface including the Pis it starts.
-fn role_args(place: &Place, scratch: &Path) -> Result<Vec<OsString>, HarnessError> {
+///
+/// A run in an orchestrator's tree whose project has a goal, instructions or
+/// memory also gets that `project` section appended.
+fn role_args(
+    place: &Place,
+    project: Option<&str>,
+    scratch: &Path,
+) -> Result<Vec<OsString>, HarnessError> {
     let extension = scratch.join("zeron-mcp.mjs");
     std::fs::write(&extension, include_str!("mcp.mjs"))?;
     let visuals = scratch.join("zeron-visuals.md");
@@ -82,6 +96,11 @@ fn role_args(place: &Place, scratch: &Path) -> Result<Vec<OsString>, HarnessErro
             args.extend(["--append-system-prompt".into(), prompt.into()]);
         }
     }
+    if let Some(project) = project.filter(|_| place.role != Role::Chat) {
+        let prompt = scratch.join("zeron-project.md");
+        std::fs::write(&prompt, project)?;
+        args.extend(["--append-system-prompt".into(), prompt.into()]);
+    }
     Ok(args)
 }
 
@@ -107,7 +126,7 @@ mod tests {
 
     fn args_at(place: &Place) -> (crate::scratch::ScratchDir, Vec<String>) {
         let scratch = ScratchDir::new("pi-mcp-test").unwrap();
-        let args = role_args(place, scratch.path())
+        let args = role_args(place, None, scratch.path())
             .unwrap()
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -181,6 +200,64 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_s_runs_get_their_project_and_a_plain_chat_does_not() {
+        let project = "# Project\n\n## Goal\n\nShip the parser\n";
+        for role in [Role::Root, Role::Member { depth: 1 }] {
+            let scratch = ScratchDir::new("pi-mcp-test").unwrap();
+            let args: Vec<String> = role_args(
+                &at(role, (role != Role::Root).then_some("parent-1")),
+                Some(project),
+                scratch.path(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+            let file = args
+                .iter()
+                .find(|arg| arg.ends_with("zeron-project.md"))
+                .unwrap_or_else(|| panic!("{role:?} gets its project: {args:?}"));
+            let at = args.iter().position(|arg| arg == file).unwrap();
+            assert_eq!(args[at - 1], "--append-system-prompt");
+            assert_eq!(std::fs::read_to_string(file).unwrap(), project);
+        }
+        // A plain chat is in no project.
+        let scratch = ScratchDir::new("pi-mcp-test").unwrap();
+        let args = role_args(&at(Role::Chat, None), Some(project), scratch.path()).unwrap();
+        assert_eq!(args.len(), 4);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_project_section_stays_out_of_the_mcp_server_s_env() {
+        let project = "# Project\n";
+        let mut cmd = Command::new("pi");
+        let config = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "zeron".into(),
+            args: vec!["mcp".into()],
+            env: [
+                ("ZERON_CHAT_ID".to_owned(), "chat-1".to_owned()),
+                (orchestrator::ENV_ROLE.to_owned(), "member".to_owned()),
+                (
+                    orchestrator::ENV_PROJECT_PROMPT.to_owned(),
+                    project.to_owned(),
+                ),
+            ]
+            .into(),
+        };
+        let _scratch = configure(&mut cmd, &config).unwrap();
+        let mcp = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "ZERON_PI_MCP")
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(!mcp.contains("ZERON_PROJECT_PROMPT"), "{mcp}");
+    }
+
+    #[test]
     fn a_side_chat_s_place_rides_the_env_not_a_prompt_file() {
         let (_scratch, args) = args_at(&at(Role::Chat, Some("parent-1")));
         assert_eq!(args.len(), 4, "{args:?}");
@@ -212,12 +289,17 @@ mod tests {
             "create_chats",
             "send_message",
             "wait_for_turn",
+            "wait_for_turns",
             "read_chat",
             "respond_to_input",
             "interrupt_chat",
             "board_post",
             "board_read",
             "show_visual",
+            "project_read",
+            "project_remember",
+            "project_forget",
+            "project_update",
         ];
         for prompt in prompts {
             for word in prompt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {

@@ -269,6 +269,20 @@ pub mod methods {
     /// The board posts the calling chat sees (`board_read`) ->
     /// `{ entries, total }`, oldest first. Local only.
     pub const LIST_BOARD: &str = "ListBoard";
+    /// The project of the orchestrator tree `chatId` is in (any of its
+    /// chats) -> `{ project, memory }`. Local only: the registry syncs it.
+    pub const GET_ORCHESTRATOR_PROJECT: &str = "GetOrchestratorProject";
+    /// Change an orchestrator project's goal, instructions or pause
+    /// (`{ chatId: root, update }`) -> `{ project }`. Local only.
+    pub const UPDATE_ORCHESTRATOR_PROJECT: &str = "UpdateOrchestratorProject";
+    /// Save a note to an orchestrator project's memory (`{ chatId: root,
+    /// text }`) -> `{ note }`, or drop one (`{ chatId: root, forget: id }`).
+    pub const ORCHESTRATOR_MEMORY: &str = "OrchestratorMemory";
+    /// Act on a whole orchestrator tree (`{ rootId, action }`): `pause`
+    /// stops every running session and keeps the tree's agents from starting
+    /// or steering any; `resume` lifts it; `archive` / `unarchive` take the
+    /// root and every session with it. Local only.
+    pub const CONTROL_ORCHESTRATOR: &str = "ControlOrchestrator";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";

@@ -557,6 +557,59 @@ struct ListBoardParams {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorChatParams {
+    chat_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateOrchestratorProjectParams {
+    chat_id: String,
+    update: zeron_proto::orchestrator_project::ProjectUpdate,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorMemoryParams {
+    chat_id: String,
+    #[serde(default)]
+    text: Option<String>,
+    /// A note id to drop instead.
+    #[serde(default)]
+    forget: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum OrchestratorAction {
+    Pause,
+    Resume,
+    Archive,
+    Unarchive,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlOrchestratorParams {
+    root_id: String,
+    action: OrchestratorAction,
+}
+
+/// The orchestrator root `chat_id` names: settings change only through it.
+fn orchestrator_root(chats: &[zeron_proto::Chat], chat_id: &str) -> Result<String, RpcError> {
+    if !zeron_proto::orchestrator::is_root_chat(chat_id) {
+        return Err(RpcError::BadParams(
+            "Only the orchestrator changes its project.".into(),
+        ));
+    }
+    if !chats.iter().any(|chat| chat.id == chat_id) {
+        return Err(RpcError::BadParams(format!("unknown chat {chat_id}")));
+    }
+    Ok(chat_id.to_owned())
+}
+
 /// The chat a board call speaks for, and its tree's root.
 fn board_member<'a>(
     chats: &'a [zeron_proto::Chat],
@@ -1274,6 +1327,106 @@ impl EngineRpc {
             .ok_or(VoiceRejection::Unsupported)
     }
 
+    /// Pause, resume, archive or unarchive an orchestrator and its tree.
+    /// The pause flag is set before any session is stopped, so nothing the
+    /// tree's agents do in between starts new work.
+    fn control_orchestrator(
+        &self,
+        root_id: &str,
+        action: OrchestratorAction,
+    ) -> Result<serde_json::Value, RpcError> {
+        use zeron_proto::orchestrator_project::ProjectUpdate;
+        let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
+        let chats = self.workspace.read_chats().map_err(failed)?;
+        let root = orchestrator_root(&chats, root_id)?;
+        let tree: Vec<&zeron_proto::Chat> = std::iter::once(root.as_str())
+            .filter_map(|id| chats.iter().find(|chat| chat.id == id))
+            .chain(zeron_proto::orchestrator::tree_members(&chats, &root))
+            .collect();
+        let set_paused = |paused| {
+            self.workspace
+                .update_orchestrator_project(
+                    &root,
+                    ProjectUpdate {
+                        paused: Some(paused),
+                        ..Default::default()
+                    },
+                )
+                .map_err(failed)
+        };
+        let stop_running = || -> Result<Vec<String>, RpcError> {
+            let sessions = self.workspace.read_sessions().map_err(failed)?;
+            let mut stopped = Vec::new();
+            for chat in &tree {
+                let running = sessions.iter().any(|session| {
+                    session.chat_id == chat.id
+                        && matches!(
+                            session.status,
+                            zeron_proto::SessionStatus::Working
+                                | zeron_proto::SessionStatus::AwaitingInput
+                        )
+                });
+                if running
+                    && self
+                        .doc_host
+                        .queue_command_with_transfers(
+                            &chat.id,
+                            zeron_doc::SessionCommandPayload::Interrupt {},
+                            vec![],
+                        )
+                        .is_ok()
+                {
+                    stopped.push(chat.id.clone());
+                }
+            }
+            Ok(stopped)
+        };
+        let archive = |archived| -> Result<usize, RpcError> {
+            for chat in &tree {
+                self.workspace
+                    .set_chat_archived(&chat.id, archived)
+                    .map_err(failed)?;
+            }
+            Ok(tree.len())
+        };
+        Ok(match action {
+            OrchestratorAction::Pause => {
+                let project = set_paused(true)?;
+                let stopped = stop_running()?;
+                serde_json::json!({ "project": project, "stopped": stopped })
+            }
+            OrchestratorAction::Resume => {
+                serde_json::json!({ "project": set_paused(false)? })
+            }
+            OrchestratorAction::Archive => {
+                let stopped = stop_running()?;
+                serde_json::json!({ "archived": archive(true)?, "stopped": stopped })
+            }
+            OrchestratorAction::Unarchive => {
+                serde_json::json!({ "unarchived": archive(false)? })
+            }
+        })
+    }
+
+    /// Drop one chat everywhere: its row, its doc and its live runtime.
+    fn delete_one_chat(&self, chat_id: &str) -> Result<(), RpcError> {
+        self.voice.retire_chat(chat_id);
+        self.workspace
+            .delete_chat(chat_id)
+            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        self.doc_host.purge_chat(chat_id);
+        // Its live runtime goes with it: one that lives as long as the app
+        // (Pi) is never reaped idle and would outlive it.
+        let sessions = self.sessions.clone();
+        let chat_id = chat_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(err) = sessions.terminate(&chat_id).await {
+                tracing::debug!(chat = %chat_id, error = %err, "deleteChat teardown skipped");
+            }
+        });
+        Ok(())
+    }
+
     fn mutate(&self, params: MutateParams) -> Result<(), RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         match params {
@@ -1389,18 +1542,20 @@ impl EngineRpc {
                     .map(drop)
             }
             MutateParams::DeleteChat { chat_id } => {
-                self.voice.retire_chat(&chat_id);
-                self.workspace.delete_chat(&chat_id).map_err(failed)?;
-                self.doc_host.purge_chat(&chat_id);
-                // Its live runtime goes with it: one that lives as long as
-                // the app (Pi) is never reaped idle and would outlive it.
-                let sessions = self.sessions.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = sessions.terminate(&chat_id).await {
-                        tracing::debug!(chat = %chat_id, error = %err, "deleteChat teardown skipped");
+                // An orchestrator takes its whole tree with it, deepest
+                // sessions first, so no session is left with a missing parent.
+                if zeron_proto::orchestrator::is_root_chat(&chat_id) {
+                    let chats = self.workspace.read_chats().map_err(failed)?;
+                    let members: Vec<String> =
+                        zeron_proto::orchestrator::tree_members(&chats, &chat_id)
+                            .iter()
+                            .map(|chat| chat.id.clone())
+                            .collect();
+                    for member in members.iter().rev() {
+                        self.delete_one_chat(member)?;
                     }
-                });
-                Ok(())
+                }
+                self.delete_one_chat(&chat_id)
             }
             MutateParams::RenameDevice { device_id, name } => self
                 .workspace
@@ -4007,6 +4162,53 @@ impl RpcService for EngineRpc {
                     "total": total,
                     "olderSkipped": skipped,
                 }))
+            }
+            methods::GET_ORCHESTRATOR_PROJECT => {
+                let p: OrchestratorChatParams = parse_params(params)?;
+                let chats = self
+                    .workspace
+                    .read_chats()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let (_, root) = board_member(&chats, &p.chat_id)?;
+                RpcReply::value(&serde_json::json!({
+                    "project": self.workspace.orchestrator_project(&root),
+                    "memory": self.workspace.orchestrator_memory(&root),
+                }))
+            }
+            methods::UPDATE_ORCHESTRATOR_PROJECT => {
+                let p: UpdateOrchestratorProjectParams = parse_params(params)?;
+                let failed = |e: crate::EngineError| RpcError::BadParams(e.to_string());
+                let chats = self.workspace.read_chats().map_err(failed)?;
+                let root = orchestrator_root(&chats, &p.chat_id)?;
+                let project = self
+                    .workspace
+                    .update_orchestrator_project(&root, p.update)
+                    .map_err(failed)?;
+                RpcReply::value(&serde_json::json!({ "project": project }))
+            }
+            methods::ORCHESTRATOR_MEMORY => {
+                let p: OrchestratorMemoryParams = parse_params(params)?;
+                let failed = |e: crate::EngineError| RpcError::BadParams(e.to_string());
+                let chats = self.workspace.read_chats().map_err(failed)?;
+                let root = orchestrator_root(&chats, &p.chat_id)?;
+                match (p.text, p.forget) {
+                    (Some(text), None) => {
+                        let note = self.workspace.remember(&root, &text).map_err(failed)?;
+                        RpcReply::value(&serde_json::json!({ "note": note }))
+                    }
+                    (None, Some(id)) => {
+                        let forgot = self.workspace.forget(&root, &id).map_err(failed)?;
+                        RpcReply::value(&serde_json::json!({ "forgot": forgot }))
+                    }
+                    _ => Err(RpcError::BadParams(
+                        "pass either text (to remember) or forget (a note id)".into(),
+                    )),
+                }
+            }
+            methods::CONTROL_ORCHESTRATOR => {
+                let p: ControlOrchestratorParams = parse_params(params)?;
+                self.control_orchestrator(&p.root_id, p.action)
+                    .and_then(|reply| RpcReply::value(&reply))
             }
             methods::PUBLISH_VISUAL => {
                 let p: PublishVisualParams = parse_params(params)?;

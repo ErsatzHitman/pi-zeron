@@ -1777,6 +1777,16 @@ impl Inner {
         self.doc_host().and_then(|host| host.workspace().cloned())
     }
 
+    /// The project section of a run in an orchestrator's tree: its goal,
+    /// standing instructions and memory, as the run's prompt carries them.
+    fn project_prompt(&self, chat_id: &str) -> Option<String> {
+        let root = zeron_proto::orchestrator::Place::of(&self.lineage(chat_id), chat_id).root_id?;
+        let workspace = self.workspace()?;
+        workspace
+            .orchestrator_project(&root)
+            .prompt(&workspace.orchestrator_memory(&root))
+    }
+
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.
     fn note_message(&self, chat_id: &str, text: &str) {
         if text.is_empty() {
@@ -2654,6 +2664,17 @@ async fn drive_run(
             session,
         );
         native_fork = true;
+    }
+    // A Pi run in an orchestrator's tree starts with its project's goal,
+    // instructions and memory (the Pi harness appends them to its prompt).
+    if harness_id == HarnessId::Pi
+        && let Some(prompt) = inner.project_prompt(&chat_id)
+        && let Some(mcp) = request.mcp.as_mut()
+    {
+        mcp.env.insert(
+            zeron_proto::orchestrator::ENV_PROJECT_PROMPT.to_owned(),
+            prompt,
+        );
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside

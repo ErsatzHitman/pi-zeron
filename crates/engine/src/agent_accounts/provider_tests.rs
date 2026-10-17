@@ -792,6 +792,64 @@ async fn pi_swaps_under_its_lockfile_and_groups_rows_per_provider() {
 }
 
 #[tokio::test]
+async fn every_provider_pi_s_login_signed_in_to_is_listed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), ProbeEndpoints::default());
+    let oauth = |token: &str| serde_json::json!({ "type": "oauth", "access": token, "refresh": "r", "expires": 1 });
+    write(
+        &config.pi_agent_dir.join("auth.json"),
+        &serde_json::json!({
+            "openai-codex": openai_entry("a@example.com", "acct-a"),
+            "kimi-coding": oauth("kimi"),
+            "openrouter": oauth("or"),
+            "my-gateway": oauth("gw"),
+            // An API key is not a login.
+            "groq": { "type": "api", "key": "gsk-1" },
+        })
+        .to_string(),
+    );
+    let rows = rows(&accounts.list(false).await.unwrap(), HarnessId::Pi);
+    let listed: Vec<(Option<&str>, Option<&str>, bool, bool)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.provider.as_deref(),
+                row.plan_label.as_deref(),
+                row.active,
+                row.switchable,
+            )
+        })
+        .collect();
+    assert_eq!(listed.len(), 4, "{listed:?}");
+    assert!(
+        rows.iter()
+            .any(|row| row.provider.as_deref() == Some("openai-codex") && row.switchable),
+        "ChatGPT stays a switchable account: {listed:?}"
+    );
+    for (provider, name) in [
+        ("kimi-coding", "Kimi Code"),
+        ("openrouter", "OpenRouter"),
+        ("my-gateway", "my-gateway"),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.provider.as_deref() == Some(provider))
+            .unwrap_or_else(|| panic!("{provider} listed: {listed:?}"));
+        assert!(row.active && !row.switchable, "{provider}");
+        assert_eq!(row.plan_label.as_deref(), Some(name));
+        assert_eq!(
+            row.email.as_deref(),
+            Some(format!("{name} account").as_str())
+        );
+    }
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.provider.as_deref() == Some("groq"))
+    );
+}
+
+#[tokio::test]
 async fn an_opaque_pi_claude_token_is_identified_once_then_matched_by_token() {
     let server = MockServer::start(|_, path, _| match path {
         "/api/oauth/profile" => (

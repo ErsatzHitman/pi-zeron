@@ -705,6 +705,42 @@ impl WorkspaceHost {
         self.read(|doc| doc.board_entries(root_id))
     }
 
+    /// An orchestrator's project (an empty one when never set).
+    pub fn orchestrator_project(
+        &self,
+        root_id: &str,
+    ) -> zeron_proto::orchestrator_project::OrchestratorProject {
+        self.read(|doc| doc.orchestrator_project(root_id))
+    }
+
+    pub fn update_orchestrator_project(
+        &self,
+        root_id: &str,
+        update: zeron_proto::orchestrator_project::ProjectUpdate,
+    ) -> Result<zeron_proto::orchestrator_project::OrchestratorProject, EngineError> {
+        Ok(self.mutate(|doc| doc.update_orchestrator_project(root_id, update))?)
+    }
+
+    /// An orchestrator project's memory, oldest first.
+    pub fn orchestrator_memory(
+        &self,
+        root_id: &str,
+    ) -> Vec<zeron_proto::orchestrator_project::MemoryNote> {
+        self.read(|doc| doc.orchestrator_memory(root_id))
+    }
+
+    pub fn remember(
+        &self,
+        root_id: &str,
+        text: &str,
+    ) -> Result<zeron_proto::orchestrator_project::MemoryNote, EngineError> {
+        Ok(self.mutate(|doc| doc.remember(root_id, text))?)
+    }
+
+    pub fn forget(&self, root_id: &str, note_id: &str) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.forget(root_id, note_id)))
+    }
+
     pub fn change_sidebar_pin(
         &self,
         change: &zeron_proto::SidebarPinChange,

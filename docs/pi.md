@@ -304,7 +304,12 @@ and also gets `crates/proto/src/orchestrator_member.md`: report in the final
 reply, the tree's depth limit and the board. The engine marks each run with
 `ZERON_ROLE` (`orchestrator` or `member`, unset for a plain chat) and, for a
 member, `ZERON_TREE_DEPTH`, in both the Zeron MCP server's env and Pi's own,
-so extensions can change their behaviour too. The user's pi-herdr-delegate
+so extensions can change their behaviour too. A run in a tree whose orchestrator has a goal,
+instructions or memory also gets them as one more `--append-system-prompt`
+file (`zeron-project.md`; see
+[orchestrator projects](reference/orchestrator-projects.md)). The engine hands
+it over in the MCP config's env as `ZERON_PROJECT_PROMPT`, and the harness
+takes it out again before the config reaches the Zeron MCP server. The user's pi-herdr-delegate
 extension sees `ZERON_PI_MCP` and starts its children the same way, so they
 join the tree. Image attachments are sent as native image blocks; image-only
 tool results do not yet render inline.

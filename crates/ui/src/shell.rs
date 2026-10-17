@@ -80,6 +80,7 @@ mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
 mod orchestrator;
+mod orchestrator_settings;
 mod panel_layout;
 use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_tween};
 #[cfg(test)]
@@ -217,6 +218,7 @@ const CHAT_MENU_ROW_COPY: u8 = 3;
 const CHAT_MENU_ROW_DELETE: u8 = 4;
 const CHAT_MENU_ROW_OPEN: u8 = 5;
 const CHAT_MENU_ROW_TAB: u8 = 6;
+const CHAT_MENU_ROW_ORCHESTRATOR: u8 = 16;
 
 #[derive(Clone, Copy)]
 enum TabCloseAction {
@@ -2199,6 +2201,10 @@ pub struct Shell {
     orchestrator_return: Option<String>,
     /// A new orchestrator being created.
     orchestrator_task: Option<Task<()>>,
+    orchestrator_settings: Option<orchestrator_settings::OrchestratorSettingsDialog>,
+    orchestrator_projects: orchestrator_settings::OrchestratorProjects,
+    /// The session card's painted height, which the btw pane matches.
+    session_card_height: std::rc::Rc<std::cell::Cell<f32>>,
     /// In-flight reorder for the pinned section only.
     pinned_session_drag: Option<PinnedSessionDragState>,
     pinned_session_drag_generation: u64,
@@ -2730,6 +2736,9 @@ impl Shell {
             normal_return: None,
             orchestrator_return: None,
             orchestrator_task: None,
+            orchestrator_settings: None,
+            orchestrator_projects: Default::default(),
+            session_card_height: Default::default(),
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
             sidebar_session_transfer: None,
@@ -11033,6 +11042,29 @@ impl Shell {
                 } else {
                     menu
                 };
+                // An orchestrator's goal, instructions, memory and controls.
+                let menu = if zeron_proto::orchestrator::is_root_chat(&chat_id) {
+                    let settings_id = chat_id.clone();
+                    let settings = popover::menu_row(
+                        &theme,
+                        false,
+                        format!("chat-menu-orchestrator-{chat_id}"),
+                    )
+                    .id("chat-menu-orchestrator")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_orchestrator_settings(settings_id.clone(), cx)
+                    }))
+                    .child(
+                        icon(icons::TUNING)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(SharedString::from("Orchestrator settings…"));
+                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_ORCHESTRATOR, settings, cx))
+                        .child(popover::menu_separator())
+                } else {
+                    menu
+                };
                 let rename = popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
                     .id("chat-menu-rename")
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -11147,6 +11179,9 @@ impl Shell {
             overlays.push(overlay);
         }
         if let Some(overlay) = self.render_project_action_overlay(viewport, window, cx) {
+            overlays.push(overlay);
+        }
+        if let Some(overlay) = self.render_orchestrator_settings_overlay(viewport, window, cx) {
             overlays.push(overlay);
         }
 

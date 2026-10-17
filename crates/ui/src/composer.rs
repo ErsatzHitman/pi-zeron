@@ -6362,6 +6362,9 @@ pub struct Composer {
     /// No model picker: the chat runs the model it inherited (a btw pane's
     /// side chat runs its parent's).
     model_picker_hidden: bool,
+    /// A bare prompt bar (a btw pane's): one line, no attachments,
+    /// microphone or footer.
+    minimal: bool,
     _picker_focus: Subscription,
     _input_events: Subscription,
     _dictation_events: Subscription,
@@ -6510,6 +6513,9 @@ impl Composer {
                 }
             }
             ComposerInputEvent::OpenAttachment(index) => this.open_attachment(*index, cx),
+            // A minimal bar takes text only.
+            ComposerInputEvent::PastedImages(_) | ComposerInputEvent::PastedPaths(_)
+                if this.minimal => {}
             ComposerInputEvent::PastedImages(images) => {
                 let images = images.clone();
                 this.stage_in_background(
@@ -6635,6 +6641,7 @@ impl Composer {
             account_usage,
             side_chat: false,
             model_picker_hidden: false,
+            minimal: false,
             _picker_focus: picker_focus,
             _input_events: input_events,
             _dictation_events: dictation_events,
@@ -6843,6 +6850,25 @@ impl Composer {
         if self.model_picker_hidden != hidden {
             self.model_picker_hidden = hidden;
             cx.notify();
+        }
+    }
+
+    /// Render as a bare one-line prompt bar (see [`Self::minimal`]).
+    pub(crate) fn set_minimal(&mut self, minimal: bool, cx: &mut Context<Self>) {
+        if self.minimal != minimal {
+            self.minimal = minimal;
+            let placeholder = self.default_placeholder();
+            self.input
+                .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+            cx.notify();
+        }
+    }
+
+    fn default_placeholder(&self) -> &'static str {
+        if self.minimal {
+            "Ask a quick question…"
+        } else {
+            "Do anything…"
         }
     }
 
@@ -9025,9 +9051,10 @@ impl Composer {
                             .get(&self.current_key)
                             .cloned()
                             .unwrap_or_default();
+                        let placeholder = self.default_placeholder();
                         self.input.update(cx, |input, cx| {
                             input.set_text(draft, cx);
-                            input.set_placeholder("Do anything…", cx);
+                            input.set_placeholder(placeholder, cx);
                         });
                     }
                 }
@@ -10268,10 +10295,11 @@ impl Composer {
             .get(&self.current_key)
             .cloned()
             .unwrap_or_default();
+        let placeholder = self.default_placeholder();
         self.input.update(cx, |input, cx| {
             input.set_text(draft, cx);
             // The panel borrowed the composer input; hand back its identity.
-            input.set_placeholder("Do anything…", cx);
+            input.set_placeholder(placeholder, cx);
             input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
         });
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -11659,7 +11687,8 @@ impl Render for Composer {
                 route_snap,
             )
         };
-        let expanded = self.expanded_mode;
+        // A minimal bar stays on its one line.
+        let expanded = self.expanded_mode && !self.minimal;
 
         let failure = self.visible_failure();
         // Composer honesty: when the target's delivery path is degraded, say
@@ -11833,7 +11862,7 @@ impl Render for Composer {
         // Route coordination must not force an established thread into the
         // two-row layout. Short drafts keep the original skinny composer.
         let session_expanded = expanded;
-        let expanded = expanded || new_chat;
+        let expanded = expanded || (new_chat && !self.minimal);
         let dock_amount = self.dock_frame.map_or(0.0, |frame| frame.amount);
         let mut dock_layout = crate::composer_dock::DockLayout {
             hero_height: composer_total_height(content_height),
@@ -12002,7 +12031,11 @@ impl Render for Composer {
         let send_button = self.render_send_button(mode, window, cx);
         let (voice_t, voice_frame) = self.update_voice(window, cx);
         let dictating = self.input.read(cx).dictation.phase.active();
-        let microphone = self.render_dictation_button(voice_t, voice_frame.as_ref(), cx);
+        let microphone = if self.minimal {
+            None
+        } else {
+            self.render_dictation_button(voice_t, voice_frame.as_ref(), cx)
+        };
         let attach_action = cx.entity().downgrade();
         let attach_hover_key: SharedString = format!("composer-attach-{}", cx.entity_id()).into();
         // Attach button — opens the native image picker (the original's hidden
@@ -12310,7 +12343,7 @@ impl Render for Composer {
                                 .flex()
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
-                                .child(attach),
+                                .when(!self.minimal, |el| el.child(attach)),
                         )
                         .child(
                             div()
@@ -12486,7 +12519,9 @@ impl Render for Composer {
         // old floating checkout/ref controls dissolve into the session footer.
         // Non-Git sessions grow the slot continuously from zero.
         let session_chrome = 1.0 - new_thread_chrome;
-        let bottom_slot = if has_new_thread_git_selectors || self.dock_frame.is_some() {
+        let bottom_slot = if self.minimal {
+            0.0
+        } else if has_new_thread_git_selectors || self.dock_frame.is_some() {
             1.0
         } else {
             session_chrome

@@ -940,7 +940,17 @@ impl Shell {
             .bg(popover::surface_bg(&theme))
             .when(!docked && !theme.is_frost(), |card| card.shadow_lg())
             .relative()
-            .child(body);
+            .child(body)
+            // The btw pane beside it matches its height.
+            .child({
+                let measured = self.session_card_height.clone();
+                gpui::canvas(
+                    move |bounds, _, _| measured.set(f32::from(bounds.size.height)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0()
+            });
 
         // Docked, the card slides in from the right beside the column;
         // floating, it drops in from just above. Either way it is placed from

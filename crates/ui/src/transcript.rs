@@ -1231,6 +1231,28 @@ pub enum RowKind {
     },
 }
 
+/// `rows` with each message's work left out: its tool groups (thinking
+/// included), folded narration, and whatever it said before its last tool
+/// group. What it answered after its work stays, and leads its turn.
+fn answer_rows(rows: Vec<Row>) -> Vec<Row> {
+    let mut last_work: HashMap<SharedString, usize> = HashMap::new();
+    for (ix, row) in rows.iter().enumerate() {
+        if matches!(row.kind, RowKind::ToolGroup { .. }) {
+            last_work.insert(row.entry_id.clone(), ix);
+        }
+    }
+    let mut kept: Vec<Row> = Vec::with_capacity(rows.len());
+    for (ix, mut row) in rows.into_iter().enumerate() {
+        if row.compact_fold.is_some() || last_work.get(&row.entry_id).is_some_and(|&work| ix <= work)
+        {
+            continue;
+        }
+        row.turn_start = kept.last().is_none_or(|prev| prev.entry_id != row.entry_id);
+        kept.push(row);
+    }
+    kept
+}
+
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
     let mut devices = Vec::new();
     for device in std::iter::once(owner).chain(fallback.iter().map(String::as_str)) {
@@ -3521,6 +3543,9 @@ pub struct Transcript {
     /// pane), so a send reserves no runway for the reply; the view follows
     /// the tail instead (see [`Self::content_height`]).
     fit_content: bool,
+    /// Replies only: a turn's thinking and tool rows are left out, and its
+    /// working trailer stands in for them (a btw pane).
+    answers_only: bool,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
@@ -4052,6 +4077,7 @@ impl Transcript {
             rail_enabled,
             bottom_clearance: 0.0,
             fit_content: false,
+            answers_only: false,
             rail_hover: None,
             hovered_entry: None,
             copied_code: None,
@@ -4141,6 +4167,15 @@ impl Transcript {
     /// measured yet count their height hints, or nothing.
     pub fn content_height(&self) -> f32 {
         f32::from(self.list.offset_for_item(self.list.item_count()))
+    }
+
+    /// Host-driven: show replies only (see `answers_only`).
+    pub fn set_answers_only(&mut self, answers_only: bool, cx: &mut Context<Self>) {
+        if self.answers_only != answers_only {
+            self.answers_only = answers_only;
+            self.sync(cx);
+            cx.notify();
+        }
     }
 
     pub fn set_rail_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -5303,6 +5338,9 @@ impl Transcript {
                     .is_some_and(|e| e.status == Some(MessageStatus::Streaming)),
             )
         };
+        if self.answers_only {
+            new_rows = answer_rows(new_rows);
+        }
 
         let baseline = self
             .chat_id
@@ -13244,6 +13282,33 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(rows[2].kind, RowKind::GeneratedImage { .. }));
+    }
+
+    #[test]
+    fn answers_only_keeps_what_a_reply_says_after_its_work() {
+        let entry = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                text_part("x0", "Let me look."),
+                reasoning_part("r1", "planning"),
+                tool_part("t2", "ls"),
+                text_part("x3", "It is in src/lib.rs."),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, false, &mut parse);
+        assert!(rows.iter().any(|row| matches!(row.kind, RowKind::ToolGroup { .. })));
+        let answer = answer_rows(rows);
+        assert_eq!(answer.len(), 1, "only the answer");
+        assert!(matches!(answer[0].kind, RowKind::Markdown { .. }));
+        assert!(answer[0].turn_start, "it leads its turn");
+        // A reply still working shows nothing yet: its trailer stands in.
+        let working = assistant(
+            "a2",
+            MessageStatus::Streaming,
+            vec![reasoning_part("r0", "thinking"), tool_part("t1", "pwd")],
+        );
+        assert!(answer_rows(rows_for_entry(&working, false, false, &mut parse)).is_empty());
     }
 
     #[test]

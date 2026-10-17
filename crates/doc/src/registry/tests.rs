@@ -2273,3 +2273,71 @@ fn a_board_keeps_its_tree_s_posts_in_order_and_drops_the_oldest() {
     assert!(ws.board_entries("orchestrator-a").is_empty());
     assert_eq!(ws.board_entries("orchestrator-b").len(), 1);
 }
+
+#[test]
+fn an_orchestrator_project_keeps_its_settings_and_memory_until_its_root_goes() {
+    use zeron_proto::orchestrator_project::{MAX_NOTES, ProjectUpdate};
+    let mut ws = RegistryDoc::new("dev-a");
+    let empty = ws.orchestrator_project("orchestrator-a");
+    assert_eq!(empty.root_id, "orchestrator-a");
+    assert!(empty.goal.is_empty() && !empty.paused);
+    let saved = ws
+        .update_orchestrator_project(
+            "orchestrator-a",
+            ProjectUpdate {
+                goal: Some(" Ship the parser ".into()),
+                instructions: Some("Run the tests.".into()),
+                paused: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(saved.goal, "Ship the parser");
+    assert!(saved.updated_at > 0);
+    // A later change keeps what it leaves out.
+    ws.update_orchestrator_project(
+        "orchestrator-a",
+        ProjectUpdate {
+            paused: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let project = ws.orchestrator_project("orchestrator-a");
+    assert!(project.paused);
+    assert_eq!(project.instructions, "Run the tests.");
+    assert!(
+        ws.update_orchestrator_project(
+            "orchestrator-a",
+            ProjectUpdate {
+                instructions: Some("x".repeat(20_000)),
+                ..Default::default()
+            },
+        )
+        .is_err(),
+        "too long for one registry op"
+    );
+
+    let first = ws.remember("orchestrator-a", "CI needs ZERON_X=1").unwrap();
+    let again = ws
+        .remember("orchestrator-a", "  CI needs ZERON_X=1 ")
+        .unwrap();
+    assert_eq!(first.id, again.id, "the same fact once");
+    ws.remember("orchestrator-b", "another tree").unwrap();
+    assert!(ws.remember("orchestrator-a", "  ").is_err());
+    for n in 0..MAX_NOTES {
+        ws.remember("orchestrator-a", &format!("fact {n}")).unwrap();
+    }
+    let notes = ws.orchestrator_memory("orchestrator-a");
+    assert_eq!(notes.len(), MAX_NOTES);
+    assert_eq!(notes[0].text, "fact 0", "the oldest went first");
+    assert!(ws.forget("orchestrator-a", &notes[0].id));
+    assert!(!ws.forget("orchestrator-a", &notes[0].id));
+    let other = ws.orchestrator_memory("orchestrator-b");
+    assert!(!ws.forget("orchestrator-a", &other[0].id), "not its note");
+
+    ws.upsert_chat(&chat("orchestrator-a", "dev-a")).unwrap();
+    ws.delete_chat("orchestrator-a").unwrap();
+    assert!(ws.orchestrator_memory("orchestrator-a").is_empty());
+    assert!(!ws.orchestrator_project("orchestrator-a").paused);
+    assert_eq!(ws.orchestrator_memory("orchestrator-b").len(), 1);
+}

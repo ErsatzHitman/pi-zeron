@@ -8,7 +8,7 @@
 use super::*;
 use crate::settings::SidebarTab;
 use std::collections::HashSet;
-use zeron_proto::{Chat, Space, orchestrator};
+use zeron_proto::{Chat, ChatIndicator, Space, orchestrator};
 
 /// Indent of each nesting level; its rail runs down the middle of it.
 pub(super) const TREE_INDENT: f32 = 14.0;
@@ -26,6 +26,38 @@ pub(super) struct OrchestratorGroup {
 pub(super) struct OrchestratorTree {
     pub root: String,
     pub groups: Vec<OrchestratorGroup>,
+}
+
+/// The caption under a root's title: where its sessions stand, what needs
+/// the user first.
+pub(super) fn tree_caption(statuses: &[ChatIndicator], paused: bool) -> String {
+    let count = |want: ChatIndicator| statuses.iter().filter(|s| **s == want).count();
+    let mut parts: Vec<String> = Vec::new();
+    if paused {
+        parts.push("Paused".into());
+    }
+    let waiting = count(ChatIndicator::AwaitingInput);
+    if waiting > 0 {
+        parts.push(format!(
+            "{waiting} need{} you",
+            if waiting == 1 { "s" } else { "" }
+        ));
+    }
+    let failed = count(ChatIndicator::Errored);
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    let working = count(ChatIndicator::Working);
+    if working > 0 {
+        parts.push(format!("{working} working"));
+    }
+    match statuses.len() {
+        0 if parts.is_empty() => parts.push(orchestrator::ROOT_CHAT_TITLE.into()),
+        0 => {}
+        1 => parts.push("1 session".into()),
+        n => parts.push(format!("{n} sessions")),
+    }
+    parts.join(" · ")
 }
 
 /// A chat's folder: its cwd, else its project's.
@@ -324,7 +356,11 @@ impl Shell {
                 Err(err) => Err(err),
             };
             this.update(cx, |shell, cx| match created {
-                Ok(()) => shell.open_chat(chat_id, cx),
+                // Its goal and instructions come first: every session gets them.
+                Ok(()) => {
+                    shell.open_chat(chat_id.clone(), cx);
+                    shell.open_orchestrator_settings(chat_id, cx);
+                }
                 Err(err) => {
                     shell.show_notice(
                         crate::toast::ToastKind::Error,
@@ -356,16 +392,22 @@ impl Shell {
             false,
             false,
         );
+        let roots: Vec<String> = trees.iter().map(|tree| tree.root.clone()).collect();
+        self.ensure_orchestrator_projects(&roots, cx);
         let mut sections: Vec<AnyElement> = Vec::with_capacity(trees.len());
         for (ix, tree) in trees.iter().enumerate() {
-            let root = self.render_orchestrator_row(
-                &tree.root,
-                0,
-                orchestrator::ROOT_CHAT_TITLE.into(),
-                now,
-                theme,
-                cx,
-            );
+            let caption = {
+                let state = self.state.read(cx);
+                let statuses: Vec<ChatIndicator> = tree
+                    .groups
+                    .iter()
+                    .flat_map(|group| &group.rows)
+                    .filter_map(|(id, _)| state.chats.iter().find(|chat| chat.id == *id))
+                    .map(|chat| state.display_status_for(chat, now))
+                    .collect();
+                tree_caption(&statuses, self.orchestrator_projects.paused(&tree.root))
+            };
+            let root = self.render_orchestrator_row(&tree.root, 0, caption.into(), now, theme, cx);
             let groups: Vec<AnyElement> = tree
                 .groups
                 .iter()
@@ -761,6 +803,22 @@ mod tests {
             "parentChatId": parent,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_root_s_caption_puts_what_needs_the_user_first() {
+        use ChatIndicator::*;
+        assert_eq!(tree_caption(&[], false), "Orchestrator");
+        assert_eq!(tree_caption(&[], true), "Paused");
+        assert_eq!(tree_caption(&[Idle], false), "1 session");
+        assert_eq!(
+            tree_caption(&[Working, AwaitingInput, Idle, Errored, Working], true),
+            "Paused · 1 needs you · 1 failed · 2 working · 5 sessions"
+        );
+        assert_eq!(
+            tree_caption(&[AwaitingInput, AwaitingInput, Completed], false),
+            "2 need you · 3 sessions"
+        );
     }
 
     #[test]

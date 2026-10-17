@@ -177,6 +177,14 @@ name (default: the local engine's device).
 | `show_visual`      | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |
 | `board_post`       | `PostBoard {chatId, kind, text}`, then a `send_message`-style delivery to each other session that sees the post (origin chat only) |
 | `board_read`       | `ListBoard {chatId, since?, limit?}` (origin chat only)    |
+| `wait_for_turns`   | `wait_for_turn` on up to 32 chats at once (default: the caller's working children); returns the first to settle and where the rest stand |
+| `project_read`     | `GetOrchestratorProject {chatId}`: the tree's goal, instructions, paused flag and memory (any chat of the tree) |
+| `project_remember` / `project_forget` | `OrchestratorMemory {chatId, text}` / `{chatId, forget}` (root only) |
+| `project_update`   | `UpdateOrchestratorProject {chatId, update: {goal?, instructions?}}` (root only) |
+
+`create_chat`, `create_chats`, `send_message` and `send_messages` refuse from a
+chat in a paused orchestrator's tree; see
+[orchestrator projects](reference/orchestrator-projects.md).
 
 ### Message board
 

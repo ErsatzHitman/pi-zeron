@@ -37,6 +37,10 @@ pub const PLACE_ENV: [&str; 6] = [
 /// the harness forks (Pi `--fork`) so the side chat starts with the
 /// parent's context. Rides the Zeron MCP server's env like the place.
 pub const ENV_FORK_SESSION: &str = "ZERON_FORK_SESSION";
+/// A Pi run in an orchestrator's tree: its project's prompt section
+/// ([`crate::orchestrator_project::OrchestratorProject::prompt`]), which the
+/// Pi harness appends to the system prompt. Rides the MCP env like the fork.
+pub const ENV_PROJECT_PROMPT: &str = "ZERON_PROJECT_PROMPT";
 /// Titles go into env and prompts as one short line.
 const MAX_LABEL_CHARS: usize = 120;
 
@@ -292,6 +296,34 @@ pub fn root_of<'a>(chats: &'a [Chat], chat_id: &str) -> Option<&'a Chat> {
         .filter(|root| is_root_chat(&root.id))
 }
 
+/// Every session below the orchestrator root `root_id`, archived ones too,
+/// parents before their children. Empty when `root_id` is not a root.
+pub fn tree_members<'a>(chats: &'a [Chat], root_id: &str) -> Vec<&'a Chat> {
+    if !is_root_chat(root_id) {
+        return Vec::new();
+    }
+    let mut members: Vec<&Chat> = Vec::new();
+    let mut level = vec![root_id];
+    for _ in 0..MAX_DEPTH {
+        let next: Vec<&Chat> = chats
+            .iter()
+            .filter(|chat| {
+                chat.parent_chat_id
+                    .as_deref()
+                    .is_some_and(|parent| level.contains(&parent))
+                    && chat.id != root_id
+                    && !members.iter().any(|seen| seen.id == chat.id)
+            })
+            .collect();
+        if next.is_empty() {
+            break;
+        }
+        level = next.iter().map(|chat| chat.id.as_str()).collect();
+        members.extend(next);
+    }
+    members
+}
+
 /// How far below its orchestrator root `chat_id` is (0 for the root), or
 /// `None` outside an orchestrator tree.
 pub fn depth(chats: &[Chat], chat_id: &str) -> Option<usize> {
@@ -343,6 +375,12 @@ mod tests {
             root_of(&chats, "child").map(|c| c.id.as_str()),
             Some(root.as_str())
         );
+        let members: Vec<&str> = tree_members(&chats, &root)
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(members, ["child", "grandchild"], "parents first");
+        assert!(tree_members(&chats, "plain").is_empty(), "not a root");
         assert_eq!(depth(&chats, "side"), None, "a side chat of a plain chat");
         assert_eq!(depth(&chats, "missing"), None);
         assert_eq!(lineage(&chats, "loop-a").len(), 2, "a cycle ends the walk");

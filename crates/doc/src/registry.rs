@@ -45,7 +45,12 @@ pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
 pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
 /// One row per post on an orchestrator tree's message board.
 pub const KIND_BOARD: &str = "boardPosts";
+/// One row per orchestrator: its project's goal, instructions and pause.
+pub const KIND_ORCHESTRATOR_PROJECTS: &str = "orchestratorProjects";
+/// One row per note in an orchestrator project's memory.
+pub const KIND_ORCHESTRATOR_MEMORY: &str = "orchestratorMemory";
 mod board;
+mod orchestrator_project;
 mod sidebar_pins;
 mod sidebar_sections;
 
@@ -1498,6 +1503,7 @@ impl RegistryDoc {
         self.delete_row_ops(&[(KIND_CHATS, chat_id), (KIND_SESSIONS, chat_id)]);
         if zeron_proto::orchestrator::is_root_chat(chat_id) {
             self.delete_board(chat_id);
+            self.delete_orchestrator_project(chat_id);
         }
         Ok(existed)
     }

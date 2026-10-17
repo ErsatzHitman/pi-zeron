@@ -169,6 +169,22 @@ fn catalog() -> Vec<ToolDef> {
             })),
         },
         ToolDef {
+            name: "wait_for_turns",
+            description: "Block until the FIRST of several chats is no longer working, then return that chat's outcome (completed, awaitingInput, errored) with its newest assistant message, and where the others stand. Without chats it watches the chats you started that are still working or that you just sent work to. Call it again for the next one; timedOut means none finished in time.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chats": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": MAX_BATCH,
+                        "description": "Chat ids, unique id prefixes, or exact titles. Omit for your own running sessions."
+                    },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
+                }
+            }),
+        },
+        ToolDef {
             name: "interrupt_chat",
             description: "Stop the chat's running turn. Only the current turn ends and its queued messages are cleared; its sub-agents and background shells keep running.",
             input_schema: chat_key_schema(json!({})),
@@ -269,15 +285,66 @@ fn catalog() -> Vec<ToolDef> {
             }
         }),
     });
+    tools.push(ToolDef {
+        name: PROJECT_READ,
+        description: "Read your orchestrator project: the goal, the user's standing instructions for every session, whether the user paused it, and the project memory (facts the orchestrator saved). Only for a chat in an orchestrator's tree. Your prompt has them as of your start; call this for the latest.",
+        input_schema: json!({ "type": "object", "properties": {} }),
+    });
+    tools.push(ToolDef {
+        name: PROJECT_REMEMBER,
+        description: "Orchestrator only: save a fact to the project memory, which every later session of the tree gets in its prompt. Save what holds for the whole project and is not in the code (a build command that works, a constraint the user gave, a decision made), one fact per note. Not for progress or a session's task.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "maxLength": zeron_proto::orchestrator_project::NOTE_MAX_CHARS, "description": "The fact, self-contained." }
+            },
+            "required": ["text"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: PROJECT_FORGET,
+        description: "Orchestrator only: drop a project memory note that is wrong or no longer holds (its id from project_read).",
+        input_schema: json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: PROJECT_UPDATE,
+        description: "Orchestrator only: set the project's goal (one line) or its standing instructions, when the user asks for it. The instructions replace the old ones whole, so read them first and keep what the user did not ask to change.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "goal": { "type": "string", "maxLength": zeron_proto::orchestrator_project::GOAL_MAX_CHARS },
+                "instructions": { "type": "string", "maxLength": zeron_proto::orchestrator_project::INSTRUCTIONS_MAX_CHARS }
+            }
+        }),
+    });
     tools
 }
+
+/// The project of the CALLING chat's orchestrator tree; only its root
+/// changes it.
+const PROJECT_READ: &str = "project_read";
+const PROJECT_REMEMBER: &str = "project_remember";
+const PROJECT_FORGET: &str = "project_forget";
+const PROJECT_UPDATE: &str = "project_update";
 
 /// The message board of the CALLING chat's orchestrator tree, offered only
 /// to an agent Zeron launched (`ZERON_CHAT_ID` set).
 const BOARD_POST: &str = "board_post";
 const BOARD_READ: &str = "board_read";
 /// Tools that act for the calling chat.
-const IN_CHAT_ONLY: [&str; 3] = [SHOW_VISUAL, BOARD_POST, BOARD_READ];
+const IN_CHAT_ONLY: [&str; 7] = [
+    SHOW_VISUAL,
+    BOARD_POST,
+    BOARD_READ,
+    PROJECT_READ,
+    PROJECT_REMEMBER,
+    PROJECT_FORGET,
+    PROJECT_UPDATE,
+];
 
 /// Shows a page in the CALLING chat, so it is offered only to an agent that
 /// Zeron launched (`ZERON_CHAT_ID` set).
@@ -599,6 +666,29 @@ struct WaitArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Deserialize, Default)]
+struct WaitAnyArgs {
+    #[serde(default)]
+    chats: Vec<String>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RememberArgs {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct ForgetArgs {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectUpdateArgs {
+    goal: Option<String>,
+    instructions: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct ArchiveArgs {
     chat: String,
@@ -735,12 +825,23 @@ impl Tools {
             "read_chat" => self.read_chat(parse(args)?).await,
             "send_message" => self.send_message(parse(args)?).await,
             "wait_for_turn" => self.wait_for_turn(parse(args)?).await,
+            "wait_for_turns" => self.wait_for_turns(parse(args)?).await,
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
             BOARD_POST => self.board_post(parse(args)?).await,
             BOARD_READ => self.board_read(parse(args)?).await,
+            PROJECT_READ => self.project_read().await,
+            PROJECT_REMEMBER => {
+                let args: RememberArgs = parse(args)?;
+                self.project_memory(json!({ "text": args.text })).await
+            }
+            PROJECT_FORGET => {
+                let args: ForgetArgs = parse(args)?;
+                self.project_memory(json!({ "forget": args.id })).await
+            }
+            PROJECT_UPDATE => self.project_update(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
@@ -942,6 +1043,7 @@ impl Tools {
         // An orchestrator's tree may grow sessions below sessions; elsewhere
         // only a top-level chat starts side chats.
         let chats = self.zeron.chats().await?;
+        self.ensure_not_paused(&chats).await?;
         if let Some(origin) = self.zeron.origin().chat_id.as_deref() {
             let chat = self.zeron.resolve_chat(origin).await?;
             anyhow::ensure!(
@@ -1240,6 +1342,9 @@ impl Tools {
                 short(&chat.id)
             );
         }
+        if self.zeron.origin().chat_id.is_some() {
+            self.ensure_not_paused(&self.zeron.chats().await?).await?;
+        }
         let (spaces, sessions, harnesses) = tokio::try_join!(
             self.zeron.spaces(),
             self.zeron.sessions(),
@@ -1421,6 +1526,150 @@ impl Tools {
         self.zeron
             .call(zeron_rpc::methods::LIST_BOARD, params)
             .await
+    }
+
+    /// The calling chat, which must be in an orchestrator's tree.
+    fn tree_origin(&self, tool: &str) -> anyhow::Result<String> {
+        self.zeron.origin().chat_id.clone().with_context(|| {
+            format!("{tool} only works from an agent Zeron launched in an orchestrator's tree")
+        })
+    }
+
+    /// The calling chat, which must be an orchestrator's root.
+    fn root_origin(&self, tool: &str) -> anyhow::Result<String> {
+        let chat_id = self.tree_origin(tool)?;
+        anyhow::ensure!(
+            zeron_proto::orchestrator::is_root_chat(&chat_id),
+            "Only the orchestrator changes the project. Report what should change in your final reply."
+        );
+        Ok(chat_id)
+    }
+
+    async fn project_read(&self) -> anyhow::Result<Value> {
+        let chat_id = self.tree_origin(PROJECT_READ)?;
+        self.zeron
+            .call(
+                zeron_rpc::methods::GET_ORCHESTRATOR_PROJECT,
+                json!({ "chatId": chat_id }),
+            )
+            .await
+    }
+
+    async fn project_memory(&self, mut params: Value) -> anyhow::Result<Value> {
+        params["chatId"] = json!(self.root_origin(PROJECT_REMEMBER)?);
+        self.zeron
+            .call(zeron_rpc::methods::ORCHESTRATOR_MEMORY, params)
+            .await
+    }
+
+    async fn project_update(&self, args: ProjectUpdateArgs) -> anyhow::Result<Value> {
+        let chat_id = self.root_origin(PROJECT_UPDATE)?;
+        anyhow::ensure!(
+            args.goal.is_some() || args.instructions.is_some(),
+            "pass goal, instructions or both"
+        );
+        self.zeron
+            .call(
+                zeron_rpc::methods::UPDATE_ORCHESTRATOR_PROJECT,
+                json!({
+                    "chatId": chat_id,
+                    "update": { "goal": args.goal, "instructions": args.instructions },
+                }),
+            )
+            .await
+    }
+
+    /// Refuse new work from an agent whose orchestrator the user paused.
+    async fn ensure_not_paused(&self, chats: &[Chat]) -> anyhow::Result<()> {
+        let Some(origin) = self.zeron.origin().chat_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(root) = zeron_proto::orchestrator::root_of(chats, origin) else {
+            return Ok(());
+        };
+        // An engine that cannot say leaves the gate open; pausing also
+        // interrupts every running turn in the tree.
+        let Ok(reply) = self
+            .zeron
+            .call(
+                zeron_rpc::methods::GET_ORCHESTRATOR_PROJECT,
+                json!({ "chatId": root.id }),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            reply["project"]["paused"] != true,
+            "The user paused this orchestrator. Start and send nothing; end your turn and say so. The user resumes it from Zeron."
+        );
+        Ok(())
+    }
+
+    /// The first of `chats` to stop working, and where the rest stand.
+    async fn wait_for_turns(&self, args: WaitAnyArgs) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            args.chats.len() <= MAX_BATCH,
+            "chats takes at most {MAX_BATCH} ids"
+        );
+        let mut targets: Vec<Chat> = Vec::new();
+        if args.chats.is_empty() {
+            let origin = self.zeron.origin().chat_id.clone().context(
+                "pass chats: wait_for_turns watches your own sessions only from an agent Zeron launched",
+            )?;
+            let (chats, sessions) = tokio::try_join!(self.zeron.chats(), self.zeron.sessions())?;
+            let pending = self.pending_turns.lock().await;
+            targets = chats
+                .into_iter()
+                .filter(|chat| {
+                    !chat.archived
+                        && chat.parent_chat_id.as_deref() == Some(origin.as_str())
+                        && (pending.contains_key(&chat.id)
+                            || session_for(&sessions, chat)
+                                .is_some_and(|s| s.status == SessionStatus::Working))
+                })
+                .collect();
+            if targets.is_empty() {
+                return Ok(json!({
+                    "outcome": "none",
+                    "note": "None of your sessions is working. zeron_list_chats shows where they stand.",
+                }));
+            }
+        } else {
+            for key in &args.chats {
+                let chat = self.zeron.resolve_chat(key).await?;
+                if !targets.iter().any(|seen| seen.id == chat.id) {
+                    targets.push(chat);
+                }
+            }
+        }
+        let timeout = wait_duration(args.timeout_secs);
+        let waits = targets.iter().map(|chat| {
+            Box::pin(async move {
+                let wait = WaitArgs {
+                    chat: chat.id.clone(),
+                    timeout_secs: Some(timeout.as_secs().max(1)),
+                };
+                (chat.id.clone(), self.wait_for_turn(wait).await)
+            })
+        });
+        let ((chat_id, first), _, _) = futures::future::select_all(waits).await;
+        let first = first?;
+        let sessions = self.zeron.sessions().await?;
+        let others: Vec<Value> = targets
+            .iter()
+            .filter(|chat| chat.id != chat_id)
+            .map(|chat| {
+                let (status, _) = status_of(session_for(&sessions, chat).as_ref());
+                json!({ "chatId": chat.id, "title": chat.title, "status": status })
+            })
+            .collect();
+        Ok(json!({
+            "chatId": first["chatId"],
+            "title": first["title"],
+            "turn": first["turn"],
+            "others": others,
+        }))
     }
 
     async fn show_visual(&self, args: ShowVisualArgs) -> anyhow::Result<Value> {
@@ -1830,6 +2079,7 @@ mod tests {
         sessions: Vec<Value>,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
+        paused: bool,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1908,6 +2158,24 @@ mod tests {
                         .unwrap()
                         .push((method.to_owned(), params.clone()));
                     RpcReply::Value(json!({ "entries": [], "total": 0, "olderSkipped": 0 }))
+                }
+                methods::GET_ORCHESTRATOR_PROJECT => {
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({
+                        "project": { "rootId": "orchestrator-root", "goal": "Ship it",
+                                     "instructions": "", "paused": self.paused, "updatedAt": 1 },
+                        "memory": [],
+                    }))
+                }
+                methods::ORCHESTRATOR_MEMORY | methods::UPDATE_ORCHESTRATOR_PROJECT => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({ "ok": true }))
                 }
                 methods::LIST_HARNESSES if remote => RpcReply::Value(json!([
                     {"id":"codex", "name":"Remote Codex", "installed":true},
@@ -2768,6 +3036,172 @@ mod tests {
         );
         assert!(same_folder("D:\\OpenTalk\\", "d:/opentalk"));
         assert!(!same_folder("/repo/Comet", "/repo/comet"));
+    }
+
+    fn orchestrator_world(paused: bool, sessions: Vec<Value>) -> Arc<World> {
+        let config = json!({ "harness": "claude-code", "model": null, "reasoning": null, "sandbox": "workspace-write" });
+        let chat = |id: &str, parent: Option<&str>| {
+            json!({
+                "id": id, "deviceId": "dev-local", "title": id, "archived": false,
+                "spaceId": "space-1", "createdAt": "2026-09-03T00:00:00Z",
+                "parentChatId": parent, "config": config,
+            })
+        };
+        Arc::new(World {
+            extra_chats: vec![
+                chat("orchestrator-root", None),
+                chat("member-a", Some("orchestrator-root")),
+                chat("member-b", Some("orchestrator-root")),
+            ],
+            sessions,
+            paused,
+            ..Default::default()
+        })
+    }
+
+    fn from(world: &Arc<World>, chat: &str) -> Tools {
+        tools(
+            world.clone(),
+            Origin {
+                chat_id: Some(chat.into()),
+                device_id: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_whole_tree_reads_its_project_and_only_the_root_changes_it() {
+        let world = orchestrator_world(false, Vec::new());
+        let read = from(&world, "member-a")
+            .call("project_read", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(read["project"]["goal"], "Ship it");
+        assert_eq!(world.reads.lock().unwrap()[0].1["chatId"], "member-a");
+
+        for (tool, args) in [
+            ("project_remember", json!({ "text": "CI runs on main" })),
+            ("project_forget", json!({ "id": "n-1" })),
+            ("project_update", json!({ "goal": "Ship it" })),
+        ] {
+            let refused = from(&world, "member-a")
+                .call(tool, args.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                refused.contains("Only the orchestrator"),
+                "{tool}: {refused}"
+            );
+            from(&world, "orchestrator-root")
+                .call(tool, args)
+                .await
+                .unwrap();
+        }
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 3);
+        assert_eq!(writes[0].0, methods::ORCHESTRATOR_MEMORY);
+        assert_eq!(
+            writes[0].1,
+            json!({ "chatId": "orchestrator-root", "text": "CI runs on main" })
+        );
+        assert_eq!(
+            writes[1].1,
+            json!({ "chatId": "orchestrator-root", "forget": "n-1" })
+        );
+        assert_eq!(writes[2].0, methods::UPDATE_ORCHESTRATOR_PROJECT);
+        assert_eq!(
+            writes[2].1["update"],
+            json!({ "goal": "Ship it", "instructions": null })
+        );
+
+        let empty = from(&world, "orchestrator-root")
+            .call("project_update", json!({}))
+            .await
+            .unwrap_err();
+        assert!(empty.contains("pass goal"), "{empty}");
+        assert!(
+            tools(world.clone(), Origin::default())
+                .call("project_read", json!({}))
+                .await
+                .unwrap_err()
+                .contains("orchestrator's tree")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paused_orchestrator_starts_and_sends_nothing() {
+        let world = orchestrator_world(true, Vec::new());
+        for (tool, args) in [
+            (
+                "create_chat",
+                json!({ "project": "space-1", "title": "Sub" }),
+            ),
+            (
+                "send_message",
+                json!({ "chat": "member-b", "text": "go on" }),
+            ),
+        ] {
+            for chat in ["orchestrator-root", "member-a"] {
+                let refused = from(&world, chat)
+                    .call(tool, args.clone())
+                    .await
+                    .unwrap_err();
+                assert!(refused.contains("paused"), "{tool} from {chat}: {refused}");
+            }
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+        // A chat outside any tree is not held back.
+        tools(world.clone(), Origin::default())
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "title": "Solo" }),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_turns_with_nothing_working_says_so() {
+        let world = orchestrator_world(false, Vec::new());
+        let reply = from(&world, "orchestrator-root")
+            .call("wait_for_turns", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(reply["outcome"], "none");
+        let refused = tools(world.clone(), Origin::default())
+            .call("wait_for_turns", json!({}))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("pass chats"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_turns_returns_the_first_session_to_stop() {
+        let idle = |chat: &str, status: &str| {
+            json!({
+                "chatId": chat, "deviceId": "dev-local", "status": status,
+                "updatedAt": "2026-09-03T00:00:00Z", "runningSubagents": 0,
+            })
+        };
+        let world = orchestrator_world(
+            false,
+            vec![idle("member-a", "idle"), idle("member-b", "working")],
+        );
+        let reply = from(&world, "orchestrator-root")
+            .call(
+                "wait_for_turns",
+                json!({ "chats": ["member-a", "member-b"], "timeout_secs": 1 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["chatId"], "member-a", "{reply}");
+        assert_eq!(reply["others"][0]["chatId"], "member-b");
+        assert!(
+            reply["others"][0]["status"]
+                .as_str()
+                .is_some_and(|status| status.starts_with("working")),
+            "{reply}"
+        );
     }
 
     #[tokio::test]

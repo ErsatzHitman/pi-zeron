@@ -5,7 +5,10 @@
 //! conversation, up to the room the window has, so a reply shows whole
 //! without scrolling while it fits. It runs its parent's model (no picker).
 //! The history button lists the conversation's side chats, so settled ones
-//! stay one click away.
+//! stay one click away. Like Claude Code's side chat, it is a bare one-line
+//! prompt (no attachments or microphone) and shows only the answers: while
+//! a reply works, its trailer ("Puzzling…") stands in for the thinking and
+//! tool rows. It is at least as tall as the session card beside it.
 
 use super::*;
 
@@ -330,12 +333,15 @@ impl Shell {
             transcript.set_top_inset(0.0, cx);
             transcript.set_rail_enabled(false, cx);
             transcript.set_fit_content(true, cx);
+            // Its answers only: "Puzzling…" stands in for the work.
+            transcript.set_answers_only(true, cx);
         });
         let bar_width = SESSION_CARD_WIDTH - 2.0 * (BAR_INSET - COMPOSER_PAD);
         composer.update(cx, |composer, cx| {
             composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
             composer.set_available_width(bar_width, cx);
             composer.set_model_picker_hidden(true, cx);
+            composer.set_minimal(true, cx);
         });
         let bar_h = match bar_height.get() {
             height if height > 0.0 => height,
@@ -345,10 +351,12 @@ impl Shell {
         let chrome = 2.0 + HEADER_HEIGHT + bar_h + BAR_INSET;
         let content = transcript.read(cx).content_height();
         fitted.set(content);
+        // As tall as the session card beside it, at least.
+        let card_h = self.session_card_height.get();
         let body_h = if history_open {
             body_height(HISTORY_HEIGHT, max_height, chrome)
         } else {
-            body_height(content, max_height, chrome)
+            body_height(content.max(card_h - chrome), max_height, chrome)
         };
         let working = status == ChatIndicator::Working;
 
@@ -382,7 +390,7 @@ impl Shell {
             .gap(px(4.0))
             .pl(px(12.0))
             .pr(px(6.0))
-            .when(history_open || content > 0.0, |header| {
+            .when(body_h > 0.0, |header| {
                 header.border_b_1().border_color(theme.border)
             })
             .child(
@@ -443,9 +451,27 @@ impl Shell {
             });
             // The thread fades at its edges only once it scrolls.
             let clipped = content > body_h + 0.5;
+            let hint = (content <= 0.0).then(|| {
+                div()
+                    .absolute()
+                    .top(px(10.0))
+                    .left(px(10.0))
+                    .right(px(10.0))
+                    .p(px(10.0))
+                    .rounded(px(8.0))
+                    .bg(theme.ink(0.04))
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .line_height(crate::typography::ui_rems(18.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(
+                        "Ask about this session without touching the main thread. \
+                         It sees the session so far, and nothing here is added to it.",
+                    ))
+            });
             div()
                 .size_full()
                 .relative()
+                .children(hint)
                 .child(crate::edge_fade::edge_faded(
                     Theme::TRANSCRIPT_FADE_BAND,
                     clipped,
@@ -462,11 +488,13 @@ impl Shell {
         let probe = {
             let transcript = transcript.clone();
             let bar_height = bar_height.clone();
+            let card_height = self.session_card_height.clone();
             gpui::canvas(
                 move |_, window, cx| {
                     let content = transcript.read(cx).content_height();
                     if (content - fitted.get()).abs() > 0.5
                         || (bar_height.get() - bar_h).abs() > 0.5
+                        || (card_height.get() - card_h).abs() > 0.5
                     {
                         window.request_animation_frame();
                     }
@@ -495,14 +523,13 @@ impl Shell {
                 .absolute()
                 .inset_0(),
             )
+            // A bare prompt bar: no attachments, so no drop zone.
             .child(
-                self.chat_dropzone(("btw-dropzone", id), composer.clone(), cx)
+                div()
                     .relative()
                     .w(px(bar_width))
                     .ml(px(BAR_INSET - COMPOSER_PAD))
-                    .child(composer)
-                    .child(Self::attachment_drop_overlay(&theme))
-                    .child(Self::mention_drop_overlay(&theme)),
+                    .child(composer),
             );
 
         let card = div()
