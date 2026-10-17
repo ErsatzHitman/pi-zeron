@@ -23,6 +23,7 @@ use zeron_proto::extension_ui::{ExtensionUiAction, PiUiAction};
 use zeron_proto::{Chat, ChatIndicator, CheckoutDiff};
 
 mod agents;
+mod board;
 mod compact;
 mod context;
 mod sections;
@@ -56,6 +57,9 @@ const AGENTS: &str = "agents";
 const BACKGROUND: &str = "background";
 const COMPACT: &str = "compact";
 const WORKFLOW: &str = "workflow";
+const BOARD: &str = "board";
+/// How often an open panel re-reads an orchestrator tree's boards.
+const BOARD_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 /// The Compaction section's body: the bar line, a gap, the caption line and
 /// its bottom padding.
 const COMPACT_BODY_HEIGHT: f32 = 40.0;
@@ -109,6 +113,22 @@ pub(super) struct SessionPanel {
         String,
         (zeron_proto::extension_ui::ContextBreakdown, DateTime<Utc>),
     >,
+    /// The selected chat's message boards while the panel is open.
+    board: BoardFeed,
+}
+
+/// The posts the selected chat sees (`ListBoard`), re-read while the panel
+/// is open on a chat of an orchestrator's tree.
+#[derive(Default)]
+struct BoardFeed {
+    chat_id: Option<String>,
+    entries: Vec<zeron_proto::board::BoardEntry>,
+    task: Option<Task<()>>,
+}
+
+#[derive(serde::Deserialize)]
+struct BoardReply {
+    entries: Vec<zeron_proto::board::BoardEntry>,
 }
 
 /// What a section draws from: moved in each frame, kept by a section
@@ -120,6 +140,7 @@ enum SectionData {
     Background(Vec<AgentRow>),
     Compact(CompactMeter),
     Workflow(WorkflowView),
+    Board(board::BoardView),
 }
 
 /// One `WatchCheckoutDiffs` frame: every checkout, or one that changed.
@@ -650,6 +671,7 @@ impl Shell {
         if reveal <= 0.001 {
             self.session_panel.sections.reset();
             self.session_panel.arrivals.reset();
+            self.session_panel.board = BoardFeed::default();
             return None;
         }
         let theme = Theme::of(cx).for_popup();
@@ -706,6 +728,7 @@ impl Shell {
             )
         };
         self.ensure_session_diff_watch(&chat, cx);
+        self.ensure_board_feed(&chat, cx);
 
         // ── Where it runs: always shown.
         let device_row = info_row(
@@ -855,6 +878,20 @@ impl Shell {
                 view.since(),
                 SectionData::Workflow(view),
             ));
+        }
+        let board = {
+            let state = self.state.read(cx);
+            let feed = &self.session_panel.board;
+            (feed.chat_id.as_deref() == Some(chat.id.as_str()))
+                .then(|| {
+                    board::BoardView::of(&feed.entries, |folder| {
+                        board::folder_label(folder, &state.spaces, &state.chats)
+                    })
+                })
+                .flatten()
+        };
+        if let Some(view) = board {
+            active.push((SectionKey::Board, view.first_at, SectionData::Board(view)));
         }
         let frame_time = self.render_time.unwrap_or_else(|| self.motion_time());
         let pulse =
@@ -1137,8 +1174,178 @@ impl Shell {
                     stack_height(rows) + 16.0,
                 )
             }
+            SectionData::Board(view) => (
+                self.render_board(view, theme, cx),
+                stack_height(view.rows()),
+            ),
         };
         section_frame(entry.key.id(), t, estimate, entry.measured.clone(), rows)
+    }
+
+    /// Keep the selected chat's boards fresh while the panel shows a chat of
+    /// an orchestrator's tree; any other chat has none.
+    fn ensure_board_feed(&mut self, chat: &Chat, cx: &mut Context<Self>) {
+        let (engine, tree) = {
+            let state = self.state.read(cx);
+            (
+                state.engine().cloned(),
+                zeron_proto::orchestrator::root_of(&state.chats, &chat.id).is_some(),
+            )
+        };
+        let feed = &mut self.session_panel.board;
+        if !tree {
+            if feed.chat_id.is_some() {
+                *feed = BoardFeed::default();
+            }
+            return;
+        }
+        let Some(engine) = engine else {
+            return;
+        };
+        if feed.chat_id.as_deref() == Some(chat.id.as_str()) && feed.task.is_some() {
+            return;
+        }
+        let chat_id = chat.id.clone();
+        *feed = BoardFeed {
+            chat_id: Some(chat_id.clone()),
+            ..BoardFeed::default()
+        };
+        let task = cx.spawn(async move |this, cx| {
+            loop {
+                let reply = engine
+                    .client()
+                    .call_as::<BoardReply>(
+                        methods::LIST_BOARD,
+                        serde_json::json!({ "chatId": chat_id, "limit": 100 }),
+                    )
+                    .await;
+                let current = this
+                    .update(cx, |shell, cx| {
+                        let feed = &mut shell.session_panel.board;
+                        if feed.chat_id.as_deref() != Some(chat_id.as_str()) {
+                            return false;
+                        }
+                        // An engine without boards just shows none.
+                        if let Ok(reply) = reply
+                            && feed.entries != reply.entries
+                        {
+                            feed.entries = reply.entries;
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !current {
+                    break;
+                }
+                cx.background_executor().timer(BOARD_REFRESH).await;
+            }
+        });
+        self.session_panel.board.task = Some(task);
+    }
+
+    /// The message boards the chat sees, newest first per folder: one folder
+    /// for a session, every folder (headed by its name) for the orchestrator.
+    fn render_board(
+        &mut self,
+        view: &board::BoardView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        use zeron_proto::board::BoardKind;
+        let mut rows = vec![
+            popover::picker_divider().into_any_element(),
+            self.render_section_header(
+                BOARD,
+                "Board",
+                Some(view.count_label().into()),
+                None,
+                theme,
+                cx,
+            ),
+        ];
+        if !self.session_panel.is_open(BOARD) {
+            return rows;
+        }
+        let now = Utc::now();
+        for group in &view.groups {
+            rows.push(
+                info_row(theme, row_glyph(icons::FOLDER, theme), group.label.clone().into())
+                    .text_size(crate::typography::ui_rems(11.5))
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
+            );
+            for entry in &group.entries {
+                let (kind, tone) = match entry.kind {
+                    BoardKind::Blocker => ("Blocker", theme.warning),
+                    BoardKind::Discovery => ("Discovery", theme.accent),
+                    BoardKind::Finding => ("Finding", theme.text_muted),
+                };
+                let when = DateTime::<Utc>::from_timestamp_millis(entry.at)
+                    .map(|at| crate::pull_requests::relative_time(at, now))
+                    .unwrap_or_default();
+                let (text, cut) = board::preview(&entry.text);
+                let post = div()
+                    .id(SharedString::from(format!("session-info-board-{}", entry.id)))
+                    .px(px(9.0))
+                    .py(px(3.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .when(cut, |post| {
+                        post.tooltip(crate::settings::widgets::text_tooltip(entry.text.clone()))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .text_size(crate::typography::ui_rems(10.5))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(tone)
+                                    .child(kind),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.text_muted)
+                                    .child(board::author(entry)),
+                            )
+                            .child(trailing_text(when, theme.text_muted.opacity(0.7))),
+                    )
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .line_height(px(17.0))
+                            .text_color(theme.text)
+                            .child(text),
+                    )
+                    .into_any_element();
+                rows.push(self.arriving(BOARD, &entry.id, post));
+            }
+            if group.hidden > 0 {
+                rows.push(
+                    div()
+                        .px(px(9.0))
+                        .pb(px(2.0))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(theme.text_muted.opacity(0.7))
+                        .child(format!(
+                            "{} older {}",
+                            group.hidden,
+                            if group.hidden == 1 { "post" } else { "posts" }
+                        ))
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
     }
 
     /// `row` of `section`, arriving if it just turned up there.

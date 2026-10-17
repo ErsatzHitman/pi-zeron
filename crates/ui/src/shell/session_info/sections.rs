@@ -28,6 +28,8 @@ pub(super) enum SectionKey {
     Background,
     /// Auto-compaction near its limit, or running.
     Compact,
+    /// An orchestrator tree's message boards, as the chat sees them.
+    Board,
 }
 
 impl SectionKey {
@@ -40,6 +42,7 @@ impl SectionKey {
             Self::Workflow => "workflow",
             Self::Background => "background",
             Self::Compact => "compact",
+            Self::Board => "board",
         }
     }
 }
