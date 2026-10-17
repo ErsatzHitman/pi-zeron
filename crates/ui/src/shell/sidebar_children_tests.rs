@@ -296,8 +296,9 @@ fn the_btw_pane_opens_at_the_bottom_left_with_its_bar_inside(cx: &mut TestAppCon
     assert!((f32::from(pane.size.height) - btw_pane::BTW_HEIGHT).abs() <= 1.0);
     assert_eq!(f32::from(pane.origin.x), 12.0);
     let viewport = cx.update(|window, _| f32::from(window.viewport_size().height));
+    // Within 3px: Windows lays the window out a pixel or two lower than Linux.
     assert!(
-        (f32::from(pane.bottom()) - (viewport - 12.0)).abs() <= 1.0,
+        (f32::from(pane.bottom()) - (viewport - 12.0)).abs() <= 3.0,
         "the pane ends at {:?} in a {viewport}px window",
         pane.bottom()
     );
