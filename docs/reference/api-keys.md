@@ -3,7 +3,7 @@
 Settings → API keys holds every provider key that Zeron and the Pi it hosts use:
 
 - Pi models;
-- Pi extensions (the OpenCode Go key router, the decisions gate, memory, uniichat);
+- Pi extensions (the OpenCode Go key router, the decisions gate, memory, uniichat, the web tools);
 - MCP servers such as video inspection;
 - dictation and voice mode.
 
@@ -11,13 +11,16 @@ You add, edit, switch and turn off keys in one place, and a change takes effect 
 
 ## The page
 
+The page opens with a **Web search & fetch** box: Pi's `web_search` and `web_fetch` tools (the web-tools extension, calling DeepSeek's Search and Fetch APIs) use your DeepSeek API key. The box is always shown, key or not. It shows the active DeepSeek key masked, or that there is none yet, and **Add key** or **Update key** opens the same form as a provider row. The key is the DeepSeek provider's, so it also appears in the DeepSeek row and reaches Pi's `auth.json` like any model key.
+
 Providers that have a key, or a Pi login, are listed first. **Add a provider's key** reveals the rest:
 
 | Provider | Used by |
 | --- | --- |
 | OpenRouter | Pi models, decisions gate, video inspection, voice mode |
 | OpenCode Go | Pi models. Several keys rotate as quota runs out. |
-| Anthropic, xAI, DeepSeek | Pi models |
+| Anthropic, xAI | Pi models |
+| DeepSeek | Pi models, web search & fetch |
 | OpenAI | Pi models, dictation, voice mode |
 | Google Gemini | Pi models, voice mode (real-time) |
 | Groq | Pi models, dictation |
@@ -63,5 +66,5 @@ From a terminal, `agent/bin/api-key.mjs` in the Pi repo lists, adds and switches
 - The engine serves the RPC methods `ListApiKeys`, `AddApiKey`, `UpdateApiKey`, `SetActiveApiKey` and `RemoveApiKey`. The local engine answers them and never forwards them to another machine.
 - Writes are serialized in-process. Writes to `auth.json` go through the same lock Pi uses.
 - A key's id is the first eight hex digits of `sha256(secret)`. Pasted secrets lose surrounding quotes, whitespace and control characters.
-- `zeron-ui::settings::api_keys` is the page. Its debug selectors are `api-keys-add-{provider}`, `api-keys-key-{provider}-{id}[-use|-toggle|-edit|-remove]`, `api-keys-form`, `api-keys-save` and `api-keys-show-all`.
+- `zeron-ui::settings::api_keys` is the page. Its debug selectors are `api-keys-add-{provider}`, `api-keys-key-{provider}-{id}[-use|-toggle|-edit|-remove]`, `api-keys-form`, `api-keys-save`, `api-keys-show-all`, and `api-keys-web-tools` for the Web search & fetch box with `api-keys-web-tools-key` for its button.
 - Session logs redact OpenAI, OpenRouter, NVIDIA, Groq, Google and Hugging Face key prefixes.

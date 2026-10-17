@@ -12,14 +12,14 @@ pub(crate) const VISUALS_PROMPT: &str = include_str!("visuals.md");
 
 /// A btw side chat's tools (Pi `--tools`): it answers questions about the
 /// session it forked from, so it reads files and the web and changes
-/// nothing. An `mcp__` entry makes Pi's allowlist cover MCP tools too, so
-/// Zeron's and every other server's are left out.
-pub(crate) const BTW_TOOLS: &str =
-    "read,grep,find,ls,mcp__firecrawl__firecrawl_search,mcp__firecrawl__firecrawl_scrape";
+/// nothing. Pi's allowlist only filters MCP tools when it names one, so the
+/// chat also runs with `--no-mcp` and gets no server's tools.
+pub(crate) const BTW_TOOLS: &str = "read,grep,find,ls,web_search,web_fetch";
 const BTW_PROMPT: &str = "This is a btw side chat: the user is asking about the conversation \
-above without interrupting it. Answer from that conversation. You can read files (read, grep, \
-find, ls) and search or fetch the web (firecrawl), and nothing else: you cannot run commands, \
-edit files, or start agents or sessions, and nothing you do here reaches the main conversation.\n";
+above without interrupting it. Answer from that conversation. You can read files with read, \
+grep, find and ls, and search and read the web with web_search and web_fetch, and nothing else: \
+you cannot run commands, edit files, or start agents or sessions, and nothing you do here \
+reaches the main conversation.\n";
 
 pub(super) fn configure(
     cmd: &mut Command,
@@ -98,7 +98,7 @@ fn role_args(
         let prompt = scratch.join("zeron-btw.md");
         std::fs::write(&prompt, BTW_PROMPT)?;
         args.extend(["--append-system-prompt".into(), prompt.into()]);
-        args.extend(["--tools".into(), BTW_TOOLS.into()]);
+        args.extend(["--tools".into(), BTW_TOOLS.into(), "--no-mcp".into()]);
         return Ok(args);
     }
     match place.role {
@@ -131,6 +131,28 @@ fn role_args(
         args.extend(["--append-system-prompt".into(), prompt.into()]);
     }
     Ok(args)
+}
+
+/// Why a run cannot start: an agent started it (it sits in an orchestrator's
+/// tree and is not a btw chat) on a reserved model, Claude Fable or GPT Astra
+/// class. A chat with a parent is not enough: the user's own forks and side
+/// chats have one too. Chats an agent creates outside a tree are refused by
+/// the create_chat tool. Only a model Zeron configured is checked: with none
+/// the run takes Pi's own default, which create_chat already refuses to leave
+/// open when its caller runs on a reserved one.
+pub(super) fn launch_refusal(
+    model: Option<&str>,
+    mcp: Option<&zeron_proto::McpServer>,
+) -> Option<String> {
+    use zeron_proto::reserved_models::{refusal, reserved_family};
+    let model = model.filter(|m| !m.is_empty() && *m != "default")?;
+    reserved_family(model)?;
+    let place = Place::from_env(&mcp?.env);
+    if place.chat_id.starts_with(zeron_proto::BTW_CHAT_PREFIX) {
+        return None;
+    }
+    matches!(place.role, Role::Member { .. })
+        .then(|| refusal(model, "A session started by an agent"))
 }
 
 #[cfg(test)]
@@ -190,15 +212,9 @@ mod tests {
             let tools: Vec<&str> = flag(&args, "--tools").unwrap().split(',').collect();
             assert_eq!(
                 tools,
-                [
-                    "read",
-                    "grep",
-                    "find",
-                    "ls",
-                    "mcp__firecrawl__firecrawl_search",
-                    "mcp__firecrawl__firecrawl_scrape"
-                ]
+                ["read", "grep", "find", "ls", "web_search", "web_fetch"]
             );
+            assert!(args.iter().any(|arg| arg == "--no-mcp"));
             assert!(args.iter().any(|arg| arg.ends_with("zeron-btw.md")));
             assert!(!args.iter().any(|arg| arg.ends_with("zeron-member.md")));
             assert!(!args.iter().any(|arg| arg == "--system-prompt"));
@@ -308,6 +324,67 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap();
         assert!(!mcp.contains("ZERON_PROJECT_PROMPT"), "{mcp}");
+    }
+
+    fn server_at(place: &Place) -> zeron_proto::McpServer {
+        zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "zeron".into(),
+            args: vec!["mcp".into()],
+            env: place
+                .env()
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .chain([("ZERON_CHAT_ID".to_owned(), place.chat_id.clone())])
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_session_an_agent_started_cannot_start_on_a_reserved_model() {
+        const FABLE: Option<&str> = Some("anthropic/claude-fable-5");
+        let member = server_at(&at(Role::Member { depth: 1 }, Some("orchestrator-r")));
+        let error = launch_refusal(FABLE, Some(&member)).expect("a member is agent-started");
+        assert!(
+            error.starts_with(
+                "A session started by an agent cannot start on anthropic/claude-fable-5"
+            ),
+            "{error}"
+        );
+        let deeper = server_at(&at(Role::Member { depth: 2 }, Some("member-1")));
+        assert!(launch_refusal(Some("openai/gpt-6-astra"), Some(&deeper)).is_some());
+        // Other models, no model and the default model pass.
+        for model in [
+            Some("anthropic/claude-opus-5"),
+            Some("default"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(launch_refusal(model, Some(&member)), None, "{model:?}");
+        }
+    }
+
+    #[test]
+    fn the_user_s_own_sessions_and_btw_chats_may_use_a_reserved_model() {
+        const FABLE: Option<&str> = Some("anthropic/claude-fable-5");
+        for role in [Role::Chat, Role::Root] {
+            let server = server_at(&at(role, None));
+            assert_eq!(launch_refusal(FABLE, Some(&server)), None, "{role:?}");
+        }
+        // A fork or a side chat the user opened has a parent chat and no tree.
+        let fork = server_at(&at(Role::Chat, Some("parent-1")));
+        assert_eq!(launch_refusal(FABLE, Some(&fork)), None);
+        // No MCP config, no place: a title run or an old host.
+        assert_eq!(launch_refusal(FABLE, None), None);
+        for role in [Role::Chat, Role::Member { depth: 2 }] {
+            let mut place = at(role, Some("parent-1"));
+            place.chat_id = format!("{}side-1", zeron_proto::BTW_CHAT_PREFIX);
+            assert_eq!(
+                launch_refusal(FABLE, Some(&server_at(&place))),
+                None,
+                "{role:?}"
+            );
+        }
     }
 
     #[test]

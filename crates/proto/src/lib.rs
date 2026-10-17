@@ -18,6 +18,7 @@ pub mod orchestrator;
 pub mod orchestrator_project;
 pub mod preview;
 pub mod projectless;
+pub mod reserved_models;
 pub mod sidebar_pins;
 pub mod usage;
 pub mod view;

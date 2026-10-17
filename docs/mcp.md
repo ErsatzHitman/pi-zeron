@@ -451,6 +451,18 @@ first, then collect replies with `wait_for_turn`. Waiting on each individual
 launch before issuing the next serializes work at the caller, even though
 both the MCP transport and engine support concurrent chat runs.
 
+## Reserved models
+
+Claude Fable and GPT Astra class models, any version, are reserved for
+sessions the user starts, so `create_chat` (and each `create_chats` request)
+refuses them: an explicit `model` that matches (`anthropic/claude-fable-5`,
+`gpt-6-astra-mini`) fails with a message naming the model. Without `model` the
+new session runs on Pi's own default, which Zeron cannot see, so a call whose
+chat, or whose `parent`, is configured with a reserved model fails too and
+asks for a `model` from `list_models`. The check runs before the host's
+catalog is read. The rule lives in `zeron_proto::reserved_models`; the Pi
+launch and the advisor settings enforce it as well (see `docs/pi.md`).
+
 ## Smoke recipe
 
 ```sh

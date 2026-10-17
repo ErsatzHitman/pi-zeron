@@ -875,6 +875,9 @@ pub struct Pickers {
     /// emits the local device's title settings instead of a composer draft.
     /// `config.harness` then only tracks the tab being browsed.
     title: Option<TitleSettings>,
+    /// Pi-only binding (Settings → General → Advisor): the title binding
+    /// held to Pi's models, with what the chip reads when none is picked.
+    pi_only: Option<SharedString>,
     /// Sticky last-used picks (zeron `zeron.composer.defaults:v1`): seeds the
     /// new-chat chips and is rewritten on every new-chat pick.
     defaults: ComposerDefaults,
@@ -1022,6 +1025,24 @@ impl Pickers {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::build(state, Some(settings), cx)
+    }
+
+    /// The model picker bound to one Pi model setting (the advisor's): only
+    /// Pi's models, picks surface as [`TitleModelPicked`] with Pi as the
+    /// harness, and the chip reads `unset` while nothing is picked.
+    pub fn new_for_pi_model(
+        state: Entity<AppState>,
+        model: Option<String>,
+        unset: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let settings = TitleSettings {
+            harness: Some(HarnessId::Pi),
+            model,
+        };
+        let mut pickers = Self::build(state, Some(settings), cx);
+        pickers.pi_only = Some(unset.into());
+        pickers
     }
 
     pub fn set_title_settings(&mut self, settings: TitleSettings, cx: &mut Context<Self>) {
@@ -1187,6 +1208,7 @@ impl Pickers {
             effort_bounds: None,
             config: DraftConfig::default(),
             title,
+            pi_only: None,
             defaults,
             data_dir,
             draft_owner,
@@ -1282,7 +1304,9 @@ impl Pickers {
     /// narrowed to title-capable agents when bound to thread naming.
     fn offered(&self, list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
         let mut offered = offered_harnesses(list);
-        if self.title.is_some() {
+        if self.pi_only.is_some() {
+            offered.retain(|d| d.id == HarnessId::Pi);
+        } else if self.title.is_some() {
             offered.retain(|d| zeron_harness::supports_titles(d.id) && d.id != HarnessId::Mock);
         }
         offered
@@ -6850,7 +6874,7 @@ impl Render for Pickers {
             // The saved choice, not the tab being browsed.
             match (title.harness, title.model.as_deref()) {
                 (None, _) => "Session agent".into(),
-                (Some(_), None) => "Automatic".into(),
+                (Some(_), None) => self.pi_only.clone().unwrap_or_else(|| "Automatic".into()),
                 (Some(harness), Some(id)) => self
                     .models
                     .get(&harness)

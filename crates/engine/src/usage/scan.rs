@@ -20,6 +20,8 @@ const MAX_ENTRIES: usize = 200_000;
 const TEST_PROVIDERS: [&str; 2] = ["faux-provider", "fake-provider"];
 /// The message a finished subagent job delivers to its parent session.
 const SUBAGENT_RESULT: &str = "subagent-result";
+/// The advisor's recommendations, delivered after its tool call returned.
+const ADVISOR_ADVICE: &str = "pi-advisor-advice";
 /// Thinking levels Pi appends to a model reference after a colon.
 const THINKING_LEVELS: [&str; 8] = [
     "thinking", "off", "minimal", "low", "medium", "high", "xhigh", "max",
@@ -531,6 +533,26 @@ fn record(entry: Entry) -> Option<Found> {
         }
         "custom_message" if text(&custom_type) == Some(SUBAGENT_RESULT) => {
             return subagent_result(content.as_ref()?, details.as_ref(), entry_ms?);
+        }
+        // The advisor answers after its tool call has returned, so its agent's
+        // usage rides on the message that delivers the advice.
+        "custom_message" if text(&custom_type) == Some(ADVISOR_ADVICE) => {
+            let details = details?;
+            let usage = details.get("usage").filter(|u| u.is_object())?;
+            let (provider, model) = details["model"]
+                .as_str()
+                .map(split_model)
+                .unwrap_or_default();
+            return found(
+                Source::Backfill,
+                &provider,
+                &model,
+                "advisor",
+                entry_ms?,
+                tokens(usage),
+                cost(usage),
+                &["advice", &raw(&id), &raw(&timestamp)],
+            );
         }
         "usage" => (
             Source::Usage,
@@ -1209,6 +1231,13 @@ pub(super) mod tests {
                         "details":{"model":"gpt-5.6-sol","usage":
                             {"input":0,"output":0,"total":0,"cost":0,"cacheRead":0,"cacheWrite":0}}}})
                 .to_string(),
+                // Advice that arrived after the tool call returned.
+                json!({"type":"custom_message","customType":"pi-advisor-advice","id":"a1",
+                    "timestamp":"2026-10-01T10:05:00.000Z","display":true,
+                    "content":"secret recommendations",
+                    "details":{"model":"openai-codex/gpt-5.6-terra","usage":
+                        {"input":200,"output":40,"total":240,"cost":0.03,"cacheRead":0,"cacheWrite":0}}})
+                .to_string(),
             ],
         );
         let state = scan_file(&path, None, FileKind::Session).unwrap().unwrap();
@@ -1229,6 +1258,13 @@ pub(super) mod tests {
                     "advisor".to_owned(),
                     [120, 30, 0, 0, 0],
                     0.02
+                ),
+                (
+                    "openai-codex".to_owned(),
+                    "gpt-5.6-terra".to_owned(),
+                    "advisor".to_owned(),
+                    [200, 40, 0, 0, 0],
+                    0.03
                 ),
             ]
         );

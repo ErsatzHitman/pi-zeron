@@ -4,8 +4,8 @@
 //!
 //! The store is `<pi agent dir>/api-keys.json` (0600), beside Pi's
 //! `auth.json`, because its readers run there: Pi extensions (the OpenCode
-//! Go key router, the decisions gate, memory, uniichat) and MCP servers
-//! (video inspection) read it on every request through the Pi repo's
+//! Go key router, the decisions gate, memory, uniichat, web tools) and MCP
+//! servers (video inspection) read it on every request through the Pi repo's
 //! `lib/api-keys.ts` and `video_inspection/openrouter.py`, and Zeron's own
 //! voice features read it per dictation and per call ([`Reader`]). Each
 //! provider holds any number of labelled keys and one active key.
@@ -33,6 +33,9 @@ use crate::agent_accounts::AgentAccounts;
 
 pub const STORE_FILE: &str = "api-keys.json";
 pub const HEALTH_FILE: &str = "api-keys-health.json";
+/// The provider whose active key Pi's `web_search` and `web_fetch` tools
+/// (the web-tools extension, DeepSeek's Search and Fetch APIs) use.
+pub const WEB_TOOLS_PROVIDER: &str = "deepseek";
 
 /// Providers the page always offers, with who uses their keys. `pi` marks
 /// a Pi provider id: its active key is projected into Pi's `auth.json`.
@@ -57,7 +60,7 @@ pub const KNOWN: &[Known] = &[
     Known::pi("groq", "Groq", "Pi models, dictation"),
     Known::pi("mistral", "Mistral", "Pi models, voice mode"),
     Known::pi("xai", "xAI", "Pi models"),
-    Known::pi("deepseek", "DeepSeek", "Pi models"),
+    Known::pi("deepseek", "DeepSeek", "Pi models, web search & fetch"),
     Known::other("nvidia", "NVIDIA", "Memory embeddings"),
     Known::other("deepgram", "Deepgram", "Voice mode"),
     Known::other("dashscope", "DashScope", "Voice mode (real-time)"),
@@ -942,6 +945,34 @@ mod tests {
         assert!(!dir.path().join("auth.json").exists());
         let reader = Reader::new(k.store_path());
         assert_eq!(reader.key("deepgram").as_deref(), Some("dg-key-12345678"));
+    }
+
+    #[test]
+    fn the_web_tools_key_is_always_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = keys(dir.path());
+        let view = k.list();
+        let row = provider(&view, WEB_TOOLS_PROVIDER);
+        assert!(row.keys.is_empty() && row.pi);
+        assert!(row.used_by.contains("Pi models"), "{}", row.used_by);
+        assert!(
+            row.used_by.contains("web search & fetch"),
+            "{}",
+            row.used_by
+        );
+        // Its key goes to Pi like any model key, where the extension reads it.
+        let view = add(&k, WEB_TOOLS_PROVIDER, "", "sk-deepseek-abcd9876");
+        assert_eq!(provider(&view, WEB_TOOLS_PROVIDER).keys[0].masked, "…9876");
+        assert_eq!(
+            auth(dir.path())[WEB_TOOLS_PROVIDER]["key"],
+            "sk-deepseek-abcd9876"
+        );
+        assert_eq!(
+            Store::load(&k.store_path())
+                .unwrap()
+                .key(WEB_TOOLS_PROVIDER),
+            Some("sk-deepseek-abcd9876")
+        );
     }
 
     #[test]

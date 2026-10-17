@@ -92,7 +92,9 @@ for a change (`delete`, `create`, `push`, ...), and bash that writes (redirects,
 installs, git commands other than read-only ones, and any command not on its
 read-only list). Zeron's board and messaging tools (`zeron_board_post`,
 `zeron_board_read`, `zeron_send_message(s)`) stay usable; starting sessions
-does not. Child Pi processes inherit it through the env and the
+does not. `web_search` and `web_fetch` stay usable too: they come from the
+web-tools extension and call DeepSeek's Search and Fetch APIs with the DeepSeek key from
+Settings → API keys. Child Pi processes inherit it through the env and the
 preload. A read-only run without the guard extension fails to start rather
 than run writable. `crates/harness/tests/fixtures/pi-read-only-test.mjs` is
 the corpus, run on macOS and Windows CI.
@@ -303,8 +305,9 @@ profile instead of the coding one:
   Pi's coding prompt: it hands each task to a Pi session in the right folder
   through `zeron_create_chat` and follows it with the other `zeron_*` tools;
 - `--tools` limited to `orchestrator::ROOT_TOOLS` (the `zeron_*` tools,
-  read-only `read`/`ls`/`find`/`grep`, `ask_user`, `todo`, `goal_*` and the
-  memory reads): no bash, edits or extension delegation tools;
+  read-only `read`/`ls`/`find`/`grep`, `web_search`/`web_fetch`, `ask_user`,
+  `todo`, `goal_*` and the memory reads): no bash, edits or extension
+  delegation tools;
 - `--no-mcp`, `--no-skills`, `--no-prompt-templates` and
   `--no-context-files`.
 
@@ -443,6 +446,38 @@ trays, screens and custom messages offline. The ignored live test requires an
 installed Pi and uses isolated settings and a local provider; it makes no model
 API requests.
 
+## Reserved models
+
+Claude Fable and GPT Astra class models, any version, current or future, are
+for sessions the user starts. No sub-agent, delegated session, workflow
+agent, advisor or reviewer child, or session an orchestrator or another agent
+launches may start on one; the user can still pick them for their own
+sessions and for btw side chats. A family matches as a whole word of the
+model's spec or name, case insensitive, with a version or suffix allowed after
+it (`anthropic/claude-fable-5`, `gpt-6-astra-mini`), not `astral` or `fables`.
+A start on one is refused with a message that says to pass another model; the
+model is never swapped silently, except in the advisor's roster and failover
+list, which skips reserved entries and fails only if none are left.
+
+Zeron enforces it in:
+
+- `zeron_proto::reserved_models` (`crates/proto/src/reserved_models.rs`): the
+  rule and the refusal text, shared by the places below. Pi keeps the same
+  rule in `agent/extensions/lib/reserved-models.ts`.
+- `create_chat` in the MCP server (`crates/mcp/src/tools.rs`): refuses a
+  reserved `model`, and refuses a call without one when the calling or parent
+  chat is configured with a reserved model, because the new session would
+  take Pi's own default, which Zeron cannot see.
+- Settings → General → Advisor (`crates/engine/src/advisor_settings.rs`):
+  `SetAdvisorSettings` refuses a reserved model or fallback. A `loop.json`
+  that already names one is still read as it is, and the settings show the
+  row as blocked.
+- The Pi launch (`launch_refusal` in `crates/harness/src/pi/mcp.rs`, called
+  from `run`): a chat in an orchestrator's tree (not a btw chat) fails to start when
+  its configured model is reserved. A fork or side chat the user opens has a
+  parent but no tree and is not checked. Only a model Zeron set is checked;
+  Pi's `settings.json` is not read.
+
 ## You should know
 
 Settings → General → Pi → You should know (off by default) adds a second
@@ -461,3 +496,19 @@ which puts the note in the composer); Knew this already silences that topic
 for the chat; Dismiss closes it. A note left unanswered goes away on the
 second prompt, and ignored notes back reviews off (1, 2, 4, up to 16 skipped
 reviews). The agent never waits for a review, and only one runs at a time.
+
+## Advisor
+
+Settings → General → Advisor picks the model Pi's advisor consults when an
+agent is stuck after three failed tries, and up to two fallbacks tried in
+order when it is unavailable. Each row uses the composer's model picker held
+to Pi's models; Pi lists them as `provider/id`, the spec the roster takes,
+so a pick is saved as is. The engine writes them to `roster.advisor.model`
+and `roster.advisor.failover` in `<pi agent dir>/loop.json`
+(`GetAdvisorSettings` / `SetAdvisorSettings`), keeping the advisor's
+`thinking` and every other key, and the advisor reads the file on every
+consultation. Reset on the model row removes both keys, so Pi's default
+roster (Claude Opus 5, with its OpenCode fallback) applies again. A
+`loop.json` that is not valid JSON is never overwritten: saving fails until
+it is fixed or removed. A reserved model (see Reserved models) is refused as
+the advisor or a fallback.

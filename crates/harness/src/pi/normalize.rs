@@ -458,6 +458,14 @@ fn tool(name: &str, args: &Value) -> ToolCall {
                 (pattern, path) => format!("{pattern} in {path}"),
             },
         },
+        // The web-tools extension's DeepSeek search and fetch.
+        "web_search" => ToolCall::WebSearch {
+            query: string(args, "query").into(),
+        },
+        "web_fetch" => ToolCall::WebFetch {
+            url: string(args, "url").into(),
+            prompt: None,
+        },
         "lsp_fix" if args["write"] == true => ToolCall::EditFile {
             path: string(args, "path").into(),
             old_string: None,
@@ -1016,6 +1024,18 @@ mod tests {
         assert!(matches!(
             tool("lsp_diagnostics", &json!({"paths":["a.rs"]})),
             ToolCall::Unknown { name, .. } if name == "LSP: diagnostics a.rs"
+        ));
+    }
+
+    #[test]
+    fn web_search_and_fetch_read_as_web_rows() {
+        assert!(matches!(
+            tool("web_search", &json!({"query":"rust 2024 edition","count":5})),
+            ToolCall::WebSearch { query } if query == "rust 2024 edition"
+        ));
+        assert!(matches!(
+            tool("web_fetch", &json!({"url":"https://example.com/a"})),
+            ToolCall::WebFetch { url, prompt: None } if url == "https://example.com/a"
         ));
     }
 

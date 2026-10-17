@@ -355,7 +355,8 @@ export function classifyCall({ toolName, input = {}, annotations, cwd = process.
 // ---- self-protection: a model must not switch the guard off through files, env or the IPC port
 const SELF = /harness-prefs|zeron-delete-guard|ZERON_DELETE_GUARD|ZERON_BLOCK_DELETES|ZERON_IPC_PORT|SetDeleteGuard|SetPiSettings|SetHarnessEnabled/i;
 const PROTECTED_FILE = /^(harness-prefs\.json(\.tmp)?|zeron-delete-guard-[0-9a-f]+\.mjs|\.zeron-delete-guard-.*\.tmp)$/i;
-const READONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+// web_search and web_fetch run on DeepSeek's servers and change nothing here.
+const READONLY_TOOLS = new Set(["read", "grep", "find", "ls", "web_search", "web_fetch"]);
 export function selfProtect({ toolName, input = {} }) {
   const deny = () => hit("guard-self", "this would change or bypass the delete guard");
   if (READONLY_TOOLS.has(toolName)) return;

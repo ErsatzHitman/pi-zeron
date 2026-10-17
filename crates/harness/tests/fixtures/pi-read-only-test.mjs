@@ -42,7 +42,8 @@ for (const [name, input] of [['write', {path: 'a', content: 'x'}], ['edit', {pat
   ['mcp__fs__write_file', {}], ['apply_patch', {}], ['memory_save', {}], ['run_command', {}], ['git_commit', {}]])
   check(`tool: ${name}`, call(name, input), true);
 for (const [name, input] of [['read', {path: 'a'}], ['grep', {}], ['find', {}], ['ls', {}], ['bash', {command: 'git status'}],
-  ['zeron_list_chats', {}], ['zeron_read_chat', {}], ['zeron_show_visual', {}], ['web_search', {}], ['subagent', {}]])
+  ['zeron_list_chats', {}], ['zeron_read_chat', {}], ['zeron_show_visual', {}], ['web_search', {query: 'rust 2024'}],
+  ['web_fetch', {url: 'https://example.com'}], ['subagent', {}]])
   check(`tool: ${name}`, call(name, input), false);
 check('tool: marked read-only', call('mcp__x__deploy', {}, {readOnlyHint: true}), false);
 check('tool: marked destructive', call('mcp__x__thing', {}, {destructiveHint: true}), true);

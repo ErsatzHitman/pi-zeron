@@ -609,6 +609,10 @@ impl Harness for PiHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        // A session an agent started never starts on a reserved model.
+        if let Some(refusal) = mcp::launch_refusal(request.model.as_deref(), request.mcp.as_ref()) {
+            return Err(HarnessError::Protocol(refusal));
+        }
         let mut request = request;
         let store = sessions::Store::new(self.session_store.clone(), self.agent_dir.clone());
         let mut lost_context = None;

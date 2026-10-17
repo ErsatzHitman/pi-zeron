@@ -1757,6 +1757,9 @@ fn forwardable(method: &str) -> bool {
             | methods::CANCEL_INSTALL
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
+            // Pi's loop.json is on the device that runs it.
+            | methods::GET_ADVISOR_SETTINGS
+            | methods::SET_ADVISOR_SETTINGS
             | methods::GET_PI_SETTINGS
             | methods::SET_PI_SETTINGS
             | methods::SET_DELETE_GUARD
@@ -2275,6 +2278,23 @@ impl RpcService for EngineRpc {
                     .set_title_settings(p)
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&self.registry.title_settings())
+            }
+            methods::GET_ADVISOR_SETTINGS | methods::SET_ADVISOR_SETTINGS => {
+                use crate::advisor_settings::{self, AdvisorSettings};
+                let save: Option<AdvisorSettings> = if method == methods::SET_ADVISOR_SETTINGS {
+                    Some(parse_params(params)?)
+                } else {
+                    None
+                };
+                let dir = self.agent_accounts.pi_agent_dir();
+                let settings = tokio::task::spawn_blocking(move || match save {
+                    Some(settings) => advisor_settings::write(&dir, settings),
+                    None => Ok(advisor_settings::read(&dir)),
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&settings)
             }
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;

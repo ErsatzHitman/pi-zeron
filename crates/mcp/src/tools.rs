@@ -150,7 +150,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness. Select a project and/or device; catalogs are validated on that host. Set write: true for a session that changes code (in a git project it works in its own new worktree on a zeron/<name> branch, so parallel sessions never touch each other's files), false for one that only reads, searches and reports (every edit is blocked; it runs in the project folder). Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
+            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness. Select a project and/or device; catalogs are validated on that host. Set write: true for a session that changes code (in a git project it works in its own new worktree on a zeron/<name> branch, so parallel sessions never touch each other's files), false for one that only reads, searches and reports (every edit is blocked; it runs in the project folder). Claude Fable and GPT Astra class models are reserved for sessions the user starts: a session you create cannot use one, and when your own chat runs on one you must pass a different model. Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -159,7 +159,7 @@ fn catalog() -> Vec<ToolDef> {
                     "device": { "type": "string", "description": "Host device (id or name). With project, it must own that project. Without either, use the local engine." },
                     "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
                     "harness": { "type": "string", "description": "Harness id; Pi is the only harness, so omit it or pass \"pi\"." },
-                    "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default." },
+                    "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default. Claude Fable and GPT Astra class models are reserved for the user's own sessions and are refused here; when your chat runs on one, always pass a different model." },
                     "reasoning": { "type": "string", "enum": THINKING_LEVELS, "description": "Thinking level: off, minimal, low, medium, high, xhigh or max. Omit for the model's default. Pi runs the closest level the model supports at or below it." },
                     "write": { "type": "boolean", "default": true, "description": "true: the session may change files, and in a git project gets its own worktree. false: read-only; every edit is blocked." },
                     "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write", "description": "Usually leave unset and use write. read-only only with write false." },
@@ -1253,6 +1253,8 @@ impl Tools {
         // only a top-level chat starts side chats.
         let chats = self.zeron.chats().await?;
         self.ensure_not_paused(&chats).await?;
+        // The models of the chats launching this one, for the reserved check.
+        let mut launcher_models: Vec<String> = Vec::new();
         if let Some(origin) = self.zeron.origin().chat_id.as_deref() {
             let chat = self.zeron.resolve_chat(origin).await?;
             anyhow::ensure!(
@@ -1261,6 +1263,7 @@ impl Tools {
                 "Side chats cannot create chats. Ask your parent chat to create another side chat."
             );
             ensure_room_below(&chats, &chat)?;
+            launcher_models.extend(chat_model(&chat));
         }
         // Parent: the explicit `parent` argument, else the chat this server
         // speaks for. Resolved so a prefix/title works and a typo fails loud.
@@ -1311,7 +1314,9 @@ impl Tools {
             if orchestrated {
                 inherited_harness = chat.config.as_ref().map(|c| c.harness);
             }
+            launcher_models.extend(chat_model(&chat));
         }
+        ensure_model_not_reserved(args.model.as_deref(), &launcher_models)?;
         let (mut space, device_id) = self
             .zeron
             .resolve_target(args.project.as_deref(), args.device.as_deref())
@@ -2262,6 +2267,39 @@ fn ensure_room_below(chats: &[Chat], parent: &Chat) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The model a chat is configured with, if it names one.
+fn chat_model(chat: &Chat) -> Option<String> {
+    chat.config.as_ref()?.model.clone()
+}
+
+/// Refuse a session on a reserved model (Claude Fable, GPT Astra). Without a
+/// `model` the session runs on Pi's own default, which Zeron cannot see, so
+/// a launcher that itself runs on a reserved model must name another one.
+fn ensure_model_not_reserved(
+    model: Option<&str>,
+    launcher_models: &[String],
+) -> anyhow::Result<()> {
+    use zeron_proto::reserved_models::{refusal, reserved_family};
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(model) => anyhow::ensure!(
+            reserved_family(model).is_none(),
+            "{}",
+            refusal(model, "create_chat")
+        ),
+        None => {
+            if let Some(reserved) = launcher_models
+                .iter()
+                .find(|m| reserved_family(m).is_some())
+            {
+                anyhow::bail!(
+                    "create_chat needs a model: this chat runs on {reserved}, a Claude Fable or GPT Astra class model reserved for sessions the user starts, and a session created without `model` could start on it. Pass `model` with another model id from list_models, e.g. an Opus, Sonnet or GPT model."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The same folder, spelled with either separator, a trailing separator,
 /// or (Windows paths) another case.
 /// `whoami`'s `place`: the calling chat's role, task, parent and
@@ -3073,6 +3111,91 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+    }
+
+    #[tokio::test]
+    async fn create_chat_refuses_a_reserved_model_and_an_unnamed_one_from_a_reserved_chat() {
+        let reserved = json!({
+            "id": "chat-reserved", "deviceId": "dev-local", "title": "Reserved",
+            "archived": false, "spaceId": "space-1", "createdAt": "2026-09-03T00:00:00Z",
+            "config": { "harness": "claude-code", "model": "anthropic/claude-fable-5", "reasoning": null, "sandbox": "workspace-write" },
+        });
+        let world = Arc::new(World {
+            extra_chats: vec![reserved],
+            ..Default::default()
+        });
+        // An explicit reserved model is refused before the catalog is asked,
+        // from any chat.
+        for origin in [None, Some("chat-alpha-1"), Some("chat-reserved")] {
+            let tools = tools(
+                world.clone(),
+                Origin {
+                    chat_id: origin.map(str::to_owned),
+                    device_id: None,
+                },
+            );
+            for model in ["anthropic/claude-fable-5", "openai/gpt-6-astra-mini"] {
+                let err = tools
+                    .call(
+                        "create_chat",
+                        json!({ "project": "space-1", "model": model }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(err.contains("cannot start on"), "{err}");
+                assert!(err.contains("reserved"), "{err}");
+            }
+        }
+        // Without a model the child runs on Pi's default: fine from a chat on
+        // an ordinary model, refused from one on a reserved model.
+        let from_alpha = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        from_alpha
+            .call("create_chat", json!({ "project": "space-1" }))
+            .await
+            .unwrap();
+        let from_reserved = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-reserved".into()),
+                device_id: None,
+            },
+        );
+        let err = from_reserved
+            .call("create_chat", json!({ "project": "space-1" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Pass `model`"), "{err}");
+        // A reserved explicit parent counts as the launcher too.
+        let err = from_alpha
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "parent": "chat-reserved" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("Pass `model`"), "{err}");
+        // Naming another model works from the reserved chat.
+        from_reserved
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "model": "sonnet" }),
+            )
+            .await
+            .unwrap();
+        let created = world
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, params)| params["op"] == "createChat")
+            .count();
+        assert_eq!(created, 2, "only the two allowed sessions were written");
     }
 
     #[tokio::test]

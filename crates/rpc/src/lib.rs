@@ -49,6 +49,12 @@ pub mod methods {
     /// replies with the device's fresh `ListHarnesses` catalog.
     pub const GET_TITLE_SETTINGS: &str = "GetTitleSettings";
     pub const SET_TITLE_SETTINGS: &str = "SetTitleSettings";
+    /// The model Pi's advisor consults and its fallbacks, from this
+    /// device's `loop.json` (`AdvisorSettings`).
+    pub const GET_ADVISOR_SETTINGS: &str = "GetAdvisorSettings";
+    /// Save `{model: string|null, fallbacks: string[]}`; replies like
+    /// `GetAdvisorSettings`.
+    pub const SET_ADVISOR_SETTINGS: &str = "SetAdvisorSettings";
     /// This device's Pi executable setting and its live status.
     pub const GET_PI_SETTINGS: &str = "GetPiSettings";
     /// Save the Pi executable (`{executable: string|null}`); replies like `GetPiSettings`.

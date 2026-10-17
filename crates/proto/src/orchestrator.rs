@@ -56,11 +56,11 @@ const MAX_LABEL_CHARS: usize = 120;
 /// delegates, and has no coding prompt to fall back on.
 pub const ROOT_SYSTEM_PROMPT: &str = include_str!("orchestrator_root.md");
 /// The root's tools (Pi `--tools`): Zeron's delegation tools, read-only
-/// files, the planning extensions and uniichat's chat memory (zoom, search,
-/// date), which runs in an orchestrator's root and nowhere else. No bash,
-/// edits or MCP servers.
-pub const ROOT_TOOLS: &str = "zeron_*,read,ls,find,grep,ask_user,todo,goal_*,\
-memory_search,memory_read,memory_status,zoom,search,date";
+/// files, web search and fetch for research, the planning extensions and
+/// uniichat's chat memory (zoom, search, date), which runs in an
+/// orchestrator's root and nowhere else. No bash, edits or MCP servers.
+pub const ROOT_TOOLS: &str = "zeron_*,read,ls,find,grep,web_search,web_fetch,ask_user,todo,\
+goal_*,memory_search,memory_read,memory_status,zoom,search,date";
 const MEMBER_PROMPT: &str = include_str!("orchestrator_member.md");
 
 /// Where a run sits relative to an orchestrator tree.
@@ -568,8 +568,8 @@ mod tests {
         );
         assert_eq!(
             ROOT_TOOLS,
-            "zeron_*,read,ls,find,grep,ask_user,todo,goal_*,memory_search,memory_read,memory_status,\
-zoom,search,date"
+            "zeron_*,read,ls,find,grep,web_search,web_fetch,ask_user,todo,goal_*,memory_search,\
+memory_read,memory_status,zoom,search,date"
         );
     }
 }

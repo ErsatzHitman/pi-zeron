@@ -9,7 +9,7 @@
 //! never come back: the page sees labels and the last four characters.
 
 use gpui::{AnyElement, Context, Entity, SharedString, Subscription, Task, div, prelude::*, px};
-use zeron_engine::api_keys::{ApiKeysView, KeyView, ProviderView};
+use zeron_engine::api_keys::{ApiKeysView, KeyView, ProviderView, WEB_TOOLS_PROVIDER};
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -51,6 +51,8 @@ struct Form {
     key: Option<String>,
     label: Entity<ComposerInput>,
     secret: Entity<ComposerInput>,
+    /// Opened from the Web search & fetch card, and shown there.
+    web: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -205,10 +207,19 @@ impl ApiKeysPage {
             key: key.map(|k| k.id.clone()),
             label,
             secret,
+            web: false,
             _subs: subs,
         });
         self.armed = None;
         cx.notify();
+    }
+
+    /// The add or edit form for the web tools' DeepSeek key, in their card.
+    fn open_web_form(&mut self, key: Option<&KeyView>, cx: &mut Context<Self>) {
+        self.open_form(WEB_TOOLS_PROVIDER, key, cx);
+        if let Some(form) = &mut self.form {
+            form.web = true;
+        }
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
@@ -299,6 +310,7 @@ impl Render for ApiKeysPage {
                 if let Some(error) = &view.error {
                     column = column.child(widgets::error_strip(&theme, error.clone()).mt(px(16.0)));
                 }
+                column = column.child(self.render_web_tools(&view, &theme, cx));
                 let (with_keys, without): (Vec<&ProviderView>, Vec<&ProviderView>) = view
                     .providers
                     .iter()
@@ -309,7 +321,7 @@ impl Render for ApiKeysPage {
                 let form_on_hidden = self
                     .form
                     .as_ref()
-                    .is_some_and(|f| without.iter().any(|p| p.name == f.provider));
+                    .is_some_and(|f| !f.web && without.iter().any(|p| p.name == f.provider));
                 if self.show_all || form_on_hidden || with_keys.is_empty() {
                     for provider in &without {
                         column = column.child(self.render_provider(provider, &theme, cx));
@@ -359,6 +371,78 @@ impl Render for ApiKeysPage {
 }
 
 impl ApiKeysPage {
+    /// Pi's `web_search` and `web_fetch` use the DeepSeek key: always shown,
+    /// key or not, with its own add or update control.
+    fn render_web_tools(
+        &self,
+        view: &ApiKeysView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let provider = view.providers.iter().find(|p| p.name == WEB_TOOLS_PROVIDER);
+        let active = provider.and_then(|p| p.keys.iter().find(|k| k.active));
+        let mut card = widgets::section_card(theme).mt_0();
+        if let Some(form) = self.form.as_ref().filter(|f| f.web) {
+            card = card.child(self.render_form(form, true, theme, cx));
+        } else {
+            let status = match (active, provider) {
+                (Some(key), _) => format!("DeepSeek key {} · {}", key.masked, key.label),
+                (None, Some(p)) if !p.keys.is_empty() => {
+                    "Every DeepSeek key is turned off.".to_owned()
+                }
+                (
+                    None,
+                    Some(ProviderView {
+                        pi_login: Some(login),
+                        ..
+                    }),
+                ) => format!("Pi's own DeepSeek key ({login})"),
+                _ => "No DeepSeek key yet".to_owned(),
+            };
+            let key = active.cloned();
+            card = card.child(
+                widgets::card_row(theme, true)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_color(theme.text_muted)
+                            .child(status),
+                    )
+                    .child(
+                        widgets::text_action(
+                            theme,
+                            widgets::ActionTone::Outlined,
+                            if key.is_some() {
+                                "Update key"
+                            } else {
+                                "Add key"
+                            },
+                        )
+                        .id("api-keys-web-tools-key")
+                        .debug_selector(|| "api-keys-web-tools-key".into())
+                        .on_click(cx.listener(move |page, _, _, cx| {
+                            page.open_web_form(key.as_ref(), cx);
+                        })),
+                    ),
+            );
+        }
+        div()
+            .debug_selector(|| "api-keys-web-tools".into())
+            .mt(px(20.0))
+            .child(widgets::section_label(theme, "Web search & fetch"))
+            .child(
+                div()
+                    .px(px(8.0))
+                    .pb(px(6.0))
+                    .text_size(crate::typography::ui_rems(11.5))
+                    .text_color(theme.text_muted)
+                    .child("web_search and web_fetch use your DeepSeek API key."),
+            )
+            .child(card)
+            .into_any_element()
+    }
+
     fn render_provider(
         &self,
         provider: &ProviderView,
@@ -383,7 +467,7 @@ impl ApiKeysPage {
             card = card.child(self.render_key(provider, key, first, theme, cx));
             first = false;
         }
-        let editing_here = self.form.as_ref().filter(|f| f.provider == name);
+        let editing_here = self.form.as_ref().filter(|f| f.provider == name && !f.web);
         if let Some(form) = editing_here.filter(|f| f.key.is_none()) {
             card = card.child(self.render_form(form, first, theme, cx));
         } else {
@@ -445,7 +529,7 @@ impl ApiKeysPage {
         if let Some(form) = self
             .form
             .as_ref()
-            .filter(|f| f.provider == provider.name && f.key.as_deref() == Some(&key.id))
+            .filter(|f| !f.web && f.provider == provider.name && f.key.as_deref() == Some(&key.id))
         {
             return self.render_form(form, first, theme, cx).into_any_element();
         }

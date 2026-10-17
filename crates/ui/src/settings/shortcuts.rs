@@ -84,6 +84,8 @@ pub struct ShortcutsPage {
     semantic_access_prompted: bool,
     /// Settings → General's thread naming card (its own title-bound picker).
     thread_naming: Entity<crate::settings::thread_naming::ThreadNamingCard>,
+    /// Settings → General's advisor card (its own Pi-only pickers).
+    advisor: Entity<crate::settings::advisor::AdvisorCard>,
     /// Settings → General's Pi executable card.
     pi: Entity<crate::settings::pi::PiSettingsCard>,
     _state: Entity<AppState>,
@@ -129,6 +131,10 @@ impl ShortcutsPage {
             thread_naming: {
                 let state = state.clone();
                 cx.new(|cx| crate::settings::thread_naming::ThreadNamingCard::new(state, cx))
+            },
+            advisor: {
+                let state = state.clone();
+                cx.new(|cx| crate::settings::advisor::AdvisorCard::new(state, cx))
             },
             pi: {
                 let state = state.clone();
@@ -962,7 +968,8 @@ impl Render for ShortcutsPage {
                                             .child(pull_request_destination_row),
                                     ))
                                     .child(self.thread_naming.clone())
-                                    .child(self.pi.clone()),
+                                    .child(self.pi.clone())
+                                    .child(self.advisor.clone()),
                             ),
                     )
                     .fade_overflow_y(&self.scroll.scroll),
