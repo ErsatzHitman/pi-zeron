@@ -11,6 +11,9 @@ pub const ROOT_CHAT_TITLE: &str = "Orchestrator";
 /// Levels a tree may grow below its root: the root's sessions are level 1,
 /// the sessions they start level 2, and so on.
 pub const MAX_DEPTH: usize = 4;
+/// Live (non-archived) sessions one tree may hold below its root, the root
+/// itself excluded. The single source for every per-tree session limit.
+pub const MAX_LIVE_SESSIONS: usize = 16;
 
 /// Process env naming a run's place in a tree: `orchestrator`, `member`,
 /// or unset for a plain chat. User extensions read it too.
@@ -324,6 +327,15 @@ pub fn tree_members<'a>(chats: &'a [Chat], root_id: &str) -> Vec<&'a Chat> {
     members
 }
 
+/// Sessions below `root_id` that still count against [`MAX_LIVE_SESSIONS`]:
+/// [`tree_members`] without the archived ones (the root is never a member).
+pub fn live_members<'a>(chats: &'a [Chat], root_id: &str) -> Vec<&'a Chat> {
+    tree_members(chats, root_id)
+        .into_iter()
+        .filter(|chat| !chat.archived)
+        .collect()
+}
+
 /// How far below its orchestrator root `chat_id` is (0 for the root), or
 /// `None` outside an orchestrator tree.
 pub fn depth(chats: &[Chat], chat_id: &str) -> Option<usize> {
@@ -339,6 +351,12 @@ mod tests {
 
     fn chat(id: &str, parent: Option<&str>) -> Chat {
         titled(id, parent, None)
+    }
+
+    fn chat_archived(id: &str, parent: Option<&str>, archived: bool) -> Chat {
+        let mut chat = chat(id, parent);
+        chat.archived = archived;
+        chat
     }
 
     fn titled(id: &str, parent: Option<&str>, title: Option<&str>) -> Chat {
@@ -493,6 +511,24 @@ mod tests {
         let long = "x".repeat(500);
         assert_eq!(label(long).unwrap().len(), MAX_LABEL_CHARS);
         assert_eq!(label(" \n ".into()), None);
+    }
+
+    #[test]
+    fn live_members_skip_archived_and_the_root() {
+        let root = new_root_chat_id();
+        let chats = vec![
+            chat_archived(&root, None, false),
+            chat_archived("a", Some(&root), false),
+            chat_archived("b", Some(&root), true),
+            chat_archived("a1", Some("a"), false),
+            chat_archived("plain", None, false),
+        ];
+        let ids: Vec<&str> = live_members(&chats, &root)
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "a1"]);
+        assert!(live_members(&chats, "plain").is_empty());
     }
 
     #[test]
