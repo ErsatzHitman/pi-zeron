@@ -215,7 +215,7 @@ async fn repos_round_trip_add_branches_worktrees() {
 
     // Delete: dir removed, zeron branch removed, refs pruned.
     repos
-        .delete_worktree(&repo_dir, Path::new(&worktree.path))
+        .delete_worktree(&repo_dir, Path::new(&worktree.path), false)
         .await
         .expect("delete worktree");
     assert!(!PathBuf::from(&worktree.path).exists());
@@ -2306,6 +2306,47 @@ async fn rpc_dispatch_for_m5_methods() {
     assert_eq!(deleted["ok"], true);
     assert!(!PathBuf::from(&worktree_path).exists());
 
+    // A worktree holding a commit is refused until forced.
+    let unsafe_worktree = client
+        .call(
+            methods::CREATE_WORKTREE,
+            serde_json::json!({ "repoPath": repo_path, "branch": "main" }),
+        )
+        .await
+        .expect("CreateWorktree for unsafe delete");
+    let unsafe_path = unsafe_worktree["path"]
+        .as_str()
+        .expect("worktree path")
+        .to_string();
+    std::fs::write(PathBuf::from(&unsafe_path).join("b.txt"), "b\n").expect("write b.txt");
+    git(Path::new(&unsafe_path), &["add", "."]).await;
+    git(Path::new(&unsafe_path), &["commit", "-m", "work"]).await;
+    let refused = client
+        .call(
+            methods::DELETE_WORKTREE,
+            serde_json::json!({ "repoPath": repo_path, "worktreePath": unsafe_path }),
+        )
+        .await
+        .expect_err("unmerged commit refused");
+    assert!(
+        refused.to_string().contains("worktree_unsafe"),
+        "refusal carries the stable prefix: {refused}"
+    );
+    assert!(PathBuf::from(&unsafe_path).exists());
+    let forced = client
+        .call(
+            methods::DELETE_WORKTREE,
+            serde_json::json!({
+                "repoPath": repo_path,
+                "worktreePath": unsafe_path,
+                "force": true,
+            }),
+        )
+        .await
+        .expect("forced DeleteWorktree");
+    assert_eq!(forced["ok"], true);
+    assert!(!PathBuf::from(&unsafe_path).exists());
+
     core.workspace
         .create_space(
             "space-wrong-root",
@@ -2377,6 +2418,7 @@ async fn rpc_dispatch_for_m5_methods() {
             serde_json::json!({
                 "repoPath": repo_path,
                 "worktreePath": outcome.worktree.path,
+                "force": true,
             }),
         )
         .await
@@ -2580,4 +2622,174 @@ async fn rpc_dispatch_for_m5_methods() {
     );
 
     core.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// delete_worktree safety
+// ---------------------------------------------------------------------------
+
+/// A repo with one worktree off `main`; returns (tmp, repos, repo_dir, worktree).
+async fn worktree_fixture() -> (tempfile::TempDir, Repos, PathBuf, zeron_proto::Worktree) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(tmp.path());
+    let worktree = repos
+        .create_worktree(&repo_dir, "main")
+        .await
+        .expect("create worktree");
+    (tmp, repos, repo_dir, worktree)
+}
+
+async fn commit_file(cwd: &Path, name: &str) {
+    std::fs::write(cwd.join(name), "x\n").expect("write file");
+    git(cwd, &["add", "."]).await;
+    git(cwd, &["commit", "-m", name]).await;
+}
+
+#[tokio::test]
+async fn delete_worktree_refuses_unmerged_commits_then_force_deletes() {
+    let (_tmp, repos, repo_dir, wt) = worktree_fixture().await;
+    let wt_path = PathBuf::from(&wt.path);
+    commit_file(&wt_path, "b.txt").await;
+    let err = repos
+        .delete_worktree(&repo_dir, &wt_path, false)
+        .await
+        .expect_err("unmerged commit refused")
+        .to_string();
+    assert!(err.contains("worktree_unsafe"), "{err}");
+    assert!(err.contains(&wt.branch), "{err}");
+    assert!(err.contains("1 unmerged"), "{err}");
+    assert!(wt_path.exists());
+    assert!(
+        repos
+            .branches(&repo_dir)
+            .await
+            .expect("branches")
+            .contains(&wt.branch)
+    );
+
+    repos
+        .delete_worktree(&repo_dir, &wt_path, true)
+        .await
+        .expect("forced delete");
+    assert!(!wt_path.exists());
+    assert!(
+        !repos
+            .branches(&repo_dir)
+            .await
+            .expect("branches")
+            .contains(&wt.branch)
+    );
+}
+
+#[tokio::test]
+async fn delete_worktree_refuses_dirty_tree() {
+    let (_tmp, repos, repo_dir, wt) = worktree_fixture().await;
+    let wt_path = PathBuf::from(&wt.path);
+
+    std::fs::write(wt_path.join("untracked.txt"), "u").expect("untracked");
+    let err = repos
+        .delete_worktree(&repo_dir, &wt_path, false)
+        .await
+        .expect_err("untracked file refused")
+        .to_string();
+    assert!(
+        err.contains("worktree_unsafe") && err.contains("uncommitted"),
+        "{err}"
+    );
+    assert!(!err.contains("unmerged"), "{err}");
+    std::fs::remove_file(wt_path.join("untracked.txt")).expect("rm untracked");
+
+    std::fs::write(wt_path.join("a.txt"), "changed\n").expect("modify tracked");
+    let err = repos
+        .delete_worktree(&repo_dir, &wt_path, false)
+        .await
+        .expect_err("modified file refused")
+        .to_string();
+    assert!(err.contains("uncommitted"), "{err}");
+    assert!(wt_path.exists());
+
+    repos
+        .delete_worktree(&repo_dir, &wt_path, true)
+        .await
+        .expect("forced delete");
+    assert!(!wt_path.exists());
+}
+
+#[tokio::test]
+async fn delete_worktree_allows_merged_branch() {
+    let (_tmp, repos, repo_dir, wt) = worktree_fixture().await;
+    let wt_path = PathBuf::from(&wt.path);
+    commit_file(&wt_path, "b.txt").await;
+    git(&repo_dir, &["merge", "--ff-only", &wt.branch]).await;
+    repos
+        .delete_worktree(&repo_dir, &wt_path, false)
+        .await
+        .expect("merged branch deletes without force");
+    assert!(!wt_path.exists());
+    assert!(
+        !repos
+            .branches(&repo_dir)
+            .await
+            .expect("branches")
+            .contains(&wt.branch)
+    );
+}
+
+#[tokio::test]
+async fn delete_worktree_detached_head_unmerged_refused() {
+    let (_tmp, repos, repo_dir, wt) = worktree_fixture().await;
+    let wt_path = PathBuf::from(&wt.path);
+    git(&wt_path, &["checkout", "--detach"]).await;
+    commit_file(&wt_path, "b.txt").await;
+    let err = repos
+        .delete_worktree(&repo_dir, &wt_path, false)
+        .await
+        .expect_err("detached commits refused")
+        .to_string();
+    assert!(
+        err.contains("worktree_unsafe") && err.contains("1 unmerged"),
+        "{err}"
+    );
+    assert!(wt_path.exists());
+    repos
+        .delete_worktree(&repo_dir, &wt_path, true)
+        .await
+        .expect("forced delete");
+    assert!(!wt_path.exists());
+}
+
+#[tokio::test]
+async fn delete_worktree_non_zeron_branch_is_kept_and_not_commit_checked() {
+    let (_tmp, repos, repo_dir, wt) = worktree_fixture().await;
+    let wt_path = PathBuf::from(&wt.path);
+    git(&wt_path, &["checkout", "-b", "feature/x"]).await;
+    commit_file(&wt_path, "b.txt").await;
+    repos
+        .delete_worktree(&repo_dir, &wt_path, false)
+        .await
+        .expect("clean user branch worktree deletes");
+    assert!(!wt_path.exists());
+    assert!(
+        repos
+            .branches(&repo_dir)
+            .await
+            .expect("branches")
+            .contains(&"feature/x".to_string())
+    );
+}
+
+#[tokio::test]
+async fn delete_worktree_already_gone_is_idempotent() {
+    let (_tmp, repos, repo_dir, wt) = worktree_fixture().await;
+    let wt_path = PathBuf::from(&wt.path);
+    repos
+        .delete_worktree(&repo_dir, &wt_path, false)
+        .await
+        .expect("first delete");
+    repos
+        .delete_worktree(&repo_dir, &wt_path, false)
+        .await
+        .expect("second delete is a no-op");
 }

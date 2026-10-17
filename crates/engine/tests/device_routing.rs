@@ -1092,6 +1092,7 @@ async fn target_device_id_routes_over_the_relay() {
             serde_json::json!({
                 "repoPath": project_root,
                 "worktreePath": setup_worktree,
+                "force": true,
                 "targetDeviceId": "device-b",
             }),
         )

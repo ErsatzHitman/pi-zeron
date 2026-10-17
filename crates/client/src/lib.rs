@@ -44,6 +44,7 @@ pub use config::{
     AuthTokens, ClientConfig, Credentials, DemoFixture, DemoOptions, StreamSpeed, TranscriptScale,
 };
 pub use connectivity::{Connectivity, ConnectivityState, SendState};
+pub use client::is_worktree_unsafe;
 pub use error::ClientError;
 pub use events::{ClientEvent, ClientListener};
 pub use session::{

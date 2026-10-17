@@ -50,6 +50,9 @@ pub const HOME_FOLDER_MAX_RESULTS: usize = 50;
 const HOME_FOLDER_CANDIDATES: usize = 300;
 const HOME_FOLDER_PATH_CANDIDATES: usize = 2_000;
 const GITHUB_AVATAR_TIMEOUT: Duration = Duration::from_secs(6);
+/// Stable prefix of the error `delete_worktree` returns when it refuses to
+/// discard unmerged commits or uncommitted changes (clients match on it).
+pub use zeron_rpc::WORKTREE_UNSAFE_PREFIX;
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
 
@@ -1392,20 +1395,30 @@ impl Repos {
         self.current_branch(worktree_path).await
     }
 
-    /// Best-effort worktree removal (if it still exists), then prune stale refs.
-    /// Deletes the worktree's branch ONLY when zeron created it (`zeron/…`) — the
-    /// user may have checked out their own branch inside the worktree.
+    /// Remove a worktree (if it still exists), then prune stale refs. Deletes the
+    /// worktree's branch ONLY when zeron created it (`zeron/…`) — the user may
+    /// have checked out their own branch inside the worktree.
+    ///
+    /// Without `force`, refuses (a [`WORKTREE_UNSAFE_PREFIX`] error naming the
+    /// branch and commit count) when removal would discard unmerged commits or
+    /// uncommitted changes; nothing is touched in that case.
     pub async fn delete_worktree(
         &self,
         repo_path: &Path,
         worktree_path: &Path,
+        force: bool,
     ) -> Result<(), EngineError> {
-        let branch = if worktree_path.exists() {
+        let exists = worktree_path.exists();
+        let branch = if exists {
             self.current_branch(worktree_path).await.unwrap_or_default()
         } else {
             String::new()
         };
-        if worktree_path.exists() {
+        if !force {
+            self.ensure_worktree_safe_to_delete(repo_path, worktree_path, &branch, exists)
+                .await?;
+        }
+        if exists {
             let removed = self
                 .git(
                     &[
@@ -1427,6 +1440,94 @@ impl Repos {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
         Ok(())
+    }
+
+    /// Refuse (before anything is removed) when deleting would lose work: commits
+    /// on the doomed branch (or a detached HEAD) that no other branch contains,
+    /// or uncommitted/untracked files in the worktree. A failing probe is an
+    /// error, never "safe".
+    async fn ensure_worktree_safe_to_delete(
+        &self,
+        repo_path: &Path,
+        worktree_path: &Path,
+        branch: &str,
+        worktree_exists: bool,
+    ) -> Result<(), EngineError> {
+        let mut unmerged = 0u32;
+        if branch.starts_with("zeron/") {
+            let full = format!("refs/heads/{branch}");
+            let exists = self
+                .git_probe(
+                    &["rev-parse", "--verify", "--quiet", &full],
+                    Some(repo_path),
+                )
+                .await?
+                .is_some();
+            if exists {
+                // `--exclude` globs are relative to the `--branches` namespace.
+                let exclude = format!("--exclude={branch}");
+                let out = self
+                    .git(
+                        &[
+                            "rev-list",
+                            "--count",
+                            &full,
+                            "--not",
+                            &exclude,
+                            "--branches",
+                            "--remotes",
+                        ],
+                        Some(repo_path),
+                    )
+                    .await?;
+                unmerged = out.parse().unwrap_or(0);
+            }
+        } else if branch == "HEAD" && worktree_exists {
+            let out = self
+                .git(
+                    &[
+                        "rev-list",
+                        "--count",
+                        "HEAD",
+                        "--not",
+                        "--branches",
+                        "--remotes",
+                    ],
+                    Some(worktree_path),
+                )
+                .await?;
+            unmerged = out.parse().unwrap_or(0);
+        }
+        let dirty = if worktree_exists {
+            self.git(
+                &["status", "--porcelain", "--untracked-files=normal"],
+                Some(worktree_path),
+            )
+            .await?
+            .lines()
+            .count()
+        } else {
+            0
+        };
+        if unmerged == 0 && dirty == 0 {
+            return Ok(());
+        }
+        let label = if branch == "HEAD" {
+            "detached HEAD".to_string()
+        } else {
+            format!("branch {branch}")
+        };
+        let mut problems = Vec::new();
+        if unmerged > 0 {
+            problems.push(format!("{unmerged} unmerged commit(s)"));
+        }
+        if dirty > 0 {
+            problems.push(format!("{dirty} uncommitted change(s)"));
+        }
+        Err(EngineError::Other(format!(
+            "{WORKTREE_UNSAFE_PREFIX} {label} has {}; pass force to discard",
+            problems.join(" and ")
+        )))
     }
 
     // ── ListFolders ─────────────────────────────────────────────────────────

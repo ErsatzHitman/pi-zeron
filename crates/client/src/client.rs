@@ -1387,6 +1387,33 @@ impl Client {
         }
     }
 
+    /// Remove a worktree and its `zeron/*` branch. Without `force` the host
+    /// refuses when that would discard unmerged commits or uncommitted changes;
+    /// check the error with [`is_worktree_unsafe`] and confirm before retrying
+    /// with `force`.
+    pub async fn delete_worktree(
+        &self,
+        device_id: &str,
+        repo_path: &str,
+        worktree_path: &str,
+        force: bool,
+    ) -> Result<()> {
+        match self.inner.backend() {
+            Backend::Demo(demo) => demo.delete_worktree(repo_path, worktree_path).await,
+            Backend::Live(live) => {
+                let mut params =
+                    serde_json::json!({ "repoPath": repo_path, "worktreePath": worktree_path });
+                if force {
+                    params["force"] = serde_json::Value::Bool(true);
+                }
+                live.relay
+                    .call(device_id, zeron_rpc::methods::DELETE_WORKTREE, params)
+                    .await
+                    .map(|_| ())
+            }
+        }
+    }
+
     /// Chunked upload of one file to the host; returns its durable path there.
     pub async fn upload_attachment(
         &self,
@@ -1573,5 +1600,39 @@ mod tests {
         });
         assert_eq!(pending, 0);
         assert_eq!(title.as_deref(), Some("title 19"));
+    }
+}
+
+/// The host's explanation when `err` is a refused [`Client::delete_worktree`]
+/// (unmerged commits / uncommitted changes), so the caller can offer a forced
+/// retry.
+pub fn is_worktree_unsafe(err: &ClientError) -> Option<&str> {
+    let text = match err {
+        ClientError::HostError(text) | ClientError::Internal(text) => text.as_str(),
+        _ => return None,
+    };
+    let at = text.find(zeron_rpc::WORKTREE_UNSAFE_PREFIX)?;
+    Some(text[at + zeron_rpc::WORKTREE_UNSAFE_PREFIX.len()..].trim())
+}
+
+#[cfg(test)]
+mod worktree_unsafe_tests {
+    use super::*;
+
+    #[test]
+    fn detects_the_stable_prefix() {
+        let err = ClientError::HostError(
+            "worktree_unsafe: branch zeron/x has 2 unmerged commit(s); pass force to discard"
+                .into(),
+        );
+        assert_eq!(
+            is_worktree_unsafe(&err),
+            Some("branch zeron/x has 2 unmerged commit(s); pass force to discard")
+        );
+        assert_eq!(
+            is_worktree_unsafe(&ClientError::HostError("git: nope".into())),
+            None
+        );
+        assert_eq!(is_worktree_unsafe(&ClientError::Closed), None);
     }
 }
