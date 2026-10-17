@@ -741,8 +741,12 @@ fn status_of(session: Option<&Session>) -> (String, Option<i64>) {
     };
     let age = chrono::Utc::now() - session.updated_at;
     let stale = age > SESSION_STALE;
+    let queued = format!("queued for capacity (#{})", session.queue_position);
     let label = match session.status {
         SessionStatus::Working if stale => "working (stale — host may be offline)",
+        // Still `Working` for every wait; this only tells the parent why it
+        // has not started.
+        SessionStatus::Working if session.queue_position > 0 => queued.as_str(),
         SessionStatus::Working => "working",
         SessionStatus::AwaitingInput => "awaitingInput",
         SessionStatus::Errored => "errored",
@@ -2625,6 +2629,28 @@ mod tests {
         assert_eq!(writes.last().unwrap().1["chatId"], second);
     }
 
+    #[test]
+    fn status_of_reports_a_capacity_queue() {
+        let mut session = Session {
+            chat_id: "c".into(),
+            device_id: "dev-local".into(),
+            status: SessionStatus::Working,
+            started_at: None,
+            updated_at: chrono::Utc::now(),
+            last_completed_turn: None,
+            running_subagents: 0,
+            queue_position: 2,
+            subagents: Vec::new(),
+        };
+        assert_eq!(status_of(Some(&session)).0, "queued for capacity (#2)");
+        session.queue_position = 0;
+        assert_eq!(status_of(Some(&session)).0, "working");
+        // A stale row is stale first, queued or not.
+        session.queue_position = 2;
+        session.updated_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        assert!(status_of(Some(&session)).0.starts_with("working (stale"));
+    }
+
     #[tokio::test]
     async fn auto_steers_busy_chats_even_at_turn_boundaries_or_after_long_quiet_tools() {
         let world = Arc::new(World::default());
@@ -2638,6 +2664,7 @@ mod tests {
             updated_at: chrono::Utc::now() - chrono::Duration::minutes(10),
             last_completed_turn: None,
             running_subagents: 0,
+            queue_position: 0,
             subagents: Vec::new(),
         };
         // No mid-turn capability is required for a live mailbox delivery.

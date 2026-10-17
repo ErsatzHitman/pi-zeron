@@ -297,6 +297,7 @@ fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
         last_completed_turn: None,
         running_subagents: 0,
+        queue_position: 0,
         subagents: Vec::new(),
         chat_id: chat_id.into(),
         device_id: device_id.into(),

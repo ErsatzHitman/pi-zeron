@@ -329,6 +329,12 @@ pub struct Session {
     /// Empty from an engine that predates it.
     #[serde(default)]
     pub subagents: Vec<RunningSubagent>,
+    /// Waiting on engine capacity (the global running-turn cap): the 1-based
+    /// place in the start queue, 0 when not queued. A queued chat stays
+    /// `Working` so every status reader keeps its meaning; read it through
+    /// `view::queue_position`. 0 from an engine that predates it.
+    #[serde(default)]
+    pub queue_position: u32,
 }
 
 /// A subagent at work under a chat, as its session row carries it: a

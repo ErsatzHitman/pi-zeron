@@ -37,6 +37,50 @@ fn resource_limit_child() {
 }
 
 #[cfg(unix)]
+#[test]
+fn engine_raises_nofile_soft_limit_to_hard_limit() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "nofile_raise_child", "--nocapture"])
+        .env("ZERON_RESOURCE_TEST_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn nofile_raise_child() {
+    if std::env::var_os("ZERON_RESOURCE_TEST_CHILD").is_none() {
+        return;
+    }
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = 256.min(limit.rlim_max);
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+    let hard = limit.rlim_max as u64;
+    let want = hard.min(10_240);
+    let (before, after) = zeron_engine::raise_nofile_soft_limit().expect("limit readable");
+    assert_eq!(before, 256.min(hard));
+    assert_eq!(after, want);
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+    }
+    assert_eq!(limit.rlim_cur as u64, want);
+    // Idempotent: a second call reports the same pair and changes nothing.
+    assert_eq!(
+        zeron_engine::raise_nofile_soft_limit(),
+        Some((before, after))
+    );
+}
+
+#[cfg(unix)]
 async fn stress() {
     use futures::{SinkExt, StreamExt};
     use std::{sync::Arc, time::Duration};

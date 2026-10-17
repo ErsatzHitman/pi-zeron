@@ -74,6 +74,16 @@ pub fn running_subagents(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
         .map_or(0, |s| s.running_subagents)
 }
 
+/// A chat's place in the engine's start queue (1-based), or 0 when it is not
+/// waiting on capacity, under the same staleness gate as [`running_subagents`].
+/// Only a `Working` row can be queued. Pure.
+pub fn queue_position(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
+    session
+        .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
+        .filter(|s| s.status == SessionStatus::Working)
+        .map_or(0, |s| s.queue_position)
+}
+
 /// The subagents running under a chat, under the same staleness gate as
 /// [`running_subagents`]. Pure.
 pub fn running_subagent_list(session: Option<&Session>, now: DateTime<Utc>) -> &[RunningSubagent] {
@@ -307,6 +317,7 @@ mod gate_tests {
             started_at: None,
             updated_at,
             running_subagents: running,
+            queue_position: 0,
             subagents: (0..running)
                 .map(|ix| RunningSubagent {
                     doc_id: format!("sub-{ix}"),
@@ -333,6 +344,21 @@ mod gate_tests {
         assert_eq!(running_subagent_list(Some(&fresh), now).len(), 3);
         assert!(running_subagent_list(Some(&stale), now).is_empty());
         assert!(running_subagent_list(None, now).is_empty());
+    }
+
+    #[test]
+    fn queue_position_counts_only_a_fresh_working_row() {
+        let now = Utc::now();
+        let mut queued = running_session(0, now - chrono::Duration::seconds(10));
+        queued.queue_position = 2;
+        assert_eq!(queue_position(Some(&queued), now), 2);
+        let mut stale = queued.clone();
+        stale.updated_at = now - chrono::Duration::milliseconds(SESSION_STALE_MS + 1);
+        assert_eq!(queue_position(Some(&stale), now), 0);
+        let mut settled = queued.clone();
+        settled.status = SessionStatus::Idle;
+        assert_eq!(queue_position(Some(&settled), now), 0);
+        assert_eq!(queue_position(None, now), 0);
     }
 
     #[test]
