@@ -160,7 +160,7 @@ fn catalog() -> Vec<ToolDef> {
                     "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
                     "harness": { "type": "string", "description": "Harness id; Pi is the only harness, so omit it or pass \"pi\"." },
                     "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default." },
-                    "reasoning": { "type": "string", "description": "Reasoning level the model supports (e.g. low, medium, high, max)." },
+                    "reasoning": { "type": "string", "enum": THINKING_LEVELS, "description": "Thinking level: off, minimal, low, medium, high, xhigh or max. Omit for the model's default. Pi runs the closest level the model supports at or below it." },
                     "write": { "type": "boolean", "default": true, "description": "true: the session may change files, and in a git project gets its own worktree. false: read-only; every edit is blocked." },
                     "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write", "description": "Usually leave unset and use write. read-only only with write false." },
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
@@ -833,6 +833,9 @@ fn now_millis() -> i64 {
         .unwrap_or_default()
 }
 
+/// The thinking levels a parent may give a session it starts (Pi's own).
+const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 fn parse_enum<T: serde::de::DeserializeOwned>(what: &str, raw: &str) -> Result<T, String> {
     serde_json::from_value(Value::String(raw.trim().to_owned()))
         .map_err(|_| format!("unknown {what}: {raw:?}"))
@@ -1355,10 +1358,27 @@ impl Tools {
                     .join(", ")
             );
         }
-        let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
-            Some(raw) => Some(parse_enum("reasoning level", raw).map_err(anyhow::Error::msg)?),
+        // `off` is no effort level: Pi turns thinking off through its
+        // `pi_thinking` option, as the composer's picker does.
+        let thinking = args
+            .reasoning
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let thinking_off = thinking.is_some_and(|raw| raw.eq_ignore_ascii_case("off"));
+        let reasoning: Option<ReasoningLevel> = match thinking.filter(|_| !thinking_off) {
+            Some(raw) => Some(parse_enum("reasoning level", raw).map_err(|_| {
+                anyhow::anyhow!(
+                    "unknown reasoning level {raw:?}: use one of {}",
+                    THINKING_LEVELS.join(", ")
+                )
+            })?),
             None => None,
         };
+        let mut model_options = serde_json::Map::new();
+        if thinking_off {
+            model_options.insert("pi_thinking".into(), json!("off"));
+        }
         let write = args.write.unwrap_or(true);
         let sandbox: SandboxLevel = match args.sandbox.as_deref() {
             Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
@@ -1374,7 +1394,7 @@ impl Tools {
             harness,
             model: args.model.clone(),
             reasoning,
-            model_options: Default::default(),
+            model_options,
             sandbox,
         };
 
@@ -1455,7 +1475,7 @@ impl Tools {
             "project": space.as_ref().map(|s| json!({ "id": s.id, "name": s.display_name(), "path": s.path })),
             "harness": harness,
             "model": args.model,
-            "reasoning": reasoning,
+            "reasoning": if thinking_off { json!("off") } else { json!(reasoning) },
             "title": args.title,
             "parentChatId": parent_chat_id,
             "write": write,
@@ -3053,6 +3073,37 @@ mod tests {
         assert_eq!(writes[1].1["op"], "renameChat");
         assert_eq!(writes[2].0, methods::QUEUE_COMMAND);
         assert_eq!(writes[2].1["command"]["request"]["prompt"], "go");
+    }
+
+    #[tokio::test]
+    async fn a_parent_picks_the_sessions_thinking_level_or_turns_it_off() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let err = tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "reasoning": "extreme" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("off, minimal, low, medium, high, xhigh, max"), "{err}");
+        let high = tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "reasoning": "xhigh" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(high["reasoning"], "xhigh");
+        let off = tools
+            .call("create_chat", json!({ "project": "space-1", "reasoning": "off" }))
+            .await
+            .unwrap();
+        assert_eq!(off["reasoning"], "off");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["config"]["reasoning"], "xhigh");
+        assert_eq!(writes[1].1["config"]["reasoning"], Value::Null);
+        assert_eq!(writes[1].1["config"]["modelOptions"]["pi_thinking"], "off");
     }
 
     #[tokio::test]
