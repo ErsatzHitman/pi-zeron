@@ -641,11 +641,10 @@ struct ModelRowData {
     ambiguous: bool,
 }
 
-/// The group a model row lists under: the provider serving it (Anthropic,
-/// OpenAI, OpenCode Go, OpenRouter, … — see [`zeron_proto::model_provider`]),
-/// or the harness itself where nothing names one. Groups key on the
-/// provider, so one provider's models from every harness list together, and
-/// a provider signed in later groups under its own name with no change here.
+/// The group a model row lists under: the Pi provider serving it
+/// (Anthropic, OpenAI, OpenCode Go, OpenRouter, … — see
+/// [`zeron_proto::model_provider`]), or the harness where nothing names one.
+/// A provider signed in later groups under its own name with no change here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModelGroup {
     pub key: String,
@@ -653,15 +652,16 @@ pub(crate) struct ModelGroup {
     pub harness: HarnessId,
 }
 
-/// The provider a row's model comes from. The stand-in for a pick missing
-/// from the list carries prose, so only its id can name one.
+/// The Pi provider a row's model comes from. The stand-in for a pick
+/// missing from the list carries prose, so only its id can name one.
 fn row_provider(row: &ModelRowData) -> Option<zeron_proto::model_provider::ModelProvider> {
-    if row.selected_only {
-        return zeron_proto::model_provider::single_provider(row.harness)
-            .and_then(zeron_proto::model_provider::resolve)
-            .or_else(|| zeron_proto::model_provider::of_id(&row.model.id));
+    if row.harness != HarnessId::Pi {
+        return None;
     }
-    zeron_proto::model_provider::of_model(row.harness, &row.model)
+    if row.selected_only {
+        return zeron_proto::model_provider::of_id(&row.model.id);
+    }
+    zeron_proto::model_provider::of_model(&row.model)
 }
 
 fn row_group(row: &ModelRowData) -> ModelGroup {
@@ -691,14 +691,11 @@ fn group_by_provider(rows: &mut [ModelRowData]) {
     rows.sort_by_cached_key(|row| first[&row_group(row).key]);
 }
 
-/// What a row shows beside its name: the provider wherever the harness
-/// spans providers, otherwise the description only to tell identically
-/// named rows apart (and never a repeat of the harness name).
+/// What a row shows beside its name: its Pi provider, otherwise the
+/// description only to tell identically named rows apart (and never a
+/// repeat of the harness name).
 fn row_attribution(row: &ModelRowData) -> Option<SharedString> {
-    zeron_proto::model_provider::single_provider(row.harness)
-        .is_none()
-        .then(|| row_provider(row))
-        .flatten()
+    row_provider(row)
         .map(|provider| provider.name)
         .or_else(|| {
             row.ambiguous
@@ -4787,9 +4784,8 @@ impl Pickers {
         let harness_name = row.harness_name.clone();
         let harness = row.harness;
         let star_model = row.model.id.clone();
-        // The provider rides beside the name wherever a harness spans
-        // providers; elsewhere the description appears only to tell
-        // identically-named rows apart.
+        // A Pi row's provider rides beside the name; elsewhere the
+        // description appears only to tell identically-named rows apart.
         let attribution = row_attribution(row);
         let compact = self.model_rail == ModelRail::Harness;
         let mut el = div()
@@ -5945,7 +5941,9 @@ fn scoped_model_rows<'a>(
                 }
                 let by_label = popover::match_rank(query, &model.label);
                 // The provider's id finds its models too ("opencode-go").
-                let provider = zeron_proto::model_provider::of_model(descriptor.id, model)
+                let provider = (descriptor.id == HarnessId::Pi)
+                    .then(|| zeron_proto::model_provider::of_model(model))
+                    .flatten()
                     .map(|p| p.key)
                     .unwrap_or_default();
                 let by_description = popover::match_rank(
@@ -9187,12 +9185,16 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(
                     group_keys(&picker.compact_groups(cx)),
-                    vec![(Some("openai"), 0), (Some("anthropic"), 2)]
+                    vec![(Some("harness:Codex"), 0), (Some("harness:ClaudeCode"), 2)]
                 );
                 picker.toggle_model_favorite(HarnessId::Codex, "gpt-a", cx);
                 assert_eq!(
                     group_keys(&picker.compact_groups(cx)),
-                    vec![(None, 0), (Some("openai"), 1), (Some("anthropic"), 2)]
+                    vec![
+                        (None, 0),
+                        (Some("harness:Codex"), 1),
+                        (Some("harness:ClaudeCode"), 2),
+                    ]
                 );
                 let rows = picker.model_rows(cx);
                 assert_eq!(
@@ -9280,7 +9282,7 @@ mod tests {
                 // A chat's provider is fixed: one tab, its own.
                 assert_eq!(
                     group_keys(&picker.compact_groups(cx)),
-                    vec![(Some("openai"), 0)]
+                    vec![(Some("harness:Codex"), 0)]
                 );
                 picker.compact_model_list = false;
                 picker.focus_on_mount = true;
@@ -9517,42 +9519,31 @@ mod tests {
         assert_eq!(row_attribution(&row), None);
     }
 
-    /// Every harness's models group by the provider serving them: one
-    /// provider from two harnesses is one group, Pi's provider names come
-    /// as ids (older engines) or names alike, and a provider Zeron has never
-    /// heard of still gets its own group.
+    /// Pi's models group by the provider serving them: names come as ids
+    /// (older engines) or Pi's own names alike, and a provider Zeron has
+    /// never heard of still gets its own group under a readable name.
     #[test]
-    fn models_group_by_provider_across_harnesses() {
-        let descriptors = vec![
-            descriptor(HarnessId::ClaudeCode, "Claude"),
-            descriptor(HarnessId::Pi, "Pi"),
-            descriptor(HarnessId::Codex, "Codex"),
-        ];
+    fn pi_models_group_by_provider_id_or_name() {
+        let descriptors = vec![descriptor(HarnessId::Pi, "Pi")];
         let model = |id: &str, provider: &str| {
             let mut model = bare_model(id, id.rsplit('/').next().unwrap());
             model.description = Some(provider.into());
             model
         };
-        let claude = vec![bare_model("opus", "Opus")];
         let pi = vec![
             model("opencode-go/glm-5.3", "OpenCode Go"),
             model("openai/gpt-5.5", "openai"),
             model("anthropic/claude-opus-5-5", "Anthropic"),
             model("acme/fast", "acme"),
             model("opencode-go/kimi-k3", "opencode-go"),
+            model("openai/gpt-5.5-mini", "OpenAI"),
         ];
-        let codex = vec![bare_model("gpt-5.5-codex", "GPT-5.5 Codex")];
         let rows = scoped_model_rows(
             "",
-            ModelRail::All,
-            None,
+            ModelRail::Harness,
+            Some(HarnessId::Pi),
             &descriptors,
-            |harness| match harness {
-                HarnessId::ClaudeCode => Some(claude.as_slice()),
-                HarnessId::Pi => Some(pi.as_slice()),
-                HarnessId::Codex => Some(codex.as_slice()),
-                _ => None,
-            },
+            |harness| (harness == HarnessId::Pi).then_some(pi.as_slice()),
             |_, _| false,
         );
         let order: Vec<_> = rows
@@ -9562,27 +9553,30 @@ mod tests {
         assert_eq!(
             order,
             [
-                ("anthropic".to_string(), "opus"),
-                ("anthropic".to_string(), "anthropic/claude-opus-5-5"),
                 ("opencode-go".to_string(), "opencode-go/glm-5.3"),
                 ("opencode-go".to_string(), "opencode-go/kimi-k3"),
                 ("openai".to_string(), "openai/gpt-5.5"),
-                ("openai".to_string(), "gpt-5.5-codex"),
+                ("openai".to_string(), "openai/gpt-5.5-mini"),
+                ("anthropic".to_string(), "anthropic/claude-opus-5-5"),
                 ("acme".to_string(), "acme/fast"),
             ]
         );
-        let names: Vec<_> = rows.iter().map(|r| row_group(r).name.to_string()).collect();
-        assert_eq!(names[2], "OpenCode Go");
-        assert_eq!(names[4], "OpenAI");
-        assert_eq!(names[6], "Acme");
-        // Single-provider harnesses don't repeat their provider on each row.
-        assert_eq!(row_attribution(&rows[0]), None);
-        assert_eq!(row_attribution(&rows[5]), None);
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|r| row_attribution(r).unwrap().to_string())
+            .collect();
         assert_eq!(
-            row_attribution(&rows[1]).map(|a| a.to_string()),
-            Some("Anthropic".to_string())
+            shown,
+            [
+                "OpenCode Go",
+                "OpenCode Go",
+                "OpenAI",
+                "OpenAI",
+                "Anthropic",
+                "Acme"
+            ]
         );
-        // A provider's id finds its models from inside a tab.
+        // A provider's id finds its models.
         let found = scoped_model_rows(
             "opencode-go",
             ModelRail::Harness,
