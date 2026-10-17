@@ -77,6 +77,7 @@ impl Harness for RecordingHarness {
                 result: None,
                 error: None,
                 session_id: Some("sess-np".into()),
+                class: None,
             }),
         ];
         Ok(futures::stream::iter(events).boxed())

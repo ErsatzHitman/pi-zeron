@@ -95,6 +95,7 @@ impl Harness for SmokeHarness {
                     result: None,
                     error: None,
                     session_id: Some(session_id),
+                    class: None,
                 },
             ],
         };

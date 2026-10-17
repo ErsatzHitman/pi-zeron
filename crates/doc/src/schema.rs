@@ -92,6 +92,9 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Failure class of an `error` part (additive; old docs lack it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_class: Option<serde_json::Value>,
     /// Fork seam (`kind: "fork"`, additive): the chat the history above was
     /// copied from, and its title at the time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,10 +218,14 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             resolved: Some(*resolved),
             ..Default::default()
         },
-        MessagePart::Error { id, message } => DocPartJson {
+        MessagePart::Error { id, message, class } => DocPartJson {
             id: id.clone(),
             kind: "error".into(),
             message: Some(message.clone()),
+            error_class: class
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
             ..Default::default()
         },
         MessagePart::Fork {
@@ -248,6 +255,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             None => MessagePart::Error {
                 id: p.id,
                 message: "Visual unavailable".into(),
+                class: None,
             },
         },
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
@@ -288,6 +296,9 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "error" => MessagePart::Error {
             id: p.id,
             message: p.message.unwrap_or_default(),
+            class: p
+                .error_class
+                .and_then(|class| serde_json::from_value(class).ok()),
         },
         "reasoning" => MessagePart::Reasoning {
             id: p.id,
@@ -330,6 +341,7 @@ fn image_part(
         _ => MessagePart::Error {
             id,
             message: "Generated image unavailable".into(),
+            class: None,
         },
     }
 }
@@ -759,6 +771,7 @@ impl SessionDoc {
                 &MessagePart::Error {
                     id: part_id.to_string(),
                     message: message.to_string(),
+                    class: None,
                 },
             )?;
             self.doc.commit();
@@ -960,6 +973,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
+    }
+    if let Some(class) = &doc_part.error_class {
+        map.insert("errorClass", loro_value_from_json(class))?;
     }
     for (key, value) in [
         ("sourceChatId", &doc_part.source_chat_id),
@@ -1166,6 +1182,7 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         return Some(MessagePart::Error {
             id,
             message: message.to_owned(),
+            class: None,
         });
     }
     None
@@ -1419,6 +1436,9 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    if let Some(class) = &doc_part.error_class {
+        map.insert("errorClass", loro_value_from_json(class))?;
+    }
     if let Some(output) = &doc_part.output {
         map.insert("output", output.as_str())?;
     }
@@ -1647,6 +1667,46 @@ mod tests {
             ),
             MessagePart::Visual { .. }
         ));
+    }
+
+    #[test]
+    fn error_part_class_round_trips_and_old_docs_read_as_none() {
+        let doc = SessionDoc::init("errors").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![];
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("429 too many requests".into()),
+                session_id: None,
+                class: Some(zeron_proto::ErrorClass::RateLimited { resets_at: Some(5) }),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Error {
+                message: "plain".into(),
+            },
+        );
+        writer.sync(&parts).unwrap();
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        let loaded = SessionDoc::from_doc(imported);
+        let read = loaded.read_entries().unwrap()[0].parts.clone();
+        assert_eq!(read, parts);
+        assert!(matches!(
+            &read[0],
+            MessagePart::Error { class: Some(zeron_proto::ErrorClass::RateLimited { resets_at: Some(5) }), .. }
+        ));
+        assert!(matches!(&read[1], MessagePart::Error { class: None, .. }));
+        // A doc written before the key existed.
+        let old = from_doc_part(
+            serde_json::from_value(serde_json::json!({"kind":"error","id":"e","message":"boom"}))
+                .unwrap(),
+        );
+        assert!(matches!(old, MessagePart::Error { class: None, .. }));
     }
 
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {

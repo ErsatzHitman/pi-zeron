@@ -66,6 +66,7 @@ async fn terminal_contract_handles_normal_errors_retries_compaction_and_consumed
     for (prompt, status) in [
         ("hello", DoneStatus::Completed),
         ("error", DoneStatus::Errored),
+        ("quota", DoneStatus::Errored),
         ("reject", DoneStatus::Errored),
         ("retry", DoneStatus::Completed),
         ("compact", DoneStatus::Completed),
@@ -99,6 +100,56 @@ async fn terminal_contract_handles_normal_errors_retries_compaction_and_consumed
             assert_eq!(text, "reply:hello");
         }
     }
+}
+
+#[tokio::test]
+async fn failed_runs_carry_a_failure_class() {
+    use zeron_proto::ErrorClass;
+    let done_class = |events: &[AgentEvent]| -> Option<ErrorClass> {
+        events.iter().find_map(|e| match e {
+            AgentEvent::Done { class, .. } => Some(class.clone()),
+            _ => None,
+        })?
+    };
+    for (prompt, want) in [
+        (
+            "quota",
+            Some(ErrorClass::QuotaExhausted { resets_at: None }),
+        ),
+        (
+            "auth",
+            Some(ErrorClass::AuthRequired {
+                provider: Some("anthropic".into()),
+            }),
+        ),
+        ("overload", Some(ErrorClass::ProviderOverloaded)),
+        ("error", Some(ErrorClass::Other)),
+        ("reject", Some(ErrorClass::Other)),
+        (
+            "reject-auth",
+            Some(ErrorClass::AuthRequired { provider: None }),
+        ),
+        ("retry", None),
+        ("hello", None),
+    ] {
+        let events = collect(prompt).await;
+        assert_eq!(done_class(&events), want, "{prompt}: {events:?}");
+    }
+    let events = collect("limit").await;
+    let Some(ErrorClass::RateLimited {
+        resets_at: Some(at),
+    }) = done_class(&events)
+    else {
+        panic!("limit: {events:?}");
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(
+        (at - now - 30_000).abs() < 5_000,
+        "reset in about 30s: {at} vs {now}"
+    );
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
-use zeron_proto::ToolCall;
+use zeron_proto::{ErrorClass, ToolCall};
 
 #[derive(Debug, Clone, Copy)]
 pub struct RenderOptions {
@@ -51,6 +51,21 @@ pub struct RenderedMessage {
     pub pending_input: Option<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    /// What kind of failure `errors` describe, when the harness classified
+    /// it: `{class, hint, resetsAt, provider}`. `class` lets an orchestrator
+    /// decide whether to retry later or ask the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Value>,
+}
+
+/// The wire form of a failure class.
+fn failure_json(class: &ErrorClass) -> Value {
+    json!({
+        "class": class.slug(),
+        "hint": class.hint(),
+        "resetsAt": class.resets_at(),
+        "provider": class.provider(),
+    })
 }
 
 /// Render entries in order, folding continuation entries into the message
@@ -93,6 +108,9 @@ fn fold_into(parent: &mut RenderedMessage, child: RenderedMessage) {
     }
     parent.tools.extend(child.tools);
     parent.errors.extend(child.errors);
+    if child.failure.is_some() {
+        parent.failure = child.failure;
+    }
     if child.pending_input.is_some() {
         parent.pending_input = child.pending_input;
     }
@@ -108,6 +126,7 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
     let mut tools = Vec::new();
     let mut pending_input = None;
     let mut errors = Vec::new();
+    let mut failure = None;
     for part in &entry.parts {
         match part {
             MessagePart::Text { text, .. } => {
@@ -146,7 +165,12 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
                     }));
                 }
             }
-            MessagePart::Error { message, .. } => errors.push(message.clone()),
+            MessagePart::Error { message, class, .. } => {
+                errors.push(message.clone());
+                if failure.is_none() {
+                    failure = class.as_ref().map(failure_json);
+                }
+            }
             // The fork seam is a transcript marker, not agent content: an
             // orchestrator reads the copied history as ordinary turns.
             MessagePart::Fork { .. } => {}
@@ -164,6 +188,7 @@ fn render_one(entry: &SessionMessageEntry, options: RenderOptions) -> RenderedMe
         tools,
         pending_input,
         errors,
+        failure,
     }
 }
 
@@ -300,6 +325,45 @@ mod tests {
             Some("req-1")
         );
         assert_eq!(rendered[1].created_at_iso, "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn classified_errors_surface_as_a_failure() {
+        let error = |class| MessagePart::Error {
+            id: "e".into(),
+            message: "401 Unauthorized".into(),
+            class,
+        };
+        let classed = render_entries(
+            &[entry(
+                "a1",
+                MessageRole::Assistant,
+                vec![error(Some(ErrorClass::AuthRequired {
+                    provider: Some("anthropic".into()),
+                }))],
+            )],
+            RenderOptions::default(),
+        );
+        let failure = classed[0].failure.as_ref().unwrap();
+        assert_eq!(failure["class"], "authRequired");
+        assert_eq!(failure["provider"], "anthropic");
+        assert_eq!(failure["resetsAt"], Value::Null);
+        assert!(failure["hint"].as_str().unwrap().contains("anthropic"));
+        assert_eq!(classed[0].errors, ["401 Unauthorized"]);
+        let json = serde_json::to_value(&classed[0]).unwrap();
+        assert_eq!(json["failure"]["class"], "authRequired");
+
+        let plain = render_entries(
+            &[entry("a2", MessageRole::Assistant, vec![error(None)])],
+            RenderOptions::default(),
+        );
+        assert!(plain[0].failure.is_none());
+        assert!(
+            serde_json::to_value(&plain[0])
+                .unwrap()
+                .get("failure")
+                .is_none()
+        );
     }
 
     #[test]

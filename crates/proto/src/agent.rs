@@ -504,7 +504,8 @@ pub const VISUAL_MAX_TOTAL_ASSET_BYTES: usize = 10 * 1024 * 1024;
 // assets base64-encoded; that message must fit the engine's 16 MiB frame
 // (tungstenite's default), with room for the script escaped as JSON.
 const _: () = assert!(
-    VISUAL_MAX_TOTAL_ASSET_BYTES.div_ceil(3) * 4 + VISUAL_MAX_BYTES * 6 + 64 * 1024 < 16 * 1024 * 1024
+    VISUAL_MAX_TOTAL_ASSET_BYTES.div_ceil(3) * 4 + VISUAL_MAX_BYTES * 6 + 64 * 1024
+        < 16 * 1024 * 1024
 );
 
 /// Whether `name` can name a visual's asset: a plain file name.
@@ -691,6 +692,102 @@ pub enum DoneStatus {
     Errored,
 }
 
+/// Why a run failed, when the failure text is recognisable. Informational:
+/// it picks the hint the UI shows and what orchestrators are told, and never
+/// triggers a resume or failover. `Other` is the conservative default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ErrorClass {
+    /// `resets_at` is unix ms when the provider said when it clears.
+    #[serde(rename_all = "camelCase")]
+    RateLimited {
+        resets_at: Option<i64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    QuotaExhausted {
+        resets_at: Option<i64>,
+    },
+    #[serde(rename_all = "camelCase")]
+    AuthRequired {
+        provider: Option<String>,
+    },
+    ProviderOverloaded,
+    SessionGone,
+    Other,
+}
+
+impl ErrorClass {
+    /// Stable camelCase name of the class (the serde `kind`).
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ErrorClass::RateLimited { .. } => "rateLimited",
+            ErrorClass::QuotaExhausted { .. } => "quotaExhausted",
+            ErrorClass::AuthRequired { .. } => "authRequired",
+            ErrorClass::ProviderOverloaded => "providerOverloaded",
+            ErrorClass::SessionGone => "sessionGone",
+            ErrorClass::Other => "other",
+        }
+    }
+
+    /// The `resets_at` (unix ms) of a class that carries one.
+    pub fn resets_at(&self) -> Option<i64> {
+        match self {
+            ErrorClass::RateLimited { resets_at } | ErrorClass::QuotaExhausted { resets_at } => {
+                *resets_at
+            }
+            _ => None,
+        }
+    }
+
+    /// The provider an `AuthRequired` failure names.
+    pub fn provider(&self) -> Option<&str> {
+        match self {
+            ErrorClass::AuthRequired { provider } => provider.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// One line telling the user what to do next; `None` for `Other`.
+    pub fn hint(&self) -> Option<String> {
+        Some(match self {
+            ErrorClass::AuthRequired { provider } => match provider.as_deref() {
+                Some(p) => format!("Log in to {p} again (Settings > Accounts)"),
+                None => "Log in again (Settings > Accounts)".to_string(),
+            },
+            ErrorClass::RateLimited { resets_at } => match resets_at.and_then(local_time_label) {
+                Some(at) => format!("Rate limited; try again after {at}"),
+                None => "Rate limited; try again shortly".to_string(),
+            },
+            ErrorClass::QuotaExhausted { resets_at } => {
+                let base = "Usage limit reached; wait for it to reset or switch account or model";
+                match resets_at.and_then(local_time_label) {
+                    Some(at) => format!("{base} (resets {at})"),
+                    None => base.to_string(),
+                }
+            }
+            ErrorClass::ProviderOverloaded => {
+                "The provider is overloaded; try again in a moment".to_string()
+            }
+            ErrorClass::SessionGone => {
+                "Pi no longer has this session; start a new chat".to_string()
+            }
+            ErrorClass::Other => return None,
+        })
+    }
+}
+
+/// `3:04 PM` in the host's local zone, or `Mon 3:04 PM` when more than a day
+/// out; `None` for an unrepresentable timestamp.
+fn local_time_label(ms: i64) -> Option<String> {
+    use chrono::{Local, TimeZone};
+    let at = Local.timestamp_millis_opt(ms).single()?;
+    let far = at.signed_duration_since(Local::now()) > chrono::Duration::hours(24);
+    Some(
+        at.format(if far { "%a %-I:%M %p" } else { "%-I:%M %p" })
+            .to_string(),
+    )
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors zeron's `AgentEvent` tagged enum.
@@ -807,6 +904,9 @@ pub enum AgentEvent {
         result: Option<String>,
         error: Option<String>,
         session_id: Option<String>,
+        /// What kind of failure `error` is, when the harness could tell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<ErrorClass>,
     },
     /// A USER-role message injected into a running session — today only seen
     /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its
@@ -836,6 +936,82 @@ pub enum AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_class_round_trips_and_done_stays_compatible() {
+        let class = ErrorClass::RateLimited {
+            resets_at: Some(1_700_000_000_000),
+        };
+        let json = serde_json::to_value(&class).unwrap();
+        assert_eq!(json["kind"], "rateLimited");
+        assert_eq!(json["resetsAt"], 1_700_000_000_000i64);
+        assert_eq!(serde_json::from_value::<ErrorClass>(json).unwrap(), class);
+
+        // A journal written before the field existed.
+        let old =
+            r#"{"type":"done","status":"errored","result":null,"error":"x","sessionId":null}"#;
+        let ev: AgentEvent = serde_json::from_str(old).unwrap();
+        assert!(matches!(ev, AgentEvent::Done { class: None, .. }));
+
+        let plain = AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("x".into()),
+            session_id: None,
+            class: None,
+        };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("class"));
+        let classed = AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some("x".into()),
+            session_id: None,
+            class: Some(ErrorClass::SessionGone),
+        };
+        let json = serde_json::to_string(&classed).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), classed);
+    }
+
+    #[test]
+    fn error_class_hints() {
+        let auth = ErrorClass::AuthRequired {
+            provider: Some("openai-codex".into()),
+        };
+        assert!(
+            auth.hint()
+                .unwrap()
+                .starts_with("Log in to openai-codex again")
+        );
+        assert_eq!(auth.slug(), "authRequired");
+        assert!(
+            ErrorClass::AuthRequired { provider: None }
+                .hint()
+                .unwrap()
+                .starts_with("Log in again")
+        );
+        assert_eq!(
+            ErrorClass::RateLimited { resets_at: None }.hint().unwrap(),
+            "Rate limited; try again shortly"
+        );
+        let soon = chrono::Utc::now().timestamp_millis() + 60_000;
+        assert!(
+            ErrorClass::RateLimited {
+                resets_at: Some(soon)
+            }
+            .hint()
+            .unwrap()
+            .starts_with("Rate limited; try again after ")
+        );
+        assert!(
+            ErrorClass::QuotaExhausted { resets_at: None }
+                .hint()
+                .unwrap()
+                .starts_with("Usage limit reached")
+        );
+        assert!(ErrorClass::ProviderOverloaded.hint().is_some());
+        assert!(ErrorClass::SessionGone.hint().is_some());
+        assert_eq!(ErrorClass::Other.hint(), None);
+    }
 
     #[test]
     fn agent_event_round_trips() {

@@ -169,6 +169,7 @@ impl Harness for InstantHarness {
                 result: None,
                 error: None,
                 session_id: Some("hs-relay".into()),
+                class: None,
             }),
         ])
         .boxed())

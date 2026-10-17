@@ -795,6 +795,7 @@ pub fn default_registry() -> HarnessRegistry {
                 result: None,
                 error: None,
                 session_id: None,
+                class: None,
             },
         ],
     }));

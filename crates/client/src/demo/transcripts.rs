@@ -460,6 +460,7 @@ fn errored(host: &str, now: i64) -> Vec<SessionMessageEntry> {
             MessagePart::Error {
                 id: "e0".into(),
                 message: "Harness exited with status 1: rate limited — retry in 2m".into(),
+                class: None,
             },
         ],
     );

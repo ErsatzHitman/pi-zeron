@@ -194,7 +194,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "wait_for_turn",
-            description: "Block until a chat is no longer working: returns completed, awaitingInput (answer with respond_to_input), errored, or timedOut, with the newest assistant message.",
+            description: "Block until a chat is no longer working: returns completed, awaitingInput (answer with respond_to_input), errored, or timedOut, with the newest assistant message. When errored, failure.class says why when known: retry later on rateLimited or providerOverloaded, ask the user on authRequired or quotaExhausted.",
             input_schema: chat_key_schema(json!({
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
             })),
@@ -891,6 +891,11 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
 
 fn last_pending_input(messages: &[RenderedMessage]) -> Option<Value> {
     messages.iter().rev().find_map(|m| m.pending_input.clone())
+}
+
+/// The classified failure of the newest reply that has one.
+fn failure_of(replies: &[RenderedMessage]) -> Option<Value> {
+    replies.iter().rev().find_map(|m| m.failure.clone())
 }
 
 // ---- dispatch ----------------------------------------------------------------
@@ -2137,13 +2142,17 @@ impl Tools {
             tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
         }
         let (status, _) = status_of(session.as_ref());
-        Ok(json!({
+        let mut turn = json!({
             "outcome": outcome,
             "status": status,
             "timedOut": outcome == TurnOutcome::TimedOut,
             "pendingInput": last_pending_input(&rendered),
             "replies": replies,
-        }))
+        });
+        if let Some(failure) = failure_of(&replies) {
+            turn["failure"] = failure;
+        }
+        Ok(turn)
     }
 }
 
@@ -2256,6 +2265,35 @@ mod tests {
     use futures::StreamExt;
     use std::sync::Mutex;
     use zeron_rpc::{RpcError, RpcReply, RpcService, memory_client, methods};
+
+    #[test]
+    fn failure_of_reports_the_newest_classified_reply() {
+        let reply = |id: &str, class: Option<zeron_proto::ErrorClass>| {
+            let entry = zeron_doc::SessionMessageEntry {
+                duration_ms: None,
+                id: id.into(),
+                role: zeron_doc::MessageRole::Assistant,
+                parts: vec![zeron_doc::MessagePart::Error {
+                    id: "e".into(),
+                    message: "boom".into(),
+                    class,
+                }],
+                created_at: 0,
+                device_id: "d".into(),
+                status: None,
+                continuation_of: None,
+            };
+            render_entries(&[entry], RenderOptions::default()).remove(0)
+        };
+        assert_eq!(failure_of(&[]), None);
+        assert_eq!(failure_of(&[reply("a", None)]), None);
+        let replies = [
+            reply("a", Some(zeron_proto::ErrorClass::SessionGone)),
+            reply("b", Some(zeron_proto::ErrorClass::ProviderOverloaded)),
+            reply("c", None),
+        ];
+        assert_eq!(failure_of(&replies).unwrap()["class"], "providerOverloaded");
+    }
 
     /// Two devices with distinct catalogs and repeated project paths, plus
     /// two chats with a two-message transcript. Writes are recorded for assertions.

@@ -1138,6 +1138,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: norm.session_id.clone(),
+                        class: None,
                     });
                     if event_tx.send(Ok(done)).await.is_err() {
                         break 'main;
@@ -1210,6 +1211,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: norm.session_id.clone(),
+                    class: None,
                 }))
                 .await;
         } else if !interrupted && !any_done {
@@ -1220,6 +1222,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(crate::crash_message("claude", status, &stderr_tail)),
                     session_id: norm.session_id.clone(),
+                    class: None,
                 }))
                 .await;
         }

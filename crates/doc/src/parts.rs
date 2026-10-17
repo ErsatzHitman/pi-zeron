@@ -211,6 +211,10 @@ pub enum MessagePart {
     Error {
         id: String,
         message: String,
+        /// What kind of failure `message` is, when the harness could tell
+        /// (drives the UI hint and what orchestrators are told).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<zeron_proto::ErrorClass>,
     },
     /// The seam in a forked chat's transcript: everything above was copied
     /// from `source_chat_id` when the fork was cut, everything below is this
@@ -450,14 +454,16 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
             out.push(MessagePart::Error {
                 id,
                 message: message.clone(),
+                class: None,
             });
         }
-        AgentEvent::Done { error, .. } => {
+        AgentEvent::Done { error, class, .. } => {
             if let Some(message) = error {
                 let id = format!("e{}", out.len());
                 out.push(MessagePart::Error {
                     id,
                     message: message.clone(),
+                    class: class.clone(),
                 });
             }
         }
@@ -1312,6 +1318,7 @@ mod tests {
                     result: None,
                     error: None,
                     session_id: None,
+                    class: None,
                 }),
             },
         );
@@ -1377,6 +1384,7 @@ mod tests {
                     result: None,
                     error: None,
                     session_id: None,
+                    class: None,
                 }),
             },
         );

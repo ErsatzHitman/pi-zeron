@@ -634,6 +634,7 @@ impl ChildStream {
                     result: None,
                     error,
                     session_id: Some(child.to_owned()),
+                    class: None,
                 }]
             }
             "error" => vec![AgentEvent::Error {

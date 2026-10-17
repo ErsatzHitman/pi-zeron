@@ -93,6 +93,7 @@ impl DevinTracker {
                     result: None,
                     error: None,
                     session_id: None,
+                    class: None,
                 },
             ));
             return events;
@@ -147,6 +148,7 @@ impl DevinTracker {
                         result: None,
                         error: None,
                         session_id: None,
+                        class: None,
                     },
                 )
             })

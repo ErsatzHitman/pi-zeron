@@ -46,6 +46,7 @@ impl Harness for Capture {
                 result: None,
                 error: None,
                 session_id: Some("side-provider-session".into()),
+                class: None,
             }),
         ])
         .boxed())
@@ -549,6 +550,7 @@ impl Harness for Warm {
                     result: None,
                     error: None,
                     session_id: Some("warm-session".into()),
+                    class: None,
                 }),
             ]
         };
@@ -745,6 +747,7 @@ impl Harness for Dropping {
                 result: None,
                 error: None,
                 session_id: Some("drop-session".into()),
+                class: None,
             }),
         ];
         let release = self.release.clone();
@@ -1006,6 +1009,7 @@ impl Harness for CaptureAs {
                 result: None,
                 error: None,
                 session_id: Some("side-pi-session".into()),
+                class: None,
             }),
         ])
         .boxed())

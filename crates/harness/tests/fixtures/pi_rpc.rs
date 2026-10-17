@@ -29,9 +29,25 @@ fn disposition(v: &Value, disposition: &str) {
     response(v, json!({ "disposition": disposition }));
 }
 fn message(text: &str, stop: &str) {
-    emit(
-        json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":text}],"stopReason":stop,"errorMessage":"mock provider failure","usage":{"input":12,"output":3}}}),
-    );
+    message_err(text, stop, "mock provider failure", None);
+}
+fn message_err(text: &str, stop: &str, error: &str, provider: Option<&str>) {
+    let mut message = json!({"role":"assistant","content":[{"type":"text","text":text}],"stopReason":stop,"errorMessage":error,"usage":{"input":12,"output":3}});
+    if let Some(provider) = provider {
+        message["provider"] = json!(provider);
+    }
+    emit(json!({"type":"message_end","message":message}));
+}
+/// The failures a prompt of that name makes the provider report: the error
+/// text and the provider it came from.
+fn provider_failure(text: &str) -> Option<(&'static str, Option<&'static str>)> {
+    Some(match text {
+        "quota" => ("insufficient_quota: You exceeded your current quota", Some("openai")),
+        "auth" => ("No API key found for anthropic", Some("anthropic")),
+        "limit" => ("429 rate limit exceeded, retry after 30 seconds", Some("anthropic")),
+        "overload" => ("529 overloaded_error", Some("anthropic")),
+        _ => return None,
+    })
 }
 /// PIUI emulation (the user's `00-piui.ts` hub): one envelope per notify,
 /// a process-wide `agentSeq`, and nothing published before `hello`.
@@ -269,9 +285,14 @@ fn main() {
                 if text == "which-model" {
                     text = format!("{model}/{thinking}");
                 }
-                if text == "reject" {
+                if text == "reject" || text == "reject-auth" {
+                    let error = if text == "reject" {
+                        "preflight rejected"
+                    } else {
+                        "No API key found for anthropic"
+                    };
                     emit(
-                        json!({"type":"response","id":v["id"],"command":"prompt","success":false,"error":"preflight rejected"}),
+                        json!({"type":"response","id":v["id"],"command":"prompt","success":false,"error":error}),
                     );
                     continue;
                 }
@@ -427,6 +448,8 @@ fn main() {
                             message("", "aborted");
                         } else if text == "error" {
                             message("", "error");
+                        } else if let Some((error, provider)) = provider_failure(&text) {
+                            message_err("", "error", error, provider);
                         } else {
                             emit(json!({"type":"message_start","message":{"role":"assistant"}}));
                             emit(

@@ -48,6 +48,7 @@ fn done(status: DoneStatus) -> AgentEvent {
         result: None,
         error: None,
         session_id: Some("hs-1".into()),
+        class: None,
     }
 }
 
@@ -2535,6 +2536,7 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
         result: Some("done".into()),
         error: None,
         session_id: None,
+        class: None,
     });
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(MockHarness { script }));
