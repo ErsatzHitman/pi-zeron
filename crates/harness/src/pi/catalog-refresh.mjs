@@ -5,8 +5,29 @@
 // start late, or (inside the pi.dev catalog's 4 h window) hours late.
 // `force` skips that window; Zeron asks for it on its first probe after it
 // opens. A refresh that fails or times out leaves the stored catalog.
+// Afterwards it names every available model's provider the way Pi does
+// (`ZERON-PROVIDERS {"names":{"opencode-go":"OpenCode Go"}}`), so the picker
+// groups by provider name for providers Zeron has never heard of too.
 export const REFRESH_COMMAND = "pi_ui_refresh_models";
 export const REFRESH_TIMEOUT_MS = 20_000;
+export const PROVIDERS_PREFIX = "ZERON-PROVIDERS ";
+
+export function providerNames(registry) {
+  const names = {};
+  if (typeof registry?.getAvailable !== "function") return names;
+  for (const model of registry.getAvailable()) {
+    const id = model?.provider;
+    if (typeof id !== "string" || id in names) continue;
+    let name;
+    try {
+      name = registry.getProviderDisplayName?.(id);
+    } catch {
+      // A provider without a name keeps its id.
+    }
+    names[id] = typeof name === "string" && name.trim() ? name.trim() : id;
+  }
+  return names;
+}
 
 export async function refreshModels(registry, force, env = process.env) {
   if (typeof registry?.refresh !== "function") return;
@@ -23,6 +44,10 @@ export default function zeronCatalogRefresh(pi) {
     description: "Refresh model catalogs for Zeron's model picker",
     handler: async (args, ctx) => {
       await refreshModels(ctx.modelRegistry, String(args ?? "").trim() === "force");
+      ctx.ui?.notify?.(
+        PROVIDERS_PREFIX + JSON.stringify({ names: providerNames(ctx.modelRegistry) }),
+        "info",
+      );
     },
   });
 }

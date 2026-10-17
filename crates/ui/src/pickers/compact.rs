@@ -386,14 +386,18 @@ impl Pickers {
     }
 
     /// Where each provider's group starts in the unsearched list: starred
-    /// models first, then one run per provider.
-    pub(super) fn compact_groups(&self, cx: &App) -> Vec<(Option<HarnessId>, usize)> {
+    /// models first (`None`), then one run per provider — Anthropic, OpenAI,
+    /// OpenCode Go, … whichever harness serves them (see `ModelGroup`).
+    pub(super) fn compact_groups(&self, cx: &App) -> Vec<(Option<super::ModelGroup>, usize)> {
         let rows = self.model_rows(cx);
-        let mut groups: Vec<(Option<HarnessId>, usize)> = Vec::new();
+        let mut groups: Vec<(Option<super::ModelGroup>, usize)> = Vec::new();
         for (ix, row) in rows.iter().enumerate() {
-            let group =
-                (!self.defaults.is_favorite(row.harness, &row.model.id)).then_some(row.harness);
-            if groups.last().is_none_or(|(last, _)| *last != group) {
+            let group = (!self.defaults.is_favorite(row.harness, &row.model.id))
+                .then(|| super::row_group(row));
+            let same = |last: &Option<super::ModelGroup>| {
+                last.as_ref().map(|g| &g.key) == group.as_ref().map(|g| &g.key)
+            };
+            if groups.last().is_none_or(|(last, _)| !same(last)) {
                 groups.push((group, ix));
             }
         }
@@ -421,10 +425,10 @@ impl Pickers {
             .iter()
             .rev()
             .find(|(_, start)| *start <= top)
-            .map(|(group, _)| *group);
+            .map(|(_, start)| *start);
         // Many providers overflow the strip: keep the viewed tab in sight
         // as the list scrolls, without fighting a manual sideways scroll.
-        let viewed_ix = groups.iter().position(|(group, _)| current == Some(*group));
+        let viewed_ix = groups.iter().position(|(_, start)| current == Some(*start));
         if viewed_ix != self.compact_strip_viewed {
             self.compact_strip_viewed = viewed_ix;
             if let Some(ix) = viewed_ix {
@@ -443,21 +447,16 @@ impl Pickers {
                 .overflow_x_scroll()
                 .track_scroll(&self.compact_strip_scroll)
                 .children(groups.into_iter().map(|(group, start)| {
-                    let viewed = current == Some(group);
-                    let (icon, tint, name): (&'static str, Option<gpui::Hsla>, SharedString) =
-                        match group {
-                            None => (crate::icons::STAR_BOLD, None, "Starred".into()),
-                            Some(harness) => {
-                                let (icon, tint) = harness_brand_icon(harness);
-                                let name = self
-                                    .rail_descriptors(cx)
-                                    .into_iter()
-                                    .find(|d| d.id == harness)
-                                    .map(|d| d.name)
-                                    .unwrap_or_default();
-                                (icon, tint, name.into())
-                            }
-                        };
+                    let viewed = current == Some(start);
+                    // A provider with a brand mark wears it; any other shows
+                    // its initial, its name in the tooltip.
+                    let (mark, name) = match &group {
+                        None => (
+                            Some((crate::icons::STAR_BOLD, None)),
+                            SharedString::from("Starred"),
+                        ),
+                        Some(group) => (provider_brand_icon(group), group.name.clone()),
+                    };
                     let hint = name.clone();
                     div()
                         .id(SharedString::from(format!("compact-group-{start}")))
@@ -485,9 +484,22 @@ impl Pickers {
                                 .scroll_to_item_strict(start, gpui::ScrollStrategy::Top);
                             cx.notify();
                         }))
-                        .child(crate::icons::icon(icon).size(px(14.0)).text_color(
-                            tint.unwrap_or(if viewed { theme.text } else { theme.text_muted }),
-                        ))
+                        .child(match mark {
+                            Some((icon, tint)) => crate::icons::icon(icon)
+                                .size(px(14.0))
+                                .text_color(tint.unwrap_or(if viewed {
+                                    theme.text
+                                } else {
+                                    theme.text_muted
+                                }))
+                                .into_any_element(),
+                            None => div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(if viewed { theme.text } else { theme.text_muted })
+                                .child(monogram(&name))
+                                .into_any_element(),
+                        })
                 }));
             // Each side fades over the tabs hidden past it, up to one tab
             // pitch, reaching zero exactly at the clip edge.

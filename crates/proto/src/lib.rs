@@ -12,6 +12,7 @@ pub mod entities;
 pub mod extension_ui;
 pub mod file_mentions;
 pub mod invocation;
+pub mod model_provider;
 pub mod motion;
 pub mod orchestrator;
 pub mod orchestrator_project;

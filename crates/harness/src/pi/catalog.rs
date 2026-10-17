@@ -27,14 +27,36 @@ pub(super) fn refresh_prompt(force: bool) -> Value {
     let args = if force { " force" } else { "" };
     json!({"type":"prompt","message":format!("/{REFRESH_COMMAND}{args}")})
 }
+const PROVIDERS_PREFIX: &str = "ZERON-PROVIDERS ";
+/// Provider id → Pi's display name, from the refresh's notify.
+type ProviderNames = std::collections::HashMap<String, String>;
+/// The provider names a notify carries, when it is the refresh's answer. A
+/// "name" that is only the id again leaves the provider to Zeron's naming.
+fn providers_notice(frame: &Value) -> Option<ProviderNames> {
+    if frame["type"] != "extension_ui_request" || frame["method"] != "notify" {
+        return None;
+    }
+    let payload = frame["message"].as_str()?.strip_prefix(PROVIDERS_PREFIX)?;
+    let answer: Value = serde_json::from_str(payload).ok()?;
+    Some(
+        answer["names"]
+            .as_object()?
+            .iter()
+            .filter_map(|(id, name)| Some((id.clone(), name.as_str()?.trim().to_owned())))
+            .filter(|(id, name)| !name.is_empty() && name != id)
+            .collect(),
+    )
+}
 /// Run the refresh when this Pi lists the command: an unknown `/command`
 /// would go to the model as a prompt. A failed or slow refresh leaves the
-/// stored catalog, which the probe then reads as before.
-async fn refresh(process: &mut Process, force: bool, backlog: &mut Vec<Value>) {
+/// stored catalog, which the probe then reads as before. Answers Pi's name
+/// for each available model's provider, empty when the refresh didn't run.
+async fn refresh(process: &mut Process, force: bool, backlog: &mut Vec<Value>) -> ProviderNames {
     let commands = match process.query(json!({"type":"get_commands"}), backlog).await {
         Ok(commands) => commands,
         Err(error) => {
-            return tracing::debug!(%error, "Pi listed no commands; catalog not refreshed");
+            tracing::debug!(%error, "Pi listed no commands; catalog not refreshed");
+            return ProviderNames::new();
         }
     };
     let listed = commands["commands"]
@@ -43,18 +65,22 @@ async fn refresh(process: &mut Process, force: bool, backlog: &mut Vec<Value>) {
         .flatten()
         .any(|c| c["name"] == REFRESH_COMMAND);
     if !listed {
-        return;
+        return ProviderNames::new();
     }
-    match tokio::time::timeout(
+    let asked = tokio::time::timeout(
         REFRESH_TIMEOUT,
         process.query(refresh_prompt(force), backlog),
     )
-    .await
-    {
+    .await;
+    match asked {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => tracing::debug!(%error, "Pi refused the catalog refresh"),
         Err(_) => tracing::debug!("Pi's catalog refresh timed out"),
     }
+    backlog
+        .iter()
+        .find_map(providers_notice)
+        .unwrap_or_default()
 }
 /// `refresh`: refresh the catalogs first (`Some(force)`), when this Pi
 /// loaded the refresh extension.
@@ -63,8 +89,9 @@ pub(super) async fn models(
     refresh_first: Option<bool>,
 ) -> Result<Vec<Model>, HarnessError> {
     let mut backlog = vec![];
+    let mut names = ProviderNames::new();
     if let Some(force) = refresh_first {
-        refresh(process, force, &mut backlog).await;
+        names = refresh(process, force, &mut backlog).await;
         backlog.clear();
     }
     let data = process
@@ -89,7 +116,13 @@ pub(super) async fn models(
         result.push(Model {
             id: format!("{provider}/{id}"),
             label: model["name"].as_str().unwrap_or(id).into(),
-            description: Some(provider.into()),
+            // The picker groups by provider: Pi's name for it, else Zeron's.
+            description: Some(
+                names
+                    .get(provider)
+                    .cloned()
+                    .unwrap_or_else(|| zeron_proto::model_provider::display_name(provider)),
+            ),
             reasoning_levels: levels(&supported),
             options: thinking_option(&supported),
         });
@@ -322,6 +355,23 @@ fn is_queue_mode(mode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_refresh_names_each_provider_the_way_pi_does() {
+        assert!(REFRESH_SOURCE.contains(&format!("\"{PROVIDERS_PREFIX}\"")));
+        let notify = |message: &str| json!({"type":"extension_ui_request","method":"notify","message":message});
+        let names = providers_notice(&notify(
+            r#"ZERON-PROVIDERS {"names":{"opencode-go":"OpenCode Go","acme":" ","x":1,"y":"y"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names["opencode-go"], "OpenCode Go");
+        assert!(providers_notice(&notify("ZERON-COMPLETIONS {}")).is_none());
+        assert!(
+            providers_notice(&json!({"type":"extension_ui_request","method":"setStatus"}))
+                .is_none()
+        );
+    }
 
     #[test]
     fn the_catalog_refresh_is_a_hidden_extension_command() {

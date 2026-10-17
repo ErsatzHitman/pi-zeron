@@ -641,48 +641,74 @@ struct ModelRowData {
     ambiguous: bool,
 }
 
-/// The provider a model comes from, for harnesses whose catalog spans
-/// providers: Pi and OpenCode ship the provider in `description`.
-fn model_provider(harness: HarnessId, model: &Model) -> Option<&str> {
-    if !matches!(harness, HarnessId::Pi | HarnessId::Opencode) {
-        return None;
-    }
-    model
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
+/// The group a model row lists under: the provider serving it (Anthropic,
+/// OpenAI, OpenCode Go, OpenRouter, … — see [`zeron_proto::model_provider`]),
+/// or the harness itself where nothing names one. Groups key on the
+/// provider, so one provider's models from every harness list together, and
+/// a provider signed in later groups under its own name with no change here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelGroup {
+    pub key: String,
+    pub name: SharedString,
+    pub harness: HarnessId,
 }
 
-/// One harness's models grouped by provider, providers in the order they
-/// first appear and models in catalog order within each — the same model
-/// from two providers then sits in two labelled groups.
-fn grouped_by_provider(harness: HarnessId, models: &[Model]) -> Vec<&Model> {
-    let mut first: HashMap<&str, usize> = HashMap::new();
-    for model in models {
-        if let Some(provider) = model_provider(harness, model) {
-            let next = first.len();
-            first.entry(provider).or_insert(next);
-        }
+/// The provider a row's model comes from. The stand-in for a pick missing
+/// from the list carries prose, so only its id can name one.
+fn row_provider(row: &ModelRowData) -> Option<zeron_proto::model_provider::ModelProvider> {
+    if row.selected_only {
+        return zeron_proto::model_provider::single_provider(row.harness)
+            .and_then(zeron_proto::model_provider::resolve)
+            .or_else(|| zeron_proto::model_provider::of_id(&row.model.id));
     }
-    let mut grouped: Vec<&Model> = models.iter().collect();
-    grouped.sort_by_key(|model| model_provider(harness, model).map_or(usize::MAX, |p| first[p]));
-    grouped
+    zeron_proto::model_provider::of_model(row.harness, &row.model)
+}
+
+fn row_group(row: &ModelRowData) -> ModelGroup {
+    match row_provider(row) {
+        Some(provider) => ModelGroup {
+            key: provider.key,
+            name: provider.name.into(),
+            harness: row.harness,
+        },
+        None => ModelGroup {
+            key: format!("harness:{:?}", row.harness),
+            name: row.harness_name.clone(),
+            harness: row.harness,
+        },
+    }
+}
+
+/// Rows grouped by provider: groups in the order they first appear, rows in
+/// list order within each — the same model from two providers then sits in
+/// two groups.
+fn group_by_provider(rows: &mut [ModelRowData]) {
+    let mut first: HashMap<String, usize> = HashMap::new();
+    for row in rows.iter() {
+        let next = first.len();
+        first.entry(row_group(row).key).or_insert(next);
+    }
+    rows.sort_by_cached_key(|row| first[&row_group(row).key]);
 }
 
 /// What a row shows beside its name: the provider wherever the harness
 /// spans providers, otherwise the description only to tell identically
 /// named rows apart (and never a repeat of the harness name).
 fn row_attribution(row: &ModelRowData) -> Option<SharedString> {
-    model_provider(row.harness, &row.model)
+    zeron_proto::model_provider::single_provider(row.harness)
+        .is_none()
+        .then(|| row_provider(row))
+        .flatten()
+        .map(|provider| provider.name)
         .or_else(|| {
             row.ambiguous
                 .then(|| row.model.description.as_deref().map(str::trim))
                 .flatten()
                 .filter(|d| !d.is_empty())
+                .map(str::to_owned)
         })
         .filter(|d| !d.eq_ignore_ascii_case(row.harness_name.as_ref()))
-        .map(|d| SharedString::from(d.to_owned()))
+        .map(SharedString::from)
 }
 
 /// Flag rows whose label another listed row of the same harness shares.
@@ -4761,9 +4787,9 @@ impl Pickers {
         let harness_name = row.harness_name.clone();
         let harness = row.harness;
         let star_model = row.model.id.clone();
-        // The provider rides beside the name for Pi and OpenCode, whose
-        // catalogs offer one model under many providers; elsewhere the
-        // description appears only to tell identically-named rows apart.
+        // The provider rides beside the name wherever a harness spans
+        // providers; elsewhere the description appears only to tell
+        // identically-named rows apart.
         let attribution = row_attribution(row);
         let compact = self.model_rail == ModelRail::Harness;
         let mut el = div()
@@ -5918,11 +5944,16 @@ fn scoped_model_rows<'a>(
                     continue;
                 }
                 let by_label = popover::match_rank(query, &model.label);
+                // The provider's id finds its models too ("opencode-go").
+                let provider = zeron_proto::model_provider::of_model(descriptor.id, model)
+                    .map(|p| p.key)
+                    .unwrap_or_default();
                 let by_description = popover::match_rank(
                     query,
                     &format!(
-                        "{} {}",
+                        "{} {} {}",
                         model.description.as_deref().unwrap_or(""),
+                        provider,
                         model.label
                     ),
                 )
@@ -5950,12 +5981,13 @@ fn scoped_model_rows<'a>(
                 let Some(models) = models_for(descriptor.id) else {
                     continue;
                 };
-                for model in grouped_by_provider(descriptor.id, models) {
+                for model in models {
                     if rail == ModelRail::All || is_favorite(descriptor.id, &model.id) {
                         rows.push(row(descriptor, model));
                     }
                 }
             }
+            group_by_provider(&mut rows);
             if rail == ModelRail::All {
                 rows.sort_by_key(|row| !is_favorite(row.harness, &row.model.id));
             }
@@ -5968,15 +6000,12 @@ fn scoped_model_rows<'a>(
             let Some(models) = models_for(descriptor.id) else {
                 return Vec::new();
             };
-            let (starred, rest): (Vec<&Model>, Vec<&Model>) =
-                grouped_by_provider(descriptor.id, models)
-                    .into_iter()
-                    .partition(|m| is_favorite(descriptor.id, &m.id));
-            starred
-                .into_iter()
-                .chain(rest)
-                .map(|model| row(descriptor, model))
-                .collect()
+            let mut rows: Vec<ModelRowData> =
+                models.iter().map(|model| row(descriptor, model)).collect();
+            group_by_provider(&mut rows);
+            // Stable: stars first, each part still grouped.
+            rows.sort_by_key(|row| !is_favorite(descriptor.id, &row.model.id));
+            rows
         }
     }
 }
@@ -6098,6 +6127,33 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
     }
+}
+
+/// The brand mark for a provider group, where Zeron ships one; a group
+/// named for its harness wears the harness's.
+pub(crate) fn provider_brand_icon(
+    group: &ModelGroup,
+) -> Option<(&'static str, Option<gpui::Hsla>)> {
+    match group.key.as_str() {
+        "anthropic" => Some((
+            crate::icons::CLAUDE_MARK,
+            Some(crate::icons::claude_brand()),
+        )),
+        "openai" | "openai-codex" => Some((crate::icons::OPENAI_MARK, None)),
+        "xai" => Some((crate::icons::GROK_MARK, None)),
+        "opencode" | "opencode-go" => Some((crate::icons::OPENCODE_MARK, None)),
+        key if key.starts_with("harness:") => Some(harness_brand_icon(group.harness)),
+        _ => None,
+    }
+}
+
+/// A provider's initial, for a tab with no brand mark.
+pub(crate) fn monogram(name: &str) -> SharedString {
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_else(|| "?".into())
+        .into()
 }
 
 /// `ZERON_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
@@ -7731,6 +7787,14 @@ mod tests {
         });
     }
 
+    /// Compact groups by provider key, `None` for the starred run.
+    fn group_keys(groups: &[(Option<ModelGroup>, usize)]) -> Vec<(Option<&str>, usize)> {
+        groups
+            .iter()
+            .map(|(group, start)| (group.as_ref().map(|g| g.key.as_str()), *start))
+            .collect()
+    }
+
     fn bare_model(id: &str, label: &str) -> Model {
         Model {
             id: id.into(),
@@ -9122,17 +9186,13 @@ mod tests {
                 // starred models from every provider.
                 picker.show_compact_models(cx);
                 assert_eq!(
-                    picker.compact_groups(cx),
-                    vec![(Some(HarnessId::Codex), 0), (Some(HarnessId::ClaudeCode), 2)]
+                    group_keys(&picker.compact_groups(cx)),
+                    vec![(Some("openai"), 0), (Some("anthropic"), 2)]
                 );
                 picker.toggle_model_favorite(HarnessId::Codex, "gpt-a", cx);
                 assert_eq!(
-                    picker.compact_groups(cx),
-                    vec![
-                        (None, 0),
-                        (Some(HarnessId::Codex), 1),
-                        (Some(HarnessId::ClaudeCode), 2),
-                    ]
+                    group_keys(&picker.compact_groups(cx)),
+                    vec![(None, 0), (Some("openai"), 1), (Some("anthropic"), 2)]
                 );
                 let rows = picker.model_rows(cx);
                 assert_eq!(
@@ -9219,8 +9279,8 @@ mod tests {
                 picker.search.update(cx, |input, cx| input.set_text("", cx));
                 // A chat's provider is fixed: one tab, its own.
                 assert_eq!(
-                    picker.compact_groups(cx),
-                    vec![(Some(HarnessId::Codex), 0)]
+                    group_keys(&picker.compact_groups(cx)),
+                    vec![(Some("openai"), 0)]
                 );
                 picker.compact_model_list = false;
                 picker.focus_on_mount = true;
@@ -9437,12 +9497,12 @@ mod tests {
         assert_eq!(
             shown,
             [
-                Some("clinepass".to_string()),
-                Some("opencode-go".to_string()),
-                Some("opencode-go".to_string()),
-                Some("clinepass".to_string()),
+                Some("Clinepass".to_string()),
+                Some("OpenCode Go".to_string()),
+                Some("OpenCode Go".to_string()),
+                Some("Clinepass".to_string()),
             ],
-            "every Pi row names its provider, clash or not"
+            "every Pi row names its provider by name, clash or not"
         );
         // A harness whose description is prose keeps it hidden unless
         // two rows share a name.
@@ -9455,6 +9515,83 @@ mod tests {
             ambiguous: false,
         };
         assert_eq!(row_attribution(&row), None);
+    }
+
+    /// Every harness's models group by the provider serving them: one
+    /// provider from two harnesses is one group, Pi's provider names come
+    /// as ids (older engines) or names alike, and a provider Zeron has never
+    /// heard of still gets its own group.
+    #[test]
+    fn models_group_by_provider_across_harnesses() {
+        let descriptors = vec![
+            descriptor(HarnessId::ClaudeCode, "Claude"),
+            descriptor(HarnessId::Pi, "Pi"),
+            descriptor(HarnessId::Codex, "Codex"),
+        ];
+        let model = |id: &str, provider: &str| {
+            let mut model = bare_model(id, id.rsplit('/').next().unwrap());
+            model.description = Some(provider.into());
+            model
+        };
+        let claude = vec![bare_model("opus", "Opus")];
+        let pi = vec![
+            model("opencode-go/glm-5.3", "OpenCode Go"),
+            model("openai/gpt-5.5", "openai"),
+            model("anthropic/claude-opus-5-5", "Anthropic"),
+            model("acme/fast", "acme"),
+            model("opencode-go/kimi-k3", "opencode-go"),
+        ];
+        let codex = vec![bare_model("gpt-5.5-codex", "GPT-5.5 Codex")];
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::All,
+            None,
+            &descriptors,
+            |harness| match harness {
+                HarnessId::ClaudeCode => Some(claude.as_slice()),
+                HarnessId::Pi => Some(pi.as_slice()),
+                HarnessId::Codex => Some(codex.as_slice()),
+                _ => None,
+            },
+            |_, _| false,
+        );
+        let order: Vec<_> = rows
+            .iter()
+            .map(|r| (row_group(r).key, r.model.id.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("anthropic".to_string(), "opus"),
+                ("anthropic".to_string(), "anthropic/claude-opus-5-5"),
+                ("opencode-go".to_string(), "opencode-go/glm-5.3"),
+                ("opencode-go".to_string(), "opencode-go/kimi-k3"),
+                ("openai".to_string(), "openai/gpt-5.5"),
+                ("openai".to_string(), "gpt-5.5-codex"),
+                ("acme".to_string(), "acme/fast"),
+            ]
+        );
+        let names: Vec<_> = rows.iter().map(|r| row_group(r).name.to_string()).collect();
+        assert_eq!(names[2], "OpenCode Go");
+        assert_eq!(names[4], "OpenAI");
+        assert_eq!(names[6], "Acme");
+        // Single-provider harnesses don't repeat their provider on each row.
+        assert_eq!(row_attribution(&rows[0]), None);
+        assert_eq!(row_attribution(&rows[5]), None);
+        assert_eq!(
+            row_attribution(&rows[1]).map(|a| a.to_string()),
+            Some("Anthropic".to_string())
+        );
+        // A provider's id finds its models from inside a tab.
+        let found = scoped_model_rows(
+            "opencode-go",
+            ModelRail::Harness,
+            Some(HarnessId::Pi),
+            &descriptors,
+            |harness| (harness == HarnessId::Pi).then_some(pi.as_slice()),
+            |_, _| false,
+        );
+        assert_eq!(found.len(), 2);
     }
 
     /// Rows show descriptions only to tell same-named models apart.

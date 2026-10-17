@@ -436,10 +436,17 @@ impl Harness for PiHarness {
     }
     fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
         let root = sessions::agent_dir(self.agent_dir.clone());
+        // `auth.json` here too: a configured agent dir isn't the default one
+        // the context hashes, and a provider signed in there (Pi's /login,
+        // Settings → API keys) must bring its models into the list.
         crate::model_context::context(
             HarnessId::Pi,
             &self.resolve_executable()?,
-            &[root.join("models.json"), root.join("settings.json")],
+            &[
+                root.join("models.json"),
+                root.join("settings.json"),
+                root.join("auth.json"),
+            ],
         )
         .map(Some)
     }
