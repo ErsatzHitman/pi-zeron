@@ -474,8 +474,11 @@ fn the_btw_pane_drags_by_its_header_and_stays_in_the_window(cx: &mut TestAppCont
     drag(cx, start + gpui::point(px(600.0), px(-300.0)));
     let after = cx.debug_bounds("session-btw").expect("the btw pane");
     let moved = before.origin + gpui::point(px(600.0), px(-300.0));
+    // Within 3px, as for the opened corner: Windows lays the pane out a pixel
+    // or two off its Linux position.
     assert!(
-        near(after.origin, moved),
+        (f32::from(after.origin.x) - f32::from(moved.x)).abs() <= 3.0
+            && (f32::from(after.origin.y) - f32::from(moved.y)).abs() <= 3.0,
         "dragged to {:?}, not {moved:?}",
         after.origin
     );
