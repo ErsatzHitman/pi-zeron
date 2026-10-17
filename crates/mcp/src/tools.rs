@@ -995,47 +995,51 @@ impl Tools {
     /// `Ok` is the tool's structured result; `Err` is a message the model
     /// should read (surfaced as `isError`, never as a protocol error).
     pub async fn call(&self, name: &str, args: Value) -> Result<Value, String> {
+        // Each tool's future is boxed so `call` stays small: inline, the
+        // largest arm sized every caller's future and overflowed the stack
+        // of a debug build.
+        use futures::FutureExt;
         let result = match name {
             "whoami" => {
                 no_args(args)?;
-                self.whoami().await
+                self.whoami().boxed().await
             }
             "list_devices" => {
                 no_args(args)?;
-                self.list_devices().await
+                self.list_devices().boxed().await
             }
-            "list_projects" => self.list_projects(parse(args)?).await,
-            "list_harnesses" => self.list_harnesses(parse(args)?).await,
-            "list_models" => self.list_models(parse(args)?).await,
-            "list_chats" => self.list_chats(parse(args)?).await,
-            "get_chat" => self.get_chat(parse(args)?).await,
-            "create_chat" => self.create_chat(parse(args)?).await,
-            "create_chats" => self.batch(parse(args)?, true).await,
-            "send_messages" => self.batch(parse(args)?, false).await,
-            "read_chat" => self.read_chat(parse(args)?).await,
-            "send_message" => self.send_message(parse(args)?).await,
-            "wait_for_turn" => self.wait_for_turn(parse(args)?).await,
-            "wait_for_turns" => self.wait_for_turns(parse(args)?).await,
-            "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
-            "respond_to_input" => self.respond_to_input(parse(args)?).await,
-            "archive_chat" => self.archive_chat(parse(args)?).await,
-            SHOW_VISUAL => self.show_visual(parse(args)?).await,
-            BOARD_POST => self.board_post(parse(args)?).await,
-            BOARD_READ => self.board_read(parse(args)?).await,
+            "list_projects" => self.list_projects(parse(args)?).boxed().await,
+            "list_harnesses" => self.list_harnesses(parse(args)?).boxed().await,
+            "list_models" => self.list_models(parse(args)?).boxed().await,
+            "list_chats" => self.list_chats(parse(args)?).boxed().await,
+            "get_chat" => self.get_chat(parse(args)?).boxed().await,
+            "create_chat" => self.create_chat(parse(args)?).boxed().await,
+            "create_chats" => self.batch(parse(args)?, true).boxed().await,
+            "send_messages" => self.batch(parse(args)?, false).boxed().await,
+            "read_chat" => self.read_chat(parse(args)?).boxed().await,
+            "send_message" => self.send_message(parse(args)?).boxed().await,
+            "wait_for_turn" => self.wait_for_turn(parse(args)?).boxed().await,
+            "wait_for_turns" => self.wait_for_turns(parse(args)?).boxed().await,
+            "interrupt_chat" => self.interrupt_chat(parse(args)?).boxed().await,
+            "respond_to_input" => self.respond_to_input(parse(args)?).boxed().await,
+            "archive_chat" => self.archive_chat(parse(args)?).boxed().await,
+            SHOW_VISUAL => self.show_visual(parse(args)?).boxed().await,
+            BOARD_POST => self.board_post(parse(args)?).boxed().await,
+            BOARD_READ => self.board_read(parse(args)?).boxed().await,
             PROJECT_READ => {
                 no_args(args)?;
-                self.project_read().await
+                self.project_read().boxed().await
             }
             PROJECT_REMEMBER => {
                 let args: RememberArgs = parse(args)?;
-                self.project_memory(json!({ "text": args.text })).await
+                self.project_memory(json!({ "text": args.text })).boxed().await
             }
             PROJECT_FORGET => {
                 let args: ForgetArgs = parse(args)?;
-                self.project_memory(json!({ "forget": args.id })).await
+                self.project_memory(json!({ "forget": args.id })).boxed().await
             }
-            PROJECT_UPDATE => self.project_update(parse(args)?).await,
-            MERGE_PREVIEW => self.merge_preview(parse(args)?).await,
+            PROJECT_UPDATE => self.project_update(parse(args)?).boxed().await,
+            MERGE_PREVIEW => self.merge_preview(parse(args)?).boxed().await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
