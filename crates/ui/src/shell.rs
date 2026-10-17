@@ -8273,7 +8273,6 @@ impl Shell {
         space_name: SharedString,
         branch: Option<SharedString>,
         change_request: Option<zeron_proto::ChangeRequestSummary>,
-        harness: Option<zeron_proto::HarnessId>,
         status: zeron_proto::ChatIndicator,
         selected: bool,
         archived: bool,
@@ -8829,8 +8828,7 @@ impl Shell {
                         .child(div().text_color(subline).children(corner.take())),
                 )
             })
-            // Line 2: harness identity belongs directly with the title,
-            // instead of floating as unrelated metadata below it.
+            // Line 2: status and title.
             .child(
                 div()
                     .w_full()
@@ -8843,23 +8841,6 @@ impl Shell {
                         SIDEBAR_ACTIVE_HARNESS_TITLE_GAP
                     }))
                     .children(compact_status)
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(
-                                        tint.unwrap_or(subline).opacity(if archived_muted {
-                                            0.4
-                                        } else {
-                                            0.8
-                                        }),
-                                    ),
-                            )
-                        },
-                    )
                     .children(project_icon)
                     .child(match rename_input {
                         Some(input) => chat_title_editor(

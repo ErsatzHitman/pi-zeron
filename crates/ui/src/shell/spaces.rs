@@ -2117,7 +2117,6 @@ enum SidebarViewRow {
     Created,
     ShowBranch,
     ShowPullRequest,
-    ShowHarness,
     ShowProjectFilter,
 }
 
@@ -2133,9 +2132,9 @@ impl SidebarViewRow {
 }
 
 const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
-    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..11)];
+    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..10)];
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 10] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
@@ -2143,7 +2142,6 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
     SidebarViewRow::Created,
     SidebarViewRow::ShowBranch,
     SidebarViewRow::ShowPullRequest,
-    SidebarViewRow::ShowHarness,
     SidebarViewRow::ShowProjectIcon,
     SidebarViewRow::ShowProjectLabel,
     SidebarViewRow::ShowProjectFilter,
@@ -3836,9 +3834,6 @@ impl Shell {
                     state.set_change_requests_visible(visible, cx)
                 });
             }
-            SidebarViewRow::ShowHarness => {
-                self.settings.sidebar_show_harness = !self.settings.sidebar_show_harness
-            }
             SidebarViewRow::ShowProjectFilter => {
                 self.settings.sidebar_show_project_filter =
                     !self.settings.sidebar_show_project_filter;
@@ -4001,7 +3996,6 @@ impl Shell {
         let focus = menu_state.focus.clone();
         let organization = self.settings.sidebar_organization;
         let sort = self.settings.sidebar_sort;
-        let show_harness = self.settings.sidebar_show_harness;
         let show_branch = self.settings.sidebar_show_branch;
         let show_pr = self.settings.sidebar_show_pull_request;
 
@@ -4013,7 +4007,6 @@ impl Shell {
             "Created",
             "Branch",
             "Pull request",
-            "Harness",
             "Project icon",
             "Location",
             "Project filter",
@@ -4026,7 +4019,6 @@ impl Shell {
             icons::CALENDAR,
             icons::GIT_BRANCH,
             icons::PULL_REQUEST,
-            icons::BOT,
             icons::PROJECT_DEFAULT,
             // Location names the host: the remote glyph sidebar rows wear.
             icons::REMOTE_SERVER,
@@ -4040,7 +4032,6 @@ impl Shell {
             sort == SidebarSort::Created,
             show_branch,
             show_pr,
-            show_harness,
             self.settings.sidebar_show_project_icon,
             self.settings.sidebar_show_project_label,
             self.settings.sidebar_show_project_filter,
@@ -5334,11 +5325,6 @@ impl Shell {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let harness = self
-                    .settings
-                    .sidebar_show_harness
-                    .then(|| chat.config.as_ref().map(|c| c.harness))
-                    .flatten();
                 let height = sidebar_row_height(
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
@@ -5407,7 +5393,6 @@ impl Shell {
                     folder.into(),
                     branch.map(SharedString::from),
                     change_request,
-                    harness,
                     status,
                     is_selected,
                     false,
@@ -5919,11 +5904,6 @@ impl Shell {
             for row in rows.into_iter().take(shown) {
                 let chat = row.chat;
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                let harness = self
-                    .settings
-                    .sidebar_show_harness
-                    .then(|| chat.config.as_ref().map(|c| c.harness))
-                    .flatten();
                 list = list.child(
                     self.render_chat_row(
                         chat.id.clone(),
@@ -5936,7 +5916,6 @@ impl Shell {
                         row.folder.into(),
                         row.branch.map(SharedString::from),
                         row.change_request,
-                        harness,
                         row.status,
                         is_selected,
                         true,
