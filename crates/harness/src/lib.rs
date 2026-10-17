@@ -77,9 +77,32 @@ impl SteerMessage {
 pub struct TurnControl {
     stop: std::sync::Arc<tokio::sync::Notify>,
     background: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    trace: std::sync::Arc<turn_trace::TurnTrace>,
 }
 
 impl TurnControl {
+    /// A control whose trace records regardless of `ZERON_TURN_TRACE` (tests).
+    pub fn with_trace_enabled(enabled: bool) -> Self {
+        Self {
+            trace: std::sync::Arc::new(turn_trace::TurnTrace::with_enabled(enabled)),
+            ..Self::default()
+        }
+    }
+
+    /// Driver: a prompt just went out; start this turn's trace (opt-in, see [`turn_trace`]).
+    pub fn trace_begin(&self) {
+        self.trace.begin();
+    }
+
+    pub fn trace_mark(&self, phase: turn_trace::Phase) {
+        self.trace.mark(phase);
+    }
+
+    /// Host: take the turn's timings; `None` unless tracing is on and the turn began.
+    pub fn trace_finish(&self) -> Option<turn_trace::TurnTimings> {
+        self.trace.finish()
+    }
+
     /// Host: end the in-flight turn, keeping the runtime and its background work.
     pub fn stop_turn(&self) {
         self.stop.notify_one();
@@ -332,6 +355,7 @@ pub mod pi;
 pub mod process;
 mod scratch;
 pub mod shell_env;
+pub mod turn_trace;
 pub(crate) mod skills;
 #[cfg(windows)]
 pub mod windows_process;

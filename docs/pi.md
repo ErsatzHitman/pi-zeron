@@ -381,6 +381,52 @@ keys):
 Projects, chats and terminals are the remote machine's; paths are its paths.
 SSH (a key, over the LAN or Tailscale) is the only way in.
 
+## Turn trace and scheduling lag
+
+Two diagnostics for "the turn felt slow" reports. This is the first, small step:
+no UI paint span and no benchmark harness yet.
+
+**Turn trace** (opt-in). Set `ZERON_TURN_TRACE=1` (`true`, `on` and `yes` also
+work) and the run driver logs one `info` line per turn on target
+`zeron::turn_trace`, so also allow it in the log filter:
+
+```sh
+ZERON_TURN_TRACE=1 RUST_LOG=zeron::turn_trace=info zeron
+```
+
+```text
+turn trace chat=c1 run=r7 harness=Pi status="Completed" prompt_sent_ms=0 ack_ms=Some(4) barrier_ms=Some(6) first_event_ms=Some(412) first_commit_ms=Some(470) done_ms=3180
+```
+
+All fields are milliseconds after `prompt_sent`, the moment the prompt went to
+Pi. `ack` is Pi's response accepting the prompt; `barrier` is the `get_state`
+response after it (the point where Pi's earlier lifecycle events are known to
+have arrived); `first_event` is the first agent output the engine saw (not
+session or context bookkeeping, not sub-agent traffic); `first_commit` is the
+first successful write of the turn into the chat doc; `done` is the turn end. A
+phase the turn never reached prints `None`.
+
+A parked Pi session reuses one run for many turns, and each prompt (including a
+queued message that starts an idle runtime) restarts the clock. A steer into a
+turn already running does not. A turn the agent starts on its own has no
+`prompt_sent`, so it logs nothing. Other harnesses count from the start of the
+run and only report `first_event`, `first_commit` and `done`. A turn the quiesce
+watchdog parks logs with `status="quiesced"`. With the flag off the cost is one
+cached flag read per call.
+
+**Scheduling lag** (always on). The engine runs a 50 ms tick on the tokio
+runtime and warns on target `zeron::lag` when a tick runs 100 ms or more late,
+which means something blocked a worker or starved the runtime:
+
+```text
+WARN zeron::lag: tokio scheduling lag late_ms=240 max_late_ms=240 suppressed=0
+```
+
+At most one warning is logged per 10 s; later late ticks in that window are
+counted into the next line as `suppressed`, with the worst lag as `max_late_ms`.
+`ZERON_LAG_WARN_MS` changes the threshold in milliseconds; `0` turns the monitor
+off. The monitor wakes about 20 times a second and allocates nothing.
+
 ## Validation
 
 ```sh
