@@ -24,6 +24,8 @@ use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 
 /// Default and ceiling for the blocking waits.
 const MAX_BATCH: usize = 32;
+/// Longest first prompt or message, in characters (a JSON-Schema `maxLength`).
+const MAX_PROMPT_CHARS: usize = 100_000;
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
 const MAX_WAIT: Duration = Duration::from_secs(3600);
 /// A session row older than this is not trusted to still be working
@@ -43,6 +45,35 @@ pub struct Tools {
     // Remember successful sends on this MCP connection so wait_for_turn after
     // wait:false also waits for a newly created chat with no session row yet.
     pending_turns: tokio::sync::Mutex<HashMap<String, Arc<PendingTurn>>>,
+    // Sessions being started on this connection, by orchestrator root: a
+    // batch runs against one chats() snapshot and new rows fold in late, so
+    // the live-session cap counts these on top of the snapshot.
+    reserved: std::sync::Mutex<HashMap<String, Slots>>,
+}
+
+#[derive(Default)]
+struct Slots {
+    /// create_chat calls between their cap check and their return.
+    held: usize,
+    /// Sessions this connection created that the snapshot has not shown yet.
+    unfolded: std::collections::HashSet<String>,
+}
+
+/// One session slot of a tree, held while it is being started.
+struct Reservation<'a> {
+    tools: &'a Tools,
+    root: String,
+    created: Option<String>,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut reserved = self.tools.reserved();
+        if let Some(slots) = reserved.get_mut(&self.root) {
+            slots.held = slots.held.saturating_sub(1);
+            slots.unfolded.extend(self.created.take());
+        }
+    }
 }
 
 fn chat_key_schema(extra: Value) -> Value {
@@ -135,7 +166,7 @@ fn catalog() -> Vec<ToolDef> {
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
                     "branch": { "type": "string", "description": "With write true in a git project: the branch or commit the new worktree starts from (default: the project's current HEAD). Otherwise a branch label to record on the chat." },
                     "cwd": { "type": "string", "description": "Working directory (an existing folder or worktree path). Defaults to the project folder; without a project, a cwd that is a project's folder joins that project." },
-                    "prompt": { "type": "string", "description": "First message to send right away." },
+                    "prompt": { "type": "string", "maxLength": MAX_PROMPT_CHARS, "description": "First message to send right away." },
                     "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
                 }
@@ -155,7 +186,7 @@ fn catalog() -> Vec<ToolDef> {
             name: "send_message",
             description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Mode 'queue' puts it in the chat's queue: a running turn takes queued text as steering; otherwise it waits for the turn to end. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
             input_schema: chat_key_schema(json!({
-                "text": { "type": "string" },
+                "text": { "type": "string", "maxLength": MAX_PROMPT_CHARS },
                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
                 "wait": { "type": "boolean", "default": false },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
@@ -331,7 +362,29 @@ fn catalog() -> Vec<ToolDef> {
             }
         })),
     });
+    for tool in &mut tools {
+        forbid_extra(&mut tool.input_schema);
+    }
     tools
+}
+
+/// Make every object schema with `properties` closed (`additionalProperties:
+/// false`), nested array items included, to match the arg structs' serde
+/// `deny_unknown_fields`. A schema that already says (the `assets` map) is
+/// left alone.
+fn forbid_extra(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("properties") && !object.contains_key("additionalProperties") {
+        object.insert("additionalProperties".into(), json!(false));
+    }
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.values_mut().for_each(forbid_extra);
+    }
+    if let Some(items) = object.get_mut("items") {
+        forbid_extra(items);
+    }
 }
 
 /// The project of the CALLING chat's orchestrator tree; only its root
@@ -561,6 +614,7 @@ async fn read_visual_assets(
 // ---- argument shapes ---------------------------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShowVisualArgs {
     script: String,
     title: String,
@@ -569,28 +623,33 @@ struct ShowVisualArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BatchArgs {
     requests: Vec<Value>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatArgs {
     chat: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MergePreviewArgs {
     chat: String,
     base: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListModelsArgs {
     harness: String,
     device: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ListChatsArgs {
     project: Option<String>,
     device: Option<String>,
@@ -608,6 +667,7 @@ enum ChatKind {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct DeviceArgs {
     device: Option<String>,
 }
@@ -627,6 +687,7 @@ struct PendingTurn {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct CreateChatArgs {
     kind: Option<ChatKind>,
     project: Option<String>,
@@ -647,6 +708,7 @@ struct CreateChatArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadChatArgs {
     chat: String,
     limit: Option<usize>,
@@ -658,6 +720,7 @@ struct ReadChatArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SendArgs {
     chat: String,
     text: String,
@@ -668,24 +731,28 @@ struct SendArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BoardPostArgs {
     kind: String,
     text: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BoardReadArgs {
     since: Option<String>,
     limit: Option<u64>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WaitArgs {
     chat: String,
     timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct WaitAnyArgs {
     #[serde(default)]
     chats: Vec<String>,
@@ -693,28 +760,33 @@ struct WaitAnyArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RememberArgs {
     text: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ForgetArgs {
     id: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProjectUpdateArgs {
     goal: Option<String>,
     instructions: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArchiveArgs {
     chat: String,
     archived: Option<bool>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RespondArgs {
     chat: String,
     request_id: Option<String>,
@@ -723,13 +795,25 @@ struct RespondArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AnswerArg {
     question_id: String,
     labels: Vec<String>,
 }
 
+/// Arguments of a tool that takes none: anything but an empty object (or
+/// null) is an error naming the stray field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoArgs {}
+
 fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
     serde_json::from_value(args).map_err(|e| format!("invalid arguments: {e}"))
+}
+
+fn no_args(args: Value) -> Result<(), String> {
+    let args = if args.is_null() { json!({}) } else { args };
+    parse::<NoArgs>(args).map(|NoArgs {}| ())
 }
 
 fn wait_duration(secs: Option<u64>) -> Duration {
@@ -816,7 +900,37 @@ impl Tools {
         Self {
             zeron,
             pending_turns: Default::default(),
+            reserved: Default::default(),
         }
+    }
+
+    fn reserved(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slots>> {
+        self.reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take a session slot below `root_id`, or say why the tree is full.
+    /// Counts and takes the slot under one lock, so concurrent batch items
+    /// cannot all pass the check.
+    fn reserve_slot(&self, chats: &[Chat], root_id: &str) -> anyhow::Result<Reservation<'_>> {
+        use zeron_proto::orchestrator::{MAX_LIVE_SESSIONS, live_members};
+        let mut reserved = self.reserved();
+        let slots = reserved.entry(root_id.to_owned()).or_default();
+        slots
+            .unfolded
+            .retain(|id| !chats.iter().any(|chat| chat.id == *id));
+        let live = live_members(chats, root_id).len() + slots.held + slots.unfolded.len();
+        anyhow::ensure!(
+            live < MAX_LIVE_SESSIONS,
+            "This orchestrator already has {live} live sessions, the most one tree may hold ({MAX_LIVE_SESSIONS}). Wait for a session to finish, or archive one you are done with (archive_chat), then try again."
+        );
+        slots.held += 1;
+        Ok(Reservation {
+            tools: self,
+            root: root_id.to_owned(),
+            created: None,
+        })
     }
 
     pub fn list(&self) -> Vec<ToolDef> {
@@ -835,8 +949,14 @@ impl Tools {
     /// should read (surfaced as `isError`, never as a protocol error).
     pub async fn call(&self, name: &str, args: Value) -> Result<Value, String> {
         let result = match name {
-            "whoami" => self.whoami().await,
-            "list_devices" => self.list_devices().await,
+            "whoami" => {
+                no_args(args)?;
+                self.whoami().await
+            }
+            "list_devices" => {
+                no_args(args)?;
+                self.list_devices().await
+            }
             "list_projects" => self.list_projects(parse(args)?).await,
             "list_harnesses" => self.list_harnesses(parse(args)?).await,
             "list_models" => self.list_models(parse(args)?).await,
@@ -855,7 +975,10 @@ impl Tools {
             SHOW_VISUAL => self.show_visual(parse(args)?).await,
             BOARD_POST => self.board_post(parse(args)?).await,
             BOARD_READ => self.board_read(parse(args)?).await,
-            PROJECT_READ => self.project_read().await,
+            PROJECT_READ => {
+                no_args(args)?;
+                self.project_read().await
+            }
             PROJECT_REMEMBER => {
                 let args: RememberArgs = parse(args)?;
                 self.project_memory(json!({ "text": args.text })).await
@@ -883,12 +1006,16 @@ impl Tools {
                 let result = if create {
                     match serde_json::from_value(args) {
                         Ok(args) => self.create_chat(args).await,
-                        Err(error) => Err(error.into()),
+                        Err(error) => Err(anyhow::anyhow!(
+                            "requests[{index}]: invalid arguments: {error}"
+                        )),
                     }
                 } else {
                     match serde_json::from_value(args) {
                         Ok(args) => self.send_message(args).await,
-                        Err(error) => Err(error.into()),
+                        Err(error) => Err(anyhow::anyhow!(
+                            "requests[{index}]: invalid arguments: {error}"
+                        )),
                     }
                 };
                 match result {
@@ -1064,6 +1191,7 @@ impl Tools {
     }
 
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+        ensure_prompt_fits("prompt", args.prompt.as_deref().unwrap_or_default())?;
         // An orchestrator's tree may grow sessions below sessions; elsewhere
         // only a top-level chat starts side chats.
         let chats = self.zeron.chats().await?;
@@ -1110,6 +1238,8 @@ impl Tools {
 
         // Sessions of an orchestrator's tree default to their parent's harness.
         let mut inherited_harness = None;
+        // Held until this call returns, so a batch counts its own sessions.
+        let mut slot = None;
         if let Some(parent) = parent_chat_id.as_deref() {
             let chat = self.zeron.resolve_chat(parent).await?;
             let orchestrated = zeron_proto::orchestrator::depth(&chats, &chat.id).is_some();
@@ -1118,6 +1248,9 @@ impl Tools {
                 "Cannot create a child of a side chat. Choose a top-level parent chat."
             );
             ensure_room_below(&chats, &chat)?;
+            if let Some(root) = zeron_proto::orchestrator::root_of(&chats, &chat.id) {
+                slot = Some(self.reserve_slot(&chats, &root.id)?);
+            }
             if orchestrated {
                 inherited_harness = chat.config.as_ref().map(|c| c.harness);
             }
@@ -1242,6 +1375,9 @@ impl Tools {
             mutate["cwd"] = json!(cwd);
         }
         self.zeron.mutate(mutate).await?;
+        if let Some(slot) = &mut slot {
+            slot.created = Some(chat_id.clone());
+        }
         if let Some(title) = args
             .title
             .as_deref()
@@ -1355,6 +1491,7 @@ impl Tools {
     }
 
     async fn send_message(&self, args: SendArgs) -> anyhow::Result<Value> {
+        ensure_prompt_fits("text", &args.text)?;
         let text = args.text.trim();
         if text.is_empty() {
             anyhow::bail!("text is empty");
@@ -2014,6 +2151,17 @@ impl Tools {
 /// An orchestrator's tree stops growing [`MAX_DEPTH`] levels below its root.
 ///
 /// [`MAX_DEPTH`]: zeron_proto::orchestrator::MAX_DEPTH
+/// Refuse a prompt or message over [`MAX_PROMPT_CHARS`] before anything is
+/// written.
+fn ensure_prompt_fits(what: &str, text: &str) -> anyhow::Result<()> {
+    let chars = text.chars().count();
+    anyhow::ensure!(
+        chars <= MAX_PROMPT_CHARS,
+        "{what} is {chars} characters; the limit is {MAX_PROMPT_CHARS}. Put long material in a file in the worktree and send its path."
+    );
+    Ok(())
+}
+
 fn ensure_room_below(chats: &[Chat], parent: &Chat) -> anyhow::Result<()> {
     let max = zeron_proto::orchestrator::MAX_DEPTH;
     anyhow::ensure!(
@@ -3901,5 +4049,317 @@ mod tests {
             whoami["result"]["structuredContent"]["localDeviceId"],
             "dev-local"
         );
+    }
+
+    // ---- strict, bounded control plane -------------------------------------
+
+    fn no_writes(world: &World) {
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_arguments_are_rejected_naming_the_field() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        for (tool, args, field) in [
+            ("create_chat", json!({ "files": ["a"] }), "files"),
+            (
+                "send_message",
+                json!({ "chat": "chat-alpha-1", "text": "x", "scope": "all" }),
+                "scope",
+            ),
+            ("list_chats", json!({ "scope": 1 }), "scope"),
+            (
+                "read_chat",
+                json!({ "chat": "chat-alpha-1", "tail": 3 }),
+                "tail",
+            ),
+            (
+                "wait_for_turn",
+                json!({ "chat": "chat-alpha-1", "timeout": 3 }),
+                "timeout",
+            ),
+            (
+                "archive_chat",
+                json!({ "chat": "chat-alpha-1", "hide": true }),
+                "hide",
+            ),
+            (
+                "board_post",
+                json!({ "kind": "finding", "text": "x", "tag": "y" }),
+                "tag",
+            ),
+            (
+                "project_update",
+                json!({ "goal": "x", "notes": "y" }),
+                "notes",
+            ),
+            (
+                "respond_to_input",
+                json!({
+                    "chat": "chat-alpha-1",
+                    "answers": [{ "question_id": "q", "labels": [], "free_text": "z" }]
+                }),
+                "free_text",
+            ),
+            ("whoami", json!({ "x": 1 }), "x"),
+            ("list_devices", json!({ "x": 1 }), "x"),
+            ("project_read", json!({ "x": 1 }), "x"),
+        ] {
+            let err = tools.call(tool, args).await.unwrap_err();
+            assert!(err.contains("invalid arguments"), "{tool}: {err}");
+            assert!(err.contains("unknown field"), "{tool}: {err}");
+            assert!(err.contains(&format!("`{field}`")), "{tool}: {err}");
+        }
+        no_writes(&world);
+        // A null or empty argument object is still fine for zero-arg tools.
+        assert!(tools.call("whoami", Value::Null).await.is_ok());
+        assert!(tools.call("whoami", json!({})).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_in_batch_items_error_per_item() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let created = tools
+            .call(
+                "create_chats",
+                json!({ "requests": [
+                    { "project": "space-1" },
+                    { "prompt": "x", "files": [] },
+                ] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["results"][0]["isError"], false);
+        assert_eq!(created["results"][1]["isError"], true);
+        let error = created["results"][1]["error"].as_str().unwrap();
+        assert!(error.contains("requests[1]"), "{error}");
+        assert!(error.contains("unknown field `files`"), "{error}");
+
+        let sent = tools
+            .call(
+                "send_messages",
+                json!({ "requests": [
+                    { "chat": "chat-alpha-1", "text": "hi", "urgent": true },
+                ] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent["results"][0]["isError"], true);
+        let error = sent["results"][0]["error"].as_str().unwrap();
+        assert!(error.contains("unknown field `urgent`"), "{error}");
+
+        let before = world.writes.lock().unwrap().len();
+        let err = tools
+            .call(
+                "create_chats",
+                json!({ "requests": [{ "project": "space-1" }], "extra": 1 }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown field `extra`"), "{err}");
+        assert_eq!(world.writes.lock().unwrap().len(), before);
+    }
+
+    #[test]
+    fn every_schema_forbids_extra_properties() {
+        fn walk(path: &str, schema: &Value) {
+            let Some(object) = schema.as_object() else {
+                return;
+            };
+            if object.contains_key("properties") {
+                assert_eq!(
+                    object.get("additionalProperties"),
+                    Some(&json!(false)),
+                    "{path} must forbid extra properties"
+                );
+            }
+            for (key, child) in object {
+                if key == "properties" {
+                    for (name, property) in child.as_object().unwrap() {
+                        walk(&format!("{path}.{name}"), property);
+                    }
+                } else if key == "items" {
+                    walk(&format!("{path}[]"), child);
+                }
+            }
+        }
+        let tools = catalog();
+        for tool in &tools {
+            assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
+            walk(tool.name, &tool.input_schema);
+        }
+        let find = |name: &str| tools.iter().find(|t| t.name == name).unwrap();
+        let item = &find("create_chats").input_schema["properties"]["requests"]["items"];
+        assert_eq!(item["additionalProperties"], false);
+        let answers = &find("respond_to_input").input_schema["properties"]["answers"]["items"];
+        assert_eq!(answers["additionalProperties"], false);
+        assert_eq!(
+            find(SHOW_VISUAL).input_schema["properties"]["assets"]["additionalProperties"],
+            json!({ "type": "string" })
+        );
+        assert_eq!(
+            find("create_chat").input_schema["properties"]["prompt"]["maxLength"],
+            MAX_PROMPT_CHARS
+        );
+        assert_eq!(
+            find("send_message").input_schema["properties"]["text"]["maxLength"],
+            MAX_PROMPT_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_size_is_capped_before_anything_is_written() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let too_long = "x".repeat(MAX_PROMPT_CHARS + 1);
+        let err = tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "prompt": too_long }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("the limit is 100000"), "{err}");
+        let err = tools
+            .call(
+                "send_message",
+                json!({ "chat": "chat-alpha-1", "text": too_long }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("the limit is 100000"), "{err}");
+        let batch = tools
+            .call(
+                "create_chats",
+                json!({ "requests": [{ "project": "space-1", "prompt": too_long }] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch["results"][0]["isError"], true);
+        assert!(
+            batch["results"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("the limit is 100000")
+        );
+        no_writes(&world);
+
+        // The characters count, not the bytes.
+        let exact = "é".repeat(MAX_PROMPT_CHARS);
+        tools
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "prompt": exact }),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn capped_world(live: usize, archived: usize) -> Arc<World> {
+        let config = json!({ "harness": "claude-code", "model": null, "reasoning": null, "sandbox": "workspace-write" });
+        let chat = |id: &str, parent: &str, archived: bool| {
+            json!({
+                "id": id, "deviceId": "dev-local", "title": id, "archived": archived,
+                "spaceId": "space-1", "createdAt": "2026-09-03T00:00:00Z",
+                "parentChatId": parent, "config": config,
+            })
+        };
+        let mut extra_chats = vec![json!({
+            "id": "orchestrator-root", "deviceId": "dev-local", "title": "Orchestrator",
+            "archived": false, "createdAt": "2026-09-03T00:00:00Z", "config": config,
+        })];
+        for n in 0..live + archived {
+            // The last live one is nested, to count every level.
+            let parent = if n + 1 == live && live > 1 {
+                "live-0"
+            } else {
+                "orchestrator-root"
+            };
+            let id = if n < live {
+                format!("live-{n}")
+            } else {
+                format!("done-{n}")
+            };
+            extra_chats.push(chat(&id, parent, n >= live));
+        }
+        Arc::new(World {
+            extra_chats,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tree_cannot_hold_more_than_the_live_session_cap() {
+        use zeron_proto::orchestrator::MAX_LIVE_SESSIONS as MAX;
+        let start = |world: &Arc<World>| {
+            let tools = from(world, "orchestrator-root");
+            async move {
+                tools
+                    .call("create_chat", json!({ "project": "space-1" }))
+                    .await
+            }
+        };
+
+        let full = capped_world(MAX, 0);
+        let err = start(&full).await.unwrap_err();
+        assert!(err.contains("live sessions"), "{err}");
+        assert!(err.contains("archive"), "{err}");
+        assert!(err.contains("Wait for a session to finish"), "{err}");
+        no_writes(&full);
+        // A session deep in the tree is held to the same cap.
+        let err = from(&full, "live-0")
+            .call("create_chat", json!({ "project": "space-1" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("live sessions"), "{err}");
+
+        // Archived sessions free their slot.
+        assert!(start(&capped_world(MAX, 3)).await.is_err());
+        assert!(start(&capped_world(MAX - 1, 3)).await.is_ok());
+
+        // A chat outside any tree is not capped by a full tree.
+        let standalone = tools(full.clone(), Origin::default())
+            .call("create_chat", json!({ "project": "space-1" }))
+            .await;
+        assert!(standalone.is_ok(), "{standalone:?}");
+        let created = from(&full, "orchestrator-root")
+            .call(
+                "create_chat",
+                json!({ "kind": "chat", "project": "space-1" }),
+            )
+            .await;
+        assert!(created.is_ok(), "{created:?}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_cannot_overshoot_the_live_session_cap() {
+        use zeron_proto::orchestrator::MAX_LIVE_SESSIONS as MAX;
+        let world = capped_world(MAX - 2, 0);
+        let root = from(&world, "orchestrator-root");
+        let batch = root
+            .call(
+                "create_chats",
+                json!({ "requests": [
+                    { "project": "space-1" }, { "project": "space-1" },
+                    { "project": "space-1" }, { "project": "space-1" },
+                ] }),
+            )
+            .await
+            .unwrap();
+        let results = batch["results"].as_array().unwrap();
+        let ok = results.iter().filter(|r| r["isError"] == false).count();
+        assert_eq!(ok, 2, "{batch}");
+        for refused in results.iter().filter(|r| r["isError"] == true) {
+            let error = refused["error"].as_str().unwrap();
+            assert!(error.contains("live sessions"), "{error}");
+        }
+        // The snapshot has not folded the two new rows in, but they count.
+        let err = root
+            .call("create_chat", json!({ "project": "space-1" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("live sessions"), "{err}");
     }
 }
