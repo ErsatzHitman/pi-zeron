@@ -2725,11 +2725,9 @@ impl Pickers {
                 );
             }
         }
-        // A provider tab lists only that provider's models; a search looks
-        // across them all.
-        if query.is_empty()
-            && let Some(provider) = self.viewed_provider(cx)
-        {
+        // A provider tab lists only that provider's models, and its search
+        // looks only there.
+        if let Some(provider) = self.viewed_provider(cx) {
             rows.retain(|row| row.harness != HarnessId::Pi || row_group(row).key == provider);
         }
         mark_ambiguous(&mut rows);
@@ -5149,10 +5147,8 @@ impl Pickers {
         // description appears only to tell identically-named rows apart.
         let compact = self.model_rail == ModelRail::Harness;
         // On a provider tab every row is that provider's: no label for it.
-        let provider_tab = compact
-            && row.harness == HarnessId::Pi
-            && self.search.read(cx).text().trim().is_empty()
-            && self.viewed_provider(cx).is_some();
+        let provider_tab =
+            compact && row.harness == HarnessId::Pi && self.viewed_provider(cx).is_some();
         let attribution = if provider_tab {
             row_description(row)
         } else {
