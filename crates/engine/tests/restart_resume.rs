@@ -509,6 +509,101 @@ async fn launch_reaps_orphans_of_a_dead_engine_but_spares_live_and_unmarked() {
     core.shutdown().await;
 }
 
+/// The idle journal sweep rewrites a finished chat's journal; a crash in the NEXT
+/// turn must still be revived from it (session id from the journal, stale journal
+/// closed by boot recovery).
+#[tokio::test]
+async fn compacted_journal_still_revives_a_crashed_next_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let journals = dir.join("orgs/dev-org/dev-user/journals");
+
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-first".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    pre_title(&core);
+    queue_run(&core, "first turn", "/tmp", "msg-user-1");
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "first turn to complete",
+    )
+    .await;
+    wait_for(|| !core.sessions.has_run(CHAT), "the run to end").await;
+
+    // The sweep compacts the finished turn's deltas away.
+    let compacted = core.sessions.compact_idle_journals(Duration::ZERO, 0).await;
+    assert_eq!(compacted, 1);
+    core.shutdown().await;
+    drop(core);
+    let journal = RunJournal::open(&journals).unwrap();
+    let events = journal.replay(CHAT, 0).unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, AgentEvent::TextDelta { .. })),
+        "{events:?}"
+    );
+    let last_seq = events.last().unwrap().0;
+
+    // The next turn dies mid-stream, after the compaction.
+    journal
+        .append(
+            CHAT,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: "/tmp".into(),
+                session_id: "hs-crash-2".into(),
+                assistant_message_id: "a-2".into(),
+            },
+        )
+        .unwrap();
+    journal
+        .append(
+            CHAT,
+            &AgentEvent::TextDelta {
+                text: "partial".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(journal.stale_sessions().unwrap(), vec![CHAT.to_string()]);
+    drop(journal);
+
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "hs-after".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    let journal = RunJournal::open(&journals).unwrap();
+    assert!(journal.stale_sessions().unwrap().is_empty());
+    let (seq, event) = journal.last_event(CHAT).unwrap().unwrap();
+    assert!(seq > last_seq + 2, "seqs stay monotonic across compaction");
+    assert!(matches!(event, AgentEvent::Done { .. }));
+
+    queue_run(&core, "keep going", "/tmp", "msg-user-2");
+    wait_for(
+        || complete_assistant_count(&core) == 2,
+        "post-crash turn to complete",
+    )
+    .await;
+    assert_eq!(
+        requests.lock().unwrap()[1].resume.as_deref(),
+        Some("hs-crash-2"),
+        "journal-recovered session id must ride the next dispatch"
+    );
+    core.shutdown().await;
+}
+
 /// A harness whose stream stays OPEN after each turn's Done, serving follow-up
 /// turns from the steering mailbox — the persistent-session shape (codex; and
 /// claude's stream-json stdin). Counts `run()` calls to prove the engine

@@ -262,6 +262,63 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Journal sweep defaults: pass every 15 min; a journal must be quiet for 10 min (the doc
+/// snapshot debounce and `Done` finalization settle) and at least 1 MiB to be worth a rewrite.
+const JOURNAL_SWEEP_INTERVAL_MS: u64 = 15 * 60 * 1000;
+const JOURNAL_SETTLE_MS: u64 = 10 * 60 * 1000;
+const JOURNAL_MIN_COMPACT_BYTES: u64 = 1024 * 1024;
+
+/// A chat with a run entry (live or parked) is never compacted. `chat` may be the
+/// sanitized journal file stem, so compare run keys through the same sanitizer.
+fn journal_chat_is_live(inner: &Inner, chat: &str) -> bool {
+    lock(&inner.runs)
+        .keys()
+        .any(|id| id == chat || crate::run_journal::sanitize_id(id) == chat)
+}
+
+async fn sweep_journals_once(
+    inner: &Inner,
+    settle: std::time::Duration,
+    min_bytes: u64,
+    is_live: impl Fn(&str) -> bool,
+) -> usize {
+    let mut compacted = 0;
+    for chat in inner.journal.journaled_chats() {
+        if inner
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            break;
+        }
+        if is_live(&chat) {
+            continue;
+        }
+        if inner.journal.idle_for(&chat).is_none_or(|age| age < settle) {
+            continue;
+        }
+        let journal = inner.journal.clone();
+        let name = chat.clone();
+        match tokio::task::spawn_blocking(move || journal.compact(&name, min_bytes)).await {
+            Ok(Ok(Some(stats))) => {
+                compacted += 1;
+                tracing::info!(
+                    chat = %chat,
+                    before = stats.before_bytes,
+                    after = stats.after_bytes,
+                    dropped = stats.dropped,
+                    "run journal compacted"
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => tracing::warn!(chat = %chat, error = %err, "journal compaction failed"),
+            Err(err) => tracing::warn!(chat = %chat, error = %err, "journal compaction panicked"),
+        }
+        // Low priority: yield between chats so the sweep never hogs a worker.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    compacted
+}
+
 #[derive(Clone)]
 pub struct SessionsEngine {
     inner: Arc<Inner>,
@@ -338,6 +395,76 @@ impl SessionsEngine {
                 }
             }
         });
+    }
+
+    /// Start the low-priority sweep that compacts idle chats' run journals (see
+    /// [`RunJournal::compact`]). Weak-held: it ends with the engine. Knobs, read once:
+    /// `ZERON_JOURNAL_SWEEP_MS`, `ZERON_JOURNAL_SETTLE_MS`, `ZERON_JOURNAL_MIN_BYTES`.
+    pub fn spawn_journal_sweep(&self) {
+        const FIRST_DELAY: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+        let env_ms = |key: &str, default: u64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(default)
+        };
+        let interval = std::time::Duration::from_millis(env_ms(
+            "ZERON_JOURNAL_SWEEP_MS",
+            JOURNAL_SWEEP_INTERVAL_MS,
+        ));
+        let settle =
+            std::time::Duration::from_millis(env_ms("ZERON_JOURNAL_SETTLE_MS", JOURNAL_SETTLE_MS));
+        let min_bytes = env_ms("ZERON_JOURNAL_MIN_BYTES", JOURNAL_MIN_COMPACT_BYTES);
+        let first = FIRST_DELAY.min(interval);
+        // Assembly can run from a bare sync context; there is nothing to sweep then.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let inner = Arc::downgrade(&self.inner);
+        runtime.spawn(async move {
+            tokio::time::sleep(first).await;
+            loop {
+                {
+                    let Some(inner) = inner.upgrade() else {
+                        return;
+                    };
+                    if inner
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return;
+                    }
+                    let compacted = sweep_journals_once(&inner, settle, min_bytes, |chat| {
+                        journal_chat_is_live(&inner, chat)
+                    })
+                    .await;
+                    tracing::info!(
+                        journal_bytes = inner.journal.total_bytes(),
+                        chats_compacted = compacted,
+                        "journal sweep finished"
+                    );
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    /// One sweep pass: compact every idle chat's journal. Returns how many were
+    /// compacted. Public so tests (and tools) can run a pass without the timer.
+    pub async fn compact_idle_journals(
+        &self,
+        settle: std::time::Duration,
+        min_bytes: u64,
+    ) -> usize {
+        sweep_journals_once(&self.inner, settle, min_bytes, |chat| {
+            journal_chat_is_live(&self.inner, chat)
+        })
+        .await
+    }
+
+    /// Combined size of all run journals on disk.
+    pub fn journal_bytes(&self) -> u64 {
+        self.inner.journal.total_bytes()
     }
 
     /// Watch a chat's live extension UI; see [`crate::extension_ui`].
@@ -4445,6 +4572,58 @@ mod tests {
     }
 
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+
+    #[tokio::test]
+    async fn journal_sweep_skips_live_and_unsettled_chats() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            journal.clone(),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let finished_turn = |chat: &str| {
+            for event in [
+                AgentEvent::TextDelta { text: "a".into() },
+                AgentEvent::TextDelta { text: "b".into() },
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            ] {
+                journal.append(chat, &event).unwrap();
+            }
+        };
+        for chat in ["idle", "live", "fresh"] {
+            finished_turn(chat);
+        }
+        let inner = &sessions.inner;
+        let zero = std::time::Duration::ZERO;
+        let live = |chat: &str| chat == "live";
+
+        // A chat written moments ago has not settled.
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(sweep_journals_once(inner, hour, 0, live).await, 0);
+        assert_eq!(journal.size_bytes("idle"), journal.size_bytes("live"));
+
+        let live_len = journal.size_bytes("live");
+        assert_eq!(sweep_journals_once(inner, zero, 0, live).await, 2);
+        assert_eq!(journal.size_bytes("live"), live_len, "live run untouched");
+        assert!(journal.size_bytes("idle") < live_len);
+        assert_eq!(journal.replay("idle", 0).unwrap().len(), 1);
+        // Idempotent, and below-minimum journals are left alone.
+        assert_eq!(sweep_journals_once(inner, zero, 0, live).await, 0);
+        assert_eq!(
+            sweep_journals_once(inner, zero, u64::MAX, |_| false).await,
+            0
+        );
+        assert!(sessions.journal_bytes() > 0);
+        // No run entry exists, so the engine-level pass also compacts "live".
+        assert_eq!(sessions.compact_idle_journals(zero, 0).await, 1);
+    }
 
     #[tokio::test]
     async fn a_shared_image_is_copied_in_from_the_chat_folder_only() {

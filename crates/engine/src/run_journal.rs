@@ -7,14 +7,18 @@
 //! `Done` belongs to a run that died mid-stream — boot recovery stamps its doc entry
 //! `aborted` and closes the journal with a synthetic `Done`.
 //!
-//! Bounded-window compaction is deferred (whole file kept for now, per M2 scope); a torn
-//! trailing line from a crash mid-write is tolerated everywhere.
+//! Compaction ([`RunJournal::compact`], driven by the sessions idle sweep) drops the
+//! text/reasoning deltas of turns that already ended in a `Done` — the doc entry was
+//! finalized there, so the deltas are redundant — and keeps every other event, the tail
+//! after the last `Done`, and every original `seq`. A torn trailing line from a crash
+//! mid-write is tolerated everywhere.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +46,20 @@ struct ChatJournal {
     needs_newline: bool,
 }
 
+/// What one [`RunJournal::compact`] pass reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactStats {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    /// Events removed from the file.
+    pub dropped: usize,
+}
+
+/// Prefix/suffix of the temp files compaction writes beside a journal. The name does
+/// not end in `.jsonl`, so journal scans never mistake one for a chat.
+const COMPACT_TMP_PREFIX: &str = ".compact-";
+const COMPACT_TMP_SUFFIX: &str = ".tmp";
+
 /// Append-only JSONL journal store, one file per chat.
 pub struct RunJournal {
     dir: PathBuf,
@@ -52,6 +70,17 @@ impl RunJournal {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, JournalError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
+        // A crash mid-compaction leaves its temp file behind; the journal itself is
+        // intact (the rename never happened).
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(COMPACT_TMP_PREFIX) && name.ends_with(COMPACT_TMP_SUFFIX) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         Ok(Self {
             dir,
             open_files: Mutex::new(HashMap::new()),
@@ -146,6 +175,8 @@ impl RunJournal {
 
     /// Events with `seq > after_seq`, in order. A cursor ahead of the last issued seq is
     /// from a previous era (file replaced) — falls back to a full replay, mirroring zeron.
+    /// After [`Self::compact`] a replay below the compaction boundary no longer yields the
+    /// text/reasoning deltas of completed turns; transcripts come from the chat doc.
     pub fn replay(
         &self,
         chat_id: &str,
@@ -180,23 +211,169 @@ impl RunJournal {
     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
         let mut stale = Vec::new();
+        for (chat_id, path) in self.journal_files()? {
+            // Tail read only: journals reach tens of MB and boot scans every one.
+            match last_valid_line(&path)? {
+                Some((_, AgentEvent::Done { .. })) | None => {}
+                Some(_) => stale.push(chat_id),
+            }
+        }
+        stale.sort();
+        Ok(stale)
+    }
+
+    /// `(chat id stem, path)` of every `*.jsonl` journal file.
+    fn journal_files(&self) -> Result<Vec<(String, PathBuf)>, JournalError> {
+        let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let path = entry.path();
+            let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
             let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            // Tail read only: journals reach tens of MB and boot scans every one.
-            match last_valid_line(&path)? {
-                Some((_, AgentEvent::Done { .. })) | None => {}
-                Some(_) => stale.push(chat_id.to_string()),
-            }
+            out.push((chat_id.to_string(), path));
         }
-        stale.sort();
-        Ok(stale)
+        Ok(out)
+    }
+
+    /// Every chat id that has a journal file, sorted.
+    pub fn journaled_chats(&self) -> Vec<String> {
+        let mut chats: Vec<String> = self
+            .journal_files()
+            .map(|files| files.into_iter().map(|(id, _)| id).collect())
+            .unwrap_or_default();
+        chats.sort();
+        chats
+    }
+
+    /// Size of a chat's journal file (0 when absent).
+    pub fn size_bytes(&self, chat_id: &str) -> u64 {
+        std::fs::metadata(self.path_for(chat_id)).map_or(0, |m| m.len())
+    }
+
+    /// Combined size of every journal file.
+    pub fn total_bytes(&self) -> u64 {
+        self.journal_files()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|(_, p)| std::fs::metadata(p).ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// How long since the chat's journal was last written; `None` when absent.
+    pub fn idle_for(&self, chat_id: &str) -> Option<Duration> {
+        let modified = std::fs::metadata(self.path_for(chat_id))
+            .ok()?
+            .modified()
+            .ok()?;
+        // A clock that moved backwards reads as "just written".
+        Some(modified.elapsed().unwrap_or_default())
+    }
+
+    /// Drop the text/reasoning deltas of turns that already ended in a `Done` (the doc
+    /// entry was finalized there), keeping every other event, the tail after the last
+    /// `Done`, and all original `seq` numbers. `Ok(None)` when the file is smaller than
+    /// `min_bytes`, has no `Done`, or has nothing to drop.
+    ///
+    /// The caller guarantees the chat has no live run. The rewrite goes to a temp file
+    /// in the same directory and is renamed over the journal; the open-fd lock is held
+    /// only to sample the length and for the final catch-up + rename, so concurrent
+    /// appends are copied verbatim and never land in the replaced inode.
+    pub fn compact(
+        &self,
+        chat_id: &str,
+        min_bytes: u64,
+    ) -> Result<Option<CompactStats>, JournalError> {
+        let path = self.path_for(chat_id);
+        let len0 = {
+            let mut files = self.lock();
+            let len0 = match std::fs::metadata(&path) {
+                Ok(m) => m.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            // Release the fd so none stays open on the inode we are about to replace.
+            files.remove(chat_id);
+            len0
+        };
+        if len0 == 0 || len0 < min_bytes {
+            return Ok(None);
+        }
+        let Some(boundary) = compaction_boundary(&path)? else {
+            return Ok(None);
+        };
+
+        // Phase 1 (unlocked): filtered copy of the first `len0` bytes.
+        let mut tmp = tempfile::Builder::new()
+            .prefix(COMPACT_TMP_PREFIX)
+            .suffix(COMPACT_TMP_SUFFIX)
+            .tempfile_in(&self.dir)?;
+        let mut consumed = 0u64;
+        let mut dropped = 0usize;
+        {
+            let mut reader = BufReader::new(File::open(&path)?.take(len0));
+            let mut out = std::io::BufWriter::new(tmp.as_file_mut());
+            let mut raw = Vec::new();
+            loop {
+                raw.clear();
+                if reader.read_until(b'\n', &mut raw)? == 0 {
+                    break;
+                }
+                // An unterminated final line is a torn tail: the catch-up copies it.
+                if raw.last() != Some(&b'\n') {
+                    break;
+                }
+                if is_covered_delta(&path, &raw, boundary) {
+                    dropped += 1;
+                } else {
+                    out.write_all(&raw)?;
+                }
+                consumed += raw.len() as u64;
+            }
+            out.flush()?;
+        }
+        if dropped == 0 {
+            return Ok(None);
+        }
+
+        // Phase 2 (locked): copy whatever was appended meanwhile, swap, drop the fd.
+        let mut files = self.lock();
+        files.remove(chat_id);
+        let mut old = File::open(&path)?;
+        let before_bytes = old.metadata()?.len();
+        let old_last = last_valid_line(&path)?.map(|(seq, _)| seq);
+        old.seek(SeekFrom::Start(consumed))?;
+        std::io::copy(&mut old, tmp.as_file_mut())?;
+        tmp.as_file_mut().flush()?;
+        let new_last = last_valid_line(tmp.path())?.map(|(seq, _)| seq);
+        let after_bytes = tmp.as_file().metadata()?.len();
+        if old_last != new_last || after_bytes == 0 {
+            return Err(JournalError::Io(std::io::Error::other(
+                "journal compaction would change the last seq; aborted",
+            )));
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let _ = tmp.as_file().set_permissions(meta.permissions());
+        }
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| e.error)?;
+        #[cfg(unix)]
+        if let Ok(dir) = File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
+        // The next append reopens the new file and rescans its tail.
+        files.remove(chat_id);
+        Ok(Some(CompactStats {
+            before_bytes,
+            after_bytes,
+            dropped,
+        }))
     }
 
     /// Remove a chat's journal file entirely (tests / future compaction).
@@ -208,6 +385,38 @@ impl RunJournal {
         }
         Ok(())
     }
+}
+
+/// Text and reasoning deltas — the only events the chat doc's final text makes
+/// redundant (a subagent's nested deltas likewise: its doc is finalized with the run).
+/// Tool calls/results exist only in the journal and are never droppable.
+fn is_droppable_delta(event: &AgentEvent) -> bool {
+    match event {
+        AgentEvent::TextDelta { .. } | AgentEvent::ReasoningDelta { .. } => true,
+        AgentEvent::Subagent { event, .. } => is_droppable_delta(event),
+        _ => false,
+    }
+}
+
+/// Seq of the last valid `Done`: everything up to it belongs to finalized turns. `None`
+/// when the journal has no `Done` (a run that never finished), so nothing is compacted.
+fn compaction_boundary(path: &Path) -> Result<Option<u64>, JournalError> {
+    for item in RevEvents::open(path)? {
+        let (seq, event) = item?;
+        if matches!(event, AgentEvent::Done { .. }) {
+            return Ok(Some(seq));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a raw journal line parses, sits at or before `boundary`, and is a droppable
+/// delta. Anything unparsable is kept verbatim.
+fn is_covered_delta(path: &Path, raw: &[u8], boundary: u64) -> bool {
+    let Ok(line) = std::str::from_utf8(raw) else {
+        return false;
+    };
+    parse_line(path, line).is_some_and(|(seq, event)| seq <= boundary && is_droppable_delta(&event))
 }
 
 /// Parse every valid line; malformed lines (torn tail writes) are skipped.
@@ -398,7 +607,7 @@ pub fn journal_paths(dir: &Path, chat_id: &str) -> (PathBuf, PathBuf) {
 
 /// Chat ids become file names; anything outside a conservative set is replaced so a
 /// hostile id cannot traverse paths. (Ids are uuids in practice.)
-fn sanitize_id(chat_id: &str) -> String {
+pub(crate) fn sanitize_id(chat_id: &str) -> String {
     chat_id
         .chars()
         .map(|c| {
@@ -659,5 +868,344 @@ mod tests {
             Some((1, AgentEvent::Done { .. }))
         ));
         assert!(journal.stale_sessions().unwrap().is_empty());
+    }
+
+    fn started(session: &str) -> AgentEvent {
+        AgentEvent::SessionStarted {
+            harness: zeron_proto::HarnessId::Mock,
+            model: "m".into(),
+            tools: vec![],
+            cwd: "/w".into(),
+            session_id: session.into(),
+            assistant_message_id: "a".into(),
+        }
+    }
+
+    fn reasoning(s: &str) -> AgentEvent {
+        AgentEvent::ReasoningDelta { text: s.into() }
+    }
+
+    fn tool_call(id: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            call: zeron_proto::ToolCall::Exec {
+                command: "ls".into(),
+            },
+        }
+    }
+
+    fn tool_result(id: &str) -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: id.into(),
+            is_error: false,
+            output: Some("out".into()),
+            diff: None,
+        }
+    }
+
+    fn nested(event: AgentEvent) -> AgentEvent {
+        AgentEvent::Subagent {
+            parent_tool_use_id: "p".into(),
+            event: Box::new(event),
+        }
+    }
+
+    /// One finished turn (seqs 1..=7, `Done` = 7) plus a two-delta tail (8, 9).
+    fn standard_events() -> Vec<AgentEvent> {
+        vec![
+            started("hs-1"),
+            text("a"),
+            text("b"),
+            tool_call("t1"),
+            tool_result("t1"),
+            reasoning("r"),
+            done(),
+            text("tail1"),
+            text("tail2"),
+        ]
+    }
+
+    fn fill(journal: &RunJournal, chat: &str, events: &[AgentEvent]) {
+        for event in events {
+            journal.append(chat, event).unwrap();
+        }
+    }
+
+    fn seqs_of(journal: &RunJournal, chat: &str) -> Vec<u64> {
+        let all = journal.replay(chat, 0).unwrap();
+        all.into_iter().map(|(seq, _)| seq).collect()
+    }
+
+    #[test]
+    fn compact_drops_covered_deltas_and_keeps_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        fill(&journal, "c", &standard_events());
+        let before = journal.size_bytes("c");
+
+        let stats = journal.compact("c", 0).unwrap().unwrap();
+        assert_eq!(stats.dropped, 3);
+        assert_eq!(stats.before_bytes, before);
+        assert_eq!(stats.after_bytes, journal.size_bytes("c"));
+        assert!(stats.after_bytes < stats.before_bytes);
+
+        assert_eq!(seqs_of(&journal, "c"), vec![1, 4, 5, 7, 8, 9]);
+        let all = journal.replay("c", 0).unwrap();
+        assert!(matches!(all[0].1, AgentEvent::SessionStarted { .. }));
+        assert!(matches!(all[1].1, AgentEvent::ToolCall { .. }));
+        assert!(matches!(all[2].1, AgentEvent::ToolResult { .. }));
+        assert!(matches!(all[3].1, AgentEvent::Done { .. }));
+        assert_eq!(all[4].1, text("tail1"));
+        assert_eq!(all[5].1, text("tail2"));
+        // Seq stays stable for the next append.
+        assert_eq!(journal.append("c", &text("more")).unwrap(), 10);
+        // A second pass has nothing left to drop below the boundary.
+        assert_eq!(journal.compact("c", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn compact_replay_after_seq_matches_uncompacted() {
+        let events = standard_events();
+        let plain_dir = tempfile::tempdir().unwrap();
+        let packed_dir = tempfile::tempdir().unwrap();
+        let plain = RunJournal::open(plain_dir.path()).unwrap();
+        let packed = RunJournal::open(packed_dir.path()).unwrap();
+        fill(&plain, "c", &events);
+        fill(&packed, "c", &events);
+        packed.compact("c", 0).unwrap().unwrap();
+
+        let boundary = 7;
+        let last = events.len() as u64;
+        for after in 0..=last + 1 {
+            let expected: Vec<_> = plain
+                .replay("c", after)
+                .unwrap()
+                .into_iter()
+                .filter(|(seq, ev)| !is_droppable_delta(ev) || *seq > boundary)
+                .collect();
+            assert_eq!(
+                packed.replay("c", after).unwrap(),
+                expected,
+                "after {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_keeps_nested_subagent_non_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        fill(
+            &journal,
+            "c",
+            &[
+                started("hs"),
+                nested(text("x")),
+                nested(nested(reasoning("deep"))),
+                nested(tool_call("s1")),
+                nested(tool_result("s1")),
+                done(),
+            ],
+        );
+        let stats = journal.compact("c", 0).unwrap().unwrap();
+        assert_eq!(stats.dropped, 2);
+        assert_eq!(seqs_of(&journal, "c"), vec![1, 4, 5, 6]);
+    }
+
+    #[test]
+    fn only_text_and_reasoning_deltas_are_droppable() {
+        for ev in [
+            started("s"),
+            done(),
+            tool_call("t"),
+            tool_result("t"),
+            AgentEvent::Error {
+                message: "e".into(),
+            },
+            AgentEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 2,
+            },
+            AgentEvent::ContextUsage {
+                tokens: Some(1),
+                window: None,
+            },
+            AgentEvent::Steered {
+                assistant_message_id: None,
+                next_assistant_message_id: None,
+            },
+            AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: "a".into(),
+            },
+            nested(done()),
+        ] {
+            assert!(!is_droppable_delta(&ev), "{ev:?}");
+        }
+        assert!(is_droppable_delta(&text("x")));
+        assert!(is_droppable_delta(&reasoning("x")));
+    }
+
+    #[test]
+    fn compact_noop_without_done_or_below_min() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // A run that never finished: no boundary, untouched byte for byte.
+        fill(&journal, "live", &[started("s"), text("a"), text("b")]);
+        let path = dir.path().join("live.jsonl");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(journal.compact("live", 0).unwrap(), None);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        fill(&journal, "done", &standard_events());
+        let path = dir.path().join("done.jsonl");
+        let bytes = std::fs::read(&path).unwrap();
+        let too_big = bytes.len() as u64 + 1;
+        assert_eq!(journal.compact("done", too_big).unwrap(), None);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(journal.compact("missing", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn compact_crash_revival_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // Turn 1 finished (and is compacted); turn 2 died mid-stream.
+        fill(&journal, "c", &standard_events()[..7]);
+        journal.compact("c", 0).unwrap().unwrap();
+        fill(
+            &journal,
+            "c",
+            &[started("hs-2"), text("partial"), tool_call("t2")],
+        );
+
+        assert_eq!(journal.stale_sessions().unwrap(), vec!["c".to_string()]);
+        let last = journal.last_event("c").unwrap().unwrap();
+        assert_eq!(last.1, tool_call("t2"));
+        let sessions: Vec<String> = journal
+            .events_rev("c")
+            .unwrap()
+            .filter_map(|e| match e.unwrap().1 {
+                AgentEvent::SessionStarted { session_id, .. } => Some(session_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sessions, vec!["hs-2".to_string(), "hs-1".to_string()]);
+
+        // Revival closes the journal with a synthetic Done.
+        journal.append("c", &done()).unwrap();
+        assert!(journal.stale_sessions().unwrap().is_empty());
+        // Turn 2's deltas then compact too; the closing Done stays last.
+        journal.compact("c", 0).unwrap().unwrap();
+        assert!(matches!(
+            journal.last_event("c").unwrap(),
+            Some((_, AgentEvent::Done { .. }))
+        ));
+    }
+
+    #[test]
+    fn compact_preserves_torn_tail_and_append_isolates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        fill(&journal, "c", &standard_events());
+        let path = dir.path().join("c.jsonl");
+        let torn: &[u8] = b"{\"seq\":10,\"event\":{\"type\":\"textD";
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(torn).unwrap();
+        drop(f);
+
+        journal.compact("c", 0).unwrap().unwrap();
+        assert!(std::fs::read(&path).unwrap().ends_with(torn));
+        // The reopened fd recomputes needs_newline: the torn line stays isolated.
+        assert_eq!(journal.append("c", &text("next")).unwrap(), 10);
+        let all = journal.replay("c", 0).unwrap();
+        assert_eq!(all.last().unwrap(), &(10, text("next")));
+        assert_eq!(all.len(), 7);
+    }
+
+    #[test]
+    fn compact_append_after_reopen_lands_in_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // The appends cache an open fd for "c".
+        fill(&journal, "c", &standard_events());
+        journal.compact("c", 0).unwrap().unwrap();
+        assert_eq!(journal.append("c", &text("after")).unwrap(), 10);
+
+        let fresh = RunJournal::open(dir.path()).unwrap();
+        let all = fresh.replay("c", 0).unwrap();
+        assert_eq!(all.last().unwrap(), &(10, text("after")));
+        let seqs: Vec<u64> = all.iter().map(|(s, _)| *s).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    }
+
+    #[test]
+    fn compact_concurrent_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = std::sync::Arc::new(RunJournal::open(dir.path()).unwrap());
+        let mut events = vec![started("s")];
+        events.extend((0..300).map(|i| text(&format!("pre{i}"))));
+        events.push(done());
+        fill(&journal, "c", &events);
+
+        let writer = {
+            let journal = journal.clone();
+            std::thread::spawn(move || {
+                for i in 0..200 {
+                    let ev = if i % 10 == 0 {
+                        tool_call(&format!("w{i}"))
+                    } else {
+                        text(&format!("live{i}"))
+                    };
+                    journal.append("c", &ev).unwrap();
+                }
+            })
+        };
+        let mut compacted = 0;
+        while !writer.is_finished() {
+            compacted += usize::from(journal.compact("c", 0).unwrap().is_some());
+        }
+        writer.join().unwrap();
+        compacted += usize::from(journal.compact("c", 0).unwrap().is_some());
+        assert!(compacted >= 1);
+
+        let seqs = seqs_of(&journal, "c");
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "strictly increasing");
+        // Everything appended after the Done (seq 302) survives, in order.
+        let tail: Vec<u64> = seqs.iter().copied().filter(|s| *s > 302).collect();
+        assert_eq!(tail, (303..=502).collect::<Vec<_>>());
+        // The pre-Done deltas are gone; SessionStarted and Done remain.
+        assert_eq!(seqs[..2], [1, 302]);
+    }
+
+    #[test]
+    fn compact_leftover_tmp_is_ignored_and_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".compact-x.tmp");
+        std::fs::write(&tmp, "junk").unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        assert!(!tmp.exists());
+        std::fs::write(&tmp, "junk").unwrap();
+        assert!(journal.stale_sessions().unwrap().is_empty());
+        assert!(journal.journaled_chats().is_empty());
+    }
+
+    #[test]
+    fn size_metrics_and_chat_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        fill(&journal, "b", &[text("x")]);
+        fill(&journal, "a", &[text("y"), done()]);
+        std::fs::write(dir.path().join("a.resume"), "1").unwrap();
+        assert_eq!(
+            journal.journaled_chats(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            journal.total_bytes(),
+            journal.size_bytes("a") + journal.size_bytes("b")
+        );
+        assert_eq!(journal.size_bytes("none"), 0);
+        assert!(journal.idle_for("a").is_some());
+        assert!(journal.idle_for("none").is_none());
     }
 }
