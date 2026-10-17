@@ -3633,12 +3633,14 @@ async fn an_orchestrator_tree_shares_a_board_per_folder() {
     core.workspace
         .rename_chat("a-1-1", "Map the\nparser")
         .expect("rename chat");
-    let post = |chat: &str, kind: &str, text: &str| {
-        client.call(
-            zeron_rpc::methods::POST_BOARD,
-            serde_json::json!({ "chatId": chat, "kind": kind, "text": text }),
-        )
+    let post_to = |chat: &str, board: Option<&str>, kind: &str, text: &str| {
+        let mut params = serde_json::json!({ "chatId": chat, "kind": kind, "text": text });
+        if let Some(board) = board {
+            params["boardChatId"] = board.into();
+        }
+        client.call(zeron_rpc::methods::POST_BOARD, params)
     };
+    let post = |chat: &str, kind: &str, text: &str| post_to(chat, None, kind, text);
     let posted = post("a-1-1", "finding", "  the parser lives in src/parse.rs  ")
         .await
         .expect("PostBoard");
@@ -3646,9 +3648,24 @@ async fn an_orchestrator_tree_shares_a_board_per_folder() {
     assert_eq!(posted["entry"]["authorDepth"], 2);
     assert_eq!(posted["entry"]["authorTitle"], "Map the parser");
     assert_eq!(posted["entry"]["rootId"], "orchestrator-a");
-    post("orchestrator-a", "discovery", "use cargo nextest")
+    assert!(
+        post("orchestrator-a", "discovery", "x").await.is_err(),
+        "the root names a folder: no board spans the tree"
+    );
+    assert!(
+        post_to("orchestrator-a", Some("b-1"), "finding", "x")
+            .await
+            .is_err(),
+        "another tree's session"
+    );
+    assert!(
+        post_to("a-1", Some("a-3"), "finding", "x").await.is_err(),
+        "a session cannot post to another folder"
+    );
+    let rooted = post_to("orchestrator-a", Some("a-1"), "discovery", "use cargo nextest")
         .await
-        .expect("the root posts to the whole tree");
+        .expect("the root posts to a-1's folder");
+    assert_eq!(rooted["entry"]["folder"], "dir:/repo");
     post("b-1", "blocker", "another tree's post")
         .await
         .expect("PostBoard");
@@ -3665,10 +3682,9 @@ async fn an_orchestrator_tree_shares_a_board_per_folder() {
 
     let both = ["the parser lives in src/parse.rs", "use cargo nextest"];
     assert_eq!(board_texts(&client, "a-2").await, both, "same folder");
-    assert_eq!(
-        board_texts(&client, "a-3").await,
-        ["use cargo nextest"],
-        "another folder sees only the root's posts"
+    assert!(
+        board_texts(&client, "a-3").await.is_empty(),
+        "another folder sees none of them"
     );
     assert_eq!(board_texts(&client, "orchestrator-a").await, both);
     assert_eq!(

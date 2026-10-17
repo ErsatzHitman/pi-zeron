@@ -199,9 +199,14 @@ chat in a paused orchestrator's tree; see
 The sessions of one orchestrator tree share a board of findings, discoveries
 and blockers (`zeron_proto::board`). A post's board is the author's folder
 (`folder_of`: its project, so writers in their own worktrees still share one;
-else its working folder). The root reads every folder's posts, and its own
-posts reach the whole tree. A different tree never sees them: the engine
-derives the tree from the calling chat (`root_of`), never from the caller.
+else its working folder), and a session sees only that board: sessions in
+different directories never read or receive each other's posts. The root
+reads every folder's posts and posts to one folder at a time (`board_post`'s
+`session`, `PostBoard`'s `boardChatId`: a session of its tree, whose folder
+gets the post); a session cannot post to another folder. Root posts from
+before boards were per folder (empty `folder`) are the root's alone. A
+different tree never sees them: the engine derives the tree from the calling
+chat (`root_of`), never from the caller.
 
 `PostBoard` stores the post as a registry row (kind `boardPosts`, id an HLC,
 so posts sort in order and sync to other devices; at most 200 per tree, the

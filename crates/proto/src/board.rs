@@ -1,7 +1,9 @@
-//! The message board an orchestrator's sessions share: findings, discoveries
+//! The message boards an orchestrator's sessions share: findings, discoveries
 //! and blockers, posted while they work. Each folder of a tree has its own
-//! board; the root reads all of them, and its own posts reach the whole tree.
-//! Unrelated trees never see each other's posts.
+//! board, and a session sees only its folder's: sessions working in different
+//! directories never read or receive each other's posts. The root reads every
+//! board and posts to one folder's at a time. Unrelated trees never see each
+//! other's posts.
 use serde::{Deserialize, Serialize};
 
 use crate::{Chat, orchestrator};
@@ -38,7 +40,8 @@ pub struct BoardEntry {
     /// The registry row id: an HLC, so ids sort in posting order.
     pub id: String,
     pub root_id: String,
-    /// The board it is on ([`folder_of`]); empty for the whole tree.
+    /// The board it is on ([`folder_of`]). Empty on a root post from before
+    /// boards were per folder: only the root sees those.
     pub folder: String,
     pub author_chat_id: String,
     #[serde(default)]
@@ -63,12 +66,10 @@ pub fn folder_of(chat: &Chat) -> String {
     }
 }
 
-/// Whether `reader` sees `entry`: posts to the whole tree, the root, and
-/// sessions of the same folder.
+/// Whether `reader` sees `entry`: the root sees every board, a session only
+/// its own folder's.
 pub fn visible_to(entry: &BoardEntry, reader: &Chat) -> bool {
-    entry.folder.is_empty()
-        || orchestrator::is_root_chat(&reader.id)
-        || entry.folder == folder_of(reader)
+    orchestrator::is_root_chat(&reader.id) || entry.folder == folder_of(reader)
 }
 
 /// The text a post arrives as in another session's conversation.
@@ -148,7 +149,18 @@ mod tests {
             &post,
             &chat("orchestrator-r", None, Some("/scratch"))
         ));
-        assert!(visible_to(&entry(""), &chat("other", Some("s2"), None)));
+        assert!(
+            !visible_to(&entry(""), &chat("other", Some("s2"), None)),
+            "no board spans folders"
+        );
+        assert!(!visible_to(
+            &entry("dir:/repo/a"),
+            &chat("peer", None, Some("/repo/b"))
+        ));
+        assert!(visible_to(
+            &entry(""),
+            &chat("orchestrator-r", None, Some("/scratch"))
+        ));
     }
 
     #[test]

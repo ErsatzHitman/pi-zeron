@@ -295,19 +295,20 @@ fn catalog() -> Vec<ToolDef> {
     });
     tools.push(ToolDef {
         name: BOARD_POST,
-        description: "Post to your orchestrator tree's message board: a finding (a fact about the code or task), a discovery (a command, tool or shortcut that works) or a blocker (something stopping you that others may hit or can fix). Only for a session in an orchestrator's tree. The post reaches the other sessions of your folder and the orchestrator by itself (a running session at its next step; an idle one reads it when it next starts), and the root's posts reach the whole tree. Post only what they need now; no progress reports.",
+        description: "Post to your folder's message board: a finding (a fact about the code or task), a discovery (a command, tool or shortcut that works) or a blocker (something stopping you that others may hit or can fix). Only for a session in an orchestrator's tree. Each folder has its own board: the post reaches the other sessions of your folder and the orchestrator by itself (a running session at its next step; an idle one reads it when it next starts), never sessions in other folders. The orchestrator posts to one folder's board at a time, naming a session there. Post only what they need now; no progress reports.",
         input_schema: json!({
             "type": "object",
             "properties": {
                 "kind": { "type": "string", "enum": ["finding", "discovery", "blocker"] },
-                "text": { "type": "string", "maxLength": zeron_proto::board::BOARD_MAX_TEXT, "description": "The post, self-contained: name files, commands and errors exactly." }
+                "text": { "type": "string", "maxLength": zeron_proto::board::BOARD_MAX_TEXT, "description": "The post, self-contained: name files, commands and errors exactly." },
+                "session": { "type": "string", "description": "The orchestrator only (required there): a session of your tree, by id or title; the post goes on that session's folder board. Sessions omit it." }
             },
             "required": ["kind", "text"]
         }),
     });
     tools.push(ToolDef {
         name: BOARD_READ,
-        description: "Read your orchestrator tree's message board: the posts your folder's sessions and the orchestrator made, oldest first (the orchestrator sees every folder). Call it when you start and after a resume or compaction. Pass since (the last id you saw) for only newer posts.",
+        description: "Read your folder's message board: the posts your folder's sessions and the orchestrator made there, oldest first (the orchestrator sees every folder's board). Call it when you start and after a resume or compaction. Pass since (the last id you saw) for only newer posts.",
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -735,6 +736,8 @@ struct SendArgs {
 struct BoardPostArgs {
     kind: String,
     text: String,
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1665,12 +1668,13 @@ impl Tools {
         let chat_id = self.zeron.origin().chat_id.clone().context(
             "board_post only works from an agent Zeron launched in an orchestrator's tree",
         )?;
+        let mut params = json!({ "chatId": chat_id, "kind": args.kind, "text": args.text });
+        if let Some(session) = args.session.filter(|s| !s.trim().is_empty()) {
+            params["boardChatId"] = json!(self.zeron.resolve_chat(&session).await?.id);
+        }
         let posted = self
             .zeron
-            .call(
-                zeron_rpc::methods::POST_BOARD,
-                json!({ "chatId": chat_id, "kind": args.kind, "text": args.text }),
-            )
+            .call(zeron_rpc::methods::POST_BOARD, params)
             .await?;
         let entry: BoardEntry = serde_json::from_value(posted["entry"].clone())?;
         let (chats, spaces, sessions) = tokio::try_join!(
@@ -2431,9 +2435,14 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((method.to_owned(), params.clone()));
+                    let folder = if params["boardChatId"] == "m-elsewhere" {
+                        "space:space-2"
+                    } else {
+                        "space:space-1"
+                    };
                     RpcReply::Value(json!({ "entry": {
                         "id": "0000000000001-000000-dev-local", "rootId": "orchestrator-t",
-                        "folder": "space:space-1", "authorChatId": params["chatId"],
+                        "folder": folder, "authorChatId": params["chatId"],
                         "authorTitle": "Member A", "authorDepth": 1,
                         "kind": params["kind"], "text": params["text"], "at": 1,
                     }}))
@@ -2743,6 +2752,34 @@ mod tests {
         assert_eq!(params["chatId"], "m-a");
         assert_eq!(params["since"], "0000000000001-000000-dev-local");
         assert_eq!(params["limit"], 5);
+    }
+
+    #[tokio::test]
+    async fn the_orchestrator_posts_to_one_folders_board() {
+        let world = Arc::new(board_world());
+        let root = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("orchestrator-t".into()),
+                device_id: Some("dev-local".into()),
+            },
+        );
+        let posted = root
+            .call(
+                "board_post",
+                json!({ "kind": "finding", "text": "the API moved to v2", "session": "m-elsewhere" }),
+            )
+            .await
+            .unwrap();
+        let recipients: Vec<_> = posted["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["chatId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(recipients, ["m-elsewhere"], "never the other folder's sessions");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["boardChatId"], "m-elsewhere");
     }
 
     #[tokio::test]

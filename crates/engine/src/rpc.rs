@@ -560,6 +560,10 @@ struct PostBoardParams {
     chat_id: String,
     kind: zeron_proto::board::BoardKind,
     text: String,
+    /// The session whose folder's board gets the post: required from the
+    /// root (it has no folder of its own); a session posts to its own.
+    #[serde(default)]
+    board_chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4168,14 +4172,50 @@ impl RpcService for EngineRpc {
                 let chats = self.workspace.read_chats().map_err(failed)?;
                 let (chat, root) = board_member(&chats, &p.chat_id)?;
                 let place = zeron_proto::orchestrator::Place::of(&chats, &chat.id);
+                let target = p
+                    .board_chat_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty());
+                // No board spans folders: the root names the session whose
+                // folder it posts to, and a session posts only to its own.
+                let folder = match target {
+                    None if chat.id == root => {
+                        return Err(RpcError::BadParams(
+                            "The orchestrator has no board of its own: name the session \
+                             whose folder's board gets the post (session)."
+                                .into(),
+                        ));
+                    }
+                    None => folder_of(chat),
+                    Some(target) => {
+                        let board = chats
+                            .iter()
+                            .find(|c| {
+                                c.id == target
+                                    && c.id != root
+                                    && zeron_proto::orchestrator::root_of(&chats, &c.id)
+                                        .is_some_and(|r| r.id == root)
+                            })
+                            .ok_or_else(|| {
+                                RpcError::BadParams(format!(
+                                    "{target} is not a session of this orchestrator's tree"
+                                ))
+                            })?;
+                        let folder = folder_of(board);
+                        if chat.id != root && folder != folder_of(chat) {
+                            return Err(RpcError::BadParams(
+                                "Sessions in other folders have their own board; yours is \
+                                 your folder's. Tell the orchestrator what they need."
+                                    .into(),
+                            ));
+                        }
+                        folder
+                    }
+                };
                 let entry = BoardEntry {
                     id: String::new(),
-                    // The root's posts reach its whole tree.
-                    folder: if chat.id == root {
-                        String::new()
-                    } else {
-                        folder_of(chat)
-                    },
+                    folder,
                     root_id: root,
                     author_chat_id: chat.id.clone(),
                     author_depth: place.depth().unwrap_or(0),
