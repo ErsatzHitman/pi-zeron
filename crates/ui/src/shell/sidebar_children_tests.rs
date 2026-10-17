@@ -304,7 +304,12 @@ fn the_btw_pane_opens_at_the_bottom_left_with_its_bar_inside(cx: &mut TestAppCon
     assert_eq!(f32::from(pane.size.width), btw_pane::BTW_WIDTH);
     assert!((f32::from(pane.size.height) - btw_pane::BTW_HEIGHT).abs() <= 1.0);
     assert_eq!(f32::from(pane.origin.x), 12.0);
-    assert!((f32::from(pane.bottom()) - (900.0 - 12.0)).abs() <= 1.0);
+    let viewport = cx.update(|window, _| f32::from(window.viewport_size().height));
+    assert!(
+        (f32::from(pane.bottom()) - (viewport - 12.0)).abs() <= 1.0,
+        "the pane ends at {:?} in a {viewport}px window",
+        pane.bottom()
+    );
     // The prompt bar is inside the pane, at its bottom, on one line.
     assert!(bar.origin.x >= pane.origin.x && bar.right() <= pane.right());
     assert!(bar.origin.y > pane.origin.y && bar.bottom() <= pane.bottom() + px(0.5));
@@ -349,6 +354,12 @@ fn open_btw<'a>(
         *shell.test_time.as_mut().unwrap() += Duration::from_secs(3);
     });
     (shell, cx)
+}
+
+/// Within a pixel: layout rounds the pane's edges to device pixels, a pixel
+/// apart between platforms and frames.
+fn near(a: gpui::Point<Pixels>, b: gpui::Point<Pixels>) -> bool {
+    (f32::from(a.x) - f32::from(b.x)).abs() <= 1.0 && (f32::from(a.y) - f32::from(b.y)).abs() <= 1.0
 }
 
 /// Draw until the pane stops asking for frames (it follows its thread's
@@ -412,7 +423,11 @@ fn the_btw_pane_keeps_its_size_and_scrolls_a_long_reply(cx: &mut TestAppContext)
     // The same pane: the reply scrolls inside it, the bar stays at its bottom.
     let pane = cx.debug_bounds("session-btw").expect("the btw pane");
     let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
-    assert_eq!(pane, empty);
+    assert_eq!(pane.size, empty.size);
+    assert!(
+        near(pane.origin, empty.origin),
+        "{pane:?} moved from {empty:?}"
+    );
     assert!(bar.bottom() <= pane.bottom() + px(0.5));
     let content = transcript.read_with(cx, |transcript, _| transcript.content_height());
     let room = f32::from(bar.origin.y - pane.origin.y) - 34.0 - 2.0;
@@ -463,9 +478,11 @@ fn the_btw_pane_drags_by_its_header_and_stays_in_the_window(cx: &mut TestAppCont
     };
     drag(cx, start + gpui::point(px(600.0), px(-300.0)));
     let after = cx.debug_bounds("session-btw").expect("the btw pane");
-    assert_eq!(
-        after.origin,
-        before.origin + gpui::point(px(600.0), px(-300.0))
+    let moved = before.origin + gpui::point(px(600.0), px(-300.0));
+    assert!(
+        near(after.origin, moved),
+        "dragged to {:?}, not {moved:?}",
+        after.origin
     );
     assert_eq!(after.size, before.size);
     // Flung past the window's corner, it stops inside it.
@@ -486,8 +503,11 @@ fn the_btw_pane_drags_by_its_header_and_stays_in_the_window(cx: &mut TestAppCont
     );
     settle(cx);
     let flung = cx.debug_bounds("session-btw").expect("the btw pane");
-    assert_eq!(f32::from(flung.right()), 1600.0 - 12.0);
-    assert_eq!(f32::from(flung.origin.y), 12.0);
+    assert!(
+        (f32::from(flung.right()) - (1600.0 - 12.0)).abs() <= 1.0,
+        "{flung:?}"
+    );
+    assert!((f32::from(flung.origin.y) - 12.0).abs() <= 1.0, "{flung:?}");
     // Closed and opened again, it comes back where it was left.
     cx.update(|_, cx| {
         shell.update(cx, |shell, cx| {
@@ -505,7 +525,10 @@ fn the_btw_pane_drags_by_its_header_and_stays_in_the_window(cx: &mut TestAppCont
     });
     settle(cx);
     let reopened = cx.debug_bounds("session-btw").expect("the btw pane");
-    assert_eq!(reopened.origin, flung.origin);
+    assert!(
+        near(reopened.origin, flung.origin),
+        "{reopened:?} vs {flung:?}"
+    );
 }
 
 #[gpui::test]
