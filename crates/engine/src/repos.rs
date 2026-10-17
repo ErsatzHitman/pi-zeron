@@ -20,7 +20,8 @@ use sha2::{Digest, Sha256};
 use zeron_proto::{
     DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit,
     GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind, HomeFolderMatch,
-    HomeFolderSearchResult, Repo, RepoRef, Worktree,
+    HomeFolderSearchResult, MergeConflictCheck, MergePreview, MergePreviewDirty, MergePreviewFile,
+    Repo, RepoRef, Worktree,
 };
 
 use crate::EngineError;
@@ -310,6 +311,45 @@ impl Repos {
             output.status,
             stderr.trim()
         )))
+    }
+
+    /// Like [`Self::git`], for commands whose exit code carries meaning
+    /// (`merge-tree` exits 1 on conflicts): `(exit code, untrimmed stdout,
+    /// stderr)` for ANY exit, `Err` only when git cannot be spawned.
+    async fn git_status(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> Result<(i32, String, String), EngineError> {
+        let mut cmd = tokio::process::Command::new("git");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut().creation_flags(0x08000000);
+        }
+        cmd.args(args);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+        Ok((
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+
+    /// The installed git as `(major, minor, version text)`, if it parses.
+    async fn git_version(&self) -> Option<(u32, u32, String)> {
+        let (code, out, _) = self.git_status(&["--version"], None).await.ok()?;
+        if code != 0 {
+            return None;
+        }
+        parse_git_version(&out)
     }
 
     /// Async existence probe with a timeout: a wedged network mount just reads
@@ -1429,6 +1469,234 @@ impl Repos {
         Ok(())
     }
 
+    // ── merge preview ───────────────────────────────────────────────────────
+
+    /// Read-only preview of merging the branch checked out in `worktree` into
+    /// the lead branch of `base_repo` (`base_override`, else the branch checked
+    /// out there). Changes no tree, index, HEAD or ref.
+    pub async fn merge_preview(
+        &self,
+        worktree: &Path,
+        base_repo: &Path,
+        base_override: Option<&str>,
+    ) -> Result<MergePreview, EngineError> {
+        let version = self.git_version().await;
+        // Unknown version: try anyway, a usage error (129) falls back below.
+        let supported = version
+            .as_ref()
+            .is_none_or(|(major, minor, _)| (*major, *minor) >= MERGE_TREE_WRITE_TREE_MIN);
+        self.merge_preview_with(
+            worktree,
+            base_repo,
+            base_override,
+            supported,
+            version.map(|(_, _, text)| text),
+        )
+        .await
+    }
+
+    /// [`Self::merge_preview`] with the `merge-tree --write-tree` capability
+    /// given (tests force the old-git fallback).
+    pub(crate) async fn merge_preview_with(
+        &self,
+        worktree: &Path,
+        base_repo: &Path,
+        base_override: Option<&str>,
+        conflict_check_supported: bool,
+        git_version: Option<String>,
+    ) -> Result<MergePreview, EngineError> {
+        if !Self::path_exists(worktree).await || !self.is_repo(worktree).await {
+            return Err(EngineError::Other(
+                "this session has no worktree yet".into(),
+            ));
+        }
+        // Resolve the lead first, in the project folder: a bare `HEAD` inside the
+        // worktree is the member's own head. Both sides become full shas before
+        // `merge-tree`, which exits 1 for an unknown ref just as for conflicts.
+        let base_ref = match base_override.map(str::trim).filter(|b| !b.is_empty()) {
+            Some(b) if b.starts_with('-') => {
+                return Err(EngineError::Other(format!("lead branch {b} not found")));
+            }
+            Some(b) => b.to_string(),
+            None => self.current_branch(base_repo).await?,
+        };
+        let base_head = self
+            .git(
+                &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+                Some(base_repo),
+            )
+            .await
+            .map_err(|_| EngineError::Other(format!("lead branch {base_ref} not found")))?;
+        let branch_head = self
+            .git(&["rev-parse", "--verify", "HEAD^{commit}"], Some(worktree))
+            .await?;
+        let branch = match self.current_branch(worktree).await? {
+            b if b == "HEAD" => branch_head.chars().take(7).collect(),
+            b => b,
+        };
+
+        // `left` = only on the lead (behind), `right` = only on the member (ahead).
+        let counts = self
+            .git(
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{base_head}...{branch_head}"),
+                ],
+                Some(worktree),
+            )
+            .await?;
+        let mut counts = counts
+            .split_whitespace()
+            .map(|n| n.parse::<usize>().unwrap_or(0));
+        let behind = counts.next().unwrap_or(0);
+        let ahead = counts.next().unwrap_or(0);
+
+        let mut preview = MergePreview {
+            chat_id: String::new(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            branch,
+            branch_head: branch_head.clone(),
+            base: base_ref,
+            base_head: base_head.clone(),
+            merge_base: None,
+            ahead,
+            behind,
+            already_merged: ahead == 0,
+            fast_forward: behind == 0 && ahead > 0,
+            files: Vec::new(),
+            files_total: 0,
+            files_truncated: false,
+            uncommitted: MergePreviewDirty::default(),
+            conflict_check: MergeConflictCheck::Clean,
+            conflicts: Vec::new(),
+            conflicts_total: 0,
+            merge_tree: None,
+            note: None,
+            git_version,
+        };
+
+        // Uncommitted edits. `--no-optional-locks` keeps `status` from refreshing
+        // (and locking) the index under the member's own git.
+        let (code, out, err) = self
+            .git_status(
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "-uall",
+                ],
+                Some(worktree),
+            )
+            .await?;
+        if code == 0 {
+            preview.uncommitted = parse_porcelain_status(&out);
+        } else {
+            preview.note = Some(format!("uncommitted edits not read: {}", err.trim()));
+        }
+
+        let (code, out, _) = self
+            .git_status(&["merge-base", &base_head, &branch_head], Some(worktree))
+            .await?;
+        let merge_base = out.trim().to_string();
+        if code != 0 || merge_base.is_empty() {
+            preview.conflict_check = MergeConflictCheck::Failed;
+            preview.note = Some(
+                "the member branch and the lead share no history, so there is nothing to merge"
+                    .into(),
+            );
+            return Ok(preview);
+        }
+        preview.merge_base = Some(merge_base.clone());
+
+        let (code, out, err) = self
+            .git_status(
+                &[
+                    "diff",
+                    "--name-status",
+                    "-z",
+                    "--find-renames",
+                    &merge_base,
+                    &branch_head,
+                ],
+                Some(worktree),
+            )
+            .await?;
+        if code == 0 {
+            let mut files = parse_name_status(&out);
+            preview.files_total = files.len();
+            if files.len() > MERGE_PREVIEW_MAX_FILES {
+                files.truncate(MERGE_PREVIEW_MAX_FILES);
+                preview.files_truncated = true;
+            }
+            preview.files = files;
+        } else {
+            preview.note = Some(format!("files not listed: {}", err.trim()));
+        }
+
+        if !conflict_check_supported {
+            preview.conflict_check = MergeConflictCheck::Unavailable;
+            preview.note = Some(unavailable_note(preview.git_version.as_deref()));
+            return Ok(preview);
+        }
+        // `--write-tree` writes loose tree/blob objects for the merge result into
+        // the object database (harmless, gc-able) but never touches the index,
+        // any working tree, HEAD or refs.
+        let (code, out, err) = self
+            .git_status(
+                &[
+                    "merge-tree",
+                    "--write-tree",
+                    "-z",
+                    "--name-only",
+                    "--no-messages",
+                    &base_head,
+                    &branch_head,
+                ],
+                Some(worktree),
+            )
+            .await?;
+        match code {
+            0 | 1 => {
+                let mut parts = out.split('\0');
+                let tree = parts.next().unwrap_or("").trim();
+                if !tree.is_empty() {
+                    preview.merge_tree = Some(tree.to_string());
+                }
+                let mut conflicts: Vec<String> = Vec::new();
+                for path in parts.filter(|p| !p.is_empty()) {
+                    if !conflicts.iter().any(|c| c == path) {
+                        conflicts.push(path.to_string());
+                    }
+                }
+                preview.conflicts_total = conflicts.len();
+                conflicts.truncate(MERGE_PREVIEW_MAX_CONFLICTS);
+                preview.conflicts = conflicts;
+                preview.conflict_check = if code == 0 {
+                    MergeConflictCheck::Clean
+                } else {
+                    MergeConflictCheck::Conflicts
+                };
+            }
+            129 => {
+                preview.conflict_check = MergeConflictCheck::Unavailable;
+                preview.note = Some(unavailable_note(preview.git_version.as_deref()));
+            }
+            _ => {
+                preview.conflict_check = MergeConflictCheck::Failed;
+                let err = err.trim();
+                preview.note = Some(if err.is_empty() {
+                    format!("git merge-tree failed (exit {code})")
+                } else {
+                    format!("git merge-tree failed: {err}")
+                });
+            }
+        }
+        Ok(preview)
+    }
+
     // ── ListFolders ─────────────────────────────────────────────────────────
 
     /// One directory level (home by default): dotfiles hidden, directories first,
@@ -1563,6 +1831,88 @@ async fn disposable_worker<T: Send + 'static>(
         })
         .ok()?;
     rx.await.ok()
+}
+
+/// First git that has `merge-tree --write-tree`.
+const MERGE_TREE_WRITE_TREE_MIN: (u32, u32) = (2, 38);
+const MERGE_PREVIEW_MAX_FILES: usize = 200;
+const MERGE_PREVIEW_MAX_CONFLICTS: usize = 100;
+const MERGE_PREVIEW_MAX_DIRTY_PATHS: usize = 50;
+
+fn unavailable_note(version: Option<&str>) -> String {
+    format!(
+        "git {} is older than 2.38, which merge-tree --write-tree needs; conflicts not checked. \
+         Files touched, ahead/behind and uncommitted are still accurate.",
+        version.unwrap_or("(unknown)")
+    )
+}
+
+/// `git version 2.43.0`, `2.39.5 (Apple Git-154)`, `2.37.1.windows.1` ->
+/// `(major, minor, "2.43.0" | "2.39.5" | "2.37.1.windows.1")`.
+fn parse_git_version(text: &str) -> Option<(u32, u32, String)> {
+    let text = text.trim();
+    let rest = text.strip_prefix("git version").unwrap_or(text).trim();
+    let token = rest.split_whitespace().next()?;
+    let mut numbers = token.split('.');
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next()?.parse().ok()?;
+    Some((major, minor, token.to_string()))
+}
+
+/// `diff --name-status -z`: `<status>\0<path>\0`, with two paths for `R`/`C`.
+fn parse_name_status(out: &str) -> Vec<MergePreviewFile> {
+    let mut tokens = out.split('\0').filter(|t| !t.is_empty());
+    let mut files = Vec::new();
+    while let Some(status) = tokens.next() {
+        let letter = status.chars().next().unwrap_or('M');
+        let (path, old_path) = if matches!(letter, 'R' | 'C') {
+            let old = tokens.next();
+            (tokens.next(), old)
+        } else {
+            (tokens.next(), None)
+        };
+        let Some(path) = path else { break };
+        files.push(MergePreviewFile {
+            path: path.to_string(),
+            status: letter.to_string(),
+            old_path: old_path.map(str::to_string),
+        });
+    }
+    files
+}
+
+/// `status --porcelain=v1 -z`: `XY path\0`, renames/copies add a source path.
+fn parse_porcelain_status(out: &str) -> MergePreviewDirty {
+    let mut dirty = MergePreviewDirty::default();
+    let mut tokens = out.split('\0').filter(|t| !t.is_empty());
+    while let Some(entry) = tokens.next() {
+        let mut chars = entry.chars();
+        let (Some(x), Some(y)) = (chars.next(), chars.next()) else {
+            continue;
+        };
+        let path = entry.get(3..).unwrap_or("");
+        if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+            tokens.next();
+        }
+        if x == '!' {
+            continue;
+        }
+        if x == '?' {
+            dirty.untracked += 1;
+        } else {
+            if matches!(x, 'M' | 'A' | 'D' | 'R' | 'C' | 'T') {
+                dirty.staged += 1;
+            }
+            if matches!(y, 'M' | 'D' | 'T') || x == 'U' || y == 'U' {
+                dirty.unstaged += 1;
+            }
+        }
+        dirty.total += 1;
+        if dirty.paths.len() < MERGE_PREVIEW_MAX_DIRTY_PATHS {
+            dirty.paths.push(path.to_string());
+        }
+    }
+    dirty
 }
 
 /// The blocking walk: ONE readdir of the target; `is_repo` is a cheap `.git`
@@ -2836,5 +3186,252 @@ tmpfs /run tmpfs rw 0 0
 
         assert_eq!(alpha.unwrap()[0].path, "alpha.rs");
         assert_eq!(beta.unwrap()[0].path, "beta.rs");
+    }
+
+    mod merge_preview {
+        use super::*;
+
+        fn sh(dir: &Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@test")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@test")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn commit_file(dir: &Path, name: &str, body: &str) {
+            std::fs::write(dir.join(name), body).unwrap();
+            sh(dir, &["add", "."]);
+            sh(dir, &["commit", "-q", "-m", name]);
+        }
+
+        struct Fixture {
+            _data: tempfile::TempDir,
+            lead: PathBuf,
+            wt: PathBuf,
+            repos: Repos,
+        }
+
+        /// A repo on `main` with a three-line a.txt, plus a `zeron/*` worktree.
+        async fn fixture() -> Fixture {
+            let data = tempfile::tempdir().unwrap();
+            let lead = data.path().join("lead");
+            std::fs::create_dir_all(&lead).unwrap();
+            sh(&lead, &["init", "-q", "-b", "main"]);
+            commit_file(&lead, "a.txt", "one\ntwo\nthree\n");
+            commit_file(&lead, "b.txt", "b\n");
+            let repos =
+                Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+            let wt = repos.create_worktree(&lead, "main").await.unwrap();
+            Fixture {
+                lead,
+                wt: PathBuf::from(wt.path),
+                repos,
+                _data: data,
+            }
+        }
+
+        /// HEAD, status and refs of both trees: must not change in a preview.
+        fn snapshot(f: &Fixture) -> Vec<String> {
+            [&f.lead, &f.wt]
+                .iter()
+                .flat_map(|d| {
+                    [
+                        sh(d, &["rev-parse", "HEAD"]),
+                        sh(d, &["status", "--porcelain"]),
+                        sh(d, &["for-each-ref"]),
+                        sh(d, &["ls-files", "-u"]),
+                    ]
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_clean_branch_is_a_fast_forward_that_adds_a_file() {
+            let f = fixture().await;
+            commit_file(&f.wt, "new.txt", "hi\n");
+            let before = snapshot(&f);
+            let p = f.repos.merge_preview(&f.wt, &f.lead, None).await.unwrap();
+            assert_eq!(p.conflict_check, MergeConflictCheck::Clean);
+            assert_eq!((p.ahead, p.behind), (1, 0));
+            assert!(p.fast_forward && !p.already_merged);
+            assert_eq!(p.base, "main");
+            assert!(p.branch.starts_with("zeron/"));
+            assert_eq!(
+                p.files,
+                vec![MergePreviewFile {
+                    path: "new.txt".into(),
+                    status: "A".into(),
+                    old_path: None
+                }]
+            );
+            assert_eq!(p.merge_tree.as_deref().map(str::len), Some(40));
+            assert!(p.git_version.is_some());
+            assert_eq!(snapshot(&f), before, "a preview changes nothing");
+        }
+
+        #[tokio::test]
+        async fn a_lead_that_moved_on_is_behind_but_still_clean() {
+            let f = fixture().await;
+            commit_file(&f.wt, "new.txt", "hi\n");
+            commit_file(&f.lead, "b.txt", "b2\n");
+            let p = f.repos.merge_preview(&f.wt, &f.lead, None).await.unwrap();
+            assert_eq!((p.ahead, p.behind), (1, 1));
+            assert!(!p.fast_forward);
+            assert_eq!(p.conflict_check, MergeConflictCheck::Clean);
+            assert!(p.conflicts.is_empty());
+        }
+
+        #[tokio::test]
+        async fn editing_the_same_line_conflicts() {
+            let f = fixture().await;
+            commit_file(&f.wt, "a.txt", "one\nmember\nthree\n");
+            commit_file(&f.lead, "a.txt", "one\nlead\nthree\n");
+            let before = snapshot(&f);
+            let p = f.repos.merge_preview(&f.wt, &f.lead, None).await.unwrap();
+            assert_eq!(p.conflict_check, MergeConflictCheck::Conflicts);
+            assert_eq!(p.conflicts, vec!["a.txt".to_string()]);
+            assert_eq!(p.conflicts_total, 1);
+            let tree = p.merge_tree.unwrap();
+            assert!(tree.len() == 40 && tree.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_eq!(snapshot(&f), before);
+            assert_eq!(sh(&f.lead, &["ls-files", "-u"]), "");
+        }
+
+        #[tokio::test]
+        async fn uncommitted_edits_are_counted_apart_from_the_merge() {
+            let f = fixture().await;
+            commit_file(&f.wt, "new.txt", "hi\n");
+            std::fs::write(f.wt.join("untracked.txt"), "u\n").unwrap();
+            std::fs::write(f.wt.join("b.txt"), "changed\n").unwrap();
+            std::fs::write(f.wt.join("staged.txt"), "s\n").unwrap();
+            sh(&f.wt, &["add", "staged.txt"]);
+            let p = f.repos.merge_preview(&f.wt, &f.lead, None).await.unwrap();
+            let d = &p.uncommitted;
+            assert_eq!((d.staged, d.unstaged, d.untracked, d.total), (1, 1, 1, 3));
+            assert_eq!(d.paths.len(), 3);
+            assert_eq!(p.files.len(), 1, "uncommitted files are not in the merge");
+        }
+
+        #[tokio::test]
+        async fn an_unknown_base_is_an_error_not_a_conflict() {
+            let f = fixture().await;
+            let err = f
+                .repos
+                .merge_preview(&f.wt, &f.lead, Some("no-such-branch"))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("no-such-branch"), "{err}");
+            let err = f
+                .repos
+                .merge_preview(&f.wt, &f.lead, Some("--output=x"))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not found"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn unrelated_histories_fail_with_a_note() {
+            let f = fixture().await;
+            sh(&f.wt, &["checkout", "-q", "--orphan", "island"]);
+            sh(&f.wt, &["rm", "-rq", "--cached", "."]);
+            commit_file(&f.wt, "island.txt", "x\n");
+            let p = f.repos.merge_preview(&f.wt, &f.lead, None).await.unwrap();
+            assert_eq!(p.conflict_check, MergeConflictCheck::Failed);
+            assert!(p.note.unwrap().contains("no history"));
+            assert_eq!(p.branch, "island");
+        }
+
+        #[tokio::test]
+        async fn a_merged_branch_reports_already_merged() {
+            let f = fixture().await;
+            let p = f.repos.merge_preview(&f.wt, &f.lead, None).await.unwrap();
+            assert!(p.already_merged && !p.fast_forward);
+            assert_eq!((p.ahead, p.behind), (0, 0));
+            assert!(p.files.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_detached_member_still_previews() {
+            let f = fixture().await;
+            commit_file(&f.wt, "new.txt", "hi\n");
+            sh(&f.wt, &["checkout", "-q", "--detach"]);
+            let p = f.repos.merge_preview(&f.wt, &f.lead, None).await.unwrap();
+            assert_eq!(p.branch, p.branch_head[..7]);
+            assert_eq!(p.ahead, 1);
+            assert_eq!(p.conflict_check, MergeConflictCheck::Clean);
+        }
+
+        #[tokio::test]
+        async fn an_explicit_base_and_a_missing_worktree() {
+            let f = fixture().await;
+            sh(&f.lead, &["branch", "release"]);
+            commit_file(&f.wt, "new.txt", "hi\n");
+            let p = f
+                .repos
+                .merge_preview(&f.wt, &f.lead, Some("release"))
+                .await
+                .unwrap();
+            assert_eq!(p.base, "release");
+            let err = f
+                .repos
+                .merge_preview(&f.lead.join("nope"), &f.lead, None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("no worktree"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn without_merge_tree_support_everything_else_is_still_reported() {
+            let f = fixture().await;
+            commit_file(&f.wt, "new.txt", "hi\n");
+            std::fs::write(f.wt.join("dirty.txt"), "d\n").unwrap();
+            let p = f
+                .repos
+                .merge_preview_with(&f.wt, &f.lead, None, false, Some("2.30.0".into()))
+                .await
+                .unwrap();
+            assert_eq!(p.conflict_check, MergeConflictCheck::Unavailable);
+            assert!(p.note.unwrap().contains("2.38"));
+            assert!(p.conflicts.is_empty() && p.merge_tree.is_none());
+            assert_eq!((p.ahead, p.behind, p.files.len()), (1, 0, 1));
+            assert_eq!(p.uncommitted.untracked, 1);
+        }
+
+        #[test]
+        fn git_versions_parse_across_platforms() {
+            let v = |s| parse_git_version(s).map(|(a, b, _)| (a, b));
+            assert_eq!(v("git version 2.43.0\n"), Some((2, 43)));
+            assert_eq!(v("git version 2.39.5 (Apple Git-154)"), Some((2, 39)));
+            assert_eq!(v("git version 2.37.1.windows.1"), Some((2, 37)));
+            assert_eq!(
+                parse_git_version("git version 2.37.1.windows.1").unwrap().2,
+                "2.37.1.windows.1"
+            );
+            assert_eq!(v("not git"), None);
+        }
+
+        #[test]
+        fn name_status_and_porcelain_records_parse() {
+            let files = parse_name_status("M\0a.txt\0R100\0old.txt\0new.txt\0A\0c.txt\0");
+            assert_eq!(files.len(), 3);
+            assert_eq!(files[1].path, "new.txt");
+            assert_eq!(files[1].old_path.as_deref(), Some("old.txt"));
+            assert_eq!(files[1].status, "R");
+            let d =
+                parse_porcelain_status("R  to.txt\0from.txt\0 M m.txt\0?? u.txt\0MM both.txt\0");
+            assert_eq!((d.staged, d.unstaged, d.untracked, d.total), (2, 2, 1, 4));
+            assert_eq!(d.paths[0], "to.txt");
+        }
     }
 }

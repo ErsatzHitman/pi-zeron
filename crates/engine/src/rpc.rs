@@ -569,6 +569,18 @@ struct OrchestratorChatParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MergePreviewParams {
+    /// The calling orchestrator root.
+    chat_id: String,
+    /// The tree member whose worktree branch is previewed.
+    member: String,
+    /// Lead ref to compare against; default the project folder's branch.
+    #[serde(default)]
+    base: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UpdateOrchestratorProjectParams {
     chat_id: String,
     update: zeron_proto::orchestrator_project::ProjectUpdate,
@@ -1786,6 +1798,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_WORKSPACE_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
+            | methods::MERGE_PREVIEW
             // Project Actions live in the owning engine's private profile store.
             | methods::LIST_PROJECT_ACTIONS
             | methods::UPSERT_PROJECT_ACTION
@@ -4179,6 +4192,70 @@ impl RpcService for EngineRpc {
                     "project": self.workspace.orchestrator_project(&root),
                     "memory": self.workspace.orchestrator_memory(&root),
                 }))
+            }
+            methods::MERGE_PREVIEW => {
+                let p: MergePreviewParams = parse_params(params)?;
+                let chats = self
+                    .workspace
+                    .read_chats()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if !zeron_proto::orchestrator::is_root_chat(&p.chat_id) {
+                    return Err(RpcError::BadParams(
+                        "Only the orchestrator can preview merges.".into(),
+                    ));
+                }
+                if !chats.iter().any(|chat| chat.id == p.chat_id) {
+                    return Err(RpcError::BadParams(format!("unknown chat {}", p.chat_id)));
+                }
+                let member = zeron_proto::orchestrator::tree_members(&chats, &p.chat_id)
+                    .into_iter()
+                    .find(|chat| chat.id == p.member)
+                    .ok_or_else(|| {
+                        RpcError::BadParams(format!(
+                            "{} is not a session of this orchestrator",
+                            p.member
+                        ))
+                    })?;
+                if member.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::Failed(format!(
+                        "{} runs on device {}; preview its merge there",
+                        p.member, member.device_id
+                    )));
+                }
+                let space = member
+                    .space_id
+                    .as_deref()
+                    .map(|id| self.workspace.space(id))
+                    .transpose()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .flatten()
+                    .ok_or_else(|| RpcError::Failed("Project space not found".into()))?;
+                let space_path = std::path::Path::new(&space.path);
+                // A read-only member runs in the project folder itself.
+                let cwd = member
+                    .cwd
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .filter(|cwd| {
+                        *cwd != space_path
+                            && std::fs::canonicalize(cwd).ok()
+                                != std::fs::canonicalize(space_path).ok()
+                    })
+                    .ok_or_else(|| {
+                        RpcError::Failed(
+                            "this session has no worktree of its own (read-only or not started)"
+                                .into(),
+                        )
+                    })?;
+                let mut preview = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    self.repos.merge_preview(cwd, space_path, p.base.as_deref()),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("merge preview timed out".into()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                preview.chat_id = member.id.clone();
+                RpcReply::value(&preview)
             }
             methods::UPDATE_ORCHESTRATOR_PROJECT => {
                 let p: UpdateOrchestratorProjectParams = parse_params(params)?;

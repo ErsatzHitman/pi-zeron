@@ -181,6 +181,7 @@ name (default: the local engine's device).
 | `project_read`     | `GetOrchestratorProject {chatId}`: the tree's goal, instructions, paused flag and memory (any chat of the tree) |
 | `project_remember` / `project_forget` | `OrchestratorMemory {chatId, text}` / `{chatId, forget}` (root only) |
 | `project_update`   | `UpdateOrchestratorProject {chatId, update: {goal?, instructions?}}` (root only) |
+| `merge_preview`    | `MergePreview {chatId, member, base?, targetDeviceId}`: read-only merge preview of a session's worktree branch (root only) |
 
 `create_chat`, `create_chats`, `send_message` and `send_messages` refuse from a
 chat in a paused orchestrator's tree; see
@@ -247,6 +248,33 @@ before the send: it returns on a new `last_completed_turn`, an
 edge. A brand-new chat has no session row until the host picks the run up, so
 the wait keeps waiting in that case rather than reporting the unstarted run as
 done (this was the one bug the first live run found).
+
+### Merge preview
+
+`merge_preview {chat, base?}` (root only) answers "what would merging this
+writer's branch into the lead do?" without changing anything. The engine
+resolves the lead in the session's project folder (its checked-out branch, or
+`base`) and the member's live branch in its worktree, turns both into shas,
+and reports:
+
+- `ahead` / `behind`: commits only the member / only the lead has;
+  `alreadyMerged` (nothing ahead) and `fastForward` (nothing behind).
+- `files`: what `base...branch` changes (`A`, `M`, `D`, `R` with `oldPath`),
+  capped at 200 with `filesTotal` / `filesTruncated`.
+- `uncommitted`: staged / unstaged / untracked counts and the first paths in
+  the member's worktree. These are NOT part of the merge.
+- `conflictCheck`: `clean`, `conflicts` (paths in `conflicts`, capped at
+  100), `unavailable` or `failed` (see `note`), from
+  `git merge-tree --write-tree`, which needs git 2.38 or newer. On older git
+  the check is `unavailable` and the rest of the preview is still accurate.
+  `mergeTree` is the tree the merge would produce.
+
+`merge-tree --write-tree` writes loose tree and blob objects to the object
+database (harmless, collected by `git gc`); it never touches an index, a
+working tree, HEAD or a ref. `status` runs with `--no-optional-locks`. A
+member without a worktree of its own (read-only, or not started) is refused,
+and a member on another device is previewed there. Applying a merge is out of
+scope: the root asks the user, then briefs a write session.
 
 ### Visual replies
 

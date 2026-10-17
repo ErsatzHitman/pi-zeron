@@ -321,6 +321,16 @@ fn catalog() -> Vec<ToolDef> {
             }
         }),
     });
+    tools.push(ToolDef {
+        name: MERGE_PREVIEW,
+        description: "Orchestrator only. Read-only preview of merging one of your sessions' worktree branch into the lead branch: files it changed, commits ahead/behind, uncommitted edits in its worktree (these are NOT part of the merge) and whether the merge would conflict (git merge-tree). Changes nothing.",
+        input_schema: chat_key_schema(json!({
+            "base": {
+                "type": "string",
+                "description": "Lead ref to compare against. Default: the branch checked out in the session's project folder."
+            }
+        })),
+    });
     tools
 }
 
@@ -330,13 +340,15 @@ const PROJECT_READ: &str = "project_read";
 const PROJECT_REMEMBER: &str = "project_remember";
 const PROJECT_FORGET: &str = "project_forget";
 const PROJECT_UPDATE: &str = "project_update";
+/// Read-only merge preview of one of the orchestrator's sessions.
+const MERGE_PREVIEW: &str = "merge_preview";
 
 /// The message board of the CALLING chat's orchestrator tree, offered only
 /// to an agent Zeron launched (`ZERON_CHAT_ID` set).
 const BOARD_POST: &str = "board_post";
 const BOARD_READ: &str = "board_read";
 /// Tools that act for the calling chat.
-const IN_CHAT_ONLY: [&str; 7] = [
+const IN_CHAT_ONLY: [&str; 8] = [
     SHOW_VISUAL,
     BOARD_POST,
     BOARD_READ,
@@ -344,6 +356,7 @@ const IN_CHAT_ONLY: [&str; 7] = [
     PROJECT_REMEMBER,
     PROJECT_FORGET,
     PROJECT_UPDATE,
+    MERGE_PREVIEW,
 ];
 
 /// Shows a page in the CALLING chat, so it is offered only to an agent that
@@ -563,6 +576,12 @@ struct BatchArgs {
 #[derive(Deserialize)]
 struct ChatArgs {
     chat: String,
+}
+
+#[derive(Deserialize)]
+struct MergePreviewArgs {
+    chat: String,
+    base: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -842,6 +861,7 @@ impl Tools {
                 self.project_memory(json!({ "forget": args.id })).await
             }
             PROJECT_UPDATE => self.project_update(parse(args)?).await,
+            MERGE_PREVIEW => self.merge_preview(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
@@ -1540,9 +1560,27 @@ impl Tools {
         let chat_id = self.tree_origin(tool)?;
         anyhow::ensure!(
             zeron_proto::orchestrator::is_root_chat(&chat_id),
-            "Only the orchestrator changes the project. Report what should change in your final reply."
+            "Only the orchestrator can use {tool}. Report what should change in your final reply."
         );
         Ok(chat_id)
+    }
+
+    /// Read-only: the engine runs git against the member's worktree and
+    /// changes no tree or ref.
+    async fn merge_preview(&self, args: MergePreviewArgs) -> anyhow::Result<Value> {
+        let root = self.root_origin(MERGE_PREVIEW)?;
+        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        self.zeron
+            .call(
+                zeron_rpc::methods::MERGE_PREVIEW,
+                json!({
+                    "chatId": root,
+                    "member": chat.id,
+                    "base": args.base,
+                    "targetDeviceId": chat.device_id,
+                }),
+            )
+            .await
     }
 
     async fn project_read(&self) -> anyhow::Result<Value> {
@@ -2168,6 +2206,16 @@ mod tests {
                         "project": { "rootId": "orchestrator-root", "goal": "Ship it",
                                      "instructions": "", "paused": self.paused, "updatedAt": 1 },
                         "memory": [],
+                    }))
+                }
+                methods::MERGE_PREVIEW => {
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({
+                        "chatId": params["member"], "branch": "zeron/x", "base": "main",
+                        "ahead": 1, "behind": 0, "conflictCheck": "clean", "conflicts": [],
                     }))
                 }
                 methods::ORCHESTRATOR_MEMORY | methods::UPDATE_ORCHESTRATOR_PROJECT => {
@@ -3126,6 +3174,66 @@ mod tests {
                 .unwrap_err()
                 .contains("orchestrator's tree")
         );
+    }
+
+    #[tokio::test]
+    async fn only_the_root_previews_a_members_merge() {
+        let world = orchestrator_world(false, Vec::new());
+        let calls = |world: &Arc<World>| {
+            world
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == methods::MERGE_PREVIEW)
+                .map(|(_, params)| params.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !tools(world.clone(), Origin::default()).has("merge_preview"),
+            "listed only inside a chat"
+        );
+        assert!(from(&world, "orchestrator-root").has("merge_preview"));
+
+        let refused = from(&world, "member-a")
+            .call("merge_preview", json!({ "chat": "member-b" }))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("Only the orchestrator"), "{refused}");
+        assert!(calls(&world).is_empty());
+
+        let root = from(&world, "orchestrator-root");
+        let unknown = root
+            .call("merge_preview", json!({ "chat": "nobody" }))
+            .await
+            .unwrap_err();
+        assert!(unknown.contains("nobody"), "{unknown}");
+        assert!(calls(&world).is_empty(), "no RPC for an unknown chat");
+
+        for key in ["member-a", "MEMBER-A"] {
+            let preview = root
+                .call("merge_preview", json!({ "chat": key }))
+                .await
+                .unwrap();
+            assert_eq!(preview["chatId"], "member-a");
+        }
+        root.call(
+            "merge_preview",
+            json!({ "chat": "member-b", "base": "dev" }),
+        )
+        .await
+        .unwrap();
+        let calls = calls(&world);
+        assert_eq!(
+            calls[0],
+            json!({
+                "chatId": "orchestrator-root", "member": "member-a",
+                "base": null, "targetDeviceId": "dev-local",
+            })
+        );
+        assert_eq!(calls[2]["member"], "member-b");
+        assert_eq!(calls[2]["base"], "dev");
+        assert!(world.writes.lock().unwrap().is_empty(), "read-only");
     }
 
     #[tokio::test]
