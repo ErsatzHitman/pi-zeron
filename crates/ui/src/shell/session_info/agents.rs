@@ -391,12 +391,15 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
 }
 
 /// The live (unarchived) children of `chat_id`, most recent activity first —
-/// the same order the sidebar's Sessions list keeps.
+/// the same order the sidebar's Sessions list keeps. An orchestrator's
+/// members are its tree (the Orchestrator tab), not sub-agents of the
+/// session that started them; a btw aside under one is still listed.
 fn child_chat_rows(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<AgentRow> {
     let mut rows: Vec<(DateTime<Utc>, AgentRow)> = state
         .chats
         .iter()
         .filter(|chat| !chat.archived && chat.parent_chat_id.as_deref() == Some(chat_id))
+        .filter(|chat| chat.is_btw() || !tree_member(state, &chat.id))
         .map(|chat| {
             let activity = chat.last_message_at.unwrap_or(chat.created_at);
             let row = AgentRow {
@@ -416,6 +419,14 @@ fn child_chat_rows(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<A
         .collect();
     rows.sort_by_key(|(activity, _)| std::cmp::Reverse(*activity));
     rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// A session in an orchestrator's tree, below its root.
+fn tree_member(state: &AppState, chat_id: &str) -> bool {
+    matches!(
+        zeron_proto::orchestrator::Role::of(&state.chats, chat_id),
+        zeron_proto::orchestrator::Role::Member { .. }
+    )
 }
 
 /// A btw question is listed but is the user's own aside, not work under
@@ -672,6 +683,41 @@ mod tests {
         assert_eq!(
             member.sessions[0].trailing.as_deref(),
             Some("Orchestrator · you are level 1")
+        );
+    }
+
+    #[test]
+    fn an_orchestrators_sessions_are_not_its_sub_agents() {
+        let mut state = AppState::new();
+        let root = zeron_proto::orchestrator::new_root_chat_id();
+        let mut first = chat("first", Some(&root), 60);
+        first.last_message_at = Some(Utc::now());
+        state.apply_chats(vec![
+            chat(&root, None, 90),
+            first,
+            chat("second", Some(&root), 50),
+            chat("nested", Some("first"), 30),
+            chat("btw-aside", Some(&root), 10),
+        ]);
+        let row = |id: &str| state.chats.iter().find(|c| c.id == id).unwrap().clone();
+        let orchestrator = agent_list(&state, &row(&root), Utc::now());
+        assert_eq!(
+            orchestrator
+                .sessions
+                .iter()
+                .map(AgentRow::key)
+                .collect::<Vec<_>>(),
+            ["chat-btw-aside"],
+            "the members it launched are its tree, not sub-agents"
+        );
+        assert_eq!(orchestrator.running(), 0);
+        let member = agent_list(&state, &row("first"), Utc::now());
+        assert!(
+            member
+                .sessions
+                .iter()
+                .all(|row| matches!(row.kind, AgentKind::Parent { .. })),
+            "nor are a member's own"
         );
     }
 
