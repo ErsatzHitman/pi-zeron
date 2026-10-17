@@ -372,6 +372,15 @@ mod tests {
         reap_orphans_with(|pid, start| start != tag || live_engine(pid, start))
     }
 
+    /// The real-liveness pass, except it spares the tagged targets of the
+    /// other tests running in parallel (their "dead" engines would otherwise
+    /// be reaped here first and their own `reap_tagged` would count 0).
+    fn reap_untagged() -> usize {
+        reap_orphans_with(|pid, start| TEST_TAGS.contains(&start) || live_engine(pid, start))
+    }
+
+    const TEST_TAGS: [&str; 3] = ["dead", "reused", "group"];
+
     #[test]
     fn reaps_marked_process_of_dead_engine() {
         let mut child = sleeper(Some((dead_pid().to_string(), "dead".into())), false, false);
@@ -383,7 +392,7 @@ mod tests {
     fn spares_process_of_live_engine() {
         let (pid, start) = current_marker();
         let mut child = sleeper(Some((pid.to_string(), start)), false, false);
-        reap_orphans();
+        reap_untagged();
         assert!(survives(&mut child));
     }
 
@@ -398,7 +407,7 @@ mod tests {
     #[test]
     fn ignores_unmarked_processes() {
         let mut child = sleeper(None, false, false);
-        reap_orphans();
+        reap_untagged();
         assert!(survives(&mut child));
     }
 
