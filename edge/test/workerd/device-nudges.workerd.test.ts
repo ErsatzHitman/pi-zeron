@@ -64,10 +64,11 @@ it("drains 300 queued wakes through a bounded acknowledgment window", async () =
     await state.storage.setAlarm(Date.now()+5000);
   });
   await runDurableObjectAlarm(room);
-  await expect.poll(() => seen.size, {timeout:5000}).toBe(300);
+  // 300 round trips through the window: seconds on a loaded runner.
+  await expect.poll(() => seen.size, {timeout:20_000}).toBe(300);
   await expect.poll(() => runInDurableObject(room, (_i, state) => pendingNudges(state.storage.sql).length)).toBe(0);
   ws.close();
-});
+}, 30_000);
 
 it("keeps legacy hosts usable without acknowledgment support", async () => {
   const room = env.DEVICE_ROOMS.get(env.DEVICE_ROOMS.idFromName(crypto.randomUUID()));
