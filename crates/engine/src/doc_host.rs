@@ -3530,6 +3530,37 @@ impl DocHost {
         Ok(id)
     }
 
+    /// Tell an orchestrator parent that children settled (see the engine's
+    /// `parent_notify`): an idle parent gets a durable `Run` (a turn like the
+    /// MCP's `run` delivery, `auto_approve` off); a parent waiting on an
+    /// answer gets the text queued and held for its turn's end, never
+    /// answering the question. A parent with no chat row is skipped silently.
+    pub(crate) fn notify_parent(
+        &self,
+        parent_id: &str,
+        text: &str,
+        awaiting_input: bool,
+    ) -> Result<(), EngineError> {
+        if awaiting_input {
+            self.queue_message_with_behavior(parent_id, text, Vec::new(), true)?;
+            return Ok(());
+        }
+        let Some(mut request) = self.request_from_chat_row(parent_id, text) else {
+            return Ok(());
+        };
+        if request.cwd.is_empty() {
+            request.cwd = "~".into();
+        }
+        self.queue_command(
+            parent_id,
+            SessionCommandPayload::Run {
+                request,
+                message_id: new_id(),
+            },
+        )?;
+        Ok(())
+    }
+
     /// Retype a queued message. Empty text deletes the row — emptying the box
     /// is how you say "drop it". `false` when the row is already gone.
     pub fn update_queued_message(
