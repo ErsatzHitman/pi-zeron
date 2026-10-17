@@ -935,6 +935,7 @@ impl SessionsEngine {
             titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
         }
 
+        crate::lag_monitor::ensure_started();
         tokio::spawn(drive_run(
             self.inner.clone(),
             chat_id.to_string(),
@@ -2618,6 +2619,31 @@ fn cursor_unstarted_history(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// One `zeron::turn_trace` line for a finished turn (opt-in, see
+/// `zeron_harness::turn_trace`). Absent phases are omitted.
+fn log_turn_trace(
+    chat_id: &str,
+    run_id: &str,
+    harness_id: HarnessId,
+    status: &str,
+    t: zeron_harness::turn_trace::TurnTimings,
+) {
+    tracing::info!(
+        target: "zeron::turn_trace",
+        chat = %chat_id,
+        run = %run_id,
+        harness = ?harness_id,
+        status,
+        prompt_sent_ms = 0u64,
+        ack_ms = ?t.ack_ms,
+        barrier_ms = ?t.barrier_ms,
+        first_event_ms = ?t.first_event_ms,
+        first_commit_ms = ?t.first_commit_ms,
+        done_ms = t.done_ms,
+        "turn trace"
+    );
+}
+
 async fn drive_run(
     inner: Arc<Inner>,
     chat_id: String,
@@ -2747,6 +2773,10 @@ async fn drive_run(
                 if resume_state.idle {
                     harness.start_idle(wire_request, controls).await
                 } else {
+                    // Pi marks its own prompt_sent; others start at run start.
+                    if harness_id != HarnessId::Pi {
+                        turn.trace_begin();
+                    }
                     harness.run(wire_request, controls).await
                 }
             } else {
@@ -3122,6 +3152,8 @@ async fn drive_run(
                             doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
                         ) {
                             tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                        } else {
+                            turn.trace_mark(zeron_harness::turn_trace::Phase::FirstCommit);
                         }
                         dirty = false;
                     }
@@ -3183,8 +3215,13 @@ async fn drive_run(
                             MessageStatus::Complete,
                         ) {
                             tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
+                        } else {
+                            turn.trace_mark(zeron_harness::turn_trace::Phase::FirstCommit);
                         }
                         inner.note_message(&chat_id, &folded_text(&folded));
+                    }
+                    if let Some(t) = turn.trace_finish() {
+                        log_turn_trace(&chat_id, &run_id, harness_id, "quiesced", t);
                     }
                     folded.clear();
                     dirty = false;
@@ -3404,6 +3441,12 @@ async fn drive_run(
         // push the quiesce watchdog's window out.
         inner.touch_session(&chat_id);
         last_stream_activity = tokio::time::Instant::now();
+        if !matches!(
+            event,
+            AgentEvent::SessionStarted { .. } | AgentEvent::ContextUsage { .. }
+        ) {
+            turn.trace_mark(zeron_harness::turn_trace::Phase::FirstEvent);
+        }
         // The engine's input bridge is the sole authority on input requests:
         // it mints the id and parks the resolver BEFORE emitting the event,
         // so a legitimate id is always pending here. A harness emitting its
@@ -3645,6 +3688,8 @@ async fn drive_run(
                 MessageStatus::Complete,
             ) {
                 tracing::warn!(chat = %chat_id, error = %err, "segment finish failed");
+            } else {
+                turn.trace_mark(zeron_harness::turn_trace::Phase::FirstCommit);
             }
             inner.note_message(&chat_id, &folded_text(&folded));
             folded.clear();
@@ -3761,8 +3806,13 @@ async fn drive_run(
                     message_status,
                 ) {
                     tracing::warn!(chat = %chat_id, error = %err, "final segment finish failed");
+                } else {
+                    turn.trace_mark(zeron_harness::turn_trace::Phase::FirstCommit);
                 }
                 inner.note_message(&chat_id, &folded_text(&folded));
+            }
+            if let Some(t) = turn.trace_finish() {
+                log_turn_trace(&chat_id, &run_id, harness_id, &format!("{status:?}"), t);
             }
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival

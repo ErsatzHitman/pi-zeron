@@ -30,6 +30,7 @@ pub mod harness_updates;
 pub(crate) mod home_index;
 mod http_error;
 pub mod instance_lock;
+pub mod lag_monitor;
 pub mod local_import;
 mod model_catalogs;
 pub mod profile;
@@ -889,6 +890,7 @@ impl Engine {
     pub async fn run(self) -> anyhow::Result<()> {
         let config = self.config;
         tracing::info!(data_dir = %config.data_dir.display(), "engine starting");
+        lag_monitor::ensure_started();
 
         std::fs::create_dir_all(&config.data_dir)?;
         let auth = Self::build_auth(&config).await;

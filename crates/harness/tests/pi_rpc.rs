@@ -1616,3 +1616,44 @@ async fn an_unforkable_parent_session_starts_the_side_chat_fresh_with_a_notice()
         Some(AgentEvent::Done { status: DoneStatus::Completed, .. })
     ));
 }
+
+#[tokio::test]
+async fn turn_trace_marks_each_pi_turn_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut c, tx, _) = controls();
+    c.turn = zeron_harness::TurnControl::with_trace_enabled(true);
+    let turn = c.turn.clone();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "first"), c)
+        .await
+        .unwrap();
+    let mut sender = Some(tx);
+    let mut traces = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::Done { .. } = event.unwrap() {
+                traces.push(turn.trace_finish());
+                assert_eq!(turn.trace_finish(), None, "a turn is reported once");
+                if let Some(tx) = sender.take() {
+                    tx.send(SteerMessage {
+                        prompt: "second".into(),
+                        message_id: None,
+                        attachments: Vec::new(),
+                        config: None,
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(traces.len(), 2);
+    for t in traces {
+        let t = t.expect("turn began");
+        let (ack, barrier) = (t.ack_ms.expect("ack"), t.barrier_ms.expect("barrier"));
+        assert!(ack <= barrier && barrier <= t.done_ms, "{t:?}");
+    }
+}

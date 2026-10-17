@@ -1130,6 +1130,7 @@ impl Runner {
         self.epoch += 1;
         self.active = true;
         self.norm.reset();
+        self.turn.trace_begin();
         self.submit(text, images, false)
     }
     async fn bootstrap(&mut self, backlog: &mut Vec<Value>) -> Result<Value, HarnessError> {
@@ -1349,6 +1350,7 @@ impl Runner {
                         if !self.active {
                             self.norm.reset();
                             self.interrupted = false;
+                            self.turn.trace_begin();
                         }
                         self.epoch += 1;
                         self.active = true;
@@ -1691,6 +1693,7 @@ impl Runner {
             }
             match pending {
                 Pending::Prompt(epoch) if epoch == self.epoch && self.active => {
+                    self.turn.trace_mark(crate::turn_trace::Phase::Ack);
                     let id = self
                         .process
                         .transport
@@ -1699,6 +1702,7 @@ impl Runner {
                     self.pending.insert(id, Pending::Barrier(epoch));
                 }
                 Pending::Barrier(epoch) if epoch == self.epoch && self.active => {
+                    self.turn.trace_mark(crate::turn_trace::Phase::Barrier);
                     self.state(data, None).await?;
                 }
                 Pending::Commands => {
