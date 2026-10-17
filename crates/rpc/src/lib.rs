@@ -302,6 +302,11 @@ pub mod methods {
     pub const SET_HARNESS_UPDATE_POLICY: &str = "SetHarnessUpdatePolicy";
 }
 
+/// Prefix of the `DeleteWorktree` failure text when the engine refuses to
+/// discard unmerged commits or uncommitted changes; retry with `force: true`
+/// to delete anyway.
+pub const WORKTREE_UNSAFE_PREFIX: &str = "worktree_unsafe:";
+
 /// Stable capability error codes transported without provider stderr.
 pub mod capability_errors {
     pub const PULL_REQUESTS_CLI_UNAVAILABLE: &str = "pull_requests.cli_unavailable";

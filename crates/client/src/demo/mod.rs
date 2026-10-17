@@ -992,6 +992,19 @@ impl DemoHost {
         Ok(worktree)
     }
 
+    pub(crate) async fn delete_worktree(&self, path: &str, worktree: &str) -> Result<()> {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut refs = lock(&self.refs);
+        if let Some(list) = refs.get_mut(path) {
+            for r in list.iter_mut() {
+                if r.worktree_path.as_deref() == Some(worktree) {
+                    r.worktree_path = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn list_folders(
         &self,
         device_id: &str,
