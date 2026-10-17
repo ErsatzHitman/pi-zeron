@@ -274,12 +274,13 @@ fn main() {
                 if text == "guard-env" {
                     let var = |key| std::env::var(key).unwrap_or_else(|_| "-".into());
                     text = format!(
-                        "on={} file={} force={} ext={} args={}",
+                        "on={} file={} force={} ext={} args={} usage={}",
                         var("ZERON_DELETE_GUARD"),
                         var("ZERON_DELETE_GUARD_FILE"),
                         var("ZERON_DELETE_GUARD_FORCE"),
                         var("ZERON_DELETE_GUARD_EXT"),
-                        std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+                        std::env::args().skip(1).collect::<Vec<_>>().join(" "),
+                        var("ZERON_USAGE_ALERTS_FILE"),
                     );
                 }
                 if text == "which-model" {

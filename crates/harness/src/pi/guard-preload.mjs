@@ -25,6 +25,7 @@ export function addGuard(argv, env, exists = existsSync, config = CONFIG, self =
   if (config.file && !env.ZERON_DELETE_GUARD_FILE) env.ZERON_DELETE_GUARD_FILE = config.file;
   if (config.force && !env.ZERON_DELETE_GUARD_FORCE) env.ZERON_DELETE_GUARD_FORCE = "1";
   if (self && !env.ZERON_DELETE_GUARD_PRELOAD) env.ZERON_DELETE_GUARD_PRELOAD = self;
+  if (config.usage && !env.ZERON_USAGE_ALERTS_FILE) env.ZERON_USAGE_ALERTS_FILE = config.usage;
   if (!exists(ext)) return "missing";
   if (argv.some((arg, i) => arg === ext && (argv[i - 1] === "-e" || argv[i - 1] === "--extension"))) return "present";
   argv.splice(2, 0, "--extension", ext);

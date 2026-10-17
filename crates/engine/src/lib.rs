@@ -51,6 +51,7 @@ pub mod titles;
 mod transcript_history;
 pub mod uploads;
 pub mod usage;
+pub mod usage_alerts;
 pub mod voice;
 pub mod workspace_files;
 pub mod workspace_host;
@@ -155,6 +156,7 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
+    pub usage_alerts: usage_alerts::UsageAlerts,
     /// Tokens and spend per Pi provider and model, from Pi's session files.
     pub usage: usage::UsageTracker,
     pub device_id: String,
@@ -389,6 +391,20 @@ impl EngineCore {
             harness_updates::HarnessUpdateCoordinator::new(data_dir, registry.clone());
         harness_updates.start();
         let usage = usage::UsageTracker::new(data_dir);
+        let usage_alerts = usage_alerts::UsageAlerts::new(
+            usage_alerts::UsageAlertsConfig {
+                data_dir: data_dir.to_path_buf(),
+                pi_auth_file: agent_accounts.pi_agent_dir().join("auth.json"),
+                threshold_pct: usage_alerts::threshold_from_env(
+                    std::env::var(usage_alerts::ENV_THRESHOLD).ok().as_deref(),
+                ),
+            },
+            agent_accounts.clone(),
+            sessions.clone(),
+            doc_host.clone(),
+            workspace.clone(),
+        );
+        usage_alerts.start();
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -417,6 +433,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             harness_updates,
+            usage_alerts,
             usage,
             device_id,
             local_import,
@@ -584,6 +601,7 @@ impl EngineCore {
     pub async fn shutdown(&self) {
         self.previews.shutdown().await;
         self.harness_updates.shutdown().await;
+        self.usage_alerts.shutdown();
         // A run interruption transitions its chat to Idle, and Idle normally
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.

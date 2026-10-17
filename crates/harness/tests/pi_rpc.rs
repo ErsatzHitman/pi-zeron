@@ -1083,6 +1083,7 @@ fn guard(dir: &std::path::Path) -> zeron_harness::pi::DeleteGuardSetting {
         forced: false,
         state_file: Some(dir.join("harness-prefs.json")),
         dir: dir.join("pi-guard"),
+        usage_alerts_file: Some(dir.join("usage-alerts.json")),
     };
     std::sync::Arc::new(move || guard.clone())
 }
@@ -1121,6 +1122,11 @@ async fn chat_runs_load_the_delete_guard() {
         "{text}"
     );
     assert!(text.contains("force=- "), "{text}");
+    let usage = dir.path().join("usage-alerts.json");
+    assert!(
+        text.contains(&format!("usage={}", usage.display())),
+        "the usage snapshot is named for the run and its children: {text}"
+    );
     let installed = std::fs::read_dir(dir.path().join("pi-guard"))
         .unwrap()
         .map(|entry| entry.unwrap().path())

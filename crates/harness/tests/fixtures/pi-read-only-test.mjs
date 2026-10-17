@@ -56,7 +56,7 @@ assert.equal(readOnlyOn({}), false);
 // the delete guard still works in a writing session.
 const handlers = [];
 guard.default({on: (event, handler) => handlers.push([event, handler]), getAllTools: () => []});
-const hook = handlers[0][1];
+const hook = handlers.find(([event]) => event === 'tool_call')[1];
 const prior = {...process.env};
 delete process.env.ZERON_DELETE_GUARD_FILE;
 process.env.ZERON_DELETE_GUARD = '0';
@@ -97,7 +97,10 @@ assert.equal(process.env.ZERON_SUBAGENT_DEPTH, '1');
 assert.equal(process.env.ZERON_PI_PID, String(process.pid));
 load();
 assert.equal(process.env.ZERON_SUBAGENT_DEPTH, '1', 'loading again in the same Pi keeps its level');
-assert.ok(!child.some(([event]) => event === 'before_agent_start'), 'the guard adds no prompt text');
+// Only a subscription usage alert ever adds a note; without one, no prompt text.
+process.env.ZERON_USAGE_ALERTS_FILE = '/nonexistent/zeron-usage-alerts.json';
+assert.ok(child.filter(([event]) => event === 'before_agent_start')
+  .every(([, handler]) => handler({}, {model: {provider: 'anthropic', id: 'x'}}) === undefined), 'the guard adds no prompt text');
 // /reload: the Zeron session gets the command, its sub-agents do not.
 const commands = (load) => { const out = []; load({on: () => {}, getAllTools: () => [], registerCommand: (name, options) => out.push([name, options])}); return out; };
 delete process.env.ZERON_PI_PID;

@@ -5,6 +5,7 @@
 // A guard against mistakes and model-driven changes, not a sandbox.
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -678,15 +679,161 @@ function enforceModels(pi) {
   });
 }
 
+// ---- subscription usage alerts. The engine evaluates the one usage reader
+// (the accounts snapshot behind the composer footer) and writes what is low
+// to `usage-alerts.json`; this side only reads it. Every guarded Pi (the
+// session, its sub-agents, delegates, workflow agents, the advisor) checks
+// it: a running Pi on a low account is told to finish its current safe step,
+// write a handoff and end; new work aimed at a low account is refused. Never
+// a hard stop: no request is aborted, no process killed. Unknown (no file,
+// a stale file from a stopped engine, a window past its reset) blocks
+// nothing.
+export const USAGE_MARK = "[zeron:usage-alert]";
+export function usageAlertsPath(env = process.env, home = homedir()) {
+  if (env.ZERON_USAGE_ALERTS_FILE) return env.ZERON_USAGE_ALERTS_FILE;
+  if (env.ZERON_DATA_DIR) return join(env.ZERON_DATA_DIR, "usage-alerts.json");
+  return join(home, ".zeron", "usage-alerts.json");
+}
+let usageSeen = { file: "", mtimeMs: -1, size: -1, data: undefined };
+/** The alerts that hold now: fresh file, window not reset yet. */
+export function usageAlerts(env = process.env, fs = { statSync, readFileSync }, now = Date.now()) {
+  const file = usageAlertsPath(env);
+  let data;
+  try {
+    const st = fs.statSync(file);
+    if (usageSeen.file === file && usageSeen.mtimeMs === st.mtimeMs && usageSeen.size === st.size) data = usageSeen.data;
+    else {
+      data = JSON.parse(fs.readFileSync(file, "utf8"));
+      usageSeen = { file, mtimeMs: st.mtimeMs, size: st.size, data };
+    }
+  } catch (e) {
+    // Gone or corrupt: nothing known. Transient I/O: the last read.
+    if (e?.code === "ENOENT" || e instanceof SyntaxError) return [];
+    data = usageSeen.file === file ? usageSeen.data : undefined;
+  }
+  if (!data || data.version !== 1 || !Array.isArray(data.alerts)) return [];
+  const updated = Date.parse(data.updatedAt);
+  const validMs = (Number(data.validForSecs) || 900) * 1000;
+  if (!Number.isFinite(updated) || now - updated > validMs) return [];
+  return data.alerts.filter((a) => a && typeof a.key === "string" && a.harness === "pi" && typeof a.provider === "string"
+    && (!a.resetsAt || Date.parse(a.resetsAt) > now));
+}
+export const providerOf = (id) => {
+  const text = typeof id === "string" ? id.trim() : "";
+  const cut = text.indexOf("/");
+  return cut > 0 && cut < text.length - 1 ? text.slice(0, cut).toLowerCase() : undefined;
+};
+export const alertsOn = (alerts, provider) =>
+  provider ? alerts.filter((a) => a.provider.toLowerCase() === provider.toLowerCase()) : [];
+
+/** The first model a tool call's input names on a low account. */
+export function lowModelIn(input, alerts, depth = 0) {
+  if (!alerts.length || depth > 5 || !input || typeof input !== "object") return undefined;
+  for (const [key, value] of Object.entries(input)) {
+    if (/model/i.test(key))
+      for (const v of Array.isArray(value) ? value : [value]) if (alertsOn(alerts, providerOf(v)).length) return v;
+    if (value && typeof value === "object") {
+      const hit = lowModelIn(value, alerts, depth + 1);
+      if (hit) return hit;
+    }
+  }
+  return undefined;
+}
+
+// Tools that start new work: sub-agents, workflows, delegations, sessions,
+// an advisor consultation.
+export const NEW_WORK_TOOLS = new Set(["subagent_start", "workflow", "delegate", "delegate_resume",
+  "zeron_create_chat", "zeron_create_chats", "advisor"]);
+const describeAlert = (a) =>
+  `${a.provider} account ${a.accountId}: ${a.window} window ${Number(a.remainingPct).toFixed(1)}% left` +
+  (a.resetsAt ? `, resets ${new Date(a.resetsAt).toISOString().slice(0, 16).replace("T", " ")} UTC` : "");
+export function usageBlock(event, alerts, ownModel) {
+  if (!alerts.length || !NEW_WORK_TOOLS.has(event.toolName)) return undefined;
+  const own = alertsOn(alerts, ownModel?.provider);
+  if (own.length)
+    return `${USAGE_MARK} Blocked ${event.toolName}: the subscription this session runs on is almost used up ` +
+      `(${own.map(describeAlert).join("; ")}). Start no new work. Finish the step you are on, write your handoff and end your turn.`;
+  const model = lowModelIn(event.input, alerts);
+  if (model)
+    return `${USAGE_MARK} Blocked ${event.toolName}: ${model} runs on a subscription that is almost used up ` +
+      `(${alertsOn(alerts, providerOf(model)).map(describeAlert).join("; ")}). Use a model from another provider; other accounts stay usable.`;
+  return undefined;
+}
+
+// Global helpers answer one question; they are told to keep it short, not to
+// write a handoff (their caller does).
+const HELPER_SURFACES = new Set(["advisor", "decisions", "jev", "memory", "btw"]);
+export function usageNote(alerts, { surface = "", now = Date.now() } = {}) {
+  const lines = alerts.map((a) => `- ${describeAlert(a)}`).join("\n");
+  if (HELPER_SURFACES.has(surface))
+    return `${USAGE_MARK} The subscription you run on is almost used up:\n${lines}\n` +
+      `Answer what you were asked as briefly as you can and stop; start nothing new.`;
+  const stamp = new Date(now).toISOString().replace(/[-:]/g, "").slice(0, 13) + "Z";
+  const path = `.pi/handoffs/usage-${alerts[0]?.provider ?? "account"}-${stamp}.md`;
+  return `${USAGE_MARK} The subscription this session runs on is almost used up:\n${lines}\n` +
+    `Finish the step you are on now, as quickly as is safe: do not abandon a half-done action that would leave ` +
+    `things broken (finish it or roll it back), but start nothing new: no new sub-agents, workflows, delegations ` +
+    `or sessions on this account. Then write a handoff to \`${path}\` in your working directory (goal, what is done, ` +
+    `what is in progress and its exact state, next steps, branches/commits/files, commands to verify), tell any ` +
+    `sub-agents you started to wrap up the same way, and end your turn with the handoff path in your final answer.`;
+}
+
+/**
+ * Tell this Pi once per alert key. A running Pi below the session gets a
+ * steer at once; the Zeron session itself is told by the engine while it
+ * works, so here it (and any idle Pi) gets the note when its next turn starts.
+ */
+export function usageWatcher(pi, { depth, env = process.env, intervalMs = 15000, read = () => usageAlerts(env) } = {}) {
+  const told = new Set();
+  let model, timer, ctxRef;
+  const fresh = () => {
+    const own = alertsOn(read(), model?.provider);
+    return own.filter((a) => !told.has(a.key));
+  };
+  const note = (alerts) => usageNote(alerts, { surface: env.PI_USAGE_SURFACE ?? "" });
+  const check = () => {
+    if (depth === 0 || !ctxRef) return false;
+    let idle = true;
+    try { idle = ctxRef.isIdle(); } catch {}
+    if (idle) return false;
+    const alerts = fresh();
+    if (!alerts.length) return false;
+    for (const a of alerts) told.add(a.key);
+    try { pi.sendUserMessage(note(alerts), { deliverAs: "steer" }); } catch {}
+    return true;
+  };
+  pi.on("session_start", (_event, ctx) => {
+    ctxRef = ctx; model = ctx?.model ?? model;
+    if (!timer && intervalMs > 0) { timer = setInterval(check, intervalMs); timer.unref?.(); }
+  });
+  pi.on("model_select", (event) => { model = event?.model ?? model; });
+  pi.on("session_shutdown", () => { if (timer) clearInterval(timer); timer = undefined; });
+  pi.on("turn_start", () => { check(); });
+  pi.on("before_agent_start", (_event, ctx) => {
+    ctxRef = ctx ?? ctxRef; model = ctx?.model ?? model;
+    const alerts = fresh();
+    if (!alerts.length) return undefined;
+    for (const a of alerts) told.add(a.key);
+    return { message: { customType: "zeron-usage-alert", content: note(alerts), display: true } };
+  });
+  return { check, told, model: () => model };
+}
+
 export default function deleteGuard(pi) {
   inheritIntoChildren();
   guardCompiledChildren();
   const depth = piDepth(process.env, process.pid);
+  usageWatcher(pi, { depth });
   process.env.ZERON_PI_PID = String(process.pid);          // for the Pis this one starts
   process.env.ZERON_SUBAGENT_DEPTH = String(depth);
   const policed = Boolean(process.env.ZERON_MODEL_POLICY) && !policyExempt();
   if (policed) enforceModels(pi);
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
+    {
+      let reason;
+      try { reason = usageBlock(event, usageAlerts(), ctx?.model); } catch {}
+      if (reason) return { block: true, reason };
+    }
     if (policed && !POLICY_TOOLS_EXEMPT.has(event.toolName)) {
       let hit;
       try { hit = disabledModelIn(event.input, disabledModels()); } catch {}

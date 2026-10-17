@@ -27,6 +27,9 @@ pub struct DeleteGuard {
     /// Where the extension is installed. Not temp: Linux read-only
     /// subagents run with temp hidden.
     pub dir: PathBuf,
+    /// The engine's subscription-usage snapshot (`usage-alerts.json`),
+    /// re-read by the extension; exported as `ZERON_USAGE_ALERTS_FILE`.
+    pub usage_alerts_file: Option<PathBuf>,
 }
 
 /// Read on every spawn, so a toggle reaches the next run.
@@ -51,6 +54,10 @@ pub(super) fn configure(cmd: &mut Command, guard: &DeleteGuard) -> Result<(), Ha
     match &guard.state_file {
         Some(file) => cmd.env("ZERON_DELETE_GUARD_FILE", file),
         None => cmd.env_remove("ZERON_DELETE_GUARD_FILE"),
+    };
+    match &guard.usage_alerts_file {
+        Some(file) => cmd.env("ZERON_USAGE_ALERTS_FILE", file),
+        None => cmd.env_remove("ZERON_USAGE_ALERTS_FILE"),
     };
     // Never inherit a stale value.
     if guard.forced {
@@ -88,11 +95,16 @@ fn install_preload(dir: &Path, source: &str) -> std::io::Result<PathBuf> {
 /// without the parent's env (a herdr pane, a new terminal tab) still finds
 /// the extension and the live toggle.
 fn preload_source(guard: &DeleteGuard, ext: &Path) -> String {
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "ext": ext.to_string_lossy(),
         "file": guard.state_file.as_ref().map(|file| file.to_string_lossy()),
         "force": guard.forced,
     });
+    // Children started without the parent's env still find the usage
+    // snapshot (absent when unknown, so older configs read the same).
+    if let Some(usage) = &guard.usage_alerts_file {
+        config["usage"] = serde_json::Value::String(usage.to_string_lossy().into_owned());
+    }
     PRELOAD.replacen(
         "{}; // zeron:guard-config",
         &format!("{config}; // zeron:guard-config"),
@@ -177,6 +189,7 @@ mod tests {
             forced: true,
             state_file: Some(dir.path().join("harness-prefs.json")),
             dir: dir.path().to_path_buf(),
+            usage_alerts_file: None,
         };
         let source = preload_source(&guard, &ext);
         assert!(source.contains(&format!(

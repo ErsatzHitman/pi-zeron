@@ -339,6 +339,7 @@ impl HarnessRegistry {
                 forced: delete_guard_forced(),
                 state_file: None,
                 dir: std::env::temp_dir().join("zeron-pi-guard"),
+                usage_alerts_file: None,
             })),
         }
     }
@@ -533,6 +534,7 @@ impl HarnessRegistry {
                 .unwrap_or_else(PoisonError::into_inner);
             guard.state_file = Some(path.clone());
             guard.dir = data_dir.join("pi-guard");
+            guard.usage_alerts_file = Some(data_dir.join(crate::usage_alerts::FILE_NAME));
         }
         self.refresh_delete_guard();
         *self

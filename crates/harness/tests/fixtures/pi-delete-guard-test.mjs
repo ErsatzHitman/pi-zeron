@@ -108,6 +108,10 @@ assert.equal(guardOn(env, {statSync: fail('ENOENT'), readFileSync: read('{}')}),
 // The extension blocks through Pi's hook and stands aside when off.
 const handlers = [];
 guard.default({on: (event, handler) => handlers.push([event, handler]), getAllTools: () => [{name: 'nuke', annotations: {destructiveHint: true}}]});
+// Besides the tool hook: the usage-alert watcher's lifecycle hooks.
+for (const event of ['before_agent_start', 'model_select', 'session_shutdown', 'session_start', 'turn_start'])
+  assert.ok(handlers.some(([name]) => name === event), `usage-alert watcher hooks ${event}`);
+handlers.splice(0, handlers.length, ...handlers.filter(([event]) => event === 'tool_call'));
 assert.equal(handlers.length, 1);
 assert.equal(handlers[0][0], 'tool_call');
 const prior = process.env.ZERON_DELETE_GUARD_FILE;
