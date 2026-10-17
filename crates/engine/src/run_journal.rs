@@ -345,11 +345,15 @@ impl RunJournal {
         // Phase 2 (locked): copy whatever was appended meanwhile, swap, drop the fd.
         let mut files = self.lock();
         files.remove(chat_id);
-        let mut old = File::open(&path)?;
-        let before_bytes = old.metadata()?.len();
+        let before_bytes = {
+            // Closed before the rename: Windows will not replace an open file.
+            let mut old = File::open(&path)?;
+            let before_bytes = old.metadata()?.len();
+            old.seek(SeekFrom::Start(consumed))?;
+            std::io::copy(&mut old, tmp.as_file_mut())?;
+            before_bytes
+        };
         let old_last = last_valid_line(&path)?.map(|(seq, _)| seq);
-        old.seek(SeekFrom::Start(consumed))?;
-        std::io::copy(&mut old, tmp.as_file_mut())?;
         tmp.as_file_mut().flush()?;
         let new_last = last_valid_line(tmp.path())?.map(|(seq, _)| seq);
         let after_bytes = tmp.as_file().metadata()?.len();
