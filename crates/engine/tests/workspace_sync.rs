@@ -726,6 +726,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
         legacy
             .upsert_session(&Session {
                 last_completed_turn: None,
+                retry: None,
                 running_subagents: 0,
                 queue_position: 0,
                 subagents: Vec::new(),

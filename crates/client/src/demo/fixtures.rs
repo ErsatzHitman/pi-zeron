@@ -445,6 +445,7 @@ pub(crate) fn seed(
         if let Some(status) = demo.status {
             doc.upsert_session(&Session {
                 last_completed_turn: None,
+                retry: None,
                 running_subagents: 0,
                 queue_position: 0,
                 subagents: Vec::new(),

@@ -474,6 +474,9 @@ impl Zeron {
     /// to the baseline, is a run that has not started and keeps waiting.
     /// Without `expect_turn` the current posture is answered immediately
     /// unless the chat is working.
+    /// A row that carries a `retry` (the provider failed, Pi retries by
+    /// itself) is still `Working`: the wait keeps going, and a timed-out
+    /// payload carries the freshest row.
     pub async fn wait_for_turn(
         &self,
         chat: &Chat,

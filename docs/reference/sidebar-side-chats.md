@@ -18,7 +18,7 @@ The sidebar's Sessions list nests each session's side chats under it, on the Orc
 
 ## Child rows
 
-- Compact rows (29px), indented one level, with status glyph, harness icon, title and time; no project label, branch, pull request badge, jump chip, drag or pin. An untitled one reads "Side chat" until its first turn names it.
+- Compact rows (29px), indented one level, with status glyph, title and time; no project label, branch, pull request badge, jump chip, drag or pin. An untitled one reads "Side chat" until its first turn names it.
 - A child is lit while it is selected or open beside its parent.
 - Click: its parent becomes the open session, from any page, and the child opens beside it in the right pane, its composer focused.
 - Cmd-click (macOS) or Ctrl-click (Windows, Linux): opens the child as the session itself.

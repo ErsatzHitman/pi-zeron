@@ -587,14 +587,10 @@ impl Shell {
                         chat.last_message_at.unwrap_or(chat.created_at),
                         now,
                     )),
-                    self.settings
-                        .sidebar_show_harness
-                        .then(|| chat.config.as_ref().map(|c| c.harness))
-                        .flatten(),
                 )
             })
         };
-        let Some((title, time_ago, harness)) = row else {
+        let Some((title, time_ago)) = row else {
             return div().into_any_element();
         };
         self.render_chat_row(
@@ -604,7 +600,6 @@ impl Shell {
             SharedString::default(),
             None,
             None,
-            harness,
             status,
             selected,
             false,

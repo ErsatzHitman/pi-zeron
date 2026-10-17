@@ -48,6 +48,9 @@ turn.
 - `zeron_wait_for_turns {chats?, timeout_secs?}`: wait on several sessions at
   once and handle whichever finishes first, instead of waiting on them one
   by one. Without `chats` it watches the caller's working children.
+  A child whose provider failed and that Pi is retrying reads `retrying`
+  (attempt n, next try in s): it counts as working, so the wait continues
+  and the root should not treat it as stalled.
 
 ### Pushed child outcomes
 

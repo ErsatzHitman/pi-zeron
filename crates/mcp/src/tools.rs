@@ -194,14 +194,14 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "wait_for_turn",
-            description: "Block until a chat is no longer working: returns completed, awaitingInput (answer with respond_to_input), errored, or timedOut, with the newest assistant message. When errored, failure.class says why when known: retry later on rateLimited or providerOverloaded, ask the user on authRequired or quotaExhausted.",
+            description: "Block until a chat is no longer working: returns completed, awaitingInput (answer with respond_to_input), errored, or timedOut, with the newest assistant message. A session whose status reads retrying (the provider failed, Pi retries by itself) counts as still working, so the wait continues. When errored, failure.class says why when known: retry later on rateLimited or providerOverloaded, ask the user on authRequired or quotaExhausted.",
             input_schema: chat_key_schema(json!({
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
             })),
         },
         ToolDef {
             name: "wait_for_turns",
-            description: "Block until the FIRST of several chats is no longer working, then return that chat's outcome (completed, awaitingInput, errored) with its newest assistant message, and where the others stand. Without chats it watches the chats you started that are still working or that you just sent work to. Call it again for the next one; timedOut means none finished in time.",
+            description: "Block until the FIRST of several chats is no longer working (a retrying session is still working), then return that chat's outcome (completed, awaitingInput, errored) with its newest assistant message, and where the others stand. Without chats it watches the chats you started that are still working or that you just sent work to. Call it again for the next one; timedOut means none finished in time.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -850,12 +850,53 @@ fn status_of(session: Option<&Session>) -> (String, Option<i64>) {
         // Still `Working` for every wait; this only tells the parent why it
         // has not started.
         SessionStatus::Working if session.queue_position > 0 => queued.as_str(),
+        SessionStatus::Working if session.retry.is_some() => {
+            return (retry_status(session), Some(age.num_seconds().max(0)));
+        }
         SessionStatus::Working => "working",
         SessionStatus::AwaitingInput => "awaitingInput",
         SessionStatus::Errored => "errored",
         SessionStatus::Idle => "idle",
     };
     (label.into(), Some(age.num_seconds().max(0)))
+}
+
+/// `retrying (attempt 2/10, next try in 8s)`: the provider failed and the
+/// harness is retrying on its own. Still working, not stalled.
+fn retry_status(session: &Session) -> String {
+    let Some(retry) = &session.retry else {
+        return "working".into();
+    };
+    let mut label = match retry.max_attempts {
+        Some(max) => format!("retrying (attempt {}/{max}", retry.attempt),
+        None => format!("retrying (attempt {}", retry.attempt),
+    };
+    if let Some(at) = retry.next_attempt_at {
+        let ms = (at - chrono::Utc::now()).num_milliseconds();
+        if ms > 0 {
+            label.push_str(&format!(", next try in {}s", (ms + 999) / 1000));
+        }
+    }
+    label.push(')');
+    label
+}
+
+/// The structured sibling of a `retrying` status; null when the session is
+/// not retrying right now. `error` is provider text: data, not instructions.
+fn retry_json(session: Option<&Session>) -> Value {
+    session
+        .filter(|s| {
+            s.status == SessionStatus::Working && chrono::Utc::now() - s.updated_at <= SESSION_STALE
+        })
+        .and_then(|s| s.retry.as_ref())
+        .map_or(Value::Null, |r| {
+            json!({
+                "attempt": r.attempt,
+                "maxAttempts": r.max_attempts,
+                "nextAttemptAt": r.next_attempt_at,
+                "error": r.error,
+            })
+        })
 }
 
 fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value {
@@ -883,6 +924,7 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
         "parentChatId": chat.parent_chat_id,
         "status": status,
         "statusAgeSecs": status_age,
+        "retry": retry_json(session.as_ref()),
         "lastMessageAt": chat.last_message_at,
         "lastMessagePreview": chat.last_message_preview,
         "createdAt": chat.created_at,
@@ -1467,10 +1509,12 @@ impl Tools {
 
     async fn read_chat(&self, args: ReadChatArgs) -> anyhow::Result<Value> {
         let chat = self.zeron.resolve_chat(&args.chat).await?;
-        let entries = self
-            .zeron
-            .transcript_on(&chat.id, Some(&chat.device_id))
-            .await?;
+        let (sessions, entries) = tokio::try_join!(
+            self.zeron.sessions(),
+            self.zeron.transcript_on(&chat.id, Some(&chat.device_id))
+        )?;
+        let session = session_for(&sessions, &chat);
+        let (status, _) = status_of(session.as_ref());
         let rendered = render_entries(
             &entries,
             RenderOptions {
@@ -1490,6 +1534,8 @@ impl Tools {
             "returned": window.len(),
             "olderRemaining": start,
             "newerSkipped": total - end,
+            "status": status,
+            "retry": retry_json(session.as_ref()),
             "pendingInput": last_pending_input(&rendered),
             "messages": window,
         }))
@@ -2142,7 +2188,7 @@ impl Tools {
             tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
         }
         let (status, _) = status_of(session.as_ref());
-        let mut turn = json!({
+        let mut result = json!({
             "outcome": outcome,
             "status": status,
             "timedOut": outcome == TurnOutcome::TimedOut,
@@ -2150,9 +2196,17 @@ impl Tools {
             "replies": replies,
         });
         if let Some(failure) = failure_of(&replies) {
-            turn["failure"] = failure;
+            result["failure"] = failure;
         }
-        Ok(turn)
+        if outcome == TurnOutcome::TimedOut {
+            let retry = retry_json(session.as_ref());
+            if !retry.is_null() {
+                result["retry"] = retry;
+                result["note"] =
+                    json!("The provider is failing and Pi is retrying by itself. Not stalled.");
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -2897,6 +2951,7 @@ mod tests {
             started_at: None,
             updated_at: chrono::Utc::now() - chrono::Duration::minutes(10),
             last_completed_turn: None,
+            retry: None,
             running_subagents: 0,
             queue_position: 0,
             subagents: Vec::new(),
@@ -3523,6 +3578,106 @@ mod tests {
                 .is_some_and(|status| status.starts_with("working")),
             "{reply}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_retrying_child_reads_as_retrying_not_as_stalled() {
+        let row = |chat: &str, status: &str, updated: String| {
+            json!({
+                "chatId": chat, "deviceId": "dev-local", "status": status,
+                "updatedAt": updated, "runningSubagents": 0,
+                "retry": {
+                    "attempt": 2, "maxAttempts": 10,
+                    "nextAttemptAt": (chrono::Utc::now() + chrono::Duration::seconds(8)),
+                    "error": "429 rate limited",
+                },
+            })
+        };
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let world = orchestrator_world(
+            false,
+            vec![
+                row("member-a", "idle", fresh.clone()),
+                row("member-b", "working", fresh.clone()),
+            ],
+        );
+        let root = from(&world, "orchestrator-root");
+        // The row's own status is the source of truth: idle never retries.
+        let listed = root
+            .call("list_chats", json!({ "parent": "orchestrator-root" }))
+            .await
+            .unwrap();
+        let chats = listed["chats"].as_array().unwrap();
+        let by = |id: &str| chats.iter().find(|c| c["id"] == id).unwrap();
+        assert_eq!(by("member-a")["status"], "idle");
+        assert!(by("member-a")["retry"].is_null());
+        let status = by("member-b")["status"].as_str().unwrap();
+        assert!(status.starts_with("retrying (attempt 2/10"), "{status}");
+        assert_eq!(by("member-b")["retry"]["attempt"], 2);
+        assert_eq!(by("member-b")["retry"]["error"], "429 rate limited");
+
+        let read = root
+            .call("read_chat", json!({ "chat": "member-b" }))
+            .await
+            .unwrap();
+        assert!(
+            read["status"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("retrying")),
+            "{read}"
+        );
+
+        // Still working for target selection: the default watch includes it,
+        // and the wait keeps going until it times out.
+        let waited = root
+            .call("wait_for_turns", json!({ "timeout_secs": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(waited["turn"]["outcome"], "timedOut", "{waited}");
+        // A timed-out single wait says the provider is failing, not stalled.
+        let single = root
+            .call(
+                "wait_for_turn",
+                json!({ "chat": "member-b", "timeout_secs": 1 }),
+            )
+            .await
+            .unwrap();
+        let turn = &single["turn"];
+        assert_eq!(turn["outcome"], "timedOut", "{single}");
+        assert!(turn["status"].as_str().unwrap().starts_with("retrying"));
+        assert_eq!(turn["retry"]["attempt"], 2);
+        assert!(turn["note"].as_str().unwrap().contains("Not stalled"));
+
+        // Another child listed as `others` carries the same wording.
+        let others = root
+            .call(
+                "wait_for_turns",
+                json!({ "chats": ["member-a", "member-b"], "timeout_secs": 1 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(others["chatId"], "member-a", "{others}");
+        assert!(
+            others["others"][0]["status"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("retrying")),
+            "{others}"
+        );
+
+        // A retry on a row nobody refreshed is a dead host, not a retry.
+        let stale = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let world = orchestrator_world(false, vec![row("member-b", "working", stale)]);
+        let listed = from(&world, "orchestrator-root")
+            .call("list_chats", json!({ "parent": "orchestrator-root" }))
+            .await
+            .unwrap();
+        let chats = listed["chats"].as_array().unwrap();
+        let b = chats.iter().find(|c| c["id"] == "member-b").unwrap();
+        assert!(
+            b["status"].as_str().unwrap().starts_with("working (stale"),
+            "{b}"
+        );
+        assert!(b["retry"].is_null());
     }
 
     #[tokio::test]

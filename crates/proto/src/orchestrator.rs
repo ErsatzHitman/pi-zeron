@@ -554,6 +554,11 @@ mod tests {
         assert!(ROOT_SYSTEM_PROMPT.contains("automatic child-outcome notice"));
         assert!(ROOT_SYSTEM_PROMPT.contains("zeron_wait_for_turns"));
         assert!(member.contains("tail of that reply automatically"));
+        assert!(
+            ROOT_SYSTEM_PROMPT.contains("working, retrying, awaitingInput")
+                && ROOT_SYSTEM_PROMPT.contains("retrying session"),
+            "the root must know retrying is not stalled"
+        );
         assert_eq!(
             ROOT_TOOLS,
             "zeron_*,read,ls,find,grep,ask_user,todo,goal_*,memory_search,memory_read,memory_status"

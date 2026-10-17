@@ -13681,6 +13681,7 @@ mod tests {
                 status: zeron_proto::SessionStatus::Working,
                 started_at: Some(updated),
                 updated_at: updated,
+                retry: None,
                 running_subagents: 0,
                 queue_position: 0,
                 subagents: Vec::new(),

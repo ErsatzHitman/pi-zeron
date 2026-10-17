@@ -3374,6 +3374,77 @@ async fn session_row_counts_running_subagents_until_the_run_ends() {
     );
 }
 
+/// A harness retrying a failed request rides the session row while the
+/// status stays Working, and the row clears when the retry ends or the run does.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_row_carries_the_harness_retry_while_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::Retrying {
+                    attempt: 1,
+                    max_attempts: Some(3),
+                    delay_ms: Some(30_000),
+                    error: Some("overloaded".into()),
+                    active: true,
+                },
+                AgentEvent::Retrying {
+                    attempt: 1,
+                    max_attempts: None,
+                    delay_ms: None,
+                    error: None,
+                    active: false,
+                },
+            ],
+            step_delay: Duration::from_millis(600),
+            hang_until_interrupt: true,
+        }),
+    );
+    let row = || core.sessions.session_status(CHAT);
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "retry-run",
+        SessionCommandPayload::Run {
+            request: run_request("flaky provider"),
+            message_id: "retry-user".into(),
+        },
+    );
+
+    wait_for(
+        || row().is_some_and(|s| s.retry.is_some()),
+        "retry published",
+    )
+    .await;
+    let during = row().unwrap();
+    assert_eq!(during.status, SessionStatus::Working);
+    let retry = during.retry.unwrap();
+    assert_eq!((retry.attempt, retry.max_attempts), (1, Some(3)));
+    assert!(retry.next_attempt_at.is_some());
+    assert_eq!(retry.error.as_deref(), Some("overloaded"));
+
+    wait_for(
+        || row().is_some_and(|s| s.retry.is_none()),
+        "retry cleared when it ended",
+    )
+    .await;
+    assert_eq!(row().unwrap().status, SessionStatus::Working);
+
+    queue_as_viewer(
+        handle.doc(),
+        "retry-interrupt",
+        SessionCommandPayload::Interrupt {},
+    );
+    wait_for(
+        || row().map(|s| s.status) == Some(SessionStatus::Idle),
+        "run to end",
+    )
+    .await;
+    assert!(row().unwrap().retry.is_none());
+}
+
 /// `show_visual` end to end below the MCP server: the RPC checks the script,
 /// stores it, and folds a visual part into the chat's live turn, after what
 /// the harness streamed; a broken script or no live turn is refused and

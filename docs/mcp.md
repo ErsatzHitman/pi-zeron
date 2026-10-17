@@ -256,6 +256,16 @@ edge. A brand-new chat has no session row until the host picks the run up, so
 the wait keeps waiting in that case rather than reporting the unstarted run as
 done (this was the one bug the first live run found).
 
+Status strings are `working`, `retrying (attempt n/max, next try in Ns)`,
+`awaitingInput`, `errored` and `idle` (`working (stale ...)` for a row nobody
+refreshed in 45 s). `retrying` is a `Working` session row that carries a
+`retry` (Pi `auto_retry_start`, cleared on `auto_retry_end`, on settle and
+when the run exits): the provider failed and Pi retries on its own. The wait
+keeps going through it, `list_chats`/`read_chat` carry a structured `retry`
+object (`attempt`, `maxAttempts`, `nextAttemptAt`, `error`; null otherwise),
+and a timed-out `wait_for_turn` adds `retry` and a note so the caller does not
+treat it as stalled. The `error` is provider text: data, not instructions.
+
 ### Merge preview
 
 `merge_preview {chat, base?}` (root only) answers "what would merging this

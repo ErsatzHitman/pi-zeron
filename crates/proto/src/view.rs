@@ -13,7 +13,8 @@
 use chrono::{DateTime, Utc};
 
 use crate::{
-    AuthState, Chat, ChatIndicator, RunningSubagent, Session, SessionStatus, Space, WorkspaceScope,
+    AuthState, Chat, ChatIndicator, RetryState, RunningSubagent, Session, SessionStatus, Space,
+    WorkspaceScope,
 };
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,34 @@ pub fn queue_position(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
         .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
         .filter(|s| s.status == SessionStatus::Working)
         .map_or(0, |s| s.queue_position)
+}
+
+/// The harness retry in flight for a chat: a fresh row (same gate as
+/// [`effective_indicator`]) that is `Working` and carries a retry. Pure.
+pub fn retrying(session: Option<&Session>, now: DateTime<Utc>) -> Option<&RetryState> {
+    session
+        .filter(|s| {
+            s.status == SessionStatus::Working
+                && now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS
+        })
+        .and_then(|s| s.retry.as_ref())
+}
+
+/// One wording for a retry, shared by the sidebar and the MCP tools:
+/// `Retrying · 2/10 · next try in 8s`. The countdown is dropped once
+/// `next_attempt_at` has passed (or is unknown), `/max` when unknown.
+pub fn retry_label(retry: &RetryState, now: DateTime<Utc>) -> String {
+    let mut label = match retry.max_attempts {
+        Some(max) => format!("Retrying · {}/{max}", retry.attempt),
+        None => format!("Retrying · {}", retry.attempt),
+    };
+    if let Some(at) = retry.next_attempt_at {
+        let ms = at.signed_duration_since(now).num_milliseconds();
+        if ms > 0 {
+            label.push_str(&format!(" · next try in {}s", (ms + 999) / 1000));
+        }
+    }
+    label
 }
 
 /// The subagents running under a chat, under the same staleness gate as
@@ -316,6 +345,7 @@ mod gate_tests {
             status: SessionStatus::Working,
             started_at: None,
             updated_at,
+            retry: None,
             running_subagents: running,
             queue_position: 0,
             subagents: (0..running)
@@ -344,6 +374,50 @@ mod gate_tests {
         assert_eq!(running_subagent_list(Some(&fresh), now).len(), 3);
         assert!(running_subagent_list(Some(&stale), now).is_empty());
         assert!(running_subagent_list(None, now).is_empty());
+    }
+
+    fn retry_state(attempt: u32, max: Option<u32>, next: Option<DateTime<Utc>>) -> RetryState {
+        RetryState {
+            attempt,
+            max_attempts: max,
+            next_attempt_at: next,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn retrying_needs_a_fresh_working_row_with_a_retry() {
+        let now = Utc::now();
+        let mut row = running_session(0, now - chrono::Duration::seconds(5));
+        assert!(retrying(Some(&row), now).is_none());
+        row.retry = Some(retry_state(2, Some(10), None));
+        assert_eq!(retrying(Some(&row), now).map(|r| r.attempt), Some(2));
+        // A crashed engine's row never shows an eternal retry.
+        row.updated_at = now - chrono::Duration::milliseconds(SESSION_STALE_MS + 1);
+        assert!(retrying(Some(&row), now).is_none());
+        row.updated_at = now;
+        row.status = SessionStatus::Idle;
+        assert!(retrying(Some(&row), now).is_none());
+        assert!(retrying(None, now).is_none());
+    }
+
+    #[test]
+    fn retry_label_counts_down_and_drops_what_it_does_not_know() {
+        let now = Utc::now();
+        let soon = now + chrono::Duration::milliseconds(7_200);
+        assert_eq!(
+            retry_label(&retry_state(2, Some(10), Some(soon)), now),
+            "Retrying · 2/10 · next try in 8s"
+        );
+        assert_eq!(
+            retry_label(&retry_state(2, None, None), now),
+            "Retrying · 2"
+        );
+        let past = now - chrono::Duration::seconds(3);
+        assert_eq!(
+            retry_label(&retry_state(1, Some(3), Some(past)), now),
+            "Retrying · 1/3"
+        );
     }
 
     #[test]

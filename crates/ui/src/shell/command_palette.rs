@@ -1093,11 +1093,6 @@ impl Shell {
                     .sidebar_show_pull_request
                     .then(|| state.change_request_for_chat(chat).cloned())
                     .flatten();
-                let harness = self
-                    .settings
-                    .sidebar_show_harness
-                    .then(|| chat.config.as_ref().map(|c| c.harness))
-                    .flatten();
                 self.render_chat_row(
                     id.clone(),
                     transcript::single_line(chat.title.as_deref().unwrap_or("New session")).into(),
@@ -1106,7 +1101,6 @@ impl Shell {
                     folder.into(),
                     branch,
                     pr,
-                    harness,
                     state.display_status_for(chat, Utc::now()),
                     active,
                     chat.archived,

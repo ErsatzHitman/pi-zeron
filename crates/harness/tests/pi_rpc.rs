@@ -153,6 +153,45 @@ async fn failed_runs_carry_a_failure_class() {
 }
 
 #[tokio::test]
+async fn pi_retry_frames_become_retrying_events_and_the_run_still_completes() {
+    let events = collect("retry").await;
+    let retrying: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Retrying {
+                attempt,
+                max_attempts,
+                delay_ms,
+                error,
+                active,
+            } => Some((*attempt, *max_attempts, *delay_ms, error.clone(), *active)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        retrying,
+        vec![
+            (
+                1,
+                Some(3),
+                Some(150),
+                Some("mock provider failure".to_string()),
+                true
+            ),
+            (1, None, None, None, false),
+        ],
+        "{events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn nested_agent_environment_is_not_inherited() {
     if std::env::var_os("CLAUDECODE").is_none() {
         // Re-run in a private environment; never mutate this process's env.

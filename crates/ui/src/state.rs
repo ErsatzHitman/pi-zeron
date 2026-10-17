@@ -2340,6 +2340,17 @@ impl AppState {
         zeron_proto::view::queue_position(self.session_for(chat_id), now)
     }
 
+    /// The harness retry in flight for `chat_id` (Pi retrying a failed
+    /// provider request): a fresh Working row that carries one. The sidebar
+    /// row labels it; the status stays Working.
+    pub fn retrying_for(
+        &self,
+        chat_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<zeron_proto::RetryState> {
+        zeron_proto::view::retrying(self.session_for(chat_id), now).cloned()
+    }
+
     /// Those subagents by name, oldest first (empty from an engine that only
     /// publishes the count).
     pub fn running_subagent_list_for(
@@ -4287,6 +4298,7 @@ mod tests {
     ) -> Session {
         Session {
             last_completed_turn: None,
+            retry: None,
             running_subagents: 0,
             queue_position: 0,
             subagents: Vec::new(),
@@ -4534,6 +4546,7 @@ mod tests {
         let now = Utc::now();
         let mut row = Session {
             last_completed_turn: None,
+            retry: None,
             running_subagents: 0,
             queue_position: 0,
             subagents: Vec::new(),
@@ -4563,11 +4576,51 @@ mod tests {
     }
 
     #[test]
+    fn retrying_shows_only_on_a_fresh_working_row_and_repaints_on_change() {
+        let mut state = AppState::new();
+        let now = Utc::now();
+        let mut row = Session {
+            last_completed_turn: None,
+            retry: None,
+            running_subagents: 0,
+            subagents: Vec::new(),
+            chat_id: "chat".into(),
+            device_id: "host".into(),
+            status: SessionStatus::Working,
+            started_at: Some(now),
+            updated_at: now,
+        };
+        assert!(state.apply_sessions_at(vec![row.clone()], now));
+        assert!(state.retrying_for("chat", now).is_none());
+        row.retry = Some(zeron_proto::RetryState {
+            attempt: 2,
+            max_attempts: Some(10),
+            next_attempt_at: None,
+            error: None,
+        });
+        assert!(
+            state.apply_sessions_at(vec![row.clone()], now),
+            "a retry must repaint the row"
+        );
+        assert_eq!(state.retrying_for("chat", now).map(|r| r.attempt), Some(2));
+        // The same row gone stale (crashed engine) is not retrying.
+        assert!(
+            state
+                .retrying_for("chat", now + TimeDelta::seconds(60))
+                .is_none()
+        );
+        row.status = SessionStatus::Idle;
+        state.apply_sessions_at(vec![row], now);
+        assert!(state.retrying_for("chat", now).is_none());
+    }
+
+    #[test]
     fn unchanged_device_heartbeat_still_retires_stale_session_indicators() {
         let mut state = AppState::new();
         let now = Utc::now();
         state.sessions = vec![Session {
             last_completed_turn: None,
+            retry: None,
             running_subagents: 0,
             queue_position: 0,
             subagents: Vec::new(),

@@ -851,6 +851,15 @@ struct Runner {
 }
 /// The footer chip Zeron shows while Pi retries a failed request.
 const RETRY_STATUS: &str = "zeron:retry";
+/// A provider error for the session row: one capped line.
+fn retry_error(text: &str) -> String {
+    const LIMIT: usize = 160;
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.char_indices().nth(LIMIT) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line,
+    }
+}
 /// `provider/id` of the model in a `get_state` reply.
 fn model_key(state: &Value) -> Option<String> {
     let model = &state["model"];
@@ -1849,8 +1858,34 @@ impl Runner {
                     None => format!("Retrying · attempt {attempt}"),
                 };
                 self.ui.host_status(RETRY_STATUS, Some(text));
+                if self.active {
+                    self.emit(AgentEvent::Retrying {
+                        attempt: u32::try_from(attempt).unwrap_or(u32::MAX),
+                        max_attempts: frame["maxAttempts"]
+                            .as_u64()
+                            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+                        delay_ms: frame["delayMs"].as_u64(),
+                        error: frame["errorMessage"].as_str().map(retry_error),
+                        active: true,
+                    })
+                    .await?;
+                }
             }
-            "auto_retry_end" | "agent_settled" => self.ui.host_status(RETRY_STATUS, None),
+            "auto_retry_end" | "agent_settled" => {
+                self.ui.host_status(RETRY_STATUS, None);
+                if self.active && string(&frame, "type") == "auto_retry_end" {
+                    self.emit(AgentEvent::Retrying {
+                        attempt: frame["attempt"]
+                            .as_u64()
+                            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+                        max_attempts: None,
+                        delay_ms: None,
+                        error: None,
+                        active: false,
+                    })
+                    .await?;
+                }
+            }
             _ => {}
         }
         // An extension message appended between turns must not reopen a

@@ -14995,6 +14995,7 @@ mod tests {
                     this.state.update(cx, |state, _| {
                         state.sessions.push(zeron_proto::Session {
                             last_completed_turn: None,
+                            retry: None,
                             running_subagents: 0,
                             queue_position: 0,
                             subagents: Vec::new(),

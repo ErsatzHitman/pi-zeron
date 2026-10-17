@@ -857,6 +857,21 @@ pub enum AgentEvent {
         tokens: Option<u64>,
         window: Option<u64>,
     },
+    /// The harness is retrying after a provider failure (Pi `auto_retry_start`
+    /// / `auto_retry_end`). The engine publishes it on the session row; never
+    /// persisted to docs and never a turn boundary.
+    #[serde(rename_all = "camelCase")]
+    Retrying {
+        attempt: u32,
+        #[serde(default)]
+        max_attempts: Option<u32>,
+        #[serde(default)]
+        delay_ms: Option<u64>,
+        #[serde(default)]
+        error: Option<String>,
+        /// True on start, false once the retry sequence ended.
+        active: bool,
+    },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {

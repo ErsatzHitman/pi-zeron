@@ -506,7 +506,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (title, time_ago, harness, status, selected) = {
+        let (title, time_ago, status, selected) = {
             let state = self.state.read(cx);
             let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
             (
@@ -517,10 +517,6 @@ impl Shell {
                     chat.last_message_at.unwrap_or(chat.created_at),
                     now,
                 )),
-                self.settings
-                    .sidebar_show_harness
-                    .then(|| chat.config.as_ref().map(|c| c.harness))
-                    .flatten(),
                 state.display_status_for(chat, now),
                 state.selected_chat.as_deref() == Some(chat_id),
             )
@@ -532,7 +528,6 @@ impl Shell {
             label,
             None,
             None,
-            harness,
             status,
             selected,
             false,
