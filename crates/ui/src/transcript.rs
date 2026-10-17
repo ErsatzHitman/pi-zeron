@@ -7808,7 +7808,20 @@ impl Transcript {
                 self.compact_last_elapsed.insert(entry_id, elapsed_secs);
             }
         }
-        let word = if queued {
+        // Waiting on the engine's running-turn cap: the row stays Working, so
+        // this strip is where the wait shows.
+        let capacity_queue = match (&self.doc_override, &self.chat_id) {
+            (None, Some(chat_id)) if !sending => {
+                self.state.read(cx).queue_position_for(chat_id, now)
+            }
+            _ => 0,
+        };
+        let capacity_word = (capacity_queue > 0)
+            .then(|| format!("Queued, waiting for capacity (#{capacity_queue})"));
+        let queued = queued || capacity_word.is_some();
+        let word = if let Some(word) = capacity_word.as_deref() {
+            word
+        } else if queued {
             "Queued — will send automatically"
         } else if sending {
             "Sending"
@@ -14929,6 +14942,7 @@ mod tests {
                         state.sessions.push(zeron_proto::Session {
                             last_completed_turn: None,
                             running_subagents: 0,
+                            queue_position: 0,
                             subagents: Vec::new(),
                             chat_id: "chat".into(),
                             device_id: "test".into(),

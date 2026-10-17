@@ -53,6 +53,7 @@ fn working(
         started_at: Some(Utc::now()),
         updated_at: Utc::now(),
         running_subagents: count,
+        queue_position: 0,
         subagents,
     }
 }

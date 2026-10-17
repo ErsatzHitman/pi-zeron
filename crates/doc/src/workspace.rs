@@ -488,6 +488,7 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         row.insert("runningSubagents", i64::from(session.running_subagents))?;
+        row.insert("queuePosition", i64::from(session.queue_position))?;
         row.insert(
             "subagents",
             serde_json::to_string(&session.subagents)?.as_str(),
@@ -786,6 +787,9 @@ pub(crate) struct RawSession {
     updated_at: i64,
     #[serde(default)]
     running_subagents: u32,
+    /// Absent from an engine that predates the start queue: not queued.
+    #[serde(default)]
+    queue_position: u32,
     /// `Session::subagents` as JSON text.
     #[serde(default)]
     subagents: Option<String>,
@@ -801,6 +805,7 @@ impl From<RawSession> for Session {
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
             running_subagents: raw.running_subagents,
+            queue_position: raw.queue_position,
             subagents: raw
                 .subagents
                 .and_then(|json| serde_json::from_str(&json).ok())
@@ -913,6 +918,7 @@ mod tests {
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
             running_subagents: 0,
+            queue_position: 0,
             subagents: Vec::new(),
         }
     }
@@ -988,6 +994,21 @@ mod tests {
             .delete("lastCompletedTurn")
             .unwrap();
         assert_eq!(ws.read_sessions().unwrap()[0].last_completed_turn, None);
+    }
+
+    #[test]
+    fn queue_position_round_trips_and_defaults_to_zero() {
+        let ws = WorkspaceDoc::new();
+        let mut row = session("chat-1", "dev-a", SessionStatus::Working);
+        row.queue_position = 3;
+        ws.upsert_session(&row).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![row.clone()]);
+        // A row written by an engine that predates the queue reads as not queued.
+        ws.row("sessions", "chat-1")
+            .unwrap()
+            .delete("queuePosition")
+            .unwrap();
+        assert_eq!(ws.read_sessions().unwrap()[0].queue_position, 0);
     }
 
     #[test]

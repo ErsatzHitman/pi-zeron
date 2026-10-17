@@ -2334,6 +2334,12 @@ impl AppState {
         running_subagents(self.session_for(chat_id), now)
     }
 
+    /// `chat_id`'s place in the engine's start queue (1-based; 0 = not
+    /// waiting on capacity, or the row went stale).
+    pub fn queue_position_for(&self, chat_id: &str, now: DateTime<Utc>) -> u32 {
+        zeron_proto::view::queue_position(self.session_for(chat_id), now)
+    }
+
     /// Those subagents by name, oldest first (empty from an engine that only
     /// publishes the count).
     pub fn running_subagent_list_for(
@@ -4282,6 +4288,7 @@ mod tests {
         Session {
             last_completed_turn: None,
             running_subagents: 0,
+            queue_position: 0,
             subagents: Vec::new(),
             chat_id: chat_id.into(),
             device_id: "dev".into(),
@@ -4528,6 +4535,7 @@ mod tests {
         let mut row = Session {
             last_completed_turn: None,
             running_subagents: 0,
+            queue_position: 0,
             subagents: Vec::new(),
             chat_id: "chat".into(),
             device_id: "host".into(),
@@ -4561,6 +4569,7 @@ mod tests {
         state.sessions = vec![Session {
             last_completed_turn: None,
             running_subagents: 0,
+            queue_position: 0,
             subagents: Vec::new(),
             chat_id: "chat".into(),
             device_id: "host".into(),

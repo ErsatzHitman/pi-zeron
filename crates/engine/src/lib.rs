@@ -15,6 +15,7 @@ use zeron_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use zeron_sync::DocsStore;
 
+mod admission;
 pub mod agent_accounts;
 pub mod api_keys;
 pub mod auth;
@@ -170,6 +171,55 @@ pub struct EngineCore {
     _instance_lock: InstanceLock,
 }
 
+/// Upper bound we ever request for `RLIMIT_NOFILE`. macOS rejects values above
+/// `OPEN_MAX` (and `RLIM_INFINITY`) with EINVAL even when the hard limit is
+/// unlimited, so the target is `min(hard, 10240)`.
+#[cfg(unix)]
+const NOFILE_TARGET_CAP: u64 = 10_240;
+
+/// Raise the process's soft `RLIMIT_NOFILE` towards its hard limit (capped at
+/// 10240). Idempotent: only the first call does any work, later calls return
+/// the same `(before, after)` pair. Returns `None` off unix or when the limit
+/// cannot be read. On a failed `setrlimit` the unchanged values are returned.
+pub fn raise_nofile_soft_limit() -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        static RAISED: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+        *RAISED.get_or_init(|| {
+            // SAFETY: plain getrlimit/setrlimit on a zeroed, owned struct.
+            unsafe {
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    tracing::warn!("getrlimit(RLIMIT_NOFILE) failed; fd limit left as is");
+                    return None;
+                }
+                let before = limit.rlim_cur as u64;
+                let hard = limit.rlim_max as u64;
+                let target = hard.min(NOFILE_TARGET_CAP);
+                if target <= before {
+                    return Some((before, before));
+                }
+                limit.rlim_cur = target as libc::rlim_t;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    tracing::warn!(
+                        before,
+                        target,
+                        error = %std::io::Error::last_os_error(),
+                        "could not raise RLIMIT_NOFILE soft limit"
+                    );
+                    return Some((before, before));
+                }
+                tracing::info!(before, after = target, "raised RLIMIT_NOFILE soft limit");
+                Some((before, target))
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 impl EngineCore {
     /// Open stores under `data_dir`, wire sessions ⇄ doc host ⇄ workspace host, and
     /// recover stale journals from a previous crash. Identity comes from
@@ -225,6 +275,10 @@ impl EngineCore {
         edge: Option<EdgeConfig>,
         lock: InstanceLock,
     ) -> Result<Self, EngineError> {
+        // Before any store, socket or child process opens: every synced doc,
+        // journal and Pi runtime holds descriptors, and the common 256 default
+        // soft limit is far below what a busy orchestrator tree needs.
+        raise_nofile_soft_limit();
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         // We hold the single-instance lock, so any marked Pi whose engine is

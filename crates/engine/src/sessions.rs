@@ -34,6 +34,7 @@ use zeron_proto::{
     UserInputQuestion,
 };
 
+use crate::admission::{Admission, Admit};
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
@@ -222,6 +223,9 @@ struct Inner {
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
     sessions_tx: watch::Sender<Vec<Session>>,
+    /// Slots of the global running-turn cap and the queue of starts waiting
+    /// for one. Lock order: `statuses` before `admission`.
+    admission: Mutex<Admission>,
     /// Last dispatched request per chat — the steer→new-turn fallback re-derives its
     /// run config from this (chat config rows land with the workspace doc in M4).
     last_requests: Mutex<HashMap<String, RunRequest>>,
@@ -284,6 +288,7 @@ impl SessionsEngine {
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
+                admission: Mutex::new(Admission::default()),
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
@@ -920,6 +925,28 @@ impl SessionsEngine {
                 retiring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
+        // Admission: a fresh turn takes a slot or waits for one. Voice
+        // start_idle holds no turn, and routed steers never reach here.
+        let admission = if idle {
+            None
+        } else {
+            let depth = self.inner.member_depth(chat_id);
+            let cap = self.inner.max_running_turns();
+            let mut gate = lock(&self.inner.admission);
+            match gate.admit(chat_id, depth, cap) {
+                Admit::Now => None,
+                Admit::Queued(grant) => {
+                    tracing::info!(
+                        chat = %chat_id,
+                        position = gate.position(chat_id),
+                        running = gate.running(),
+                        cap,
+                        "running-turn cap reached: start queued"
+                    );
+                    Some(grant)
+                }
+            }
+        };
         self.set_status(
             chat_id,
             if idle {
@@ -929,6 +956,10 @@ impl SessionsEngine {
             },
             true,
         );
+        if admission.is_some() {
+            // A queued member can move ahead of waiters already listed.
+            self.inner.publish_queue_positions();
+        }
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
         if !idle {
@@ -962,6 +993,7 @@ impl SessionsEngine {
                 startup_retry,
                 fork_history_sent,
                 started,
+                admission,
             },
             turn,
         ));
@@ -1661,6 +1693,10 @@ impl Inner {
         let now = Utc::now();
         let settled_turn = completed_turn.clone();
         let prev;
+        // The running-turn slot follows the row: Working holds one (a queued
+        // chat keeps waiting instead), a settled or question-parked turn
+        // frees it. Done before the statuses lock (lock order).
+        let queue_changed = self.account_slot(chat_id, status);
         let session = {
             let mut statuses = lock(&self.statuses);
             prev = statuses.get(chat_id).map(|s| s.status);
@@ -1674,6 +1710,7 @@ impl Inner {
                     started_at: None,
                     updated_at: now,
                     running_subagents: 0,
+                    queue_position: 0,
                     subagents: Vec::new(),
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
@@ -1691,6 +1728,11 @@ impl Inner {
             }
             entry.status = status;
             entry.updated_at = now;
+            entry.queue_position = if status == SessionStatus::Working {
+                lock(&self.admission).position(chat_id)
+            } else {
+                0
+            };
             match status {
                 SessionStatus::Working if fresh_start || !was_active => {
                     entry.started_at = Some(now);
@@ -1714,6 +1756,120 @@ impl Inner {
             ws.record_session(&session);
         }
         self.parent_notifier_note(chat_id, prev, status, settled_turn.as_deref());
+        // A freed slot moved the queue: the waiters' rows show it.
+        if queue_changed {
+            self.publish_queue_positions();
+        }
+    }
+
+    // ── admission ───────────────────────────────────────────────────────────
+
+    /// The global cap on concurrently running turns: `ZERON_MAX_RUNNING_TURNS`,
+    /// else `maxRunningTurns` in `harness-prefs.json`, else a default scaled
+    /// to the machine. 0 = unlimited. Read on every admit/release, so it is
+    /// live.
+    fn max_running_turns(&self) -> usize {
+        std::env::var("ZERON_MAX_RUNNING_TURNS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .or(self.registry.capacity_prefs().max_running_turns)
+            .unwrap_or_else(default_max_running_turns)
+    }
+
+    /// `chat_id`'s depth below its orchestrator root when it is a tree member.
+    fn member_depth(&self, chat_id: &str) -> Option<usize> {
+        match zeron_proto::orchestrator::Place::of(&self.lineage(chat_id), chat_id).role {
+            zeron_proto::orchestrator::Role::Member { depth } => Some(depth),
+            _ => None,
+        }
+    }
+
+    /// Keep the admission slots in step with a status transition; whether the
+    /// queue changed (so its rows need republishing).
+    fn account_slot(&self, chat_id: &str, status: SessionStatus) -> bool {
+        match status {
+            SessionStatus::Working => {
+                if !lock(&self.admission).tracks(chat_id) {
+                    let depth = self.member_depth(chat_id);
+                    lock(&self.admission).mark_running(chat_id, depth);
+                }
+                false
+            }
+            SessionStatus::AwaitingInput | SessionStatus::Idle | SessionStatus::Errored => {
+                let cap = self.max_running_turns();
+                lock(&self.admission).release(chat_id, cap)
+            }
+        }
+    }
+
+    /// Drop every slot and wait of `chat_id` (its run is gone).
+    fn forget_admission(&self, chat_id: &str) {
+        let cap = self.max_running_turns();
+        if lock(&self.admission).forget(chat_id, cap) {
+            self.publish_queue_positions();
+        }
+    }
+
+    /// Withdraw a queued start (it was stopped before it began).
+    fn cancel_admission(&self, chat_id: &str) {
+        if lock(&self.admission).cancel(chat_id) {
+            self.publish_queue_positions();
+        }
+    }
+
+    /// Bring every session row's `queue_position` in line with the queue.
+    fn publish_queue_positions(&self) {
+        let changed: Vec<Session> = {
+            let mut statuses = lock(&self.statuses);
+            let positions = lock(&self.admission).positions();
+            let now = Utc::now();
+            let mut changed = Vec::new();
+            for entry in statuses.values_mut() {
+                let position = positions.get(&entry.chat_id).copied().unwrap_or(0);
+                if entry.queue_position != position {
+                    entry.queue_position = position;
+                    entry.updated_at = now;
+                    changed.push(entry.clone());
+                }
+            }
+            if changed.is_empty() {
+                return;
+            }
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            changed
+        };
+        if let Some(ws) = self.workspace() {
+            for session in &changed {
+                ws.record_session(session);
+            }
+        }
+    }
+
+    /// A granted start begins its turn now: the timer excludes the queue wait.
+    fn restart_turn_clock(&self, chat_id: &str) {
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses
+                .get_mut(chat_id)
+                .filter(|e| e.status == SessionStatus::Working)
+            else {
+                return;
+            };
+            let now = Utc::now();
+            entry.started_at = Some(now);
+            entry.updated_at = now;
+            entry.queue_position = 0;
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
     }
 
     /// The doc host, once wired. `None` before assembly or after retirement.
@@ -1930,6 +2086,55 @@ impl Inner {
         let mut runs = lock(&self.runs);
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
             runs.remove(chat_id);
+            drop(runs);
+            // Belt and braces: a removed run can never leak a slot or a wait.
+            self.forget_admission(chat_id);
+        }
+    }
+}
+
+/// Fallback for the running-turn cap: twice the cores, between 8 and 24. Runs
+/// are mostly waiting on a model, so cores bound them loosely; the cap exists
+/// to keep a runaway orchestrator from spawning dozens of Pi processes.
+fn default_max_running_turns() -> usize {
+    std::thread::available_parallelism()
+        .map_or(8, |n| n.get() * 2)
+        .clamp(8, 24)
+}
+
+/// Park a queued start until the admission queue grants it a slot. `true` =
+/// granted (the turn clock restarts); `false` = stopped or withdrawn while
+/// waiting. The row is a Working row, so it heartbeats like a live run.
+async fn wait_for_admission(
+    inner: &Inner,
+    chat_id: &str,
+    mut grant: oneshot::Receiver<()>,
+    interrupt: &CancellationToken,
+) -> bool {
+    let queued_at = tokio::time::Instant::now();
+    let mut beat = tokio::time::interval(std::time::Duration::from_secs(15));
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = interrupt.cancelled() => {
+                inner.cancel_admission(chat_id);
+                tracing::info!(chat = %chat_id, "queued start stopped before it began");
+                return false;
+            }
+            granted = &mut grant => {
+                if granted.is_err() {
+                    return false;
+                }
+                tracing::info!(
+                    chat = %chat_id,
+                    waited_ms = queued_at.elapsed().as_millis() as u64,
+                    "capacity available: queued start admitted"
+                );
+                inner.restart_turn_clock(chat_id);
+                return true;
+            }
+            _ = beat.tick() => inner.touch_session(chat_id),
         }
     }
 }
@@ -2566,6 +2771,31 @@ struct RunResumeState {
     fork_history_sent: Arc<std::sync::atomic::AtomicBool>,
     /// Set once the harness stream is open (see [`RunHandle::started`]).
     started: Arc<std::sync::atomic::AtomicBool>,
+    /// The start is queued behind the running-turn cap: fires when a slot is
+    /// granted. `None` = the run already holds its slot.
+    admission: Option<oneshot::Receiver<()>>,
+}
+
+/// Default idle window of a Pi tree member's runtime. Deliberately long: a
+/// parked Pi carries extensions, subagents and background shells, and the
+/// reaper already holds off while any of them report live work.
+const DEFAULT_MEMBER_IDLE: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// How long a parked Pi tree member's runtime may sit idle before it is
+/// stopped: `ZERON_MEMBER_IDLE_MS` (0 disables) > `memberIdleSecs` in
+/// `harness-prefs.json` (0 disables) > [`DEFAULT_MEMBER_IDLE`]. `None` = never.
+fn member_idle_ttl(registry: &HarnessRegistry) -> Option<std::time::Duration> {
+    let window = match std::env::var("ZERON_MEMBER_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => registry
+            .capacity_prefs()
+            .member_idle_secs
+            .map_or(DEFAULT_MEMBER_IDLE, std::time::Duration::from_secs),
+    };
+    (!window.is_zero()).then_some(window)
 }
 
 fn cursor_unstarted_history(
@@ -2641,7 +2871,7 @@ async fn drive_run(
     mut controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
-    resume_state: RunResumeState,
+    mut resume_state: RunResumeState,
     turn: TurnControl,
 ) {
     let device_id = inner.device_id.clone();
@@ -2739,12 +2969,21 @@ async fn drive_run(
     // The pending-update marker still orders new subprocesses after installation.
     // Share the lease with the adapter so child cleanup outlives this event loop.
     let mut _execution_lease = None;
+    let admitted = match resume_state.admission.take() {
+        Some(grant) => wait_for_admission(&inner, &chat_id, grant, &controls.interrupt).await,
+        None => true,
+    };
     let started = match prepared {
         Ok(()) => {
-            let lease = tokio::select! {
-                biased;
-                _ = controls.interrupt.cancelled() => None,
-                lease = inner.registry.execution_lease(harness_id) => Some(Arc::new(lease)),
+            // A stop while queued takes the synthetic Interrupted branch below.
+            let lease = if admitted {
+                tokio::select! {
+                    biased;
+                    _ = controls.interrupt.cancelled() => None,
+                    lease = inner.registry.execution_lease(harness_id) => Some(Arc::new(lease)),
+                }
+            } else {
+                None
             };
             if let Some(lease) = lease {
                 _execution_lease = Some(lease.clone());
@@ -2888,6 +3127,23 @@ async fn drive_run(
                 30 * 60
             },
         ));
+    // A Pi runtime is never idle-reaped (it lives as long as the app) except a
+    // tree MEMBER's: workers finish and are rarely messaged again, and each
+    // parked one holds a Pi process. Its window is the member TTL; the next
+    // message restarts it through the normal resume path. Read once, here:
+    // the chat's place cannot change under a live run. Roots and plain chats
+    // stay warm.
+    let member_ttl = if harness.keeps_runtime_alive()
+        && harness_id == HarnessId::Pi
+        && matches!(
+            zeron_proto::orchestrator::Place::of(&inner.lineage(&chat_id), &chat_id).role,
+            zeron_proto::orchestrator::Role::Member { .. }
+        ) {
+        member_idle_ttl(&inner.registry)
+    } else {
+        None
+    };
+    let session_idle = member_ttl.unwrap_or(session_idle);
     // A live subagent stretches the window, but never unbounded: every
     // driver's subagent terminal is a best-effort vendor signal (claude's
     // untagged task_notification, grok's subagent_finished, codex thread
@@ -2931,7 +3187,8 @@ async fn drive_run(
     // with an authoritative completion signal must still await that signal.
     // ACP retains the watchdog only for unowned self-continued activity.
     let deterministic_turn_end = harness.deterministic_turn_end();
-    // A runtime that lives as long as the app (Pi) is never reaped idle.
+    // A runtime that lives as long as the app (Pi) is never reaped idle,
+    // unless it is a tree member with a TTL (`member_ttl`).
     let keeps_runtime_alive = harness.keeps_runtime_alive();
     let authoritative_prompt_end = harness.authoritative_prompt_end();
     let quiesce_after: Option<std::time::Duration> = match std::env::var("ZERON_TURN_QUIESCE_MS")
@@ -3051,7 +3308,7 @@ async fn drive_run(
                             (base, deferred) => base.or(deferred).unwrap_or_else(tokio::time::Instant::now),
                         }
                     }
-                ), if idle_since.is_some() && !keeps_runtime_alive && !resume_state.voice_active.live() => {
+                ), if idle_since.is_some() && (!keeps_runtime_alive || member_ttl.is_some()) && !resume_state.voice_active.live() => {
                     // A call that began after this wait was armed holds it off.
                     if resume_state.voice_active.live() {
                         continue;
@@ -3071,11 +3328,19 @@ async fn drive_run(
                         reap_deferred_until = Some(tokio::time::Instant::now() + session_idle);
                         continue;
                     }
-                    tracing::info!(
-                        chat = %chat_id,
-                        live_subagents = subagents.len(),
-                        "reaping idle persistent session"
-                    );
+                    if member_ttl.is_some() {
+                        tracing::info!(
+                            chat = %chat_id,
+                            live_subagents = subagents.len(),
+                            "reaping idle tree-member runtime (restarts on its next message)"
+                        );
+                    } else {
+                        tracing::info!(
+                            chat = %chat_id,
+                            live_subagents = subagents.len(),
+                            "reaping idle persistent session"
+                        );
+                    }
                     if let Some(token) = lock(&inner.runs)
                         .get(&chat_id)
                         .filter(|h| h.run_id == run_id)

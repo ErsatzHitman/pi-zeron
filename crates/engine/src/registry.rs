@@ -105,10 +105,27 @@ struct HarnessPrefsFile {
     /// chats read it at each review.
     #[serde(skip_serializing_if = "Option::is_none")]
     you_should_know: Option<bool>,
+    /// Idle seconds before a Pi orchestrator-tree member's runtime is
+    /// stopped (restarted on its next message); `None` is the engine default,
+    /// 0 disables. Hand-edited; no Settings UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member_idle_secs: Option<u64>,
+    /// Global cap on concurrently running turns; `None` is the engine
+    /// default, 0 is unlimited. Hand-edited; no Settings UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_running_turns: Option<usize>,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
     #[serde(skip_serializing)]
     enabled: Option<Vec<HarnessId>>,
+}
+
+/// Capacity knobs from `harness-prefs.json` (`memberIdleSecs`,
+/// `maxRunningTurns`); `None` means "use the engine default".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapacityPrefs {
+    pub member_idle_secs: Option<u64>,
+    pub max_running_turns: Option<usize>,
 }
 
 /// Settings → General → Pi: the device's configured executable and what it
@@ -334,6 +351,15 @@ impl HarnessRegistry {
 
     pub fn block_deletes(&self) -> bool {
         delete_guard_forced() || self.prefs().block_deletes.unwrap_or(true)
+    }
+
+    /// The capacity knobs persisted in `harness-prefs.json`.
+    pub fn capacity_prefs(&self) -> CapacityPrefs {
+        let prefs = self.prefs();
+        CapacityPrefs {
+            member_idle_secs: prefs.member_idle_secs,
+            max_running_turns: prefs.max_running_turns,
+        }
     }
 
     pub fn you_should_know(&self) -> bool {

@@ -118,6 +118,7 @@ async fn two_clients_converge_and_stream_live_updates() {
         doc.upsert_session(&Session {
             last_completed_turn: None,
             running_subagents: 0,
+            queue_position: 0,
             subagents: Vec::new(),
             chat_id: "chat-1".into(),
             device_id: "dev-a".into(),
@@ -429,6 +430,7 @@ async fn churn_stays_bounded_no_history_growth() {
             d.upsert_session(&Session {
                 last_completed_turn: None,
                 running_subagents: 0,
+                queue_position: 0,
                 subagents: Vec::new(),
                 chat_id: "chat-1".into(),
                 device_id: "dev-a".into(),
