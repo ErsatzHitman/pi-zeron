@@ -130,6 +130,34 @@ constructing the next, using the captured text and 160-byte commits:
 
 These are parser-only allocation/time results, not whole-process RSS or CPU.
 
+## Run journal size
+
+Each chat's run journal is `{store_root}/journals/{chat_id}.jsonl`, one
+`{"seq": n, "event": ...}` line per streamed event, plus a `{chat_id}.resume`
+revival counter. It is append-only while a run is live and would otherwise grow
+with every token delta ever streamed.
+
+An idle sweep (first pass 3 minutes after boot, then every 15 minutes) compacts
+journals of chats with no run entry (live or parked) whose file has not been
+written for 10 minutes and is at least 1 MiB. It drops `TextDelta` and
+`ReasoningDelta` events (also when nested in a subagent event) at or before the
+last `Done`, because the chat doc entry was finalized there and holds the final
+text. Everything else is kept byte for byte: `SessionStarted`, `Done`, tool
+calls and results (their full inputs and outputs live only here), and the whole
+tail after the last `Done`. Original `seq` numbers are never rewritten, so
+`replay(after_seq)` and crash revival (`stale_sessions`, the harness session id
+and cwd read back from `SessionStarted`/`Done`) behave as before; a replay that
+starts below the boundary simply no longer yields deltas of completed turns, so
+transcripts must come from the doc. A journal with no `Done` is never touched.
+
+The rewrite goes to a `.compact-*.tmp` file in the same directory, is fsynced and
+renamed over the journal under the journal's fd lock, and the cached append fd
+is dropped so the next append reopens the new file; leftover temp files from a
+crash are removed when the journal opens. Each pass logs `journal_bytes` (total
+size of all journals) and `chats_compacted`. Knobs, read once at start:
+`ZERON_JOURNAL_SWEEP_MS` (pass interval), `ZERON_JOURNAL_SETTLE_MS` (required
+idle time) and `ZERON_JOURNAL_MIN_BYTES` (minimum file size).
+
 ## Method and limits
 
 Linux x86-64, Xvfb 1440×900, window 1280×800, software Vulkan rendering. CPU sums
