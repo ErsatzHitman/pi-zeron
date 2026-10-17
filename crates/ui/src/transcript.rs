@@ -1243,7 +1243,8 @@ fn answer_rows(rows: Vec<Row>) -> Vec<Row> {
     }
     let mut kept: Vec<Row> = Vec::with_capacity(rows.len());
     for (ix, mut row) in rows.into_iter().enumerate() {
-        if row.compact_fold.is_some() || last_work.get(&row.entry_id).is_some_and(|&work| ix <= work)
+        if row.compact_fold.is_some()
+            || last_work.get(&row.entry_id).is_some_and(|&work| ix <= work)
         {
             continue;
         }
@@ -13297,7 +13298,10 @@ mod tests {
             ],
         );
         let rows = rows_for_entry(&entry, false, false, &mut parse);
-        assert!(rows.iter().any(|row| matches!(row.kind, RowKind::ToolGroup { .. })));
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
+        );
         let answer = answer_rows(rows);
         assert_eq!(answer.len(), 1, "only the answer");
         assert!(matches!(answer[0].kind, RowKind::Markdown { .. }));

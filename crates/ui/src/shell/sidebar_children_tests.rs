@@ -296,19 +296,23 @@ fn the_btw_pane_opens_at_the_cards_width_with_its_bar_inside(cx: &mut TestAppCon
     // The prompt bar is inside the pane, at its bottom.
     assert!(bar.origin.x >= pane.origin.x && bar.right() <= pane.right());
     assert!(bar.origin.y > pane.origin.y && bar.bottom() <= pane.bottom() + px(0.5));
-    // As tall as the session card beside it, with a bare one-line prompt.
-    cx.update(|window, cx| {
-        window.refresh();
-        window.draw(cx).clear();
-    });
+    // As tall as the session card beside it, with a bare one-line prompt
+    // (the pane sizes to what the last frame measured).
+    for _ in 0..2 {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+    }
     let pane = cx.debug_bounds("session-btw").expect("the btw pane");
     let bar = cx.debug_bounds("session-btw-bar").expect("its prompt bar");
     let card = cx.debug_bounds("session-info").expect("the session card");
     assert!(
         (f32::from(pane.size.height) - f32::from(card.size.height)).abs() <= 1.0,
-        "the pane is {:?} tall, the card {:?}",
+        "the pane is {:?} tall, the card {:?}, the bar {:?}",
         pane.size.height,
-        card.size.height
+        card.size.height,
+        bar.size.height
     );
     assert!(
         f32::from(bar.size.height) < 64.0,

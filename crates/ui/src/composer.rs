@@ -11734,7 +11734,8 @@ impl Render for Composer {
             .flex_col()
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
-            .pb(px(Theme::SPACE_LG))
+            // A minimal bar's host owns the room below it.
+            .pb(px(if self.minimal { 0.0 } else { Theme::SPACE_LG }))
             .when_some(failure, |el, message| {
                 // Amber with "Warning" for the offline-ish case (engine not
                 // connected), red with "Error" for send/run failures. Click

@@ -352,7 +352,8 @@ impl Shell {
         let content = transcript.read(cx).content_height();
         fitted.set(content);
         // As tall as the session card beside it, at least.
-        let card_h = self.session_card_height.get();
+        // Measured inside the card's 1px border.
+        let card_h = self.session_card_height.get() + 2.0;
         let body_h = if history_open {
             body_height(HISTORY_HEIGHT, max_height, chrome)
         } else {
@@ -494,7 +495,7 @@ impl Shell {
                     let content = transcript.read(cx).content_height();
                     if (content - fitted.get()).abs() > 0.5
                         || (bar_height.get() - bar_h).abs() > 0.5
-                        || (card_height.get() - card_h).abs() > 0.5
+                        || (card_height.get() + 2.0 - card_h).abs() > 0.5
                     {
                         window.request_animation_frame();
                     }
