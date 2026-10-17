@@ -272,6 +272,10 @@ pub mod methods {
     /// The project of the orchestrator tree `chatId` is in (any of its
     /// chats) -> `{ project, memory }`. Local only: the registry syncs it.
     pub const GET_ORCHESTRATOR_PROJECT: &str = "GetOrchestratorProject";
+    /// Read-only merge preview of a member chat's worktree branch against the
+    /// lead branch (`{ chatId: root, member: chat id, base? }`) -> `MergePreview`.
+    /// Never modifies a tree or ref.
+    pub const MERGE_PREVIEW: &str = "MergePreview";
     /// Change an orchestrator project's goal, instructions or pause
     /// (`{ chatId: root, update }`) -> `{ project }`. Local only.
     pub const UPDATE_ORCHESTRATOR_PROJECT: &str = "UpdateOrchestratorProject";

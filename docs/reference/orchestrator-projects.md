@@ -42,6 +42,9 @@ turn.
   convention, where something lives). An identical note is not saved twice.
 - `zeron_project_forget {id}`: drop a note that is wrong or done.
 - `zeron_project_update {goal?, instructions?}`: only when the user asks.
+- `zeron_merge_preview {chat, base?}`: root only, read-only. Files, ahead/behind,
+  uncommitted edits and predicted conflicts for merging a writer's branch
+  (see [MCP](../mcp.md)).
 - `zeron_wait_for_turns {chats?, timeout_secs?}`: wait on several sessions at
   once and handle whichever finishes first, instead of waiting on them one
   by one. Without `chats` it watches the caller's working children.

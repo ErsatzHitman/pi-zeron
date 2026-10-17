@@ -455,6 +455,102 @@ pub struct Worktree {
     pub checkout_id: Option<String>,
 }
 
+/// One file a member branch changes relative to the merge base.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePreviewFile {
+    pub path: String,
+    /// `git diff --name-status` letter: `A`, `M`, `D`, `R`, `C`, `T`.
+    pub status: String,
+    /// Source path of a rename or copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+}
+
+/// Uncommitted edits in the member's worktree (NOT part of the merge).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePreviewDirty {
+    #[serde(default)]
+    pub staged: usize,
+    #[serde(default)]
+    pub unstaged: usize,
+    #[serde(default)]
+    pub untracked: usize,
+    /// Distinct dirty paths.
+    #[serde(default)]
+    pub total: usize,
+    /// First dirty paths (capped).
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// Outcome of the `git merge-tree` conflict check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeConflictCheck {
+    /// The merge would apply without conflicts.
+    #[default]
+    Clean,
+    /// The merge would conflict in `conflicts`.
+    Conflicts,
+    /// git is too old for `merge-tree --write-tree`; conflicts not checked.
+    Unavailable,
+    /// The check itself failed (see `note`).
+    Failed,
+}
+
+/// `MergePreview`: a read-only look at merging a member chat's worktree branch
+/// into the lead branch. Nothing in any tree or ref is changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePreview {
+    pub chat_id: String,
+    pub worktree_path: String,
+    /// The member's live branch (short sha when detached).
+    pub branch: String,
+    pub branch_head: String,
+    /// The lead ref compared against (display name).
+    pub base: String,
+    pub base_head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_base: Option<String>,
+    /// Commits only the member has.
+    #[serde(default)]
+    pub ahead: usize,
+    /// Commits only the lead has.
+    #[serde(default)]
+    pub behind: usize,
+    #[serde(default)]
+    pub already_merged: bool,
+    #[serde(default)]
+    pub fast_forward: bool,
+    /// What `base...branch` changes (capped).
+    #[serde(default)]
+    pub files: Vec<MergePreviewFile>,
+    #[serde(default)]
+    pub files_total: usize,
+    #[serde(default)]
+    pub files_truncated: bool,
+    #[serde(default)]
+    pub uncommitted: MergePreviewDirty,
+    #[serde(default)]
+    pub conflict_check: MergeConflictCheck,
+    /// Conflicted paths (capped).
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub conflicts_total: usize,
+    /// Tree oid `merge-tree` computed for the merge result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_tree: Option<String>,
+    /// Fallback / failure explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_version: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderEntry {
@@ -2004,5 +2100,34 @@ mod mutation_contract_tests {
             serde_json::from_value::<WorkspaceMutationRejection>(serde_json::json!("overwrite"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn merge_preview_wire_shape_is_camel_case_with_defaults() {
+        let minimal = serde_json::json!({
+            "chatId": "c", "worktreePath": "/w", "branch": "zeron/x", "branchHead": "a",
+            "base": "main", "baseHead": "b",
+        });
+        let preview: MergePreview = serde_json::from_value(minimal).unwrap();
+        assert_eq!(preview.conflict_check, MergeConflictCheck::Clean);
+        assert!(preview.files.is_empty() && preview.merge_base.is_none());
+        assert_eq!(preview.uncommitted, MergePreviewDirty::default());
+
+        let full = MergePreview {
+            conflict_check: MergeConflictCheck::Unavailable,
+            files: vec![MergePreviewFile {
+                path: "n".into(),
+                status: "R".into(),
+                old_path: Some("o".into()),
+            }],
+            note: Some("old git".into()),
+            ..preview
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["conflictCheck"], "unavailable");
+        assert_eq!(value["files"][0]["oldPath"], "o");
+        assert_eq!(value["alreadyMerged"], false);
+        assert!(value.get("mergeTree").is_none());
+        assert_eq!(serde_json::from_value::<MergePreview>(value).unwrap(), full);
     }
 }
