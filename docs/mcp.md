@@ -182,6 +182,13 @@ name (default: the local engine's device).
 | `project_remember` / `project_forget` | `OrchestratorMemory {chatId, text}` / `{chatId, forget}` (root only) |
 | `project_update`   | `UpdateOrchestratorProject {chatId, update: {goal?, instructions?}}` (root only) |
 
+**Pushed child outcomes.** `wait_for_turns` is the pull path and is unchanged.
+Besides it, the engine pushes: when a tree member settles (done, failed,
+needs input) it queues a batched `[Message from Zeron (automatic child-outcome
+notice)...]` note for the parent, delivered as a `Run` on an idle parent or a
+held queued message on one awaiting input, never to a working or paused one
+(see [orchestrator projects](reference/orchestrator-projects.md)).
+
 `create_chat`, `create_chats`, `send_message` and `send_messages` refuse from a
 chat in a paused orchestrator's tree; see
 [orchestrator projects](reference/orchestrator-projects.md).

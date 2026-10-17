@@ -242,7 +242,14 @@ struct Inner {
     turn_listener: OnceLock<TurnListener>,
     /// Live extension UI (Pi's PIUI) per chat; never persisted.
     extension_ui: crate::extension_ui::ExtensionUiHub,
+    /// Pushes a settled tree member's outcome to its parent.
+    parent_notifier: parent_notify::ParentNotifier,
+    /// This engine's own `Arc`, for background tasks started from `&self`.
+    this: std::sync::Weak<Inner>,
 }
+
+#[path = "parent_notify.rs"]
+mod parent_notify;
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
 pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
@@ -264,7 +271,7 @@ impl SessionsEngine {
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
-            inner: Arc::new(Inner {
+            inner: Arc::new_cyclic(|this| Inner {
                 voice: crate::voice::VoiceManager::default(),
                 device_id,
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -284,6 +291,8 @@ impl SessionsEngine {
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 extension_ui: Default::default(),
+                parent_notifier: parent_notify::ParentNotifier::new(),
+                this: this.clone(),
             }),
         }
     }
@@ -1650,8 +1659,11 @@ impl Inner {
         completed_turn: Option<String>,
     ) {
         let now = Utc::now();
+        let settled_turn = completed_turn.clone();
+        let prev;
         let session = {
             let mut statuses = lock(&self.statuses);
+            prev = statuses.get(chat_id).map(|s| s.status);
             let entry = statuses
                 .entry(chat_id.to_string())
                 .or_insert_with(|| Session {
@@ -1701,6 +1713,7 @@ impl Inner {
         if let Some(ws) = self.workspace() {
             ws.record_session(&session);
         }
+        self.parent_notifier_note(chat_id, prev, status, settled_turn.as_deref());
     }
 
     /// The doc host, once wired. `None` before assembly or after retirement.

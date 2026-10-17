@@ -46,6 +46,18 @@ turn.
   once and handle whichever finishes first, instead of waiting on them one
   by one. Without `chats` it watches the caller's working children.
 
+### Pushed child outcomes
+
+When a session of the tree finishes a turn, fails or asks a question, its
+parent is told automatically with a short note (child id, title, status, the
+tail of its last reply, and its pending question). Outcomes arriving within
+about 2 seconds share one note. An idle (or errored) parent is woken with a
+new turn; a parent waiting on an answer gets the note held until its turn
+ends; a working parent gets nothing (it sees the outcome through
+`zeron_wait_for_turns` / `zeron_list_chats`, which keep working). Nothing is
+sent while the project is paused or to an archived parent, and a tree gets at
+most 20 pushes per rolling hour. `ZERON_PARENT_NOTIFY=0` turns it off.
+
 The memory and update tools work only from the root; a member reports what
 should change in its final reply.
 
