@@ -168,15 +168,9 @@ impl Pickers {
         let harness = row.harness;
         let model = row.model.id.clone();
         let label: SharedString = row.model.label.clone().into();
-        // The brand mark names the provider; a description appears only to
-        // tell identically named rows apart.
-        let attribution: Option<SharedString> = row
-            .model
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| row.ambiguous && !d.is_empty())
-            .map(|d| SharedString::from(d.to_owned()));
+        // The brand mark names the harness; the provider rides beside the
+        // name where the harness spans providers (see `row_attribution`).
+        let attribution = super::row_attribution(row);
         let hovered = self.active == ix;
         let details: SharedString = match row.model.description.as_deref() {
             Some(description) => format!(

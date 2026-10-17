@@ -641,6 +641,50 @@ struct ModelRowData {
     ambiguous: bool,
 }
 
+/// The provider a model comes from, for harnesses whose catalog spans
+/// providers: Pi and OpenCode ship the provider in `description`.
+fn model_provider(harness: HarnessId, model: &Model) -> Option<&str> {
+    if !matches!(harness, HarnessId::Pi | HarnessId::Opencode) {
+        return None;
+    }
+    model
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+}
+
+/// One harness's models grouped by provider, providers in the order they
+/// first appear and models in catalog order within each — the same model
+/// from two providers then sits in two labelled groups.
+fn grouped_by_provider(harness: HarnessId, models: &[Model]) -> Vec<&Model> {
+    let mut first: HashMap<&str, usize> = HashMap::new();
+    for model in models {
+        if let Some(provider) = model_provider(harness, model) {
+            let next = first.len();
+            first.entry(provider).or_insert(next);
+        }
+    }
+    let mut grouped: Vec<&Model> = models.iter().collect();
+    grouped.sort_by_key(|model| model_provider(harness, model).map_or(usize::MAX, |p| first[p]));
+    grouped
+}
+
+/// What a row shows beside its name: the provider wherever the harness
+/// spans providers, otherwise the description only to tell identically
+/// named rows apart (and never a repeat of the harness name).
+fn row_attribution(row: &ModelRowData) -> Option<SharedString> {
+    model_provider(row.harness, &row.model)
+        .or_else(|| {
+            row.ambiguous
+                .then(|| row.model.description.as_deref().map(str::trim))
+                .flatten()
+                .filter(|d| !d.is_empty())
+        })
+        .filter(|d| !d.eq_ignore_ascii_case(row.harness_name.as_ref()))
+        .map(|d| SharedString::from(d.to_owned()))
+}
+
 /// Flag rows whose label another listed row of the same harness shares.
 fn mark_ambiguous(rows: &mut [ModelRowData]) {
     let mut labels: HashMap<(HarnessId, String), usize> = HashMap::new();
@@ -4717,19 +4761,10 @@ impl Pickers {
         let harness_name = row.harness_name.clone();
         let harness = row.harness;
         let star_model = row.model.id.clone();
-        // Rows show only the model name. The description appears only to
-        // tell identically-named rows apart (field report: "GLM-5.2" exists
-        // under 64 connected opencode providers, whose driver ships the
-        // provider name in `description`).
-        let attribution: Option<SharedString> = row
-            .model
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| {
-                row.ambiguous && !d.is_empty() && !d.eq_ignore_ascii_case(harness_name.as_ref())
-            })
-            .map(|d| SharedString::from(d.to_owned()));
+        // The provider rides beside the name for Pi and OpenCode, whose
+        // catalogs offer one model under many providers; elsewhere the
+        // description appears only to tell identically-named rows apart.
+        let attribution = row_attribution(row);
         let compact = self.model_rail == ModelRail::Harness;
         let mut el = div()
             .id(("model-row", ix))
@@ -5915,7 +5950,7 @@ fn scoped_model_rows<'a>(
                 let Some(models) = models_for(descriptor.id) else {
                     continue;
                 };
-                for model in models {
+                for model in grouped_by_provider(descriptor.id, models) {
                     if rail == ModelRail::All || is_favorite(descriptor.id, &model.id) {
                         rows.push(row(descriptor, model));
                     }
@@ -5933,9 +5968,10 @@ fn scoped_model_rows<'a>(
             let Some(models) = models_for(descriptor.id) else {
                 return Vec::new();
             };
-            let (starred, rest): (Vec<&Model>, Vec<&Model>) = models
-                .iter()
-                .partition(|m| is_favorite(descriptor.id, &m.id));
+            let (starred, rest): (Vec<&Model>, Vec<&Model>) =
+                grouped_by_provider(descriptor.id, models)
+                    .into_iter()
+                    .partition(|m| is_favorite(descriptor.id, &m.id));
             starred
                 .into_iter()
                 .chain(rest)
@@ -9357,6 +9393,68 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model.id, "glm-5.2-b");
+    }
+
+    /// Pi's models group by provider, each row naming its provider, so the
+    /// same model from two providers is told apart.
+    #[test]
+    fn pi_models_group_by_provider_and_name_it() {
+        let descriptors = vec![descriptor(HarnessId::Pi, "Pi")];
+        let model = |id: &str, label: &str, provider: &str| {
+            let mut model = bare_model(id, label);
+            model.description = Some(provider.into());
+            model
+        };
+        let pi = vec![
+            model("opencode-go/glm-5.3", "GLM-5.3", "opencode-go"),
+            model("clinepass/glm-5.3", "GLM-5.3", "clinepass"),
+            model("opencode-go/deepseek-v4.1", "DeepSeek V4.1", "opencode-go"),
+            model("clinepass/kimi-k3", "Kimi K3", "clinepass"),
+        ];
+        let rows = scoped_model_rows(
+            "",
+            ModelRail::Harness,
+            Some(HarnessId::Pi),
+            &descriptors,
+            |harness| (harness == HarnessId::Pi).then_some(pi.as_slice()),
+            |harness, id| harness == HarnessId::Pi && id == "clinepass/kimi-k3",
+        );
+        let order: Vec<_> = rows.iter().map(|r| r.model.id.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "clinepass/kimi-k3",
+                "opencode-go/glm-5.3",
+                "opencode-go/deepseek-v4.1",
+                "clinepass/glm-5.3",
+            ],
+            "stars first, then one group per provider in catalog order"
+        );
+        let shown: Vec<_> = rows
+            .iter()
+            .map(|r| row_attribution(r).map(|a| a.to_string()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                Some("clinepass".to_string()),
+                Some("opencode-go".to_string()),
+                Some("opencode-go".to_string()),
+                Some("clinepass".to_string()),
+            ],
+            "every Pi row names its provider, clash or not"
+        );
+        // A harness whose description is prose keeps it hidden unless
+        // two rows share a name.
+        let codex = descriptor(HarnessId::Codex, "Codex");
+        let row = ModelRowData {
+            harness: HarnessId::Codex,
+            harness_name: codex.name.clone().into(),
+            model: model("gpt", "GPT", "Optimized for agentic coding"),
+            selected_only: false,
+            ambiguous: false,
+        };
+        assert_eq!(row_attribution(&row), None);
     }
 
     /// Rows show descriptions only to tell same-named models apart.

@@ -406,7 +406,7 @@ fn child_chat_rows(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<A
                     change_request: state.change_request_for_chat(chat).cloned(),
                 },
                 title: child_chat_title(chat, "btw").into(),
-                status: state.display_status_for(chat, now),
+                status: side_chat_status(chat, state.display_status_for(chat, now)),
                 started: None,
                 trailing: Some(zeron_proto::view::format_time_ago(activity, now).into()),
                 detail: None,
@@ -416,6 +416,18 @@ fn child_chat_rows(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<A
         .collect();
     rows.sort_by_key(|(activity, _)| std::cmp::Reverse(*activity));
     rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// A btw question is listed but is the user's own aside, not work under
+/// the chat: while it answers it reads as idle, so it never counts as a
+/// sub-agent at work or opens the section.
+fn side_chat_status(chat: &Chat, status: ChatIndicator) -> ChatIndicator {
+    match status {
+        ChatIndicator::Working | ChatIndicator::AwaitingInput if chat.is_btw() => {
+            ChatIndicator::Idle
+        }
+        status => status,
+    }
 }
 
 /// A chat titles itself on its first turn; until then the preview or a
@@ -594,6 +606,36 @@ mod tests {
         assert_eq!(list.sessions[2].title.as_ref(), "Investigate caching");
         assert_eq!(list.running(), 0);
         assert!(list.active.is_empty() && list.previous.is_empty());
+    }
+
+    #[test]
+    fn a_working_btw_question_is_listed_but_never_counts_as_work() {
+        let side = chat("side", Some("main"), 2);
+        let btw = chat("btw-question", Some("main"), 1);
+        assert!(btw.is_btw() && !side.is_btw());
+        assert_eq!(
+            side_chat_status(&btw, ChatIndicator::Working),
+            ChatIndicator::Idle
+        );
+        assert_eq!(
+            side_chat_status(&side, ChatIndicator::Working),
+            ChatIndicator::Working
+        );
+        assert_eq!(
+            side_chat_status(&btw, ChatIndicator::Errored),
+            ChatIndicator::Errored,
+            "a failure still shows"
+        );
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("main", None, 60), btw]);
+        let main = state.chats.iter().find(|c| c.id == "main").unwrap().clone();
+        let list = agent_list(&state, &main, Utc::now());
+        assert_eq!(
+            list.sessions.iter().map(AgentRow::key).collect::<Vec<_>>(),
+            ["chat-btw-question"],
+            "listed in the session pane"
+        );
+        assert_eq!(list.running(), 0);
     }
 
     #[test]

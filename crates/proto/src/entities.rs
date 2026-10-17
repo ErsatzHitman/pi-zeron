@@ -242,6 +242,9 @@ pub struct Chat {
     pub parent_chat_id: Option<String>,
 }
 
+/// Id prefix of the btw pane's side chats (see [`Chat::is_btw`]).
+pub const BTW_CHAT_PREFIX: &str = "btw-";
+
 impl Chat {
     /// A session the user sees in chat lists: neither another chat's worker
     /// (`parent_chat_id`), a hidden voice orchestrator, nor an orchestrator
@@ -250,6 +253,12 @@ impl Chat {
         self.parent_chat_id.is_none()
             && !crate::voice::is_orchestrator_chat(&self.id)
             && !crate::orchestrator::is_root_chat(&self.id)
+    }
+
+    /// A by-the-way side question: the btw pane mints its chats with this
+    /// id prefix. Chats from before it read as ordinary side chats.
+    pub fn is_btw(&self) -> bool {
+        self.id.starts_with(BTW_CHAT_PREFIX)
     }
 
     /// True when this chat syncs over the chat2 dumb relay.
