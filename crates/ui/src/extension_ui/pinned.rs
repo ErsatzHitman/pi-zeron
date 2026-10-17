@@ -281,6 +281,22 @@ fn freeflow_status(text: &str) -> Option<String> {
     })
 }
 
+/// What the session footer shows of [`footer_chips`]: speed and spend
+/// (tokens per second, API cost so far), plus the chips that are controls
+/// (plan mode) or Zeron's own live notices (Pi retrying a request). Account
+/// usage and context sit beside them as rings. Extension metadata (key
+/// rotation, uniichat's counts, background work) stays in the session panel.
+pub(crate) fn footer_metrics(chips: Vec<Chip>) -> Vec<Chip> {
+    chips
+        .into_iter()
+        .filter(|chip| {
+            chip.key == "channel:footer"
+                || chip.action.is_some()
+                || chip.key.starts_with("status:zeron:")
+        })
+        .collect()
+}
+
 /// Chips for the session footer, in a stable order.
 pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
     let mut chips: Vec<Chip> = state
@@ -593,7 +609,7 @@ impl Composer {
     /// Status chips for the session footer, or `None` without any.
     pub(crate) fn render_extension_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = self.live_extension_ui(cx)?;
-        let chips = footer_chips(&state);
+        let chips = footer_metrics(footer_chips(&state));
         if chips.is_empty() {
             return None;
         }
@@ -739,6 +755,29 @@ mod tests {
     use super::*;
     use serde_json::json;
     use zeron_proto::extension_ui::{ExtensionStatus, ExtensionWidget};
+
+    #[test]
+    fn the_footer_keeps_speed_spend_controls_and_notices_only() {
+        let chip = |key: &str, action: bool| Chip {
+            key: key.into(),
+            text: key.into(),
+            hint: None,
+            active: false,
+            action: action.then(|| (key.to_owned(), "toggle".to_owned())),
+        };
+        let kept: Vec<String> = footer_metrics(vec![
+            chip("status:opencode-keys", false),
+            chip("status:uniichat", false),
+            chip("work:subagents:fleet", false),
+            chip("mode", true),
+            chip("status:zeron:retry", false),
+            chip("channel:footer", false),
+        ])
+        .into_iter()
+        .map(|chip| chip.key)
+        .collect();
+        assert_eq!(kept, ["mode", "status:zeron:retry", "channel:footer"]);
+    }
 
     #[test]
     fn trays_and_chips_come_from_elements_widgets_statuses_and_channels() {

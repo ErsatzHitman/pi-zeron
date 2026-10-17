@@ -48,6 +48,65 @@ pub fn active_account(
         .find(|account| account.harness == harness && account.active)
 }
 
+/// The signed-in (OAuth) accounts the harness is using that report usage:
+/// one per provider for Pi, which keeps a login per provider. Pure.
+pub fn usage_accounts(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> Vec<&AgentAccount> {
+    snapshot
+        .accounts
+        .iter()
+        .filter(|account| {
+            account.harness == harness
+                && account.active
+                && !account.usage_windows.is_empty()
+                && account.auth_kind != Some(zeron_proto::AgentAuthKind::ApiKey)
+        })
+        .collect()
+}
+
+/// A usage window's short name: the 5-hour session, the week, the month.
+fn window_name(label: &str) -> String {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "session" | "5h" | "5-hour" | "five hour" => "5h".into(),
+        "week" | "weekly" | "7d" => "wk".into(),
+        "month" | "monthly" | "30d" => "mo".into(),
+        "day" | "daily" | "24h" => "day".into(),
+        _ => label.trim().to_owned(),
+    }
+}
+
+/// The footer's usage counters: what is left of each limit window of every
+/// signed-in account in use ("5h 98% · wk 90% left"), each account named by
+/// its provider when there are several. Pure.
+pub fn usage_counters(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> Option<String> {
+    let accounts = usage_accounts(snapshot, harness);
+    if accounts.is_empty() {
+        return None;
+    }
+    let named = accounts.len() > 1;
+    let parts: Vec<String> = accounts
+        .iter()
+        .map(|account| {
+            let windows = account
+                .usage_windows
+                .iter()
+                .map(|window| {
+                    let left = ((1.0 - window.used_fraction.clamp(0.0, 1.0)) * 100.0).round() as u32;
+                    format!("{} {left}%", window_name(&window.label))
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            match account.provider.as_deref().filter(|_| named) {
+                Some(provider) => format!(
+                    "{} {windows}",
+                    zeron_proto::model_provider::display_name(provider)
+                ),
+                None => windows,
+            }
+        })
+        .collect();
+    Some(format!("{} left", parts.join(" | ")))
+}
+
 /// Loads (and switches) the accounts of the composer's target device.
 pub struct AccountUsage {
     state: Entity<AppState>,
@@ -238,7 +297,14 @@ impl AccountUsage {
     /// The ring's reading: the live account's most-used window, when the
     /// harness has a live account with usage to show.
     fn fraction(&self, cx: &gpui::App) -> Option<f32> {
-        used_fraction(active_account(self.snapshot(cx)?, self.harness?)?)
+        usage_accounts(self.snapshot(cx)?, self.harness?)
+            .into_iter()
+            .filter_map(used_fraction)
+            .reduce(f32::max)
+    }
+
+    fn counters(&self, cx: &gpui::App) -> Option<String> {
+        usage_counters(self.snapshot(cx)?, self.harness?)
     }
 
     /// A trigger click: open this ring's popover, or close it when the
@@ -428,7 +494,8 @@ impl Render for AccountUsage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let context = self.state.read(cx).context_usage;
-        let account = self.fraction(cx).map(|fraction| {
+        let counters = self.counters(cx);
+        let account = self.fraction(cx).zip(counters).map(|(fraction, counters)| {
             let level = usage_level(fraction);
             let chip = crate::context_usage::ring_chip(
                 "account-usage",
@@ -438,7 +505,7 @@ impl Render for AccountUsage {
                     UsageLevel::Normal => theme.text_muted,
                     _ => usage_color(level, &theme),
                 },
-                format!("{}%", (fraction * 100.0).round() as u32),
+                counters,
                 self.popup.get() == Some(&FooterCard::Accounts),
                 &theme,
             );
@@ -475,6 +542,34 @@ impl Render for AccountUsage {
 mod tests {
     use super::*;
     use zeron_proto::AgentUsageWindow;
+
+    #[test]
+    fn the_counters_say_what_is_left_of_each_window() {
+        let mut claude = account(HarnessId::Pi, true, &[0.02, 0.1]);
+        claude.usage_windows[0].label = "Session".into();
+        claude.usage_windows[1].label = "Week".into();
+        claude.provider = Some("anthropic".into());
+        let mut snapshot: AgentAccountsSnapshot =
+            serde_json::from_value(serde_json::json!({ "accounts": [], "warnings": [] })).unwrap();
+        snapshot.accounts = vec![claude.clone(), account(HarnessId::Pi, false, &[0.9])];
+        assert_eq!(
+            usage_counters(&snapshot, HarnessId::Pi).as_deref(),
+            Some("5h 98% · wk 90% left")
+        );
+        let mut codex = account(HarnessId::Pi, true, &[0.5]);
+        codex.usage_windows[0].label = "Month".into();
+        codex.provider = Some("openai-codex".into());
+        codex.id = "codex".into();
+        snapshot.accounts.push(codex);
+        let both = usage_counters(&snapshot, HarnessId::Pi).unwrap();
+        assert!(both.starts_with("Anthropic 5h 98% · wk 90% | "), "{both}");
+        assert!(both.ends_with("mo 50% left"), "{both}");
+        // An API key is not a plan with limits.
+        let mut keyed = claude;
+        keyed.auth_kind = Some(zeron_proto::AgentAuthKind::ApiKey);
+        snapshot.accounts = vec![keyed];
+        assert_eq!(usage_counters(&snapshot, HarnessId::Pi), None);
+    }
 
     fn account(harness: HarnessId, active: bool, used: &[f32]) -> AgentAccount {
         serde_json::from_value(serde_json::json!({
