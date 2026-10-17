@@ -3104,6 +3104,25 @@ async fn drive_run(
             prompt,
         );
     }
+    // Every Pi of this session is kept off the models it, or any chat above
+    // it (its orchestrator, a side chat's parent), disabled.
+    if harness_id == HarnessId::Pi
+        && let Some(dir) = inner.registry.data_dir()
+        && let Some(mcp) = request.mcp.as_mut()
+    {
+        let ancestors: Vec<String> = inner
+            .lineage(&chat_id)
+            .into_iter()
+            .map(|chat| chat.id)
+            .filter(|id| *id != chat_id)
+            .collect();
+        if let Some(files) = crate::model_policy::env_value(&dir, &chat_id, &ancestors) {
+            mcp.env.insert(
+                zeron_proto::orchestrator::ENV_MODEL_POLICY.to_owned(),
+                files,
+            );
+        }
+    }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
     // the event loop) can take ownership.

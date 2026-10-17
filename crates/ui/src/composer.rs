@@ -9394,6 +9394,14 @@ impl Composer {
                 state.device_supports(host, zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1)
             })
         };
+        // A new chat's model restrictions, set in the picker before it
+        // existed, are saved before its first run starts.
+        let session_models = if is_new {
+            self.pickers
+                .update(cx, |pickers, _| pickers.take_session_model_draft(&chat_id))
+        } else {
+            Vec::new()
+        };
         let create_side_chat = self.state.update(cx, |state, _| {
             if state.side_chat_unsaved()
                 && let Some(mut config) = resolved.chat_config()
@@ -9907,6 +9915,30 @@ impl Composer {
                     .ok();
                 }
 
+                if !session_models.is_empty() {
+                    let mut params = serde_json::json!({
+                        "chatId": chat_id,
+                        "disabled": session_models,
+                    });
+                    if let (Some(target), Some(object)) = (&host_device_id, params.as_object_mut()) {
+                        object.insert(
+                            "targetDeviceId".into(),
+                            serde_json::Value::String(target.clone()),
+                        );
+                    }
+                    if let Err(err) = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::SET_SESSION_MODEL_POLICY,
+                        params,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, "session model restrictions not saved");
+                        return Err("Couldn't save the models disabled for this chat.".to_string());
+                    }
+                }
                 if queue {
                     // A queue row is editable UI state, so its text must stay
                     // free of the internal attachment-path trailer. The host

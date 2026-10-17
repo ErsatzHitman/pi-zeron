@@ -45,3 +45,27 @@ async fn delete_guard_reaches_every_child_pi() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[tokio::test]
+async fn session_model_restrictions_hold_in_every_pi() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new("node")
+            .arg(root.join("tests/fixtures/pi-model-policy-test.mjs"))
+            .arg(root.join("src/pi/guard.mjs"))
+            .env_remove("ZERON_MODEL_POLICY")
+            .env_remove("PI_USAGE_SURFACE")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("the policy checks finish")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

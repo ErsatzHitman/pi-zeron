@@ -146,6 +146,8 @@ jobs:
         run: node crates/harness/tests/fixtures/pi-delete-guard-test.mjs crates/harness/src/pi/guard.mjs
       - name: Read-only sessions block edits
         run: node crates/harness/tests/fixtures/pi-read-only-test.mjs crates/harness/src/pi/guard.mjs
+      - name: Session model restrictions hold
+        run: node crates/harness/tests/fixtures/pi-model-policy-test.mjs crates/harness/src/pi/guard.mjs
       - name: Delete guard reaches child Pi processes
         run: node crates/harness/tests/fixtures/pi-delete-guard-child-test.mjs crates/harness/src/pi/guard.mjs crates/harness/src/pi/guard-preload.mjs
       - name: Install preview fixture server

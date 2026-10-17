@@ -5,7 +5,7 @@
 // A guard against mistakes and model-driven changes, not a sandbox.
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 // ---- on/off: FORCE > live file > spawn snapshot > ON
@@ -567,13 +567,130 @@ export async function packageUpdates(cwd, cli = process.argv[1]) {
 
 export const RELOAD_DESCRIPTION = "Reload keybindings, extensions, skills, prompts, themes, and context files";
 
+// ---- session model restrictions. The models a session may not use: Zeron's
+// per-chat files (the chat's own, then each parent's, orchestrator included)
+// named in `ZERON_MODEL_POLICY`. Every Pi of the session inherits the env and
+// the guard (sub-agents, workflows, orchestrator members), so none of them can
+// run one. Re-read on change: a list edited mid-session holds from the next
+// turn. Global helpers (the advisor, decisions, memory, extension utilities)
+// are not the session's and keep their own models.
+const POLICY_EXEMPT = new Set(["advisor", "decisions", "jev", "memory"]);
+export function policyExempt(env = process.env) {
+  const surface = env.PI_USAGE_SURFACE ?? "";
+  return POLICY_EXEMPT.has(surface) || surface.startsWith("ext:");
+}
+const modelKey = (id) => String(id).trim().toLowerCase();
+const THINKING_SUFFIX = /:(off|minimal|low|medium|high|xhigh|max)$/;
+let policySeen = new Map(); // file -> { mtimeMs, size, models }
+export function disabledModels(env = process.env, fs = { statSync, readFileSync }, sep = delimiter) {
+  const out = new Set();
+  if (!env.ZERON_MODEL_POLICY || policyExempt(env)) return out;
+  const next = new Map();
+  for (const file of env.ZERON_MODEL_POLICY.split(sep)) {
+    if (!file) continue;
+    let seen = policySeen.get(file);
+    try {
+      const st = fs.statSync(file);
+      if (!seen || seen.mtimeMs !== st.mtimeMs || seen.size !== st.size) {
+        const listed = JSON.parse(fs.readFileSync(file, "utf8"))?.disabled;
+        seen = { mtimeMs: st.mtimeMs, size: st.size,
+          models: Array.isArray(listed) ? listed.filter((m) => typeof m === "string" && m.trim()).map(modelKey) : [] };
+      }
+    } catch (e) {
+      // Gone: nothing disabled there. Transient I/O (a Windows rename-over):
+      // keep the last list.
+      if (e?.code === "ENOENT") seen = undefined;
+    }
+    if (!seen) continue;
+    next.set(file, seen);
+    for (const model of seen.models) out.add(model);
+  }
+  policySeen = next;
+  return out;
+}
+
+/** A model id as Zeron or a tool names it ("provider/id", maybe ":thinking"). */
+export function idDisabled(off, id) {
+  if (!off.size || typeof id !== "string" || !id.trim()) return false;
+  const key = modelKey(id);
+  if (off.has(key) || off.has(key.replace(THINKING_SUFFIX, ""))) return true;
+  // A bare id names the model on whichever provider serves it.
+  if (key.includes("/")) return false;
+  const bare = key.replace(THINKING_SUFFIX, "");
+  for (const entry of off) if (entry.slice(entry.indexOf("/") + 1) === bare) return true;
+  return false;
+}
+export const modelDisabled = (off, model) =>
+  Boolean(model) && off.has(modelKey(`${model.provider}/${model.id}`));
+
+/** The first disabled model a tool call's input names (`model`, `models`, …). */
+export function disabledModelIn(input, off, depth = 0) {
+  if (!off.size || depth > 5 || !input || typeof input !== "object") return undefined;
+  for (const [key, value] of Object.entries(input)) {
+    if (/model/i.test(key))
+      for (const v of Array.isArray(value) ? value : [value]) if (idDisabled(off, v)) return v;
+    if (value && typeof value === "object") {
+      const hit = disabledModelIn(value, off, depth + 1);
+      if (hit) return hit;
+    }
+  }
+  return undefined;
+}
+
+// The advisor's own `model` is the advisor's (global) choice.
+const POLICY_TOOLS_EXEMPT = new Set(["advisor"]);
+export const MODEL_REASON = (id) =>
+  `Model ${id} is disabled in this session (Zeron). Use a different model.`;
+
+/** A session's allowed model to fall back to: same provider first. */
+export function allowedFallback(ctx, off, current) {
+  let available = [];
+  try { available = ctx.modelRegistry?.getAvailable?.() ?? []; } catch {}
+  const pool = [...(ctx.scopedModels ?? []).map((s) => s?.model), ...available]
+    .filter((m) => m && !modelDisabled(off, m));
+  return pool.find((m) => m.provider === current?.provider) ?? pool[0];
+}
+
+function enforceModels(pi) {
+  // Off the disabled model before the turn runs; the request check is the
+  // backstop for anything that switched past this.
+  const steer = async (ctx, model) => {
+    const off = disabledModels();
+    if (!modelDisabled(off, model)) return;
+    const name = `${model.provider}/${model.id}`;
+    const next = allowedFallback(ctx, off, model);
+    let switched = false;
+    if (next) { try { switched = await pi.setModel(next); } catch {} }
+    try {
+      ctx.ui?.notify?.(switched
+        ? `${name} is disabled in this session; switched to ${next.provider}/${next.id}.`
+        : `${name} is disabled in this session and no allowed model is available.`, switched ? "warning" : "error");
+    } catch {}
+  };
+  pi.on("session_start", (_event, ctx) => steer(ctx, ctx.model));
+  pi.on("model_select", (event, ctx) => steer(ctx, event?.model));
+  pi.on("before_agent_start", async (_event, ctx) => { await steer(ctx, ctx.model); });
+  pi.on("before_provider_request", (_event, ctx) => {
+    if (!modelDisabled(disabledModels(), ctx.model)) return;
+    try { ctx.ui?.notify?.(MODEL_REASON(`${ctx.model.provider}/${ctx.model.id}`), "error"); } catch {}
+    ctx.abort();
+  });
+}
+
 export default function deleteGuard(pi) {
   inheritIntoChildren();
   guardCompiledChildren();
   const depth = piDepth(process.env, process.pid);
   process.env.ZERON_PI_PID = String(process.pid);          // for the Pis this one starts
   process.env.ZERON_SUBAGENT_DEPTH = String(depth);
+  const policed = Boolean(process.env.ZERON_MODEL_POLICY) && !policyExempt();
+  if (policed) enforceModels(pi);
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
+    if (policed && !POLICY_TOOLS_EXEMPT.has(event.toolName)) {
+      let hit;
+      try { hit = disabledModelIn(event.input, disabledModels()); } catch {}
+      if (hit) return { block: true, reason: MODEL_REASON(hit) };
+    }
     const annotationsOf = () => {
       try { return pi.getAllTools().find((t) => t.name === event.toolName)?.annotations; } catch { return undefined; }
     };

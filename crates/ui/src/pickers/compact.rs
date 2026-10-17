@@ -1475,7 +1475,7 @@ mod tests {
     }
 }
 
-struct PickerHint(SharedString);
+pub(super) struct PickerHint(pub(super) SharedString);
 impl Render for PickerHint {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_popup();

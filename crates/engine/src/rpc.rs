@@ -127,6 +127,15 @@ struct SetDeleteGuardParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionModelPolicyParams {
+    chat_id: String,
+    /// Set only: the chat's own disabled models.
+    #[serde(default)]
+    disabled: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetHarnessEnabledParams {
     harness: HarnessId,
     enabled: bool,
@@ -1748,6 +1757,9 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_PI_SETTINGS
             | methods::SET_DELETE_GUARD
             | methods::SET_YOU_SHOULD_KNOW
+            // Model restrictions are files on the chat's host.
+            | methods::GET_SESSION_MODEL_POLICY
+            | methods::SET_SESSION_MODEL_POLICY
             // Live extension UI is held by the chat's host engine.
             | methods::WATCH_EXTENSION_UI
             | methods::EXTENSION_UI_ACTION
@@ -4121,6 +4133,27 @@ impl RpcService for EngineRpc {
                 .map_err(|e| RpcError::Failed(e.to_string()))?
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&chunk)
+            }
+            methods::GET_SESSION_MODEL_POLICY | methods::SET_SESSION_MODEL_POLICY => {
+                use crate::model_policy;
+                let p: SessionModelPolicyParams = parse_params(params)?;
+                if p.chat_id.trim().is_empty() {
+                    return Err(RpcError::BadParams("chatId is required".into()));
+                }
+                let dir = self
+                    .registry
+                    .data_dir()
+                    .ok_or_else(|| RpcError::Failed("the engine has no data directory".into()))?;
+                if method == methods::SET_SESSION_MODEL_POLICY {
+                    let disabled = p.disabled.unwrap_or_default();
+                    model_policy::write(&dir, &p.chat_id, disabled)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
+                // A chat not in the registry yet (a new chat's first send)
+                // has no parents.
+                let chats = self.workspace.read_chats().unwrap_or_default();
+                let ancestors = model_policy::ancestors(&chats, &p.chat_id);
+                RpcReply::value(&model_policy::session(&dir, &p.chat_id, &ancestors))
             }
             methods::POST_BOARD => {
                 use zeron_proto::board::{BOARD_MAX_TEXT, BoardEntry, folder_of};

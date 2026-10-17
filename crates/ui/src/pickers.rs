@@ -625,6 +625,32 @@ struct ModelRowsKey {
     locked: bool,
     catalog_rev: u64,
     selected: Option<String>,
+    /// The viewed provider tab of Pi's list.
+    provider: Option<String>,
+}
+
+/// A session's model restrictions as the picker shows them: the chat's own
+/// disabled models, and those its parent chats (an orchestrator, a side
+/// chat's parent) disable, which it cannot lift. A new chat's own list is a
+/// draft its first send saves (`take_session_model_draft`).
+#[derive(Debug, Default, Clone)]
+struct SessionModels {
+    chat_id: Option<String>,
+    disabled: Vec<String>,
+    inherited: Vec<String>,
+}
+
+impl SessionModels {
+    fn blocks(&self, model: &str) -> bool {
+        self.disabled
+            .iter()
+            .chain(&self.inherited)
+            .any(|m| m.eq_ignore_ascii_case(model))
+    }
+
+    fn inherits(&self, model: &str) -> bool {
+        self.inherited.iter().any(|m| m.eq_ignore_ascii_case(model))
+    }
 }
 
 /// One row of the model list: the model plus the harness it belongs to —
@@ -679,6 +705,22 @@ fn row_group(row: &ModelRowData) -> ModelGroup {
     }
 }
 
+/// The group of a Pi catalog model, as [`row_group`] files its row.
+fn pi_model_group(model: &Model) -> ModelGroup {
+    match zeron_proto::model_provider::of_model(model) {
+        Some(provider) => ModelGroup {
+            key: provider.key,
+            name: provider.name.into(),
+            harness: HarnessId::Pi,
+        },
+        None => ModelGroup {
+            key: format!("harness:{:?}", HarnessId::Pi),
+            name: "Pi".into(),
+            harness: HarnessId::Pi,
+        },
+    }
+}
+
 /// Rows grouped by provider: groups in the order they first appear, rows in
 /// list order within each — the same model from two providers then sits in
 /// two groups.
@@ -706,6 +748,16 @@ fn row_attribution(row: &ModelRowData) -> Option<SharedString> {
         })
         .filter(|d| !d.eq_ignore_ascii_case(row.harness_name.as_ref()))
         .map(SharedString::from)
+}
+
+/// [`row_attribution`] on a provider tab, where every row shares the
+/// provider: only the description that tells identically named rows apart.
+fn row_description(row: &ModelRowData) -> Option<SharedString> {
+    row.ambiguous
+        .then(|| row.model.description.as_deref().map(str::trim))
+        .flatten()
+        .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(row.harness_name.as_ref()))
+        .map(|d| SharedString::from(d.to_owned()))
 }
 
 /// Flag rows whose label another listed row of the same harness shares.
@@ -858,6 +910,15 @@ pub struct Pickers {
     /// The harness/model picker's rail selection (favorites vs the effective
     /// harness's list). Re-primed on every open.
     model_rail: ModelRail,
+    /// The viewed provider tab of Pi's list (a [`ModelGroup`] key); `None`,
+    /// or a provider no longer listed, follows the selected model's.
+    model_provider_tab: Option<String>,
+    /// Pi's providers, per `catalog_rev`: the standard picker's tabs.
+    provider_groups_cache: std::cell::RefCell<Option<(u64, std::sync::Arc<Vec<ModelGroup>>)>>,
+    /// Harnesses whose forced catalog refresh is still running.
+    refreshing_models: HashSet<HarnessId>,
+    /// The models disabled in this session.
+    session_models: SessionModels,
     setting_menu: Option<ModelSetting>,
     setting_active: usize,
     setting_on_left: bool,
@@ -1131,6 +1192,10 @@ impl Pickers {
             draft_owner,
             open,
             model_rail: ModelRail::default(),
+            model_provider_tab: None,
+            provider_groups_cache: std::cell::RefCell::new(None),
+            refreshing_models: HashSet::new(),
+            session_models: SessionModels::default(),
             setting_menu: None,
             setting_active: 0,
             setting_on_left: false,
@@ -1681,6 +1746,7 @@ impl Pickers {
                 // cold start. Revalidate on every open instead of pinning a
                 // timeout/fallback result until the application restarts.
                 self.prefetch_models(true, cx);
+                self.load_session_models(cx);
             }
             // Projects and devices are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device => {}
@@ -1807,6 +1873,9 @@ impl Pickers {
             self.models.insert(harness, Loadable::Loading);
             self.catalog_rev += 1;
         }
+        if force {
+            self.refreshing_models.insert(harness);
+        }
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness, "force": force });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
@@ -1870,14 +1939,14 @@ impl Pickers {
                 object.insert("force".into(), false.into());
                 object.insert("wait".into(), true.into());
             }
-            let Ok(value) = engine.client().call(methods::LIST_MODELS, params).await else {
-                return;
-            };
-            let Ok(models) = serde_json::from_value::<Vec<Model>>(value) else {
-                return;
+            let waited = match engine.client().call(methods::LIST_MODELS, params).await {
+                Ok(value) => serde_json::from_value::<Vec<Model>>(value).ok(),
+                Err(_) => None,
             };
             this.update(cx, |pickers, cx| {
-                if pickers.target_generation == generation
+                pickers.refreshing_models.remove(&harness);
+                if let Some(models) = waited
+                    && pickers.target_generation == generation
                     && matches!(pickers.models.get(&harness), Some(Loadable::Ready(_)))
                 {
                     pickers.apply_model_catalog(
@@ -1886,10 +1955,198 @@ impl Pickers {
                         cx,
                     );
                 }
+                cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Refresh models: every provider is asked again for its live list
+    /// (newly launched models included); the rows stay until it lands.
+    fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        self.prefetch_models(true, cx);
+        cx.notify();
+    }
+
+    /// Pi's providers in catalog order: one per provider it lists models
+    /// for, which it does only for those signed in or keyed.
+    fn pi_provider_groups(&self) -> std::sync::Arc<Vec<ModelGroup>> {
+        if let Some((rev, groups)) = self.provider_groups_cache.borrow().as_ref()
+            && *rev == self.catalog_rev
+        {
+            return groups.clone();
+        }
+        let mut groups: Vec<ModelGroup> = Vec::new();
+        if let Some(models) = self.models.get(&HarnessId::Pi).and_then(Loadable::ready) {
+            for model in models {
+                let group = pi_model_group(model);
+                if !groups.iter().any(|g| g.key == group.key) {
+                    groups.push(group);
+                }
+            }
+        }
+        let groups = std::sync::Arc::new(groups);
+        *self.provider_groups_cache.borrow_mut() = Some((self.catalog_rev, groups.clone()));
+        groups
+    }
+
+    /// The provider tab Pi's list shows in the standard picker: the one
+    /// picked, else the selected model's provider, else the first.
+    fn viewed_provider(&self, cx: &App) -> Option<String> {
+        if self.title.is_some()
+            || self.model_rail != ModelRail::Harness
+            || self.effective_harness(cx) != Some(HarnessId::Pi)
+            || self.compact_model_picker(cx)
+        {
+            return None;
+        }
+        let groups = self.pi_provider_groups();
+        let listed = |key: &str| groups.iter().any(|g| g.key == key);
+        if let Some(tab) = self.model_provider_tab.as_deref().filter(|key| listed(key)) {
+            return Some(tab.to_owned());
+        }
+        self.effective_model_id(cx)
+            .and_then(|id| {
+                self.models
+                    .get(&HarnessId::Pi)
+                    .and_then(Loadable::ready)
+                    .and_then(|models| models.iter().find(|m| m.id == id))
+                    .map(|model| pi_model_group(model).key)
+                    .or_else(|| zeron_proto::model_provider::of_id(id).map(|p| p.key))
+            })
+            .filter(|key| listed(key))
+            .or_else(|| groups.first().map(|g| g.key.clone()))
+    }
+
+    /// Whether the open chat (or the new one being composed) disabled `model`.
+    fn session_blocks(&self, model: &str, cx: &App) -> bool {
+        let chat = self.state.read(cx).selected_chat_row().map(|c| c.id.clone());
+        self.session_models.chat_id == chat && self.session_models.blocks(model)
+    }
+
+    /// Load the open chat's model restrictions; a new chat keeps its draft.
+    fn load_session_models(&mut self, cx: &mut Context<Self>) {
+        if self.title.is_some() {
+            return;
+        }
+        let chat_id = self.state.read(cx).selected_chat_row().map(|c| c.id.clone());
+        if self.session_models.chat_id != chat_id {
+            self.session_models = SessionModels {
+                chat_id: chat_id.clone(),
+                ..Default::default()
+            };
+        }
+        let Some(chat_id) = chat_id else {
+            return;
+        };
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let target = self.space_target(cx);
+        cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "chatId": chat_id });
+            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+                object.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
+            }
+            // An engine that predates restrictions has none to show.
+            let Ok(value) = engine
+                .client()
+                .call(methods::GET_SESSION_MODEL_POLICY, params)
+                .await
+            else {
+                return;
+            };
+            this.update(cx, |pickers, cx| {
+                pickers.land_session_models(&chat_id, &value, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn land_session_models(
+        &mut self,
+        chat_id: &str,
+        value: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session_models.chat_id.as_deref() != Some(chat_id) {
+            return;
+        }
+        let list = |key: &str| {
+            value
+                .get(key)
+                .cloned()
+                .and_then(|list| serde_json::from_value::<Vec<String>>(list).ok())
+                .unwrap_or_default()
+        };
+        self.session_models.disabled = list("disabled");
+        self.session_models.inherited = list("inherited");
+        cx.notify();
+    }
+
+    /// Disable `model` in this session, or enable it again. Saved at once
+    /// for an existing chat, so a running session holds it from its next
+    /// turn; a new chat's list is saved by its first send.
+    fn toggle_session_model(&mut self, model: &str, cx: &mut Context<Self>) {
+        let chat_id = self.state.read(cx).selected_chat_row().map(|c| c.id.clone());
+        if self.session_models.chat_id != chat_id {
+            self.session_models = SessionModels {
+                chat_id: chat_id.clone(),
+                ..Default::default()
+            };
+        }
+        if self.session_models.inherits(model) {
+            return;
+        }
+        let list = &mut self.session_models.disabled;
+        match list.iter().position(|m| m.eq_ignore_ascii_case(model)) {
+            Some(ix) => {
+                list.remove(ix);
+            }
+            None => list.push(model.to_owned()),
+        }
+        cx.notify();
+        let (Some(chat_id), Some(engine)) = (chat_id, self.engine(cx)) else {
+            return;
+        };
+        let target = self.space_target(cx);
+        let disabled = self.session_models.disabled.clone();
+        cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "chatId": chat_id, "disabled": disabled });
+            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+                object.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
+            }
+            let result = engine
+                .client()
+                .call(methods::SET_SESSION_MODEL_POLICY, params)
+                .await;
+            this.update(cx, |pickers, cx| match result {
+                Ok(value) => pickers.land_session_models(&chat_id, &value, cx),
+                Err(error) => {
+                    tracing::warn!(%error, "session model restrictions not saved");
+                    pickers.load_session_models(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// At a new chat's first send: its draft restrictions, now its own.
+    pub fn take_session_model_draft(&mut self, chat_id: &str) -> Vec<String> {
+        if self.session_models.chat_id.is_some() {
+            return Vec::new();
+        }
+        self.session_models.chat_id = Some(chat_id.to_owned());
+        self.session_models.disabled.clone()
     }
 
     /// A model load for the current device landed. A slot that still held
@@ -2391,6 +2648,7 @@ impl Pickers {
             locked: self.harness_locked(cx),
             catalog_rev: self.catalog_rev,
             selected: self.effective_model_id(cx).map(str::to_owned),
+            provider: self.viewed_provider(cx),
         };
         if let Some((cached_key, rows)) = self.model_rows_cache.borrow().as_ref()
             && *cached_key == key
@@ -2467,6 +2725,13 @@ impl Pickers {
                 );
             }
         }
+        // A provider tab lists only that provider's models; a search looks
+        // across them all.
+        if query.is_empty()
+            && let Some(provider) = self.viewed_provider(cx)
+        {
+            rows.retain(|row| row.harness != HarnessId::Pi || row_group(row).key == provider);
+        }
         mark_ambiguous(&mut rows);
         rows
     }
@@ -2515,6 +2780,10 @@ impl Pickers {
             return;
         };
         if row.selected_only {
+            return;
+        }
+        // Disabled in this session: listed, never picked.
+        if row.harness == HarnessId::Pi && self.session_blocks(&row.model.id, cx) {
             return;
         }
         if self.effective_harness(cx) != Some(row.harness) {
@@ -4549,8 +4818,66 @@ impl Pickers {
                 )
                 .when(favorites_view, |el| el.child(tab_indicator(theme.accent))),
         );
+        let viewed_provider = self.viewed_provider(cx);
+        let provider_groups = self.pi_provider_groups();
         for (ix, descriptor) in descriptors.iter().enumerate() {
             let harness = descriptor.id;
+            // Pi's tab is its providers': one brand tab per provider it lists
+            // models for (signed in or keyed), each with only its models.
+            if harness == HarnessId::Pi && self.title.is_none() && !provider_groups.is_empty() {
+                for (gx, group) in provider_groups.iter().enumerate() {
+                    let is_viewed = !favorites_view
+                        && effective == Some(harness)
+                        && viewed_provider.as_deref() == Some(group.key.as_str());
+                    let key = group.key.clone();
+                    let name = group.name.clone();
+                    let hint = name.clone();
+                    let mark = provider_brand_icon(group);
+                    tabs = tabs.child(
+                        div()
+                            .id(("provider-tab", gx))
+                            .relative()
+                            .w(px(32.0))
+                            .h(px(32.0))
+                            .rounded(px(popover::MENU_ITEM_RADIUS))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .tooltip(move |_, cx| cx.new(|_| compact::PickerHint(hint.clone())).into())
+                            .when(!is_viewed, |el| el.hover(|s| s.bg(crate::theme::ink(0.06))))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.setting_menu = None;
+                                this.model_rail = ModelRail::Harness;
+                                if this.effective_harness(cx) != Some(HarnessId::Pi) {
+                                    this.pick_harness(HarnessId::Pi, cx);
+                                }
+                                this.model_provider_tab = Some(key.clone());
+                                this.active = this.selected_model_index(cx);
+                                this.model_scroll_base().set_offset(gpui::Point::default());
+                                cx.notify();
+                            }))
+                            .child(match mark {
+                                Some((icon, tint)) => crate::icons::icon(icon)
+                                    .size(px(16.0))
+                                    .text_color(tint.unwrap_or(if is_viewed {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    }))
+                                    .into_any_element(),
+                                None => div()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(if is_viewed { theme.text } else { theme.text_muted })
+                                    .child(monogram(&name))
+                                    .into_any_element(),
+                            })
+                            .when(is_viewed, |el| el.child(tab_indicator(theme.accent))),
+                    );
+                }
+                continue;
+            }
             let is_viewed = !favorites_view && effective == Some(harness);
             let (icon_path, tint) = harness_brand_icon(harness);
             tabs =
@@ -4581,6 +4908,40 @@ impl Pickers {
                         ))
                         .when(is_viewed, |el| el.child(tab_indicator(theme.accent))),
                 );
+        }
+
+        // Refresh models: every configured provider is asked again, so a
+        // newly launched model shows without waiting for the next open.
+        if self.title.is_none() {
+            let refreshing = !self.refreshing_models.is_empty();
+            let hint = SharedString::from(if refreshing {
+                "Refreshing models…"
+            } else {
+                "Refresh models"
+            });
+            tabs = tabs.child(div().flex_1()).child(
+                div()
+                    .id("model-refresh")
+                    .flex_none()
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .rounded(px(popover::MENU_ITEM_RADIUS))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(move |_, cx| cx.new(|_| compact::PickerHint(hint.clone())).into())
+                    .when(refreshing, |el| el.opacity(0.4))
+                    .when(!refreshing, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(crate::theme::ink(0.06)))
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh_models(cx)))
+                    })
+                    .child(
+                        crate::icons::icon(crate::icons::REFRESH)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    ),
+            );
         }
 
         if compact {
@@ -4786,8 +5147,27 @@ impl Pickers {
         let star_model = row.model.id.clone();
         // A Pi row's provider rides beside the name; elsewhere the
         // description appears only to tell identically-named rows apart.
-        let attribution = row_attribution(row);
         let compact = self.model_rail == ModelRail::Harness;
+        // On a provider tab every row is that provider's: no label for it.
+        let provider_tab = compact
+            && row.harness == HarnessId::Pi
+            && self.search.read(cx).text().trim().is_empty()
+            && self.viewed_provider(cx).is_some();
+        let attribution = if provider_tab {
+            row_description(row)
+        } else {
+            row_attribution(row)
+        };
+        // Session model restrictions: a disabled row stays listed, dimmed,
+        // and cannot be picked; the current pick cannot be disabled.
+        let session_off = row.harness == HarnessId::Pi && self.session_blocks(&row.model.id, cx);
+        let inherited_off = session_off && self.session_models.inherits(&row.model.id);
+        let can_restrict = self.title.is_none()
+            && row.harness == HarnessId::Pi
+            && !row.selected_only
+            && row.model.id != "default"
+            && (session_off || !is_selected);
+        let restrict_model = row.model.id.clone();
         let mut el = div()
             .id(("model-row", ix))
             .px(px(8.0))
@@ -4911,7 +5291,7 @@ impl Pickers {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_model_index(ix, cx);
             }))
-            .child(body);
+            .child(div().flex_1().min_w_0().flex().when(session_off, |el| el.opacity(0.45)).child(body));
         if ix < 9 {
             el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
         }
@@ -4991,6 +5371,52 @@ impl Pickers {
                     self.config_on_left,
                 ));
             }
+        }
+        if can_restrict {
+            // Shown on the hovered row, and always on a disabled one.
+            let hint = SharedString::from(if inherited_off {
+                "Disabled by a parent session"
+            } else if session_off {
+                "Enable in this session"
+            } else {
+                "Disable in this session"
+            });
+            let shown = session_off || is_active;
+            el = el.child(
+                div()
+                    .id(("model-session-toggle", ix))
+                    .flex_none()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded(px(popover::MENU_ITEM_RADIUS))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(shown, |el| {
+                        el.tooltip(move |_, cx| cx.new(|_| compact::PickerHint(hint.clone())).into())
+                            .child(
+                                crate::icons::icon(if session_off {
+                                    crate::icons::EYE_CLOSED
+                                } else {
+                                    crate::icons::EYE
+                                })
+                                .size(px(13.0))
+                                .text_color(if session_off {
+                                    theme.warning
+                                } else {
+                                    theme.text_muted
+                                }),
+                            )
+                    })
+                    .when(shown && !inherited_off, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(crate::theme::ink(0.08)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_session_model(&restrict_model, cx);
+                            }))
+                    }),
+            );
         }
         el = el.child(
             div()

@@ -22,6 +22,15 @@ pub(super) fn configure(
         .env
         .remove(orchestrator::ENV_PROJECT_PROMPT)
         .filter(|prompt| !prompt.trim().is_empty());
+    // So are the session's model restrictions: every Pi it starts inherits
+    // them, whatever MCP config it loads.
+    if let Some(policy) = config
+        .env
+        .remove(orchestrator::ENV_MODEL_POLICY)
+        .filter(|files| !files.is_empty())
+    {
+        cmd.env(orchestrator::ENV_MODEL_POLICY, policy);
+    }
     for arg in role_args(&place, project.as_deref(), scratch.path())? {
         cmd.arg(arg);
     }

@@ -34,6 +34,7 @@ pub mod instance_lock;
 pub mod lag_monitor;
 pub mod local_import;
 mod model_catalogs;
+pub mod model_policy;
 pub mod profile;
 pub mod project_actions;
 pub mod registry;

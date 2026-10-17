@@ -542,6 +542,15 @@ impl HarnessRegistry {
         self.migrate_legacy_prefs();
     }
 
+    /// The engine data dir the prefs live in; `None` before [`Self::load_prefs`].
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        self.prefs_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+    }
+
     /// Fold a legacy allow-list into the opt-out shape: a registered harness
     /// missing from it was a deliberate "no", so it stays off. Rewrites the
     /// file once, which is what lets later installs auto-enable.

@@ -44,6 +44,11 @@ pub const ENV_FORK_SESSION: &str = "ZERON_FORK_SESSION";
 /// ([`crate::orchestrator_project::OrchestratorProject::prompt`]), which the
 /// Pi harness appends to the system prompt. Rides the MCP env like the fork.
 pub const ENV_PROJECT_PROMPT: &str = "ZERON_PROJECT_PROMPT";
+/// A Pi run's session model restrictions: the files listing the models its
+/// chat and each chat above it disabled, joined like `PATH`. Zeron's guard
+/// extension keeps every Pi of the session off them. Rides the MCP env like
+/// the fork; the Pi harness moves it into the process env.
+pub const ENV_MODEL_POLICY: &str = "ZERON_MODEL_POLICY";
 /// Titles go into env and prompts as one short line.
 const MAX_LABEL_CHARS: usize = 120;
 

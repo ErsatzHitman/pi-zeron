@@ -266,6 +266,13 @@ pub mod methods {
     /// Post to the calling chat's orchestrator tree message board
     /// (`board_post`) -> `{ entry }`. Local only: the registry syncs it.
     pub const POST_BOARD: &str = "PostBoard";
+    /// A chat's session model restrictions -> `{ disabled, inherited }`:
+    /// its own disabled models and those its parent chats disable.
+    /// `{ chatId }`. Forwardable: the files live on the chat's host.
+    pub const GET_SESSION_MODEL_POLICY: &str = "GetSessionModelPolicy";
+    /// Replace a chat's own disabled models (`{ chatId, disabled }`), before
+    /// its first run or mid-session -> `{ disabled, inherited }`.
+    pub const SET_SESSION_MODEL_POLICY: &str = "SetSessionModelPolicy";
     /// The board posts the calling chat sees (`board_read`) ->
     /// `{ entries, total }`, oldest first. Local only.
     pub const LIST_BOARD: &str = "ListBoard";
