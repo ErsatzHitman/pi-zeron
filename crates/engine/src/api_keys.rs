@@ -40,7 +40,7 @@ pub const KNOWN: &[Known] = &[
     Known::pi(
         "openrouter",
         "OpenRouter",
-        "Pi models, decisions gate, video inspection, voice mode",
+        "Pi models, decisions gate, video inspection, voice mode, uniichat",
     ),
     Known::pi(
         "opencode-go",
