@@ -336,6 +336,9 @@ fn open_btw<'a>(
         shell.debug_gate = Some(GatePhase::Ready);
         shell.splash = SplashPhase::Gone;
         shell.active_chat = "a".into();
+        // Still, so positions compare across frames: the entrance eases on
+        // the real clock, and a slow runner measures it mid-move.
+        shell.reduced_motion = true;
         shell.test_time = Some(std::time::Instant::now());
         shell
     });
