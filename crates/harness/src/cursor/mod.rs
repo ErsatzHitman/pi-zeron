@@ -583,6 +583,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: session_id.clone(),
+                        class: None,
                     }).await { break 'main; }
                 } else {
                     stopping = true;
@@ -652,7 +653,7 @@ async fn run_session(session: Session) {
                                 // Stamp the session id onto Dones the mapper
                                 // couldn't know.
                                 let ev = if let AgentEvent::Done { status, result, error, .. } = ev {
-                                    AgentEvent::Done { status, result, error, session_id: session_id.clone() }
+                                    AgentEvent::Done { status, result, error, session_id: session_id.clone(), class: None }
                                 } else {
                                     ev
                                 };
@@ -717,6 +718,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: session_id.clone(),
+                    class: None,
                 }))
                 .await;
         } else if !interrupted && !any_done {
@@ -734,6 +736,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(crate::crash_message("cursor shim", status, &stderr_tail)),
                     session_id: session_id.clone(),
+                    class: None,
                 }))
                 .await;
         }
@@ -951,6 +954,7 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                                 result: None,
                                 error: None,
                                 session_id: None,
+                                class: None,
                             }),
                         });
                     }
@@ -981,6 +985,7 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                 result: None,
                 error,
                 session_id: None,
+                class: None,
             }]
         }
         "fatal" => vec![AgentEvent::Done {
@@ -998,6 +1003,7 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                     .to_owned(),
             ),
             session_id: None,
+            class: None,
         }],
         other => {
             tracing::debug!(target: "zeron_harness::cursor", "unknown shim frame (skipped): {other}");

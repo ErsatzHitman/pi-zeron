@@ -1328,6 +1328,7 @@ impl SessionsEngine {
                 result: None,
                 error: Some(note.into()),
                 session_id: None,
+                class: None,
             };
             self.inner.publish(&chat_id, &done);
             let stamped = handle.mark_abandoned_streams(note)?.len();
@@ -2756,6 +2757,7 @@ async fn drive_run(
                         result: None,
                         error: None,
                         session_id: None,
+                        class: None,
                     })
                 })
                 .boxed())
@@ -2779,6 +2781,7 @@ async fn drive_run(
             let parts = [MessagePart::Error {
                 id: "e0".into(),
                 message: message.clone(),
+                class: None,
             }];
             if let Err(err) = finish_segment(
                 &doc,
@@ -2804,6 +2807,7 @@ async fn drive_run(
                     result: None,
                     error: Some(message),
                     session_id: None,
+                    class: None,
                 },
             );
             inner.remove_run(&chat_id, &run_id);
@@ -2989,6 +2993,7 @@ async fn drive_run(
                     result: None,
                     error: None,
                     session_id: None,
+                    class: None,
                 },
                 _ = live_heartbeat.tick() => {
                     inner.touch_session(&chat_id);
@@ -3089,6 +3094,7 @@ async fn drive_run(
                             result: None,
                             error: Some(err.to_string()),
                             session_id: None,
+                            class: None,
                         }
                     }
                     None if interrupted => AgentEvent::Done {
@@ -3096,6 +3102,7 @@ async fn drive_run(
                         result: None,
                         error: None,
                         session_id: None,
+                        class: None,
                     },
                     // Stream end while PARKED idle: a per-turn adapter closing
                     // after its final Done — a clean end, not a crash (the turn
@@ -3109,6 +3116,7 @@ async fn drive_run(
                             result: None,
                             error: Some("harness stream ended without Done".into()),
                             session_id: None,
+                            class: None,
                         }
                     }
                 },
@@ -4256,6 +4264,7 @@ mod tests {
                 result: None,
                 error: None,
                 session_id: id.map(Into::into),
+                class: None,
             }
         }
         fn text() -> AgentEvent {
@@ -4439,6 +4448,7 @@ mod tests {
                     result: None,
                     error: Some("offline startup failed".into()),
                     session_id: None,
+                    class: None,
                 }
             } else {
                 AgentEvent::SessionStarted {
@@ -4784,6 +4794,7 @@ mod tests {
             result: None,
             error: None,
             session_id: None,
+            class: None,
         })
         .unwrap();
         core.sessions.shutdown().await;

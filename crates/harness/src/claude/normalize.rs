@@ -380,6 +380,7 @@ impl Normalizer {
                             result: None,
                             error: None,
                             session_id: None,
+                            class: None,
                         },
                     )];
                 }
@@ -708,6 +709,7 @@ impl Normalizer {
                         result: f.result,
                         error: None,
                         session_id: f.session_id,
+                        class: None,
                     }
                 } else {
                     // Split the CLI's internal `[ede_diagnostic]` breadcrumbs
@@ -757,6 +759,7 @@ impl Normalizer {
                         result: None,
                         error,
                         session_id: f.session_id,
+                        class: None,
                     }
                 };
                 let mut out = Vec::new();
@@ -1218,6 +1221,7 @@ mod tests {
                         result: None,
                         error: None,
                         session_id: None,
+                        class: None,
                     }
                 )]
             );
@@ -1298,6 +1302,7 @@ mod tests {
                     result: None,
                     error: None,
                     session_id: None,
+                    class: None,
                 }
             )]
         );

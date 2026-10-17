@@ -118,6 +118,7 @@ impl Harness for RecordingHarness {
                     "probe exited unexpectedly (exit code 1): temporary startup failure".into(),
                 ),
                 session_id: None,
+                class: None,
             })])
             .boxed());
         }

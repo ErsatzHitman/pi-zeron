@@ -1,7 +1,7 @@
 use crate::redact::strip_ansi;
 use serde_json::Value;
 use std::collections::HashMap;
-use zeron_proto::{AgentEvent, DoneStatus, TodoItem, TodoStatus, ToolCall, ToolDiff};
+use zeron_proto::{AgentEvent, DoneStatus, ErrorClass, TodoItem, TodoStatus, ToolCall, ToolDiff};
 
 /// The most images one `share_images` call shows (the extension's own cap).
 const SHARED_IMAGES_MAX: usize = 8;
@@ -12,6 +12,11 @@ pub(super) struct Normalizer {
     thinking: HashMap<usize, String>,
     tools: HashMap<String, (String, Value)>,
     pub error: Option<String>,
+    /// What kind of failure `error` is; set and cleared with it.
+    pub class: Option<ErrorClass>,
+    /// The provider the last assistant message came from (names whose login
+    /// an auth failure needs).
+    pub provider: Option<String>,
     pub aborted: bool,
     pub window: Option<u64>,
 }
@@ -53,6 +58,9 @@ fn custom_failed(details: &Value) -> bool {
         )
 }
 
+/// The error text of an assistant message that failed without saying why.
+const GENERIC_FAILURE: &str = "Pi provider failed";
+
 /// The text of a message's `content` (a string, or text parts).
 fn content_text(content: &Value) -> String {
     match content {
@@ -69,6 +77,8 @@ fn content_text(content: &Value) -> String {
 impl Normalizer {
     pub fn reset(&mut self) {
         self.error = None;
+        self.class = None;
+        self.provider = None;
         self.aborted = false;
         self.text.clear();
         self.thinking.clear();
@@ -81,6 +91,17 @@ impl Normalizer {
         } else {
             DoneStatus::Completed
         }
+    }
+    /// The failure class, only for a run that ended in error.
+    pub fn class(&self) -> Option<ErrorClass> {
+        (self.status() == DoneStatus::Errored)
+            .then(|| self.class.clone())
+            .flatten()
+    }
+    /// Record `text` as the run's failure and classify it.
+    pub fn fail(&mut self, text: String) {
+        self.class = Some(classify(&text, self.provider.as_deref()));
+        self.error = Some(text);
     }
     pub fn map(&mut self, frame: &Value) -> Vec<AgentEvent> {
         let mut events = Vec::new();
@@ -133,12 +154,21 @@ impl Normalizer {
             }
             "message_end" if frame["message"]["role"] == "assistant" => {
                 let message = &frame["message"];
-                self.error = (message["stopReason"] == "error").then(|| {
-                    message["errorMessage"]
-                        .as_str()
-                        .unwrap_or("Pi provider failed")
-                        .to_owned()
-                });
+                if let Some(provider) = message["provider"].as_str().filter(|p| !p.is_empty()) {
+                    self.provider = Some(provider.to_owned());
+                }
+                // A later successful message clears the failure and its
+                // class together (a retried 429 stops reading as failed).
+                self.error = None;
+                self.class = None;
+                if message["stopReason"] == "error" {
+                    self.fail(
+                        message["errorMessage"]
+                            .as_str()
+                            .unwrap_or(GENERIC_FAILURE)
+                            .to_owned(),
+                    );
+                }
                 self.aborted = message["stopReason"] == "aborted";
                 if let Some(content) = message["content"].as_array() {
                     for (index, part) in content.iter().enumerate() {
@@ -280,7 +310,20 @@ impl Normalizer {
             // Pi reports an aborted run here even when no assistant message
             // carried `stopReason: "aborted"` (aborted before the first token).
             "agent_settled" if frame["aborted"] == true => self.aborted = true,
+            // Pi's retries are exhausted: the last attempt's error is the
+            // better description than the first message's, which may have
+            // been generic. A cancelled retry says nothing about the cause.
+            "auto_retry_end" if frame["success"] == false => {
+                let last = string(frame, "finalError");
+                if !last.is_empty()
+                    && last != "Retry cancelled"
+                    && self.error.as_deref().is_none_or(|e| e == GENERIC_FAILURE)
+                {
+                    self.fail(last.to_owned());
+                }
+            }
             "extension_error" => {
+                self.class = None;
                 self.error = Some(string(frame, "error").into());
                 events.push(AgentEvent::Error {
                     message: format!("Pi extension: {}", string(frame, "error")),
@@ -445,10 +488,381 @@ fn tool(name: &str, args: &Value) -> ToolCall {
         },
     }
 }
+/// Whether `token` (digits) appears in `text` not touching other
+/// alphanumerics, so `429` matches `HTTP 429:` but not `4290` or `x429`.
+fn word(text: &str, token: &str) -> bool {
+    text.match_indices(token).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + token.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+fn has_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+/// Classify a Pi failure's text. Pi has no structured error codes, so this
+/// is a conservative keyword match (Pi's own retry vocabulary): anything
+/// unrecognised is `Other`, and no hint is shown for it. Quota is checked
+/// before rate limit because some quota errors arrive as 429.
+pub(super) fn classify(text: &str, provider: Option<&str>) -> ErrorClass {
+    classify_at(text, provider, now_ms())
+}
+
+fn classify_at(text: &str, provider: Option<&str>, now_ms: i64) -> ErrorClass {
+    let t = text.to_lowercase();
+    if has_any(
+        &t,
+        &["session not found", "no such session", "unknown session"],
+    ) || (t.contains("session file") && has_any(&t, &["not found", "missing", "does not exist"]))
+    {
+        return ErrorClass::SessionGone;
+    }
+    if has_any(
+        &t,
+        &[
+            "invalid api key",
+            "incorrect api key",
+            "no api key",
+            "api key not found",
+            "not logged in",
+            "please log in",
+            "please login",
+            "/login",
+            "invalid x-api-key",
+            "authentication_error",
+            "unauthorized",
+            "invalid_grant",
+            "token has expired",
+        ],
+    ) || (t.contains("oauth") && has_any(&t, &["expired", "refresh", "revoked"]))
+        || word(&t, "401")
+    {
+        return ErrorClass::AuthRequired {
+            provider: provider.map(str::to_owned),
+        };
+    }
+    if has_any(
+        &t,
+        &[
+            "insufficient_quota",
+            "quota exceeded",
+            "exceeded your current quota",
+            "out of budget",
+            "gousagelimiterror",
+            "freeusagelimiterror",
+            "usage limit reached",
+            "monthly usage limit",
+            "subscription_sharing_usage_limit_exceeded",
+            "credit balance is too low",
+            "insufficient credit",
+            "payment required",
+        ],
+    ) || word(&t, "402")
+    {
+        return ErrorClass::QuotaExhausted {
+            resets_at: parse_reset_ms(&t, now_ms),
+        };
+    }
+    if has_any(
+        &t,
+        &["rate limit", "rate_limit", "ratelimit", "too many requests"],
+    ) || word(&t, "429")
+    {
+        return ErrorClass::RateLimited {
+            resets_at: parse_reset_ms(&t, now_ms),
+        };
+    }
+    if has_any(
+        &t,
+        &[
+            "overloaded",
+            "server_busy",
+            "servers are currently busy",
+            "at capacity",
+            "high demand",
+            "service unavailable",
+        ],
+    ) || word(&t, "529")
+        || word(&t, "503")
+    {
+        return ErrorClass::ProviderOverloaded;
+    }
+    ErrorClass::Other
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64)
+}
+
+/// When a limit clears (unix ms), from the unambiguous forms providers use:
+/// `retry-after: 30`, `retry after 30 seconds`, `try again in 20m`,
+/// `resets in 2h 10m`, `resets at 2026-01-02T03:04:05Z`. `None` when unsure.
+fn parse_reset_ms(text: &str, now_ms: i64) -> Option<i64> {
+    let t = text.to_lowercase();
+    for prefix in ["resets at ", "reset at "] {
+        if let Some(at) = t.find(prefix) {
+            let stamp = t[at + prefix.len()..]
+                .split_whitespace()
+                .next()?
+                .trim_end_matches(['.', ',', ')', ';']);
+            return parse_rfc3339_ms(stamp);
+        }
+    }
+    for (prefix, bare_seconds) in [
+        ("retry-after:", true),
+        ("retry-after ", true),
+        ("retry after ", false),
+        ("try again in ", false),
+        ("resets in ", false),
+        ("reset in ", false),
+    ] {
+        if let Some(at) = t.find(prefix) {
+            let ms = parse_duration_ms(&t[at + prefix.len()..], bare_seconds)?;
+            return Some(now_ms.saturating_add(ms));
+        }
+    }
+    None
+}
+
+/// `30`, `30 seconds`, `20m`, `2h 10m`, `1h and 5 min`: a sum of number+unit
+/// pairs at the start of `text`. A bare number is seconds only when allowed.
+fn parse_duration_ms(text: &str, bare_seconds: bool) -> Option<i64> {
+    let mut rest = text.trim_start();
+    let mut total = 0f64;
+    let mut pairs = 0;
+    loop {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let Ok(n) = rest[..digits].parse::<f64>() else {
+            break;
+        };
+        let after = rest[digits..].trim_start();
+        let unit_len = after
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(after.len());
+        let unit = &after[..unit_len];
+        let secs = match unit {
+            "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60.0,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3600.0,
+            "" if bare_seconds && pairs == 0 => 1.0,
+            _ => break,
+        };
+        total += n * secs;
+        pairs += 1;
+        let tail = after[unit_len..].trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        rest = tail.strip_prefix("and ").unwrap_or(tail);
+    }
+    (pairs > 0 && total.is_finite()).then(|| (total * 1000.0).round() as i64)
+}
+
+/// `2026-01-02T03:04:05Z` / `...+01:00` (optional fraction) as unix ms.
+fn parse_rfc3339_ms(stamp: &str) -> Option<i64> {
+    let b = stamp.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let part = stamp.get(from..from + len)?;
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hour, minute, second) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut at = 19;
+    let mut millis = 0;
+    if b.get(at) == Some(&b'.') {
+        let end = (at + 1..b.len())
+            .find(|&i| !b[i].is_ascii_digit())
+            .unwrap_or(b.len());
+        let frac = &stamp[at + 1..end];
+        if frac.is_empty() {
+            return None;
+        }
+        millis = format!("{:0<3}", &frac[..frac.len().min(3)])
+            .parse::<i64>()
+            .ok()?;
+        at = end;
+    }
+    let offset = match b.get(at)? {
+        b'Z' | b'z' if at + 1 == b.len() => 0,
+        sign @ (b'+' | b'-') if b.len() == at + 6 && b[at + 3] == b':' => {
+            let secs = num(at + 1, 2)? * 3600 + num(at + 4, 2)? * 60;
+            if *sign == b'+' { secs } else { -secs }
+        }
+        _ => return None,
+    };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(((days * 86400 + hour * 3600 + minute * 60 + second - offset) * 1000) + millis)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn kind(text: &str) -> &'static str {
+        classify_at(text, Some("anthropic"), 0).slug()
+    }
+
+    #[test]
+    fn classify_table() {
+        for (text, want) in [
+            (
+                "insufficient_quota: You exceeded your current quota",
+                "quotaExhausted",
+            ),
+            ("GoUsageLimitError: out of credits", "quotaExhausted"),
+            ("Monthly usage limit reached", "quotaExhausted"),
+            ("402 Payment Required", "quotaExhausted"),
+            (
+                "Your credit balance is too low to access the API",
+                "quotaExhausted",
+            ),
+            ("429 Too Many Requests", "rateLimited"),
+            ("rate_limit_error: slow down", "rateLimited"),
+            // Quota wins over the 429 it arrives in.
+            (
+                "429 {\"error\":\"quota exceeded for this key\"}",
+                "quotaExhausted",
+            ),
+            ("No API key found for anthropic", "authRequired"),
+            ("401 Unauthorized", "authRequired"),
+            ("OAuth token has expired", "authRequired"),
+            ("Please log in with /login", "authRequired"),
+            ("529 overloaded_error", "providerOverloaded"),
+            ("503 Service Unavailable", "providerOverloaded"),
+            ("session not found", "sessionGone"),
+            ("Session file is missing", "sessionGone"),
+            ("mock provider failure", "other"),
+            ("fetch failed", "other"),
+            ("port 4290 busy", "other"),
+            ("request id 14011 failed", "other"),
+            ("403 Forbidden", "other"),
+            ("update your billing address", "other"),
+        ] {
+            assert_eq!(kind(text), want, "{text}");
+        }
+        assert_eq!(
+            classify_at("No API key found", Some("anthropic"), 0),
+            ErrorClass::AuthRequired {
+                provider: Some("anthropic".into())
+            }
+        );
+        assert_eq!(
+            classify_at("No API key found", None, 0),
+            ErrorClass::AuthRequired { provider: None }
+        );
+    }
+
+    #[test]
+    fn reset_times_are_parsed_only_when_unambiguous() {
+        let now = 1_000_000;
+        assert_eq!(
+            parse_reset_ms("rate limited, retry after 30 seconds", now),
+            Some(now + 30_000)
+        );
+        assert_eq!(parse_reset_ms("retry-after: 12", now), Some(now + 12_000));
+        assert_eq!(
+            parse_reset_ms("Try again in 20m.", now),
+            Some(now + 1_200_000)
+        );
+        assert_eq!(
+            parse_reset_ms("Usage limit reached, resets in 2h 10m", now),
+            Some(now + (2 * 3600 + 10 * 60) * 1000)
+        );
+        assert_eq!(
+            parse_reset_ms("limit resets at 2026-01-02T03:04:05Z.", now),
+            Some(1_767_323_045_000)
+        );
+        assert_eq!(
+            parse_reset_ms("resets at 2026-01-02T04:04:05+01:00", now),
+            Some(1_767_323_045_000)
+        );
+        assert_eq!(parse_reset_ms("something went wrong", now), None);
+        assert_eq!(parse_reset_ms("resets at tomorrow", now), None);
+        assert_eq!(parse_reset_ms("retry after a while", now), None);
+        assert_eq!(
+            classify_at("429 rate limit exceeded, retry after 30 seconds", None, now),
+            ErrorClass::RateLimited {
+                resets_at: Some(now + 30_000)
+            }
+        );
+    }
+
+    fn assistant_end(stop: &str, err: Option<&str>) -> serde_json::Value {
+        let mut message =
+            json!({"role":"assistant","stopReason":stop,"provider":"openai-codex","content":[]});
+        if let Some(err) = err {
+            message["errorMessage"] = json!(err);
+        }
+        json!({"type":"message_end","message":message})
+    }
+
+    #[test]
+    fn failure_class_follows_the_error() {
+        let mut n = Normalizer::default();
+        n.map(&assistant_end("error", Some("429 Too Many Requests")));
+        assert_eq!(n.class(), Some(ErrorClass::RateLimited { resets_at: None }));
+        // A successful retry clears both.
+        n.map(&assistant_end("stop", None));
+        assert_eq!(n.status(), DoneStatus::Completed);
+        assert_eq!(n.class(), None);
+
+        // The first message was generic; the exhausted retry says why.
+        n.map(&assistant_end("error", None));
+        assert_eq!(n.class(), Some(ErrorClass::Other));
+        n.map(&json!({"type":"auto_retry_end","success":false,"attempt":3,"finalError":"401 Unauthorized"}));
+        assert_eq!(
+            n.class(),
+            Some(ErrorClass::AuthRequired {
+                provider: Some("openai-codex".into())
+            })
+        );
+
+        // A cancelled retry, or a specific earlier error, is left alone.
+        let mut n = Normalizer::default();
+        n.map(&assistant_end("error", None));
+        n.map(&json!({"type":"auto_retry_end","success":false,"attempt":1,"finalError":"Retry cancelled"}));
+        assert_eq!(n.class(), Some(ErrorClass::Other));
+        let mut n = Normalizer::default();
+        n.map(&assistant_end("error", Some("insufficient_quota")));
+        n.map(
+            &json!({"type":"auto_retry_end","success":false,"attempt":1,"finalError":"overloaded"}),
+        );
+        assert_eq!(
+            n.class(),
+            Some(ErrorClass::QuotaExhausted { resets_at: None })
+        );
+
+        // No class off an aborted run, and reset forgets everything.
+        let mut n = Normalizer::default();
+        n.map(&assistant_end("error", Some("429")));
+        n.map(&json!({"type":"agent_settled","aborted":true}));
+        assert_eq!(n.class(), None);
+        n.reset();
+        assert!(n.class.is_none() && n.provider.is_none());
+    }
     fn context_tokens(events: &[AgentEvent]) -> Option<Option<u64>> {
         events.iter().find_map(|event| match event {
             AgentEvent::ContextUsage { tokens, .. } => Some(*tokens),

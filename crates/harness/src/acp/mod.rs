@@ -3878,6 +3878,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error: Some(error),
                             session_id: None,
+                            class: None,
                         }))
                         .await;
                     child.shutdown(kill_grace).await;
@@ -3892,6 +3893,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: None,
+                    class: None,
                 }))
                 .await;
             child.shutdown(kill_grace).await;
@@ -4075,6 +4077,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: Some(not_signed_in(agent_name)),
                         session_id: Some(session_id.clone()),
+                        class: None,
                     }).await;
                 }
                 break 'main;
@@ -4241,6 +4244,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error,
                             session_id: Some(session_id.clone()),
+                            class: None,
                         },
                     )
                     .await
@@ -4447,6 +4451,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error,
                                 session_id: Some(session_id.clone()),
+                                class: None,
                             },
                         )
                         .await;
@@ -4694,6 +4699,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: Some(session_id.clone()),
+                        class: None,
                     },
                 )
                 .await
@@ -4791,6 +4797,7 @@ async fn run_session(session: Session) {
                                         result: None,
                                         error: Some(message),
                                         session_id: Some(session_id.clone()),
+                                        class: None,
                                     }).await
                                 {
                                     break 'main;
@@ -4920,6 +4927,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: None,
                         session_id: Some(session_id.clone()),
+                        class: None,
                     }).await {
                         break 'main;
                     }
@@ -4975,6 +4983,7 @@ async fn run_session(session: Session) {
                             "{agent_name} is unresponsive — the run was closed."
                         )),
                         session_id: Some(session_id.clone()),
+                        class: None,
                     },
                 )
                 .await;
@@ -5027,6 +5036,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: Some(session_id.clone()),
+                    class: None,
                 }))
                 .await;
         } else if !interrupted && !done_current {
@@ -5046,6 +5056,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(crate::crash_message(agent_name, status, &stderr_tail)),
                     session_id: Some(session_id.clone()),
+                    class: None,
                 }))
                 .await;
         }

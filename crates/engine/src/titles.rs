@@ -444,6 +444,7 @@ mod tests {
                     result: None,
                     error: None,
                     session_id: None,
+                    class: None,
                 }),
             ])
             .boxed())

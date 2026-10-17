@@ -1222,6 +1222,9 @@ pub enum RowKind {
     },
     ErrorChip {
         message: SharedString,
+        /// What to do about a recognised failure ("Log in to X again"),
+        /// shown under the message.
+        hint: Option<SharedString>,
     },
     /// The fork seam: a labeled divider between copied history and the
     /// chat's own turns.
@@ -1895,14 +1898,20 @@ pub fn rows_for_entry(
                     MessagePart::Error {
                         id: part_id,
                         message,
+                        class,
                     } => {
+                        let hint = class.as_ref().and_then(|class| class.hint());
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
-                            version: message.len() as u64,
+                            // The hint rides the version so a chip that
+                            // already rendered picks it up.
+                            version: message.len() as u64
+                                ^ hint.as_deref().map_or(0, |h| fnv1a(h.as_bytes()) << 1),
                             turn_start: false,
                             kind: RowKind::ErrorChip {
                                 // Harness-generated; the chip is one line.
                                 message: single_line(message).into(),
+                                hint: hint.map(Into::into),
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -8158,7 +8167,9 @@ impl Transcript {
             RowKind::Visual { owner, path, title } => {
                 self.render_visual(&row.id, owner, path, title, cx)
             }
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip { message, hint } => {
+                error_chip(message.clone(), hint.clone(), &theme)
+            }
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         };
         // Diagram fences this row just requested start rendering after layout.
@@ -9882,14 +9893,22 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
 /// WRAPS instead of truncating: startup-crash errors carry the agent's exit
 /// status and stderr, and a one-line ellipsis was exactly what made
 /// zeronsh/comet#95 undiagnosable from the screenshot.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+fn error_chip(message: SharedString, hint: Option<SharedString>, theme: &Theme) -> AnyElement {
     div()
         .py(px(4.0))
         .w_full()
         .child(
             notice_chip(theme, false, "Error", message, Tile)
                 .overflow_hidden()
-                .w_full(),
+                .w_full()
+                .when_some(hint, |chip, hint| {
+                    chip.child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(hint),
+                    )
+                }),
         )
         .into_any_element()
 }
@@ -12584,6 +12603,7 @@ mod tests {
             turn_start: true,
             kind: RowKind::ErrorChip {
                 message: SharedString::default(),
+                hint: None,
             },
             entry_id: entry_id.into(),
             timestamp: None,
@@ -13620,6 +13640,39 @@ mod tests {
     }
 
     #[test]
+    fn error_chip_hint_follows_the_failure_class() {
+        let chip = |class: Option<zeron_proto::ErrorClass>| {
+            let entry = assistant(
+                "a1",
+                MessageStatus::Complete,
+                vec![MessagePart::Error {
+                    id: "e1".into(),
+                    message: "401 Unauthorized".into(),
+                    class,
+                }],
+            );
+            let rows = rows_for_entry(&entry, false, false, &mut parse);
+            let row = rows
+                .into_iter()
+                .find(|row| matches!(row.kind, RowKind::ErrorChip { .. }))
+                .unwrap();
+            let RowKind::ErrorChip { hint, .. } = &row.kind else {
+                unreachable!();
+            };
+            (hint.clone(), row.version)
+        };
+        let (plain, plain_version) = chip(None);
+        assert_eq!(plain, None);
+        let (other, _) = chip(Some(zeron_proto::ErrorClass::Other));
+        assert_eq!(other, None);
+        let (hint, version) = chip(Some(zeron_proto::ErrorClass::AuthRequired {
+            provider: Some("anthropic".into()),
+        }));
+        assert!(hint.unwrap().starts_with("Log in to anthropic again"));
+        assert_ne!(version, plain_version, "the chip re-renders when the class arrives");
+    }
+
+    #[test]
     fn compact_mode_keeps_input_and_error_chips_visible() {
         // Interactive/error rows are not work steps — they stay outside the
         // fold so a blocking question or a failure still surfaces.
@@ -13631,6 +13684,7 @@ mod tests {
                 MessagePart::Error {
                     id: "e1".into(),
                     message: "boom".into(),
+                    class: None,
                 },
                 tool_part("t1", "pwd"),
                 text_part("r0", "the answer"),
@@ -15577,6 +15631,7 @@ mod tests {
                     let mut row = viewport_row("prompt", "prompt");
                     row.kind = RowKind::ErrorChip {
                         message: "line\n".repeat(12).into(),
+                        hint: None,
                     };
                     this.rows = vec![row];
                     this.list.reset(1);
@@ -15602,6 +15657,7 @@ mod tests {
                     // Simulate completion removing content from the last row.
                     this.rows[0].kind = RowKind::ErrorChip {
                         message: "done".into(),
+                        hint: None,
                     };
                     this.list.remeasure_items(0..1);
                     cx.notify();
@@ -15621,6 +15677,7 @@ mod tests {
                 transcript.update(cx, |this, cx| {
                     this.rows[0].kind = RowKind::ErrorChip {
                         message: "line\n".repeat(100).into(),
+                        hint: None,
                     };
                     this.list.remeasure_items(0..1);
                     cx.notify();

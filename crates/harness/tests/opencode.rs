@@ -744,6 +744,7 @@ async fn an_acknowledged_stop_drops_late_output_and_keeps_the_session() {
             result: None,
             error: None,
             session_id: Some("ses_test".into()),
+            class: None,
         }],
         "the stopped turn's late output is dropped"
     );

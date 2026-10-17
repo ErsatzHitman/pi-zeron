@@ -330,6 +330,7 @@ mod tests {
                 MessagePart::Error {
                     id: "e".into(),
                     message: "exit status 1".into(),
+                    class: None,
                 },
             ],
             false,

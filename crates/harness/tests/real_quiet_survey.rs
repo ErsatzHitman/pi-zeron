@@ -113,6 +113,7 @@ async fn probe_once(harness: Box<dyn Harness>) -> ProbeOutcome {
                         result: None,
                         error: Some(e.to_string()),
                         session_id: None,
+                        class: None,
                     },
                 ));
                 break;

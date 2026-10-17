@@ -1222,6 +1222,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: Some(e.to_string()),
                         session_id: None,
+                        class: None,
                     }))
                     .await;
                 shutdown_child(&mut child, kill_grace).await;
@@ -1235,6 +1236,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: None,
+                    class: None,
                 }))
                 .await;
             shutdown_child(&mut child, kill_grace).await;
@@ -1307,6 +1309,7 @@ async fn run_session(session: Session) {
                         result: None,
                         error: Some(e.to_string()),
                         session_id: Some(thread_id.clone()),
+                        class: None,
                     }))
                     .await;
                 shutdown_child(&mut child, kill_grace).await;
@@ -1610,6 +1613,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error,
                                 session_id: Some(thread_id.clone()),
+                                class: None,
                             },
                         )
                         .await
@@ -1668,6 +1672,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error: None,
                                 session_id: Some(thread_id.clone()),
+                                class: None,
                             }).await {
                                 break 'main;
                             }
@@ -1690,6 +1695,7 @@ async fn run_session(session: Session) {
                                         .unwrap_or_else(|| "Codex turn failed".into()),
                                 ),
                                 session_id: Some(thread_id.clone()),
+                                class: None,
                             },
                         )
                         .await;
@@ -1713,6 +1719,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error: None,
                                 session_id: Some(thread_id.clone()),
+                                class: None,
                             }).await {
                                 break 'main;
                             }
@@ -1728,6 +1735,7 @@ async fn run_session(session: Session) {
                                 result: None,
                                 error: None,
                                 session_id: Some(thread_id.clone()),
+                                class: None,
                             },
                         )
                         .await;
@@ -1867,6 +1875,7 @@ async fn run_session(session: Session) {
                             result: None,
                             error: None,
                             session_id: Some(thread_id.clone()),
+                            class: None,
                         }).await {
                             break 'main;
                         }
@@ -1938,6 +1947,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: Some(thread_id.clone()),
+                    class: None,
                 }))
                 .await;
         } else if !interrupted && !done_current {
@@ -1955,6 +1965,7 @@ async fn run_session(session: Session) {
                         &stderr_tail,
                     )),
                     session_id: Some(thread_id.clone()),
+                    class: None,
                 }))
                 .await;
         }

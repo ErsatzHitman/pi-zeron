@@ -568,18 +568,19 @@ impl Harness for PiHarness {
                         }
                     }
                 }
-                Ok((text, norm.status(), norm.error.clone()))
+                Ok((text, norm.status(), norm.error.clone(), norm.class()))
             }
             .await;
             process.shutdown(grace).await;
             let events = match result {
-                Ok((text, status, error)) => vec![
+                Ok((text, status, error, class)) => vec![
                     Ok(AgentEvent::TextDelta { text }),
                     Ok(AgentEvent::Done {
                         status,
                         result: None,
                         error,
                         session_id: None,
+                        class,
                     }),
                 ],
                 Err(error) => vec![Err(error)],
@@ -728,11 +729,16 @@ impl Harness for PiHarness {
             };
             if let Err(error) = result {
                 let status = runner.process.child.try_wait().ok().flatten();
-                runner.norm.error = Some(if status.is_some() {
+                let crashed = status.is_some();
+                runner.norm.fail(if crashed {
                     crate::crash_message("Pi", status, &runner.process.tail)
                 } else {
                     error.to_string()
                 });
+                // A process exit says nothing about Pi's session.
+                if crashed && runner.norm.class == Some(zeron_proto::ErrorClass::SessionGone) {
+                    runner.norm.class = Some(zeron_proto::ErrorClass::Other);
+                }
             }
             runner.process.shutdown(kill_grace).await;
             // The process (and every element its extensions drew) is gone.
@@ -1088,6 +1094,11 @@ impl Runner {
             result: None,
             error: self.norm.error.clone(),
             session_id: (!self.session.is_empty()).then(|| self.session.clone()),
+            class: if self.interrupted {
+                None
+            } else {
+                self.norm.class()
+            },
         })
         .await
     }
@@ -1430,7 +1441,7 @@ impl Runner {
                 self.confirm_delivery().await?;
             }
         }
-        self.norm.error = Some(error.to_string());
+        self.norm.fail(error.to_string());
         self.finish().await
     }
     async fn confirm_delivery(&mut self) -> Result<(), HarnessError> {

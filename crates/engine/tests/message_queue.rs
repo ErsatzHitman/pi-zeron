@@ -139,13 +139,13 @@ impl Harness for HeldHarness {
                     return None;
                 }
                 let (event, ended) = tokio::select! {
-                    _ = finish.recv() => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()) }, true),
+                    _ = finish.recv() => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()), class: None }, true),
                     steer = steering.recv() => match steer {
                         Some(message) => {
                             prompts.lock().unwrap().push(message.prompt);
                             (AgentEvent::Steered { assistant_message_id: None, next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()) }, false)
                         }
-                        None => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()) }, true),
+                        None => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()), class: None }, true),
                     }
                 };
                 Some((Ok(event), (finish, steering, prompts, ended)))
