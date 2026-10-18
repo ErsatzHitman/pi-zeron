@@ -220,6 +220,12 @@ pub fn pulse_lease(view: EntityId, cx: &mut App) {
     pulse_lease_every(view, 1, cx);
 }
 
+/// Drop every lease, so a test sees only what its next paint renews.
+#[cfg(test)]
+pub(crate) fn pulse_forget_leases(cx: &mut App) {
+    cx.default_global::<PulseClock>().leases.clear();
+}
+
 /// Whether `view` is on the pulse clock's tick list right now.
 #[cfg(test)]
 pub(crate) fn pulse_leased(view: EntityId, cx: &App) -> bool {

@@ -2775,6 +2775,8 @@ mod tests {
         cx.deactivate_window();
         cx.update(|window, cx| {
             assert!(!window.is_window_active());
+            // The window's first paint, while it was still active, leased.
+            crate::motion::pulse_forget_leases(cx);
             window.refresh();
             window.draw(cx).clear();
             assert_eq!(window.simulate_next_frame(cx), 0);
