@@ -7,8 +7,9 @@ host executor, RPC, desktop composer and iOS client.
 
 `SessionDoc.queue` is a Loro movable list, separate from the immutable command
 ledger and host-authored transcript. Each row holds a stable ID, editable text,
-committed attachment paths, author/timestamps, an optional hold-until-turn-end
-policy and an optional delivery gate. Real move operations preserve row identity
+committed attachment paths, author/timestamps, a hold-until-turn-end flag
+(stored and shown to clients; the host's automatic delivery does not read it)
+and an optional delivery gate. Real move operations preserve row identity
 and converge across devices without delete-and-insert duplicates.
 
 Clients can enqueue and reorder through their local document. Only the chat host
@@ -24,11 +25,17 @@ mutex serializes drains, explicit delivery, removal and protected edits.
 | State | Automatic delivery |
 | --- | --- |
 | Idle | Start the head as the next turn. |
-| Working or awaiting input, mid-turn steering supported | Steer a text-only head unless it is held for turn end. |
-| Working or awaiting input, steering unavailable | Keep the head queued until the turn ends. |
+| Working, mid-turn steering supported | Steer a text-only head at the next step boundary. |
+| Awaiting input | Keep the head queued until the turn ends; a steer would abandon the question. |
+| Working, steering unavailable | Keep the head queued until the turn ends. |
 | Head has attachments | Wait for a new turn that can accept files. |
 | Head has an editing or review gate | Block delivery; do not skip the head. |
 | Queue paused after Cancel or snapshot recovery | Wait for a successful explicit prompt or queue delivery. |
+
+The pushed child-outcome notes of an orchestrator tree use the same rows for a
+parent that is working, waiting on an answer, frozen by Stop, or hosted on
+another device (see [orchestrator projects](orchestrator-projects.md)), so they
+follow these rules and keep their order relative to typed messages.
 
 Explicit steering never interrupts. Send-now interrupts the active turn before
 dispatching the selected row. The desktop labels both delivery paths **Steer**

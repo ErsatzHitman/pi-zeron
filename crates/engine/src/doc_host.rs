@@ -3531,22 +3531,47 @@ impl DocHost {
     }
 
     /// Tell an orchestrator parent that children settled (see the engine's
-    /// `parent_notify`): an idle parent gets a durable `Run` (a turn like the
-    /// MCP's `run` delivery, `auto_approve` off); a parent waiting on an
-    /// answer gets the text queued and held for its turn's end, never
-    /// answering the question. A parent with no chat row is skipped silently.
+    /// `parent_notify`). An idle parent gets a durable `Run` (a turn like the
+    /// MCP's `run` delivery, `auto_approve` off). Any parent that cannot
+    /// take a turn right now gets the text as a queued row instead, and the
+    /// host decides at drain time, exactly as for a message the user typed:
+    ///
+    /// - a working parent: a steerable turn takes the row at its next step
+    ///   boundary, any other starts it when the turn ends;
+    /// - a parent waiting on an answer: the row waits behind the question and
+    ///   never answers it;
+    /// - a parent whose queue the user froze with Stop (or that is hosted by
+    ///   another device): the row waits for the user to resume, so a note
+    ///   never restarts a stopped root;
+    /// - a parent with rows already queued: the note goes behind them, so
+    ///   arrival order holds.
+    ///
+    /// An error means nothing was handed over, so the caller may try again.
     pub(crate) fn notify_parent(
         &self,
         parent_id: &str,
         text: &str,
-        awaiting_input: bool,
+        parent_status: zeron_proto::SessionStatus,
     ) -> Result<(), EngineError> {
-        if awaiting_input {
-            self.queue_message_with_behavior(parent_id, text, Vec::new(), true)?;
+        use zeron_proto::SessionStatus;
+        let handle = self.open(parent_id)?;
+        let busy = matches!(
+            parent_status,
+            SessionStatus::Working | SessionStatus::AwaitingInput
+        );
+        if busy
+            || handle.queue_paused.load(Ordering::Acquire)
+            || !handle.doc.read_queue()?.is_empty()
+            || self.remote_host_for(parent_id).is_some()
+        {
+            let awaiting = parent_status == SessionStatus::AwaitingInput;
+            self.queue_message_with_behavior(parent_id, text, Vec::new(), awaiting)?;
             return Ok(());
         }
         let Some(mut request) = self.request_from_chat_row(parent_id, text) else {
-            return Ok(());
+            return Err(EngineError::Other(format!(
+                "parent {parent_id} has no run configuration yet"
+            )));
         };
         if request.cwd.is_empty() {
             request.cwd = "~".into();

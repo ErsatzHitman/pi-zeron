@@ -715,7 +715,9 @@ impl UsageAlerts {
                 DeliveryKind::Held => host
                     .queue_message_with_behavior(&delivery.chat_id, &text, Vec::new(), true)
                     .map(|_| ()),
-                DeliveryKind::Run => host.notify_parent(&delivery.chat_id, &text, false),
+                DeliveryKind::Run => {
+                    host.notify_parent(&delivery.chat_id, &text, zeron_proto::SessionStatus::Idle)
+                }
             };
             match sent {
                 Ok(()) => {

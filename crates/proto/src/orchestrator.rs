@@ -562,6 +562,10 @@ mod tests {
         assert!(ROOT_SYSTEM_PROMPT.starts_with("You are the orchestrator in Zeron"));
         assert!(ROOT_SYSTEM_PROMPT.contains("automatic child-outcome notice"));
         assert!(ROOT_SYSTEM_PROMPT.contains("zeron_wait_for_turns"));
+        assert!(
+            !ROOT_SYSTEM_PROMPT.contains("not sent while you are mid-turn"),
+            "a working root is told too"
+        );
         assert!(member.contains("tail of that reply automatically"));
         assert!(
             ROOT_SYSTEM_PROMPT.contains("working, retrying, awaitingInput")
