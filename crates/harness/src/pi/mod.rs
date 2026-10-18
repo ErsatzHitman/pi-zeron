@@ -1514,7 +1514,7 @@ impl Runner {
             // Hold the next submission until the compaction ends. The
             // answer tells whether it already has (its end frame may have
             // come first), so a missed end cannot hold the queue for good.
-            self.compaction.sync(Some(true), compact::unix_millis());
+            self.compaction.refused_prompt(compact::unix_millis());
             self.publish_compact();
             let id = self
                 .process
