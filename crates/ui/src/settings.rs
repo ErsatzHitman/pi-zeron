@@ -983,6 +983,9 @@ pub struct UiSettings {
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
+    /// Whether returning to a chat after being away writes an automatic recap
+    /// (`/recap` always works). Device-local, on by default.
+    pub recap_enabled: bool,
     /// The Settings section last viewed. ⌘, / Ctrl+,, the footer gear and the
     /// palette reopen it; links naming a section replace it. Files without
     /// it, or with a name this build does not know, open on General.
@@ -1141,6 +1144,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
+            recap_enabled: true,
             settings_section: crate::shell::SettingsSection::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
             skills_in_slash_menu: false,
@@ -1835,6 +1839,7 @@ impl UiSettings {
             appshot_sound_enabled,
             appshot_destination,
             escape_stops_active_agent,
+            recap_enabled,
             settings_section,
             appearance,
             git_history_columns,
@@ -2892,6 +2897,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             escape_stops_active_agent: true,
+            recap_enabled: false,
             settings_section: crate::shell::SettingsSection::Shortcuts,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             skills_in_slash_menu: true,
@@ -2978,6 +2984,7 @@ mod tests {
         settings.save(dir.path()).unwrap();
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(json.contains(r#""diffWrap": true"#));
+        assert!(json.contains(r#""recapEnabled": false"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));
@@ -3533,6 +3540,7 @@ mod tests {
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
         assert!(!d.escape_stops_active_agent);
+        assert!(d.recap_enabled, "automatic recaps are on by default");
     }
 
     #[test]

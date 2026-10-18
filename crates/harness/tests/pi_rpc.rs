@@ -1223,7 +1223,10 @@ async fn recap_run_uses_recap_instructions_in_a_bare_process() {
     );
     assert!(matches!(
         events.last(),
-        Some(AgentEvent::Done { status: DoneStatus::Completed, .. })
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
     ));
 }
 

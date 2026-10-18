@@ -264,7 +264,7 @@ Subagents, workflow agents and the advisor run Pi with `--no-session`, and many 
 
   From T0 on, these are ignored, because the ledger has the calls themselves.
 - **Summaries:** a compaction or branch summary is credited to the model of the session's latest assistant message, since Pi stores its usage without one.
-- **Zeron's own title runs** load the ledger extension by name and are labelled `zeron-titles`.
+- **Zeron's own title runs** load the ledger extension by name and are labelled `zeron-titles`. Recap runs are the same kind of process, labelled `zeron-recap`.
 - **Not counted:**
   - non-Pi harness chats, which bill their own accounts;
   - model calls inside third-party MCP servers;

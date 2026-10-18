@@ -859,6 +859,8 @@ pub struct AppState {
     /// Changes only when transcript/optimistic content changes. Presence,
     /// catalogs and other app-state notifications need no row derivation.
     pub(crate) transcript_revision: u64,
+    /// Recaps for returning readers (see [`crate::recap`]).
+    pub(crate) recaps: crate::recap::RecapStore,
     /// Changes whenever an input of [`Self::file_link_roots`] does — chat
     /// rows, projects, this device's id — so views can memoize the roots.
     pub(crate) link_roots_revision: u64,
@@ -990,6 +992,7 @@ impl AppState {
             transcript_cache: Default::default(),
             prepared_transcripts: HashMap::new(),
             transcript_revision: 0,
+            recaps: Default::default(),
             link_roots_revision: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
@@ -2968,6 +2971,7 @@ impl AppState {
         if self.selected_chat == chat_id {
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
+                self.note_chat_opened(&id);
                 self.mark_chat_seen(&id, cx);
             }
             return;
@@ -2985,6 +2989,15 @@ impl AppState {
             .position(|cached| Some(&cached.chat_id) == chat_id.as_ref())
             .and_then(|index| self.transcript_cache.remove(index));
         if let Some(previous) = &self.selected_chat {
+            // What the person saw of the chat they are leaving, before its
+            // transcript is cached away.
+            if self.transcript_replayed {
+                self.recaps.note_left(
+                    previous,
+                    Utc::now(),
+                    zeron_doc::recap::recap_key(&self.transcript),
+                );
+            }
             let old_baseline = self.transcript_baselines.remove(previous);
             cx.background_executor()
                 .spawn(async move {
@@ -3082,6 +3095,7 @@ impl AppState {
                     }
                 }
             }
+            self.note_chat_opened(id);
             self.mark_chat_seen(id, cx);
         }
         if let Some(chat_id) = chat_id {

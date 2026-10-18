@@ -13844,6 +13844,14 @@ impl Render for Shell {
                 WorkspaceCommand::Stop => {
                     self.composer.update(cx, |c, cx| c.interrupt_selected(cx))
                 }
+                // A side chat's composer forwards its commands here too, so
+                // /recap typed there recaps the main conversation, like
+                // /rename and /stop act on it.
+                WorkspaceCommand::Recap if !self.active_chat.is_empty() => {
+                    let chat_id = self.active_chat.clone();
+                    self.state
+                        .update(cx, |state, cx| state.request_recap(&chat_id, true, cx))
+                }
                 _ => {}
             }
         }
@@ -13996,6 +14004,18 @@ impl Render for Shell {
                 window,
                 |this: &mut Shell, window, cx| {
                     motion::window_activation_changed(window.is_window_active(), cx);
+                    // A recap is owed for time spent away: remember what the
+                    // selected chat looked like when the window left.
+                    let now = chrono::Utc::now();
+                    let active = window.is_window_active();
+                    this.state.update(cx, |state, _| {
+                        if active {
+                            state.note_window_returned();
+                        } else {
+                            state.note_window_blurred(now);
+                        }
+                    });
+                    cx.notify();
                     if window.is_window_active()
                         && let Some(update) = crate::app_update::AppUpdate::global(cx)
                     {
@@ -14309,6 +14329,14 @@ impl Render for Shell {
                     self.state.update(cx, |s, cx| s.probe_sync(cx));
                 }
                 self.was_window_active = window_active;
+                // Before the selected chat is marked seen below: a recap for
+                // the time away is decided against what was unseen.
+                if self.state.read(cx).recaps.pending().is_some() {
+                    let enabled = settings::current(cx).recap_enabled;
+                    self.state.update(cx, |state, cx| {
+                        state.recap_tick(chrono::Utc::now(), enabled, cx)
+                    });
+                }
                 // A run finishing while you're LOOKING at the session must not
                 // badge "completed" until you leave and return — mark it seen
                 // live while the window is active (idempotent guard inside;

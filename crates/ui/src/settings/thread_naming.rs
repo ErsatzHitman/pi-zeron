@@ -1,5 +1,6 @@
 //! Settings → General → Thread naming: which agent and model title new
 //! threads, chosen with the composer's own model picker (title-bound mode).
+//! The same model writes recaps, so their switch lives here too.
 
 use gpui::{AnyElement, Context, Entity, Subscription, Task, div, prelude::*, px};
 use zeron_engine::registry::TitleSettings;
@@ -139,10 +140,11 @@ impl Render for ThreadNamingCard {
                 .into_any_element(),
         };
         let description = if follows_session {
-            "Each thread is named by its own agent."
+            "Each thread is named by its own agent. Recaps use the same model."
         } else {
-            "A small model keeps titles fast and cheap."
+            "A small model keeps titles fast and cheap. Recaps use the same model."
         };
+        let recap_enabled = crate::settings::current(cx).recap_enabled;
         widgets::section_card(&theme)
             .child(
                 widgets::card_row(&theme, true)
@@ -157,6 +159,49 @@ impl Render for ThreadNamingCard {
                             )),
                     )
                     .child(control),
+            )
+            .child(
+                widgets::card_row(&theme, false)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.0))
+                            .child(widgets::row_title(&theme, "Recap when you return"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![
+                                    div()
+                                        .child(
+                                            "A short summary after time away, while the agent \
+                                             worked. /recap writes one any time.",
+                                        )
+                                        .into_any_element(),
+                                ],
+                            )),
+                    )
+                    .child(
+                        widgets::toggle_switch(&theme, recap_enabled, "recap-enabled")
+                            .id("recap-enabled-toggle")
+                            .debug_selector(|| "recap-enabled-toggle".into())
+                            .tab_index(0)
+                            .role(gpui::Role::Switch)
+                            .aria_label("Recap when you return")
+                            .aria_toggled(if recap_enabled {
+                                gpui::Toggled::True
+                            } else {
+                                gpui::Toggled::False
+                            })
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                crate::settings::update(
+                                    crate::settings::SavePolicy::Immediate,
+                                    cx,
+                                    |settings| settings.recap_enabled = !recap_enabled,
+                                );
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 }
