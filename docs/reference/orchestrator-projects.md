@@ -58,11 +58,22 @@ When a session of the tree finishes a turn, fails or asks a question, its
 parent is told automatically with a short note (child id, title, status, the
 tail of its last reply, and its pending question). Outcomes arriving within
 about 2 seconds share one note. An idle (or errored) parent is woken with a
-new turn; a parent waiting on an answer gets the note held until its turn
-ends; a working parent gets nothing (it sees the outcome through
-`zeron_wait_for_turns` / `zeron_list_chats`, which keep working). Nothing is
-sent while the project is paused or to an archived parent, and a tree gets at
-most 20 pushes per rolling hour. `ZERON_PARENT_NOTIFY=0` turns it off.
+new turn. A working parent gets the note through its message queue, like a
+message the user typed: a steerable Pi turn takes it at its next step, any
+other turn starts it when the turn ends. A parent waiting on an answer gets
+the note queued behind the question. A root the user stopped is not restarted:
+the note waits in its queue until the user sends something. The note can
+repeat a child the parent already took from `zeron_wait_for_turns`, which the
+note tells it to ignore.
+
+Delivery is at least once. A turn counts as announced only after the note
+reached the parent; a failed hand-off is retried (2, 4, 8, 16, then 32 seconds)
+and, when the 20-per-hour budget is spent or a note is too long to name every
+child, the remaining children go out in a later note instead of being
+dropped. Nothing is sent while the project is paused or to an archived parent,
+and a tree gets at most 20 pushes per rolling hour. The batch window and retry
+state live in memory, so an engine restart forgets them.
+`ZERON_PARENT_NOTIFY=0` turns it off.
 
 The memory and update tools work only from the root; a member reports what
 should change in its final reply.

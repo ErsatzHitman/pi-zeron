@@ -687,6 +687,33 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// The user messages the harness never took up, oldest first, as
+    /// `(message id, first text part)`: those after the last user entry that
+    /// has a harness ref. Pi stamps each message as it consumes it, so after
+    /// a crash these are the sends that show in the transcript but never
+    /// reached the model. Empty when no user entry has a ref (a harness that
+    /// records none, or nothing consumed yet); callers then fall back to the
+    /// last user message.
+    pub fn unconsumed_user_entries(&self) -> Result<Vec<(String, String)>, DocError> {
+        let entries = self.read_entries()?;
+        let Some(consumed) = entries
+            .iter()
+            .rposition(|e| e.role == MessageRole::User && self.harness_ref(&e.id).is_some())
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(entries[consumed + 1..]
+            .iter()
+            .filter(|e| e.role == MessageRole::User)
+            .filter_map(|e| {
+                e.parts.iter().find_map(|p| match p {
+                    MessagePart::Text { text, .. } => Some((e.id.clone(), text.clone())),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
     /// Delete the entry `message_id` and every entry after it, with their
     /// harness refs (a rewind). Returns how many entries went: 0 when no
     /// entry has that id.
@@ -1751,6 +1778,33 @@ mod tests {
             .import(&doc.doc().export(loro::ExportMode::Snapshot).unwrap())
             .unwrap();
         assert_eq!(peer.read_entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unconsumed_user_entries_follow_the_last_harness_ref() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        for id in ["u1", "u2", "u3"] {
+            doc.push_message(&user_entry(id, &format!("text {id}")))
+                .unwrap();
+        }
+        // No ref anywhere: a harness that records none.
+        assert!(doc.unconsumed_user_entries().unwrap().is_empty());
+        doc.set_harness_ref("u1", "ts:1").unwrap();
+        assert_eq!(
+            doc.unconsumed_user_entries().unwrap(),
+            [
+                ("u2".to_owned(), "text u2".to_owned()),
+                ("u3".to_owned(), "text u3".to_owned())
+            ],
+            "everything after the last consumed message, in order"
+        );
+        doc.set_harness_ref("u2", "ts:2").unwrap();
+        assert_eq!(
+            doc.unconsumed_user_entries().unwrap(),
+            [("u3".to_owned(), "text u3".to_owned())]
+        );
+        doc.set_harness_ref("u3", "ts:3").unwrap();
+        assert!(doc.unconsumed_user_entries().unwrap().is_empty());
     }
 
     #[test]

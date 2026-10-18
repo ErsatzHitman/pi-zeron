@@ -1241,8 +1241,19 @@ impl SessionsEngine {
         if accepted.is_none() {
             return Ok(SteerOutcome::DeferredByUpdate);
         }
-        let handle = self.doc_handle(chat_id)?;
-        handle.write_user_message(&user_id, prompt, issued_at.min(now_ms()))?;
+        // The mailbox owns the message from here on. A failed transcript write
+        // must not surface as an error: the caller would take the steer for
+        // undelivered and send it again (a duplicate for the model). The
+        // callers write the entry before this too, so it is usually there.
+        let written = self.doc_handle(chat_id).and_then(|handle| {
+            handle
+                .write_user_message(&user_id, prompt, issued_at.min(now_ms()))
+                .map_err(EngineError::from)
+        });
+        if let Err(err) = written {
+            tracing::warn!(chat = %chat_id, message = %user_id, error = %err,
+                "steered message accepted but its transcript write failed");
+        }
         // A routed steer is a turn too. Fired here (not only on the confirmed
         // path) — a reclaim falls back to dispatch, which just re-snapshots.
         if let Some(request) = self.last_request(chat_id) {
@@ -1471,6 +1482,11 @@ impl SessionsEngine {
                         })
                     })
             });
+            // A burst of steers can die with the run: Pi stamps each user
+            // message as it takes it up, so the ones after the last stamp
+            // are in the transcript but never reached the model. A harness
+            // that steers mid-turn gets all of them back, in order (below).
+            let unconsumed = handle.doc().unconsumed_user_entries().unwrap_or_default();
             let attempts = self.inner.journal.resume_attempts(&chat_id);
             // Fresh: the crashed reply's streaming entry is recent — or no
             // reply entry reached disk at all (the doc saves on a debounce,
@@ -1545,10 +1561,21 @@ impl SessionsEngine {
                     tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
                     return;
                 };
-                request.prompt = prompt_text;
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
                 let harness_id = host.harness_for_request(&chat_id, &request);
+                // The first unconsumed message restarts the turn, the rest
+                // steer it in behind. Without a mid-turn mailbox (or any
+                // stamp) it stays the last user message.
+                let mut followups = Vec::new();
+                let (user_id, prompt_text) =
+                    if sessions.steers_mid_turn(harness_id) && !unconsumed.is_empty() {
+                        followups = unconsumed;
+                        followups.remove(0)
+                    } else {
+                        (user_id, prompt_text)
+                    };
+                request.prompt = prompt_text;
                 match host
                     .dispatch_with_source_context(
                         &sessions,
@@ -1563,7 +1590,19 @@ impl SessionsEngine {
                         tracing::info!(chat = %chat_id, attempt, "auto-resumed crashed run")
                     }
                     Err(err) => {
-                        tracing::warn!(chat = %chat_id, error = %err, "auto-resume dispatch failed")
+                        tracing::warn!(chat = %chat_id, error = %err, "auto-resume dispatch failed");
+                        return;
+                    }
+                }
+                // Same ids as the transcript entries, so a steer that lands
+                // twice writes nothing twice.
+                for (id, text) in followups {
+                    match sessions.steer(&chat_id, &text, Some(id.clone())).await {
+                        Ok(SteerOutcome::Accepted) => {}
+                        Ok(outcome) => tracing::warn!(chat = %chat_id, message = %id, ?outcome,
+                            "auto-resume could not re-send an unconsumed message"),
+                        Err(err) => tracing::warn!(chat = %chat_id, message = %id, error = %err,
+                            "auto-resume could not re-send an unconsumed message"),
                     }
                 }
             });

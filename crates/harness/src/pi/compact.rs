@@ -60,6 +60,23 @@ impl Compaction {
         }
     }
 
+    /// A compaction is running that makes Pi refuse prompts: a manual one
+    /// (`ctx.compact()`, the `compact` command), or one `get_state` reported
+    /// without saying why. Pi's automatic compactions (`threshold`,
+    /// `overflow`) take prompts and steers.
+    pub fn refuses_prompts(&self) -> bool {
+        self.started_ms.is_some()
+            && !matches!(self.reason.as_deref(), Some("threshold" | "overflow"))
+    }
+
+    /// Pi refused a prompt for a running compaction, whatever reason the
+    /// start frame gave: hold prompts until the end frame (or a `get_state`
+    /// that says it is over), so a resend cannot spin against the refusal.
+    pub fn refused_prompt(&mut self, now_ms: u64) {
+        self.started_ms.get_or_insert(now_ms);
+        self.reason = None;
+    }
+
     pub fn status(&self, enabled: bool, threshold_tokens: Option<u64>) -> CompactStatus {
         CompactStatus {
             enabled,
@@ -143,6 +160,38 @@ mod tests {
         assert!(!status.compacting);
         assert_eq!(status.error, None);
         assert_eq!(status.tokens_after, None);
+    }
+
+    #[test]
+    fn only_a_manual_or_unexplained_compaction_refuses_prompts() {
+        let mut compaction = Compaction::default();
+        assert!(!compaction.refuses_prompts());
+        compaction.frame(&json!({"type":"compaction_start","reason":"manual"}), 1);
+        assert!(compaction.refuses_prompts());
+        compaction.frame(&json!({"type":"compaction_end"}), 2);
+        assert!(!compaction.refuses_prompts());
+        // Pi's own threshold and overflow compactions keep queued steers.
+        for reason in ["threshold", "overflow"] {
+            compaction.frame(&json!({"type":"compaction_start","reason":reason}), 3);
+            assert!(!compaction.refuses_prompts(), "{reason}");
+        }
+        // get_state says one is running but not why: hold off.
+        let mut unexplained = Compaction::default();
+        unexplained.sync(Some(true), 4);
+        assert!(unexplained.refuses_prompts());
+        unexplained.sync(Some(false), 5);
+        assert!(!unexplained.refuses_prompts());
+        // Pi refused a prompt during a threshold compaction anyway: hold.
+        compaction.frame(&json!({"type":"compaction_start","reason":"threshold"}), 6);
+        compaction.refused_prompt(7);
+        assert!(compaction.refuses_prompts());
+        compaction.frame(&json!({"type":"compaction_end"}), 8);
+        assert!(!compaction.refuses_prompts());
+        // The refusal can beat the start frame.
+        compaction.refused_prompt(9);
+        assert!(compaction.refuses_prompts());
+        compaction.sync(Some(false), 10);
+        assert!(!compaction.refuses_prompts());
     }
 
     #[test]

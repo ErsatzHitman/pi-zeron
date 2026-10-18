@@ -869,6 +869,179 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     core.shutdown().await;
 }
 
+/// A steerable harness whose turn never ends: it logs the opening prompt,
+/// then every prompt steered in behind it.
+struct SteerRecorder {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Harness for SteerRecorder {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "SteerRecorder"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.log.lock().unwrap().push(request.prompt.clone());
+        let log = self.log.clone();
+        let started = AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: request.cwd.clone(),
+            session_id: "hs-steer".into(),
+            assistant_message_id: "a-steer".into(),
+        };
+        let steered = futures::stream::unfold(controls.steering, move |mut steering| {
+            let log = log.clone();
+            async move {
+                let message = steering.recv().await?;
+                log.lock().unwrap().push(message.prompt);
+                let steered = AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()),
+                };
+                Some((Ok::<_, HarnessError>(steered), steering))
+            }
+        });
+        Ok(futures::stream::iter(vec![Ok(started)])
+            .chain(steered)
+            .boxed())
+    }
+}
+
+fn user_entry(id: &str, text: &str, created_at: i64) -> SessionMessageEntry {
+    SessionMessageEntry {
+        id: id.into(),
+        role: MessageRole::User,
+        parts: vec![MessagePart::Text {
+            id: "t0".into(),
+            text: text.into(),
+        }],
+        created_at,
+        device_id: "dev-crash".into(),
+        status: Some(MessageStatus::Complete),
+        continuation_of: None,
+        duration_ms: None,
+    }
+}
+
+/// A burst of steers died with the run: the model took up the first message
+/// (Pi stamped it), the next two are in the transcript but were never
+/// consumed. Recovery sends each of them again, in order, and the consumed
+/// one never.
+#[tokio::test]
+async fn a_crash_redispatches_every_unconsumed_steered_message_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    {
+        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&user_entry("msg-user-1", "first", now - 60_000))
+            .unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-assistant-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "partial…".into(),
+            }],
+            created_at: now - 50_000,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+        doc.push_message(&user_entry("msg-user-2", "second", now - 40_000))
+            .unwrap();
+        doc.push_message(&user_entry("msg-user-3", "third", now - 30_000))
+            .unwrap();
+        doc.set_harness_ref("msg-user-1", "ts:1").unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+
+        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-crash".into(),
+                    assistant_message_id: "msg-assistant-1".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(SteerRecorder { log: log.clone() }));
+    let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles");
+
+    // An auto-title request may also reach the harness; only the user
+    // messages matter here.
+    let sent = |log: &Arc<Mutex<Vec<String>>>| -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|p| matches!(p.as_str(), "first" | "second" | "third"))
+            .cloned()
+            .collect()
+    };
+    wait_for(
+        || sent(&log).len() >= 2,
+        "both unconsumed messages to reach the harness",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        sent(&log),
+        ["second", "third"],
+        "the first restarts the turn, the second steers in behind it"
+    );
+    let ids: Vec<String> = entries_now(&core)
+        .into_iter()
+        .filter(|e| e.role == MessageRole::User)
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(
+        ids,
+        ["msg-user-1", "msg-user-2", "msg-user-3"],
+        "re-sending reuses the transcript entries"
+    );
+    core.shutdown().await;
+}
+
 /// A kill moments into a turn: the journal shows the run, but the doc's
 /// debounced save never stored a reply entry, so the user's message is the
 /// transcript's last word. That is a crashed turn too — it is picked back
