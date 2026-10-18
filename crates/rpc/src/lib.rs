@@ -203,6 +203,16 @@ pub mod methods {
     pub const SEARCH_HOME_FOLDERS: &str = "SearchHomeFolders";
     /// The new-project picker closed: drop the host's home index if unpinned.
     pub const RELEASE_HOME_FOLDER_SEARCH: &str = "ReleaseHomeFolderSearch";
+    /// Register an existing folder as a project on the host
+    /// (`{ query, name?, dryRun? }`): `query` is a path or a short name like
+    /// `t3code`. -> `{ space, created, candidates }`. Forwardable: it
+    /// resolves folders on the device that owns them.
+    pub const REGISTER_PROJECT: &str = "RegisterProject";
+    /// Can a writer start in this checkout and see its CI (`{ cwd, branch?,
+    /// force? }`): push permission, token scopes, workflows that run for the
+    /// branch, runner availability -> `GithubPreflight`. Forwardable: the
+    /// checkout and its credentials are on the host.
+    pub const GITHUB_PREFLIGHT: &str = "GithubPreflight";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     // Device-local workspace filesystem operations. All are relay-forwardable;
@@ -285,6 +295,11 @@ pub mod methods {
     /// The project of the orchestrator tree `chatId` is in (any of its
     /// chats) -> `{ project, memory }`. Local only: the registry syncs it.
     pub const GET_ORCHESTRATOR_PROJECT: &str = "GetOrchestratorProject";
+    /// What the orchestrator tree `chatId` is in has spent on this device
+    /// since its policy's budget began (`{ chatId }`) -> `{ spentUsd,
+    /// requests, unpricedRequests, sinceMs, capCents, complete }`. Local only:
+    /// each device counts the sessions it ran.
+    pub const GET_TREE_SPEND: &str = "GetTreeSpend";
     /// Read-only merge preview of a member chat's worktree branch against the
     /// lead branch (`{ chatId: root, member: chat id, base? }`) -> `MergePreview`.
     /// Never modifies a tree or ref.
