@@ -2995,7 +2995,7 @@ impl AppState {
                 self.recaps.note_left(
                     previous,
                     Utc::now(),
-                    zeron_doc::recap::recap_key(&self.transcript),
+                    crate::recap::seen_key(&self.transcript),
                 );
             }
             let old_baseline = self.transcript_baselines.remove(previous);

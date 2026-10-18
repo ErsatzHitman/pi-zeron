@@ -8510,8 +8510,6 @@ impl Transcript {
         )
     }
 
-    /// The hover strip's rewind action: an icon that opens a three-item menu
-    /// (code and conversation, conversation, code).
     /// The "※ Recap" block: no card, a dim header and up to three dim plain
     /// lines, with a close button that appears on hover or keyboard focus.
     fn render_recap(
@@ -8591,6 +8589,8 @@ impl Transcript {
             .into_any_element()
     }
 
+    /// The hover strip's rewind action: an icon that opens a three-item menu
+    /// (code and conversation, conversation, code).
     fn render_rewind_button(
         &self,
         entry_id: &SharedString,

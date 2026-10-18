@@ -123,6 +123,17 @@ pub(crate) struct AutoInputs<'a> {
     pub existing: Option<&'a RecapPhase>,
 }
 
+/// The transcript state a person leaves behind. A reply still streaming at
+/// that moment is not "seen": it settling while they are away is exactly the
+/// work a recap covers, even when it gains no new part, so the key names the
+/// entry before it.
+pub(crate) fn seen_key(entries: &[SessionMessageEntry]) -> Option<RecapKey> {
+    match entries.split_last() {
+        Some((last, rest)) if last.status == Some(MessageStatus::Streaming) => recap_key(rest),
+        _ => recap_key(entries),
+    }
+}
+
 fn settled_assistant(entry: &SessionMessageEntry) -> bool {
     entry.role == MessageRole::Assistant && entry.status != Some(MessageStatus::Streaming)
 }
@@ -465,7 +476,7 @@ impl AppState {
         if let Some(chat_id) = self.selected_chat.clone()
             && self.transcript_replayed
         {
-            let key = recap_key(&self.transcript);
+            let key = seen_key(&self.transcript);
             self.recaps.note_left(&chat_id, now, key);
         }
     }
@@ -886,6 +897,20 @@ mod tests {
         // The remembered entry is gone (rewind): judge by what is there.
         let rewound = transcript(2);
         assert!(new_settled_assistant_work(&rewound, Some(&seen), false));
+    }
+
+    #[test]
+    fn a_reply_settling_while_away_is_new_work() {
+        let mut entries = transcript(4);
+        entries[3].status = Some(MessageStatus::Streaming);
+        let seen = seen_key(&entries).unwrap();
+        assert_eq!(seen.last_entry_id, "e2", "the streaming reply was not seen");
+        // The same single-part reply finishing, with nothing else added.
+        entries[3].status = Some(MessageStatus::Complete);
+        assert!(new_settled_assistant_work(&entries, Some(&seen), false));
+        // A settled tail is seen as it is.
+        assert_eq!(seen_key(&entries), recap_key(&entries));
+        assert_eq!(seen_key(&[]), None);
     }
 
     #[test]
