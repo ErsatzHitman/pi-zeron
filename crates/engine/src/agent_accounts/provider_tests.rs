@@ -1299,7 +1299,7 @@ async fn every_opencode_go_key_is_a_row_with_its_own_usage() {
         assert!(!row.email.as_deref().unwrap().contains("secret"), "masked");
     }
     assert!(go[0].email.as_deref().unwrap().starts_with("main · "));
-    assert_eq!(server.hits("/zen/go/v1/usage"), 3);
+    assert_eq!(server.hits("GET /zen/go/v1/usage"), 3);
     // The cache keeps windows and digests, never a key.
     let cache = std::fs::read_to_string(config.usage_cache_file()).unwrap();
     assert!(!cache.contains("sk-go-secret"), "{cache}");
