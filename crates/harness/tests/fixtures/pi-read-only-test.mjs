@@ -41,7 +41,7 @@ for (const [name, input] of [['write', {path: 'a', content: 'x'}], ['edit', {pat
   ['zeron_create_chat', {}], ['zeron_archive_chat', {}], ['zeron_respond_to_input', {}],
   ['mcp__fs__write_file', {}], ['apply_patch', {}], ['memory_save', {}], ['run_command', {}], ['git_commit', {}],
   ['subagent_start', {tasks: [{task: 'x', writeAccess: true}]}], ['subagent_start', {tasks: [{task: 'a'}, {task: 'b', writeAccess: true}]}],
-  ['subagent_start', {tasks: [{task: 'x', writeAccess: 'yes'}]}], ['workflow', {}], ['workflow_script', {}]])
+  ['subagent_start', {tasks: [{task: 'x', writeAccess: 'yes'}]}], ['subagent_start', {}], ['subagent_start', {tasks: [null]}], ['workflow', {}], ['workflow_script', {}]])
   check(`tool: ${name}`, call(name, input), true);
 for (const [name, input] of [['read', {path: 'a'}], ['grep', {}], ['find', {}], ['ls', {}], ['bash', {command: 'git status'}],
   ['zeron_list_chats', {}], ['zeron_read_chat', {}], ['zeron_show_visual', {}], ['web_search', {query: 'rust 2024'}],

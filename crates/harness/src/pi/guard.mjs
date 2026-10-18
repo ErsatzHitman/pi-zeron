@@ -523,17 +523,19 @@ const RO_ZERON_TOOLS = new Set(["zeron_board_post", "zeron_board_read", "zeron_s
 // A read-only session researches through sub-agents, so subagent_start passes
 // when every task only reads (writeAccess absent or false; the sub-agents
 // inherit the flag through env and are held to it as well). Anything else
-// fails closed, a string "true" included. Workflow agents run in-process with
-// tools outside this guard, so starting one is refused.
+// fails closed, a string "true" included, and so does a call with no task list
+// to read. Workflow agents run in-process with tools outside this guard, so
+// starting one is refused.
 export const launchWrites = (input) =>
-  Array.isArray(input?.tasks) && input.tasks.some((t) => t && typeof t === "object" && t.writeAccess !== undefined && t.writeAccess !== false);
+  !Array.isArray(input?.tasks) ||
+  input.tasks.some((t) => !t || typeof t !== "object" || (t.writeAccess !== undefined && t.writeAccess !== false));
 const RO_WORKFLOW_TOOLS = new Set(["workflow", "workflow_script"]);
 
 export function classifyReadOnly({ toolName, input = {}, annotations }) {
   if (READONLY_TOOLS.has(toolName) || RO_ZERON_TOOLS.has(toolName)) return;
   if (toolName === "write" || toolName === "edit") return hit("ro-edit", `${toolName} changes files`);
   if (toolName === "subagent_start")
-    return launchWrites(input) ? hit("ro-subagent-writer", "subagent_start with writeAccess: a read-only session starts sub-agents that only read") : undefined;
+    return launchWrites(input) ? hit("ro-subagent-writer", "subagent_start must list tasks that all leave writeAccess false: a read-only session starts sub-agents that only read") : undefined;
   if (RO_WORKFLOW_TOOLS.has(toolName))
     return hit("ro-workflow", "workflow agents can write: a read-only session researches with subagent_start (writeAccess false)");
   if (SHELL_TOOLS.has(toolName)) return shellWrites(String(input.command ?? ""), toolName === "bash" ? "posix" : "ps");
