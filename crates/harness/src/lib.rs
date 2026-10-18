@@ -457,23 +457,14 @@ impl StderrTail {
     }
 }
 
-/// "exit code 137" / "signal 9 (killed)" / "unknown" — the status half of a
-/// crash message, from a `try_wait` result after the stream ended.
+/// "exit code 23" / "killed by SIGKILL (signal 9), likely out of memory" /
+/// "unknown exit" — the status half of a crash message, from a `try_wait`
+/// result after the stream ended.
 pub(crate) fn describe_exit(status: Option<std::process::ExitStatus>) -> String {
-    let Some(status) = status else {
-        return "still running".into();
-    };
-    if let Some(code) = status.code() {
-        return format!("exit code {code}");
+    match status {
+        Some(status) => process::exit::Termination::of(status).explain(None),
+        None => "still running".into(),
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return format!("killed by signal {signal}");
-        }
-    }
-    "unknown exit".into()
 }
 
 /// Remove recognizable credentials at the boundary where diagnostics become UI text.
@@ -538,13 +529,38 @@ fn crash_diagnostics_redact_credentials_but_keep_context() {
     assert!(!message.contains("secret-one"));
 }
 
+#[cfg(all(test, unix))]
+#[test]
+fn crash_message_names_the_signal_and_keeps_the_stderr_tail_redacted() {
+    use std::os::unix::process::ExitStatusExt;
+    let tail = StderrTail::default();
+    tail.push("heap out of memory Bearer secret-token");
+    let message = crash_message("Pi", Some(std::process::ExitStatus::from_raw(9)), &tail);
+    assert!(
+        message.starts_with(
+            "Pi exited unexpectedly (killed by SIGKILL (signal 9), likely out of memory"
+        ),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("heap out of memory Bearer [REDACTED]"),
+        "{message}"
+    );
+    assert!(!message.contains("secret-token"));
+}
+
 /// The full crash message: status plus the stderr tail when there is one.
 pub(crate) fn crash_message(
     name: &str,
     status: Option<std::process::ExitStatus>,
     stderr: &StderrTail,
 ) -> String {
-    let status = describe_exit(status);
+    crash_message_with(name, &describe_exit(status), stderr)
+}
+
+/// [`crash_message`] with the status half already worded, for a caller that
+/// knows more than the exit status (Pi checks whether the OOM killer fired).
+pub(crate) fn crash_message_with(name: &str, status: &str, stderr: &StderrTail) -> String {
     match stderr.snapshot() {
         Some(tail) => format!(
             "{name} exited unexpectedly ({status}): {}",
