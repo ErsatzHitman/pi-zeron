@@ -3166,6 +3166,13 @@ mod tests {
                     ))
                 }
                 methods::REGISTER_PROJECT => {
+                    // Like the engine, only a folder that exists registers.
+                    if params["query"] != "t3code" {
+                        return Err(RpcError::Failed(format!(
+                            "no folder named {} on this device",
+                            params["query"]
+                        )));
+                    }
                     self.writes
                         .lock()
                         .unwrap()

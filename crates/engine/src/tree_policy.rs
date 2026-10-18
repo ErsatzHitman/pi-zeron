@@ -181,6 +181,11 @@ pub(crate) struct Stage {
     since_ms: i64,
     warned: bool,
     halted: bool,
+    /// The project has been seen paused since the halt: only its resume
+    /// (paused, then not) lets the cap halt it again, not a read that comes
+    /// before the pause lands.
+    #[serde(default)]
+    paused_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +210,10 @@ pub(crate) fn decide(stage: &mut Stage, project: &OrchestratorProject, spent_usd
         };
     }
     // Resumed: the cap can pause it again.
-    if !project.paused {
+    if project.paused {
+        stage.paused_seen = true;
+    } else if stage.paused_seen {
+        stage.paused_seen = false;
         stage.halted = false;
     }
     let spent = spent_usd * 100.0;

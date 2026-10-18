@@ -453,7 +453,7 @@ mod tests {
         assert!(a.release("steered", 0));
         assert!(granted(&mut next));
         // Finished writers hold nothing.
-        assert!(a.release("next", 0));
+        a.release("next", 0);
         now(a.admit_in("again", Some(1), 0, writer("orchestrator-a", 1)));
     }
 

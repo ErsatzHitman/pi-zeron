@@ -3038,8 +3038,9 @@ pub(crate) fn find_project_folders(
     // 3. Beside the projects it has.
     for parent in &parents {
         search.searched.push(folder_browser_path(parent));
-        let place = parent.join(query);
-        if is_dir(&place) && unsafe_project_root(&place, home).is_none() {
+        if let Some(place) = child_folder(parent, query)
+            && unsafe_project_root(&place, home).is_none()
+        {
             add(&mut search, &place, "sibling");
         }
     }
@@ -3056,12 +3057,33 @@ pub(crate) fn find_project_folders(
             continue;
         }
         search.searched.push(folder_browser_path(&root));
-        let place = root.join(query);
-        if is_dir(&place) && unsafe_project_root(&place, home).is_none() {
+        if let Some(place) = child_folder(&root, query)
+            && unsafe_project_root(&place, home).is_none()
+        {
             add(&mut search, &place, source);
         }
     }
     Ok(search)
+}
+
+/// The folder in `dir` named `name`, ignoring case (as the name's own match
+/// does), also on a file system that does not: an exact name first, else the
+/// one entry whose name differs only in case.
+fn child_folder(dir: &Path, name: &str) -> Option<PathBuf> {
+    let is_dir = |path: &Path| std::fs::metadata(path).is_ok_and(|meta| meta.is_dir());
+    let exact = dir.join(name);
+    if is_dir(&exact) {
+        return Some(exact);
+    }
+    let wanted = name.to_lowercase();
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_string_lossy().to_lowercase() == wanted
+                && is_dir(&entry.path())
+        })
+        .map(|entry| entry.path())
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
