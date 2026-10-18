@@ -61,6 +61,10 @@ pub(super) struct ChildNote {
     pub completed: bool,
     /// De-dup key: the completed turn's entry id, else status + time.
     pub turn_key: String,
+    /// Why the child's runtime was lost (its process died, or the engine
+    /// stopped under it), when that rather than the turn's own error is the
+    /// outcome.
+    pub lost: Option<String>,
 }
 
 #[derive(Default)]
@@ -200,6 +204,38 @@ impl Inner {
         {
             return;
         }
+        self.queue_child_note(chat_id, status, completed_turn.map(str::to_owned), None);
+    }
+
+    /// A child whose runtime was lost while it sat parked: its status goes
+    /// Idle to Errored, which is no outcome to [`is_outcome`] (a settle needs
+    /// a Working turn before it), yet the work it held died with it and its
+    /// parent is waiting on that work. Told the same way, with the cause.
+    pub(super) fn parent_notifier_lost(&self, chat_id: &str, cause: &str) {
+        if !self.parent_notifier.enabled()
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            || chat_id.starts_with(zeron_proto::BTW_CHAT_PREFIX)
+        {
+            return;
+        }
+        self.queue_child_note(
+            chat_id,
+            SessionStatus::Errored,
+            None,
+            Some(cause.to_owned()),
+        );
+    }
+
+    /// Queue the note for `chat_id`'s parent and schedule the batch's flush.
+    fn queue_child_note(
+        &self,
+        chat_id: &str,
+        status: SessionStatus,
+        completed_turn: Option<String>,
+        lost: Option<String>,
+    ) {
         let Some(ws) = self.workspace() else {
             return;
         };
@@ -218,14 +254,14 @@ impl Inner {
         if archived(chat_id) || archived(&parent) || ws.orchestrator_project(&root).paused {
             return;
         }
-        let turn_key = completed_turn
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{status:?}@{}", now_ms()));
+        let completed = completed_turn.is_some();
+        let turn_key = completed_turn.unwrap_or_else(|| format!("{status:?}@{}", now_ms()));
         let note = ChildNote {
             child_id: chat_id.to_owned(),
             status,
-            completed: completed_turn.is_some(),
+            completed,
             turn_key,
+            lost,
         };
         match self.parent_notifier.queue(&parent, note) {
             Some(true) => {}
@@ -334,7 +370,7 @@ struct ChildReport {
     outcome: &'static str,
     /// Tail source: the child's assistant text since the user's last message.
     reply: String,
-    /// The error text of a failed turn.
+    /// The error text of a failed turn, or why its runtime was lost.
     error: Option<String>,
     /// The open question(s) of a child that asks for input.
     question: Option<String>,
@@ -353,6 +389,7 @@ fn child_report(host: &DocHost, note: &ChildNote) -> ChildReport {
         .unwrap_or_default();
     let (reply, error, question) = read_turn(&entries);
     let outcome = match (note.status, note.completed) {
+        (SessionStatus::Errored, _) if note.lost.is_some() => "failed (process lost)",
         (SessionStatus::Errored, _) => "failed",
         (SessionStatus::AwaitingInput, _) => "awaiting input",
         (_, true) => "completed",
@@ -364,7 +401,7 @@ fn child_report(host: &DocHost, note: &ChildNote) -> ChildReport {
         outcome,
         reply,
         error: (note.status == SessionStatus::Errored)
-            .then_some(error)
+            .then(|| note.lost.clone().or(error))
             .flatten(),
         question: (note.status == SessionStatus::AwaitingInput)
             .then_some(question)
@@ -618,6 +655,25 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_runtime_reads_as_a_failed_process_with_its_cause() {
+        let mut lost = note("c", "t");
+        lost.status = SessionStatus::Errored;
+        lost.completed = false;
+        lost.lost = Some("Pi exited unexpectedly (killed by SIGKILL (signal 9))".into());
+        let lost_report = ChildReport {
+            child_id: "c".into(),
+            title: None,
+            outcome: "failed (process lost)",
+            reply: String::new(),
+            error: lost.lost.clone(),
+            question: None,
+        };
+        let text = render_batch(&[lost_report]);
+        assert!(text.contains("(chat c): failed (process lost)"), "{text}");
+        assert!(text.contains("Error: Pi exited unexpectedly"), "{text}");
+    }
+
+    #[test]
     fn fence_outgrows_backticks_in_the_text() {
         let fenced = fenced("a ```` b");
         assert!(fenced.starts_with("`````\n"));
@@ -649,6 +705,7 @@ mod tests {
             status: SessionStatus::Idle,
             completed: true,
             turn_key: turn.into(),
+            lost: None,
         }
     }
 

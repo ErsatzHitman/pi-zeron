@@ -1437,6 +1437,13 @@ impl SessionsEngine {
     /// UP: a fresh crashed turn with revival budget left is re-dispatched against
     /// the remembered harness session (zeron: "not just eulogized";
     /// `MAX_AUTO_RESUME` = 3 consecutive revivals, fresh = crashed < 12h ago).
+    ///
+    /// The turn is continued, never replayed: the revived run is told the
+    /// previous turn was interrupted and to check what it already did
+    /// ([`recovery_prompt`]), because a task that committed or pushed before
+    /// the crash must not be run again as if it were new. A tree an
+    /// orchestrator paused or stopped stays down, and a tree member that is
+    /// not resumed tells its parent instead of going quiet.
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
@@ -1456,9 +1463,8 @@ impl SessionsEngine {
                 self.inner
                     .remember_harness_session(&chat_id, &session_id, &cwd);
             }
-            // The revival prompt: the last user message (idempotent re-dispatch
-            // under the SAME id — `write_user_message` dedupes by id, so the
-            // transcript never shows a duplicate).
+            // The turn to continue: the last user message, quoted in the
+            // recovery notice the revived run starts from.
             let prompt = handle.doc().read_entries().ok().and_then(|entries| {
                 entries
                     .iter()
@@ -1489,23 +1495,51 @@ impl SessionsEngine {
                         .map(|e| now_ms() - e.created_at < RESUME_FRESH_MS)
                 })
                 .unwrap_or(false);
-            let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME;
+            // A paused or stopped tree stays down: nothing in it starts by itself.
+            let held = self.inner.tree_held(&chat_id);
+            let will_resume = fresh && prompt.is_some() && attempts < MAX_AUTO_RESUME && !held;
+            let not_resumed = if held {
+                "its orchestrator tree is paused or stopped"
+            } else if attempts >= MAX_AUTO_RESUME {
+                "recovery already revived it three times in a row"
+            } else {
+                "there is no recent turn to continue"
+            };
 
             let note = if will_resume {
-                "Run interrupted by engine restart — resuming"
+                "Run interrupted by engine restart — resuming".to_string()
             } else {
-                "Run interrupted by engine restart"
+                format!("Run interrupted by engine restart — not resumed: {not_resumed}")
             };
             let done = AgentEvent::Done {
                 status: DoneStatus::Interrupted,
                 result: None,
-                error: Some(note.into()),
+                error: Some(note.clone()),
                 session_id: None,
                 class: None,
             };
             self.inner.publish(&chat_id, &done);
-            let stamped = handle.mark_abandoned_streams(note)?.len();
-            self.set_status(&chat_id, SessionStatus::Idle, false);
+            let stamped = handle.mark_abandoned_streams(&note)?.len();
+            // A tree member whose recent turn will not be continued failed as
+            // far as its parent is concerned: Errored, and the parent is told.
+            let member_lost = fresh && !will_resume && !held && self.inner.in_tree(&chat_id);
+            self.set_status(
+                &chat_id,
+                if member_lost {
+                    SessionStatus::Errored
+                } else {
+                    SessionStatus::Idle
+                },
+                false,
+            );
+            if member_lost {
+                self.inner.parent_notifier_lost(
+                    &chat_id,
+                    &format!(
+                        "The engine stopped unexpectedly (a crash, an out-of-memory kill or a reboot) during this session's turn, and the turn was not resumed because {not_resumed}. Its work so far is in the worktree. Check git status before continuing."
+                    ),
+                );
+            }
             tracing::info!(chat = %chat_id, stamped, will_resume, attempts, "recovered stale session journal");
             recovered += 1;
 
@@ -1513,7 +1547,7 @@ impl SessionsEngine {
                 continue;
             }
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
-            let (user_id, prompt_text) = prompt.expect("gated by will_resume");
+            let (_, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();
             tokio::spawn(async move {
                 let Some(host) = sessions.inner.doc_host() else {
@@ -1545,17 +1579,19 @@ impl SessionsEngine {
                     tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
                     return;
                 };
-                request.prompt = prompt_text;
+                request.prompt = recovery_prompt(&prompt_text);
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
                 let harness_id = host.harness_for_request(&chat_id, &request);
+                // A NEW message: the notice is part of the transcript, and the
+                // original request stays the one entry the user sent.
                 match host
                     .dispatch_with_source_context(
                         &sessions,
                         &chat_id,
                         harness_id,
                         request,
-                        Some(user_id),
+                        Some(new_id()),
                     )
                     .await
                 {
@@ -1859,6 +1895,29 @@ impl Inner {
         }
     }
 
+    /// What a runtime that just died took with it, in words ("2 background
+    /// jobs and 1 sub-agent"): the work its session row still showed, or the
+    /// run's own sub-agent sinks. `None` when it held nothing (an idle Pi
+    /// nobody waited on dying is no loss).
+    fn lost_work(
+        &self,
+        chat_id: &str,
+        live_subagents: usize,
+        background_live: bool,
+    ) -> Option<String> {
+        let (jobs, agents) = lock(&self.statuses)
+            .get(chat_id)
+            .map_or((0, 0), |s| (s.background_jobs, s.running_subagents));
+        let agents = agents.max(u32::try_from(live_subagents).unwrap_or(u32::MAX));
+        // The runtime says it had work but the row had not counted it yet.
+        let jobs = if jobs == 0 && agents == 0 && background_live {
+            1
+        } else {
+            jobs
+        };
+        describe_lost_work(jobs, agents)
+    }
+
     fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.runs)
             .get(chat_id)
@@ -2130,6 +2189,27 @@ impl Inner {
             lineage.push(chat);
         }
         lineage
+    }
+
+    /// Whether `chat_id` belongs to an orchestrator tree its owner paused or
+    /// stopped: nothing in it may start by itself, a revival after a crash
+    /// included.
+    fn tree_held(&self, chat_id: &str) -> bool {
+        let Some(workspace) = self.workspace() else {
+            return false;
+        };
+        zeron_proto::orchestrator::Place::of(&self.lineage(chat_id), chat_id)
+            .root_id
+            .is_some_and(|root| workspace.orchestrator_project(&root).paused)
+    }
+
+    /// Whether `chat_id` is a member below an orchestrator (someone to tell
+    /// when it fails), as opposed to a root or an ordinary chat.
+    fn in_tree(&self, chat_id: &str) -> bool {
+        matches!(
+            zeron_proto::orchestrator::Place::of(&self.lineage(chat_id), chat_id).role,
+            zeron_proto::orchestrator::Role::Member { .. }
+        )
     }
 
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
@@ -2907,6 +2987,50 @@ fn folded_text(parts: &[MessagePart]) -> String {
         .join("\n")
 }
 
+/// Longest part of the interrupted request quoted back in a recovery notice.
+const RECOVERY_QUOTE_MAX_CHARS: usize = 4000;
+
+/// What a revived run is told instead of the interrupted request itself. The
+/// turn it continues may have committed, pushed or deleted before it died,
+/// so running the request again is not the same as continuing it.
+fn recovery_prompt(request: &str) -> String {
+    let request = request.trim();
+    let quoted: String = request.chars().take(RECOVERY_QUOTE_MAX_CHARS).collect();
+    let cut = if quoted.len() < request.len() {
+        "\n> [cut]"
+    } else {
+        ""
+    };
+    let quoted = quoted
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "[Message from Zeron (automatic recovery notice). Not the user. The previous turn \
+         was interrupted when the engine stopped unexpectedly (a crash, an out-of-memory \
+         kill or a reboot). Review the transcript and run git status before acting: do not \
+         repeat steps that already completed, and continue only what is unfinished.]\n\n\
+         The request that was interrupted:\n{quoted}{cut}"
+    )
+}
+
+/// "2 background jobs and 1 sub-agent" for the work a dead runtime held;
+/// `None` for none.
+fn describe_lost_work(jobs: u32, agents: u32) -> Option<String> {
+    let plural = |n: u32, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    match (jobs, agents) {
+        (0, 0) => None,
+        (jobs, 0) => Some(plural(jobs, "background job", "background jobs")),
+        (0, agents) => Some(plural(agents, "sub-agent", "sub-agents")),
+        (jobs, agents) => Some(format!(
+            "{} and {}",
+            plural(jobs, "background job", "background jobs"),
+            plural(agents, "sub-agent", "sub-agents")
+        )),
+    }
+}
+
 fn sync_segment<'a>(
     doc: &'a SessionDoc,
     writer: &mut Option<SegmentWriter<'a>>,
@@ -3511,6 +3635,9 @@ async fn drive_run(
     let mut last_subagent_activity: Option<tokio::time::Instant> = None;
 
     let mut final_completed_turn = None;
+    // Set when the runtime died while parked holding background work: the
+    // cause, for the parent's note once the final status is published.
+    let mut lost_runtime: Option<String> = None;
     let final_status = loop {
         let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
@@ -3633,8 +3760,39 @@ async fn drive_run(
                     // the turn was already finalized, so the run ends clean
                     // instead of stamping a completed session Errored.
                     Some(Err(err)) if idle_since.is_some() => {
-                        tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
-                        break SessionStatus::Idle;
+                        let Some(held) = inner.lost_work(&chat_id, subagents.len(), turn.background_live()) else {
+                            tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
+                            break SessionStatus::Idle;
+                        };
+                        // The runtime held jobs or sub-agents nobody has
+                        // heard the end of: their results died with it, and
+                        // the transcript must say so.
+                        let cause = match &err {
+                            zeron_harness::HarnessError::Protocol(text) => text.clone(),
+                            other => other.to_string(),
+                        };
+                        let message = format!(
+                            "{cause}. It was still running {held}; their results were not saved. Check git status and the worktree before continuing."
+                        );
+                        tracing::warn!(chat = %chat_id, error = %message, "parked session child died holding work");
+                        let parts = [MessagePart::Error {
+                            id: "e0".into(),
+                            message: message.clone(),
+                            class: None,
+                        }];
+                        if let Err(err) = finish_segment(
+                            doc_ref,
+                            None,
+                            &new_id(),
+                            &device_id,
+                            now_ms(),
+                            &parts,
+                            MessageStatus::Complete,
+                        ) {
+                            tracing::warn!(chat = %chat_id, error = %err, "lost-runtime entry failed");
+                        }
+                        lost_runtime = Some(message);
+                        break SessionStatus::Errored;
                     }
                     Some(Err(err)) => {
                         stream_failed = true;
@@ -4489,6 +4647,9 @@ async fn drive_run(
         .unwrap_or_default();
     inner.remove_run(&chat_id, &run_id);
     inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
+    if let Some(cause) = &lost_runtime {
+        inner.parent_notifier_lost(&chat_id, cause);
+    }
     // A Stop cancels the messages it found waiting; one accepted after it
     // began is still the user's next message and must run.
     let orphans: Vec<RoutedSteer> = if inner
@@ -4553,6 +4714,38 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lost_work_is_worded_by_what_the_runtime_held() {
+        assert_eq!(describe_lost_work(0, 0), None);
+        assert_eq!(
+            describe_lost_work(1, 0).as_deref(),
+            Some("1 background job")
+        );
+        assert_eq!(describe_lost_work(0, 2).as_deref(), Some("2 sub-agents"));
+        assert_eq!(
+            describe_lost_work(2, 1).as_deref(),
+            Some("2 background jobs and 1 sub-agent")
+        );
+    }
+
+    #[test]
+    fn a_recovery_prompt_continues_the_turn_instead_of_replaying_it() {
+        let prompt = recovery_prompt("  deploy the thing\nthen tag it  ");
+        assert!(
+            prompt.starts_with("[Message from Zeron (automatic recovery notice). Not the user.")
+        );
+        assert!(prompt.contains("git status"));
+        assert!(prompt.contains("do not repeat steps that already completed"));
+        // The request is quoted, line by line, so it cannot pass for the notice.
+        assert!(
+            prompt.ends_with("> deploy the thing\n> then tag it"),
+            "{prompt}"
+        );
+        let long = recovery_prompt(&"x".repeat(RECOVERY_QUOTE_MAX_CHARS + 50));
+        assert!(long.ends_with("\n> [cut]"));
+        assert_eq!(long.matches('x').count(), RECOVERY_QUOTE_MAX_CHARS);
+    }
 
     fn sub(title: &str, at: i64, fleet_row: Option<&str>) -> zeron_proto::RunningSubagent {
         zeron_proto::RunningSubagent {
