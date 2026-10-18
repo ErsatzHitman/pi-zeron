@@ -207,6 +207,11 @@ fn main() {
     let active = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(false));
     let steering_all = Arc::new(AtomicBool::new(false));
+    // A manual compaction runs: Pi refuses every prompt until it ends.
+    let compacting = Arc::new(AtomicBool::new(false));
+    // ... and its start was not reported: `get_state` admits it only after
+    // the first refusal.
+    let silent_compaction = AtomicBool::new(false);
     // Pi answers `abort` only once the run has settled.
     let pending_abort = Arc::new(Mutex::new(None::<Value>));
     let messages = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -220,7 +225,9 @@ fn main() {
                 &v,
                 json!({
                     "sessionId":session,"sessionFile":file,
-                    "isStreaming":active.load(Ordering::SeqCst),"isCompacting":false,
+                    "isStreaming":active.load(Ordering::SeqCst),"isCompacting":compacting.load(Ordering::SeqCst)
+                        && (!silent_compaction.load(Ordering::SeqCst)
+                            || std::path::Path::new("compaction-refusals").exists()),
                     "model":{"id":model,"provider":"mock","name":"Mock","contextWindow":128000,"reasoning":true},
                     "thinkingLevel":thinking,
                     "steeringMode":if steering_all.load(Ordering::SeqCst) {"all"} else {"one-at-a-time"},
@@ -265,6 +272,18 @@ fn main() {
             ),
             "prompt" => {
                 let mut text = v["message"].as_str().unwrap_or("").to_owned();
+                if compacting.load(Ordering::SeqCst) {
+                    let mut log = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("compaction-refusals")
+                        .unwrap();
+                    writeln!(log, "{text}").unwrap();
+                    emit(
+                        json!({"type":"response","id":v["id"],"command":"prompt","success":false,"error":"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."}),
+                    );
+                    continue;
+                }
                 if text == "env" {
                     text = format!("env:{}", std::env::var_os("CLAUDECODE").is_some());
                 }
@@ -373,6 +392,16 @@ fn main() {
                 drop(queued);
                 abort.store(false, Ordering::SeqCst);
                 messages.fetch_add(1, Ordering::SeqCst);
+                // A manual compaction begins with the turn. The client hears
+                // about it before the prompt's answer, unless Pi's frame was
+                // missed ("silent-compaction").
+                if text == "compacting-turn" || text == "silent-compaction" {
+                    compacting.store(true, Ordering::SeqCst);
+                    silent_compaction.store(text == "silent-compaction", Ordering::SeqCst);
+                    if text == "compacting-turn" {
+                        emit(json!({"type":"compaction_start","reason":"manual"}));
+                    }
+                }
                 disposition(&v, "started");
                 emit(json!({"type":"agent_start"}));
                 emit(
@@ -383,9 +412,31 @@ fn main() {
                 let queue = queue.clone();
                 let steering_all = steering_all.clone();
                 let pending_abort = pending_abort.clone();
+                let compacting = compacting.clone();
                 std::thread::spawn(move || {
                     let mut text = text;
                     loop {
+                        if text == "compacting-turn" || text == "silent-compaction" {
+                            // The compaction ends once a refused prompt was
+                            // seen, or after a while when none is coming.
+                            let polls = if text == "silent-compaction" { 600 } else { 80 };
+                            for _ in 0..polls {
+                                if (text == "silent-compaction"
+                                    && std::path::Path::new("compaction-refusals").exists())
+                                    || abort.load(Ordering::SeqCst)
+                                {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            compacting.store(false, Ordering::SeqCst);
+                            emit(
+                                json!({"type":"compaction_end","reason":"manual","result":{"estimatedTokensAfter":9},"aborted":false,"willRetry":false}),
+                            );
+                            // A prompt sent right after the end queues behind
+                            // the running turn.
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
                         if text == "burst-start" {
                             emit(json!({"type":"message_start","message":{"role":"assistant"}}));
                             emit(

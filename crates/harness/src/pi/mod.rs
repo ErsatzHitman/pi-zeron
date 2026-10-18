@@ -794,6 +794,9 @@ enum Pending {
     Command(u64),
     EmptyEntries(u64, String),
     EmptyState(u64, String, bool),
+    /// `get_state` after Pi refused a prompt for a running compaction: it
+    /// says whether the compaction is still on.
+    Compacting,
     /// The command list again, after a slash command that may change it
     /// (`/reload`, an extension that registers commands).
     Commands,
@@ -816,6 +819,11 @@ struct Delivery {
     message_id: Option<String>,
     // Queue acceptance permits sending the next steer, but is not consumption.
     queued: bool,
+    /// The steer behind this delivery, kept until Pi takes it up: a prompt
+    /// refused for a running compaction is sent again, not failed.
+    steer: Option<crate::SteerMessage>,
+    /// Whether a turn was running when the steer was submitted.
+    was_active: bool,
 }
 struct Runner {
     /// You should know: reviews of this chat's turns and the note shown.
@@ -869,6 +877,10 @@ struct Runner {
     turn: crate::TurnControl,
     /// Where this run's command list refreshes the `/` menu's cache.
     commands_cache: (commands::Cache, PathBuf, String),
+}
+/// Pi's refusal of a prompt submitted while a manual compaction runs.
+fn refused_for_compaction(error: &HarnessError) -> bool {
+    error.to_string().contains("compaction is in progress")
 }
 /// The footer chip Zeron shows while Pi retries a failed request.
 const RETRY_STATUS: &str = "zeron:retry";
@@ -1361,6 +1373,8 @@ impl Runner {
             if self.deliveries.iter().all(|delivery| delivery.queued)
                 && !(self.interrupted && self.active)
                 && !self.initial_pending
+                // Pi refuses a prompt while a manual compaction runs.
+                && !self.compaction.refuses_prompts()
                 && !self.pending.values().any(|p| {
                     matches!(
                         p,
@@ -1380,7 +1394,7 @@ impl Runner {
                                     .contains(command.split_whitespace().next().unwrap_or(""))
                             }))
                 }) {
-                    if let Some(steer) = self.queued.pop_front() {
+                    if let Some(mut steer) = self.queued.pop_front() {
                         // A changed model or thinking level applies on the
                         // live process before the message it was sent with.
                         if let Some(next) = &steer.config {
@@ -1395,7 +1409,10 @@ impl Runner {
                             for frame in backlog {
                                 self.frame(frame).await?;
                             }
+                            // Applied: a resend must not configure again.
+                            steer.config = None;
                         }
+                        let was_active = self.active;
                         if !self.active {
                             self.norm.reset();
                             self.interrupted = false;
@@ -1411,6 +1428,8 @@ impl Runner {
                             epoch: self.epoch,
                             message_id: steer.message_id.clone(),
                             queued: false,
+                            steer: Some(steer),
+                            was_active,
                         });
                     }
                 }
@@ -1450,6 +1469,10 @@ impl Runner {
             Pending::Prompt(epoch) | Pending::Barrier(epoch) | Pending::Command(epoch) => *epoch,
             // The empty-session proof cannot go on without its answer.
             Pending::EmptyEntries(..) | Pending::EmptyState(..) => return Err(error),
+            Pending::Compacting => {
+                tracing::debug!(%error, "Pi refused the compaction probe");
+                return Ok(());
+            }
             Pending::Commands => {
                 tracing::debug!(%error, "Pi refused the command list");
                 return Ok(());
@@ -1472,6 +1495,33 @@ impl Runner {
         };
         if epoch != self.epoch || !self.active {
             tracing::debug!(%error, "Pi refused a request of an earlier turn");
+            return Ok(());
+        }
+        // A steer refused because a compaction runs is not a failed turn:
+        // it goes again once the compaction ends.
+        if matches!(pending, Pending::Prompt(_))
+            && refused_for_compaction(&error)
+            && self
+                .deliveries
+                .back()
+                .is_some_and(|d| d.epoch == epoch && !d.queued && d.steer.is_some())
+            && let Some(delivery) = self.deliveries.pop_back()
+            && let Some(steer) = delivery.steer
+        {
+            tracing::debug!(%error, "Pi is compacting: the steer is sent again afterwards");
+            self.queued.push_front(steer);
+            self.active = delivery.was_active;
+            // Hold the next submission until the compaction ends. The
+            // answer tells whether it already has (its end frame may have
+            // come first), so a missed end cannot hold the queue for good.
+            self.compaction.sync(Some(true), compact::unix_millis());
+            self.publish_compact();
+            let id = self
+                .process
+                .transport
+                .client
+                .request(json!({"type":"get_state"}))?;
+            self.pending.insert(id, Pending::Compacting);
             return Ok(());
         }
         if matches!(pending, Pending::Prompt(_) | Pending::Command(_)) {
@@ -1753,6 +1803,11 @@ impl Runner {
                 Pending::Barrier(epoch) if epoch == self.epoch && self.active => {
                     self.turn.trace_mark(crate::turn_trace::Phase::Barrier);
                     self.state(data, None).await?;
+                }
+                Pending::Compacting => {
+                    self.compaction
+                        .sync(data["isCompacting"].as_bool(), compact::unix_millis());
+                    self.publish_compact();
                 }
                 Pending::Commands => {
                     let announce = self.active;

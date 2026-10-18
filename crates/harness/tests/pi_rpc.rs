@@ -456,6 +456,97 @@ async fn a_refused_prompt_ends_its_turn_and_keeps_the_pi_process() {
     assert_eq!(statuses, vec![DoneStatus::Errored, DoneStatus::Completed]);
 }
 
+/// Run `prompt` (the fixture starts a manual compaction with it), steer one
+/// message in while it runs and collect the whole run.
+async fn steer_into_a_compaction(prompt: &str) -> (Vec<AgentEvent>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    let stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), prompt), c)
+        .await
+        .unwrap();
+    tx.send(SteerMessage {
+        prompt: "after-compaction".into(),
+        message_id: Some("steer-1".into()),
+        attachments: Vec::new(),
+        config: None,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let events = tokio::time::timeout(
+        Duration::from_secs(15),
+        stream.map(Result::unwrap).collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    (events, dir)
+}
+
+fn assert_steer_taken_once_after_compaction(events: &[AgentEvent]) {
+    let dones: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert!(!dones.is_empty(), "{events:?}");
+    assert!(
+        dones.iter().all(|status| *status == DoneStatus::Completed),
+        "a steer refused for a compaction must not fail the turn: {events:?}"
+    );
+    let steered = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Steered { .. }))
+        .count();
+    assert_eq!(steered, 1, "confirmed once, when consumed: {events:?}");
+    let delivered: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::UserMessageDelivered { message_id, .. } => message_id.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, ["steer-1"], "{events:?}");
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        text.matches("reply:after-compaction").count(),
+        1,
+        "the steer reached the model exactly once: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_steer_during_compaction_waits_and_is_confirmed_only_when_consumed() {
+    // Pi's start frame never reached us, so the first send is refused.
+    let (events, dir) = steer_into_a_compaction("silent-compaction").await;
+    assert_steer_taken_once_after_compaction(&events);
+    let refusals = std::fs::read_to_string(dir.path().join("compaction-refusals")).unwrap();
+    assert_eq!(
+        refusals.lines().collect::<Vec<_>>(),
+        ["after-compaction"],
+        "refused once, then held back until the compaction ended"
+    );
+}
+
+#[tokio::test]
+async fn a_steer_is_not_submitted_while_pi_reports_compacting() {
+    let (events, dir) = steer_into_a_compaction("compacting-turn").await;
+    assert_steer_taken_once_after_compaction(&events);
+    assert!(
+        !dir.path().join("compaction-refusals").exists(),
+        "no prompt was sent into the compaction"
+    );
+}
+
 #[tokio::test]
 async fn steering_mode_is_selected_only_while_unconfigured() {
     for configured in [None, Some("one-at-a-time"), Some("all")] {
