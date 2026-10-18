@@ -743,6 +743,19 @@ pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &s
     })
 }
 
+/// Whether the wizard for `request_id` lets go of its panel. The latch holds
+/// through transient blips: it releases on an explicit resolution, or when a
+/// non-empty transcript shows the question superseded without this composer
+/// having answered it. Read in place: it runs on every state notification, and
+/// the transcript is the whole conversation.
+fn wizard_released(
+    transcript: &[SessionMessageEntry],
+    request_id: &str,
+    answered_here: bool,
+) -> bool {
+    input_request_resolved(transcript, request_id) || (!transcript.is_empty() && !answered_here)
+}
+
 // ---------------------------------------------------------------------------
 // Question wizard (pure reducer)
 // ---------------------------------------------------------------------------
@@ -9039,10 +9052,11 @@ impl Composer {
                     // assistant entry took over). Never on run death: the
                     // question stays answerable until answered — the engine
                     // delivers a dead run's answer as a resumed turn.
-                    let transcript = self.state.read(cx).transcript.clone();
-                    let released = input_request_resolved(&transcript, &wizard.request_id)
-                        || (!transcript.is_empty()
-                            && !self.answered_requests.contains(&wizard.request_id));
+                    let released = wizard_released(
+                        &self.state.read(cx).transcript,
+                        &wizard.request_id,
+                        self.answered_requests.contains(&wizard.request_id),
+                    );
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
@@ -10406,8 +10420,7 @@ impl Composer {
             // un-hide the panel instead of leaving the question unanswerable.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
-                let transcript = composer.state.read(cx).transcript.clone();
-                let still_pending = pending_input_request(&transcript)
+                let still_pending = pending_input_request(&composer.state.read(cx).transcript)
                     .is_some_and(|(pending_id, _)| pending_id == request_id);
                 if still_pending && composer.answered_requests.remove(&request_id) {
                     cx.notify();
@@ -17410,6 +17423,49 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    #[test]
+    fn wizard_release_check_reads_the_transcript_in_place() {
+        let entry = |n: usize, parts: Vec<MessagePart>| SessionMessageEntry {
+            id: format!("e{n}"),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: n as i64,
+            device_id: "d".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let text = |n: usize| {
+            entry(
+                n,
+                vec![MessagePart::Text {
+                    id: format!("t{n}"),
+                    text: "chatter".into(),
+                }],
+            )
+        };
+        let input = |resolved| MessagePart::Input {
+            id: "in-r1".into(),
+            request_id: "r1".into(),
+            questions: vec![],
+            resolved,
+        };
+        // A 5,000-entry transcript with the answered request buried in it.
+        let mut long: Vec<_> = (0..5_000).map(text).collect();
+        long[2_500] = entry(2_500, vec![input(true)]);
+        assert!(wizard_released(&long, "r1", true), "resolved releases");
+        assert!(wizard_released(&long, "r1", false));
+        // Not resolved: a non-empty transcript releases a question this
+        // composer did not answer (superseded)...
+        let mut pending = long.clone();
+        pending[2_500] = text(2_500);
+        assert!(wizard_released(&pending, "r1", false));
+        // ...but never one it answered itself, and never on a blip.
+        assert!(!wizard_released(&pending, "r1", true));
+        assert!(!wizard_released(&[], "r1", false));
+        assert!(!wizard_released(&[], "r1", true));
     }
 }
 

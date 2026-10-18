@@ -18,7 +18,6 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use gpui::Animation;
 use zeron_proto::extension_ui::{ExtensionUiAction, PiUiAction};
 use zeron_proto::{Chat, ChatIndicator, CheckoutDiff};
 
@@ -88,6 +87,9 @@ pub(super) struct SessionPanel {
     /// The agent's checklist for the selected chat, rescanned only when its
     /// transcript changes (a chat with no todo walks the whole transcript).
     todo_cache: todo_panel::TodoCache,
+    /// What the Sub-agents list derives from the chat list and the
+    /// transcript alone, rescanned only when they change.
+    agent_cache: agents::AgentListCache,
     /// Per chat: whether the folded-away todo items are revealed.
     todo_folds: std::collections::HashMap<String, TodoPanelState>,
     /// The sections up now, in the order they became active.
@@ -404,21 +406,101 @@ fn trailing_text(text: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div 
 }
 
 /// Running time since `started`, ticking while it shows.
+///
+/// The text changes once a second, so the label wakes itself at each whole
+/// elapsed second. It used to be a repeating `with_animation`, which asks the
+/// window for a frame at the display's refresh rate for as long as it is
+/// mounted; a Working turn kept the whole window redrawing at 60-240Hz to
+/// re-read a string that changes once a second.
 pub(super) fn elapsed_label(id: String, started: DateTime<Utc>, color: gpui::Hsla) -> AnyElement {
-    div()
-        .flex_none()
-        .text_size(crate::typography::ui_rems(11.0))
-        .text_color(color)
-        .with_animation(
-            SharedString::from(id),
-            Animation::new(Duration::from_secs(1)).repeat(),
-            move |label, _| {
-                label.child(crate::transcript::format_elapsed(
-                    (Utc::now() - started).num_seconds(),
-                ))
-            },
-        )
-        .into_any_element()
+    ElapsedLabel {
+        key: id.into(),
+        started,
+        color,
+    }
+    .into_any_element()
+}
+
+#[derive(IntoElement)]
+struct ElapsedLabel {
+    key: SharedString,
+    started: DateTime<Utc>,
+    color: gpui::Hsla,
+}
+
+impl RenderOnce for ElapsedLabel {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // The view owns the tick task; once the label stops rendering, its
+        // element state drops with the entity and the task is cancelled.
+        window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<ElapsedLabelView>>, _| {
+                let view = previous.unwrap_or_else(|| {
+                    cx.new(|cx| ElapsedLabelView::new(self.started, self.color, cx))
+                });
+                view.update(cx, |view, cx| {
+                    if view.started != self.started || view.color != self.color {
+                        view.started = self.started;
+                        view.color = self.color;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        })
+    }
+}
+
+/// The clock text and the task that redraws it on each elapsed second.
+struct ElapsedLabelView {
+    started: DateTime<Utc>,
+    color: gpui::Hsla,
+    _tick: Task<()>,
+}
+
+impl ElapsedLabelView {
+    fn new(started: DateTime<Utc>, color: gpui::Hsla, cx: &mut Context<Self>) -> Self {
+        let tick = cx.spawn(async move |this, cx| {
+            let mut delay = elapsed_tick_delay(started, Utc::now());
+            loop {
+                cx.background_executor().timer(delay).await;
+                let next = this.update(cx, |view, cx| {
+                    cx.notify();
+                    elapsed_tick_delay(view.started, Utc::now())
+                });
+                match next {
+                    Ok(next) => delay = next,
+                    Err(_) => return,
+                }
+            }
+        });
+        Self {
+            started,
+            color,
+            _tick: tick,
+        }
+    }
+}
+
+impl Render for ElapsedLabelView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_none()
+            .text_size(crate::typography::ui_rems(11.0))
+            .text_color(self.color)
+            .child(elapsed_text(self.started, Utc::now()))
+    }
+}
+
+/// What the clock reads at `now`; a start in the future reads zero.
+fn elapsed_text(started: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    crate::transcript::format_elapsed((now - started).num_seconds())
+}
+
+/// How long until the clock's text next changes: the time left in the
+/// current elapsed second, so always in `(0, 1s]`.
+fn elapsed_tick_delay(started: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    let into_second = (now - started).num_milliseconds().rem_euclid(1_000);
+    Duration::from_millis(1_000 - into_second as u64)
 }
 
 /// A long working directory, shortened from the left: past three parts,
@@ -653,6 +735,7 @@ impl Shell {
         let theme = Theme::of(cx).for_popup();
         let now = Utc::now();
         let todo_cache = &mut self.session_panel.todo_cache;
+        let agent_cache = &mut self.session_panel.agent_cache;
         let (chat, device, local, online, project, branch, status, started, goal, agents, todos) = {
             let state = self.state.read(cx);
             let chat = state.selected_chat_row()?.clone();
@@ -685,7 +768,7 @@ impl Shell {
                 .and_then(|ui| ui.channels.get(zeron_proto::extension_ui::GOAL_CHANNEL))
                 .filter(|goal| goal["active"] == true)
                 .cloned();
-            let agents = agents::agent_list(state, &chat, now);
+            let agents = agents::agent_list_in(agent_cache, state, &chat, now);
             let live = matches!(
                 status,
                 ChatIndicator::Working | ChatIndicator::AwaitingInput
@@ -3368,6 +3451,92 @@ mod tests {
         assert_eq!(goal_status("waiting"), ("Waiting", false));
         assert_eq!(goal_status("budget_limited"), ("Budget reached", false));
         assert_eq!(goal_status("something-new"), ("Set", false));
+    }
+
+    #[test]
+    fn the_elapsed_clock_wakes_at_each_whole_second() {
+        let started = Utc::now();
+        let at = |millis: i64| started + chrono::TimeDelta::milliseconds(millis);
+        let second = Duration::from_secs(1);
+        assert_eq!(elapsed_tick_delay(started, at(0)), second);
+        assert_eq!(
+            elapsed_tick_delay(started, at(100)),
+            Duration::from_millis(900)
+        );
+        assert_eq!(
+            elapsed_tick_delay(started, at(5_999)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(elapsed_tick_delay(started, at(61_000)), second);
+        // A start still ahead waits for it, then ticks on whole seconds.
+        assert_eq!(
+            elapsed_tick_delay(started, at(-300)),
+            Duration::from_millis(300)
+        );
+        for millis in (-3_000..90_000).step_by(37) {
+            let delay = elapsed_tick_delay(started, at(millis));
+            assert!(!delay.is_zero() && delay <= second, "{millis}ms: {delay:?}");
+        }
+    }
+
+    #[test]
+    fn the_elapsed_clock_reads_whole_seconds_and_never_negative() {
+        let started = Utc::now();
+        let at = |millis: i64| started + chrono::TimeDelta::milliseconds(millis);
+        assert_eq!(elapsed_text(started, at(-2_000)), "0s");
+        assert_eq!(elapsed_text(started, at(999)), "0s");
+        assert_eq!(elapsed_text(started, at(5_400)), "5s");
+        assert_eq!(elapsed_text(started, at(65_000)), "1m 5s");
+    }
+
+    /// Renders only an elapsed label, so any frame it asks for is its own.
+    struct ElapsedHost(DateTime<Utc>);
+
+    impl Render for ElapsedHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(elapsed_label("host-elapsed".into(), self.0, gpui::black()))
+        }
+    }
+
+    #[gpui::test]
+    fn elapsed_label_requests_no_animation_frame(cx: &mut gpui::TestAppContext) {
+        let (_host, cx) = cx.add_window_view(|_, _| ElapsedHost(Utc::now()));
+        cx.update(|window, cx| {
+            for _ in 0..3 {
+                window.refresh();
+                window.draw(cx).clear();
+                assert_eq!(
+                    window.simulate_next_frame(cx),
+                    0,
+                    "a once-a-second clock must not pull display-rate frames"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn elapsed_label_ticks_once_a_second_until_dropped(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        let ticks = Rc::new(Cell::new(0usize));
+        let view =
+            cx.update(|cx| cx.new(|cx| ElapsedLabelView::new(Utc::now(), gpui::black(), cx)));
+        let _watch = cx.update(|cx| {
+            let ticks = ticks.clone();
+            cx.observe(&view, move |_, _| ticks.set(ticks.get() + 1))
+        });
+        cx.run_until_parked();
+        assert_eq!(ticks.get(), 0, "nothing ticks before the first second");
+        for expected in 1..=3 {
+            cx.background_executor.advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            assert_eq!(ticks.get(), expected);
+        }
+        drop(view);
+        cx.run_until_parked();
+        cx.background_executor.advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        assert_eq!(ticks.get(), 3, "an unmounted label stops ticking");
     }
 
     #[test]

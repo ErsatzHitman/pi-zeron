@@ -121,6 +121,70 @@ pub fn gradient_spinner(
     view: EntityId,
     cx: &mut App,
 ) -> impl IntoElement {
+    gradient_cells(cell_px, view, cx)
+}
+
+/// [`gradient_spinner`] as its own keyed, cached view: the pulse clock leases
+/// the spinner's entity rather than the caller's, so the caller (the
+/// transcript's working trailer) is not what the clock notifies every tick.
+/// `key` scopes the view's state; give each mounted spinner a distinct one.
+pub fn gradient_spinner_view(key: impl Into<SharedString>, cell_px: f32) -> impl IntoElement {
+    GradientSpinner {
+        key: key.into(),
+        cell_px,
+    }
+}
+
+#[derive(IntoElement)]
+struct GradientSpinner {
+    key: SharedString,
+    cell_px: f32,
+}
+
+impl RenderOnce for GradientSpinner {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let cell_px = self.cell_px;
+        let view = window.with_global_id(self.key.into(), |id, window| {
+            window.with_element_state(id, |previous: Option<Entity<GradientSpinnerView>>, _| {
+                let view = previous.unwrap_or_else(|| cx.new(|_| GradientSpinnerView { cell_px }));
+                view.update(cx, |view, cx| {
+                    if view.cell_px != cell_px {
+                        view.cell_px = cell_px;
+                        cx.notify();
+                    }
+                });
+                (view.clone(), view)
+            })
+        });
+        // The cached view is laid out from this box alone: the grid's side.
+        let side = gradient_side(cell_px);
+        view.cached(
+            gpui::StyleRefinement::default()
+                .flex_none()
+                .w(px(side))
+                .h(px(side)),
+        )
+    }
+}
+
+struct GradientSpinnerView {
+    cell_px: f32,
+}
+
+impl Render for GradientSpinnerView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        gradient_cells(self.cell_px, cx.entity_id(), cx)
+    }
+}
+
+/// Width and height of the cell grid: its cells and the half-cell gaps
+/// between them.
+fn gradient_side(cell_px: f32) -> f32 {
+    let cells = MATRIX_SIDE as f32;
+    cells * cell_px + (cells - 1.0) * (cell_px / 2.0)
+}
+
+fn gradient_cells(cell_px: f32, view: EntityId, cx: &mut App) -> impl IntoElement {
     let center = (MATRIX_SIDE as f32 - 1.0) / 2.0;
     let max = MATRIX_SIDE as f32 - 1.0 + center;
     let pulse = motion::activity_pulse_slow(view, cx);
