@@ -2183,6 +2183,41 @@ fn promote_local_device_group<T>(
     }
 }
 
+/// Line 1 of a sidebar row: "project @ device", and with the worktree the
+/// session works in, "project / worktree @ device". Project-less sessions
+/// name only their device; an unknown device adds no fragment.
+fn sidebar_folder_label(
+    project: Option<String>,
+    worktree: Option<&str>,
+    device: Option<&str>,
+) -> String {
+    let project = project.map(|project| match worktree {
+        Some(worktree) => format!("{project} / {worktree}"),
+        None => project,
+    });
+    match (project, device) {
+        (Some(project), Some(device)) => format!("{project} @ {device}"),
+        (Some(project), None) => project,
+        (None, Some(device)) => device.to_owned(),
+        (None, None) => String::new(),
+    }
+}
+
+/// The folder name of the worktree a session works in, once it has one.
+fn worktree_folder_name(location: &zeron_proto::view::SessionLocation) -> Option<String> {
+    if location.cwd_kind != zeron_proto::view::CwdKind::Worktree {
+        return None;
+    }
+    location
+        .cwd
+        .as_deref()?
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 /// Project-mode group of a chat as (key, label). Projects sharing a
 /// repository identity fold into one group named for their representative
 /// space; project-less sessions group per device as "No project".
@@ -5017,13 +5052,15 @@ impl Shell {
             .device_name(&chat.device_id)
             .unwrap_or("Unknown device")
             .to_string();
+        // A session in a worktree names it: the project alone would say the
+        // folder it does not work in.
+        let location = zeron_proto::view::session_location(&chat, space);
         // Unknown device → no fragment, same as the archived list.
-        let folder = match (project, state.device_name(&chat.device_id)) {
-            (Some(project), Some(_)) => format!("{project} @ {device}"),
-            (Some(project), None) => project,
-            (None, Some(_)) => device.clone(),
-            (None, None) => String::new(),
-        };
+        let folder = sidebar_folder_label(
+            project,
+            worktree_folder_name(&location).as_deref(),
+            state.device_name(&chat.device_id),
+        );
         // The branch shows whenever the engine has stamped one —
         // main-checkout sessions included, not just worktrees.
         let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
@@ -7674,6 +7711,48 @@ mod tests {
             last_seen_at: None,
             room_gen: None,
         }
+    }
+
+    #[test]
+    fn a_worktree_session_names_its_worktree_on_the_first_line() {
+        use super::{sidebar_folder_label, worktree_folder_name};
+        use zeron_proto::view::{CwdKind, SessionLocation};
+        let location = |kind, cwd: &str| SessionLocation {
+            cwd: Some(cwd.into()),
+            cwd_kind: kind,
+            branch: None,
+            branch_source: None,
+            repo_root: None,
+        };
+        assert_eq!(
+            worktree_folder_name(&location(CwdKind::Worktree, "/repo/comet-wt/fix-parser/")),
+            Some("fix-parser".into())
+        );
+        assert_eq!(
+            worktree_folder_name(&location(CwdKind::Worktree, "C:\\wt\\fix")),
+            Some("fix".into())
+        );
+        for kind in [
+            CwdKind::ProjectFolder,
+            CwdKind::PendingWorktree,
+            CwdKind::Scratch,
+        ] {
+            assert_eq!(worktree_folder_name(&location(kind, "/repo/comet")), None);
+        }
+        assert_eq!(
+            sidebar_folder_label(Some("comet".into()), Some("fix-parser"), Some("Laptop")),
+            "comet / fix-parser @ Laptop"
+        );
+        assert_eq!(
+            sidebar_folder_label(Some("comet".into()), None, Some("Laptop")),
+            "comet @ Laptop"
+        );
+        assert_eq!(
+            sidebar_folder_label(Some("comet".into()), None, None),
+            "comet"
+        );
+        assert_eq!(sidebar_folder_label(None, None, Some("Laptop")), "Laptop");
+        assert_eq!(sidebar_folder_label(None, None, None), "");
     }
 
     #[test]
