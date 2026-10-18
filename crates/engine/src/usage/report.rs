@@ -181,6 +181,10 @@ pub(super) fn build(
         UsageBucket::Day => DAY_MS,
     };
     let offset_ms = i64::from(query.utc_offset_minutes) * 60_000;
+    let only_sessions: Option<HashSet<&str>> = query
+        .sessions
+        .as_ref()
+        .map(|ids| ids.iter().map(String::as_str).collect());
     let mut models: HashMap<(&str, &str), Tally> = HashMap::new();
     let mut surfaces: HashMap<&str, Tally> = HashMap::new();
     let mut series: BTreeMap<(i64, &str), (u64, f64)> = BTreeMap::new();
@@ -192,6 +196,12 @@ pub(super) fn build(
             continue;
         }
         let file = files[ix].1;
+        if only_sessions
+            .as_ref()
+            .is_some_and(|only| !only.contains(file.session(record)))
+        {
+            continue;
+        }
         let (provider, model) = file.name(record);
         let surface = surface(file, record);
         let tokens = record.tokens();
@@ -512,5 +522,78 @@ mod tests {
             },
         );
         assert_eq!(hourly.series.len(), 2);
+    }
+
+    #[test]
+    fn a_report_can_be_limited_to_the_requests_of_some_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = file(
+            dir.path(),
+            "a.jsonl",
+            &[
+                header("2026-10-01T09:00:00Z"),
+                assistant("a1", "anthropic", "claude-opus-5-5", 1_000, 10, 0.5),
+            ],
+        );
+        let theirs = file(
+            dir.path(),
+            "b.jsonl",
+            &[
+                header("2026-10-01T09:00:00Z").replace("\"id\":\"s1\"", "\"id\":\"s2\""),
+                assistant("b1", "openai", "gpt-5.6", 2_000, 20, 0.25),
+            ],
+        );
+        // A sub-agent's call of each session, in the ledger.
+        let ledger = file_of(
+            dir.path(),
+            "2026-10.jsonl",
+            &[
+                ledger_call(
+                    "1-a-1",
+                    "subagent",
+                    "openai",
+                    "gpt-5.6",
+                    1_790_848_000_000,
+                    30,
+                ),
+                ledger_call(
+                    "2-a-1",
+                    "subagent",
+                    "openai",
+                    "gpt-5.6",
+                    1_790_848_100_000,
+                    40,
+                )
+                .replace("\"sid\":\"s1\"", "\"sid\":\"s2\""),
+            ],
+            FileKind::Ledger,
+        );
+        let files = [
+            ("a.jsonl", &mine),
+            ("b.jsonl", &theirs),
+            ("l.jsonl", &ledger),
+        ];
+        let ask = |sessions: Option<&[&str]>| {
+            let report = build(
+                &files,
+                &PriceBook::default(),
+                &UsageQuery {
+                    sessions: sessions.map(|ids| ids.iter().map(|id| (*id).to_owned()).collect()),
+                    ..Default::default()
+                },
+            );
+            let requests: u64 = report.models.iter().map(|row| row.requests).sum();
+            let spent: f64 = report.models.iter().map(UsageModelRow::cost_usd).sum();
+            (requests, spent)
+        };
+        // Its own request and its sub-agent's call, and nothing of the other.
+        assert_eq!(ask(Some(&["s1"])), (2, 1.0));
+        assert_eq!(ask(Some(&["s2"])), (2, 0.75));
+        assert_eq!(ask(Some(&["s1", "s2"])), (4, 1.75));
+        assert_eq!(ask(None), (4, 1.75), "no limit counts every session");
+        assert_eq!(ask(Some(&[])), (0, 0.0), "an empty tree spent nothing");
+        assert_eq!(ask(Some(&["unknown"])), (0, 0.0));
+        // A ledger call carries the session that made it, its file has none.
+        assert_eq!(ledger.session(&ledger.records[0]), "s1");
     }
 }

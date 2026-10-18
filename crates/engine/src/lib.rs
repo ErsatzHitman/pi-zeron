@@ -28,6 +28,7 @@ pub mod diff_sync;
 pub mod doc_host;
 mod extension_ui;
 mod fs_watch;
+pub mod github_preflight;
 pub mod harness_updates;
 pub(crate) mod home_index;
 mod http_error;
@@ -52,6 +53,7 @@ pub mod terminals;
 pub mod titles;
 mod transcript_history;
 pub mod tree_stop;
+pub mod tree_policy;
 pub mod uploads;
 pub mod usage;
 pub mod usage_alerts;
@@ -161,6 +163,9 @@ pub struct EngineCore {
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
     pub usage_alerts: usage_alerts::UsageAlerts,
+    /// Holds each orchestrator's tree to its policy: the files Pi's guard
+    /// reads, and the spending cap.
+    pub tree_policy: tree_policy::TreeWatcher,
     /// Tokens and spend per Pi provider and model, from Pi's session files.
     pub usage: usage::UsageTracker,
     /// "Where this chat stands" summaries for someone returning to it.
@@ -418,6 +423,14 @@ impl EngineCore {
             registry.clone(),
             Some(profile.store_root().join("recaps.json")),
         );
+        let tree_policy = tree_policy::TreeWatcher::new(
+            data_dir,
+            usage.clone(),
+            sessions.clone(),
+            doc_host.clone(),
+            workspace.clone(),
+        );
+        tree_policy.start();
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -447,6 +460,7 @@ impl EngineCore {
             agent_accounts,
             harness_updates,
             usage_alerts,
+            tree_policy,
             usage,
             recaps,
             device_id,
@@ -617,6 +631,7 @@ impl EngineCore {
         self.previews.shutdown().await;
         self.harness_updates.shutdown().await;
         self.usage_alerts.shutdown();
+        self.tree_policy.shutdown();
         // A run interruption transitions its chat to Idle, and Idle normally
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.

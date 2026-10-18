@@ -2300,6 +2300,108 @@ fn a_board_keeps_its_tree_s_posts_in_order_and_drops_the_oldest() {
 }
 
 #[test]
+fn an_orchestrator_projects_tree_policy_is_kept_validated_and_budgeted() {
+    use zeron_proto::orchestrator_project::{ProjectUpdate, TreePolicy};
+    let mut ws = RegistryDoc::new("dev-a");
+    assert!(
+        ws.orchestrator_project("orchestrator-a")
+            .policy
+            .is_default()
+    );
+    let policy = TreePolicy {
+        github_only_tests: true,
+        heavy_command_limit: Some(2),
+        allowed_models: vec![
+            " openai/gpt-5.6 ".into(),
+            "OPENAI/gpt-5.6".into(),
+            "".into(),
+        ],
+        spend_cap_cents: Some(2_500),
+        ..TreePolicy::default()
+    };
+    let saved = ws
+        .update_orchestrator_project(
+            "orchestrator-a",
+            ProjectUpdate {
+                policy: Some(policy.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .policy;
+    assert!(saved.github_only_tests);
+    assert_eq!(saved.heavy_command_limit, Some(2));
+    assert_eq!(saved.allowed_models, ["openai/gpt-5.6"], "tidied, once");
+    assert!(saved.spend_since_ms > 0, "a new cap starts a budget");
+    assert_eq!(ws.orchestrator_project("orchestrator-a").policy, saved);
+    // Another edit keeps the budget running; a different cap starts a new one.
+    let same_cap = TreePolicy {
+        writer_limit: Some(3),
+        ..saved.clone()
+    };
+    let kept = ws
+        .update_orchestrator_project(
+            "orchestrator-a",
+            ProjectUpdate {
+                policy: Some(same_cap),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .policy;
+    assert_eq!(kept.spend_since_ms, saved.spend_since_ms);
+    assert_eq!(kept.writer_limit, Some(3));
+    // The policy rides along when only the pause changes.
+    ws.update_orchestrator_project(
+        "orchestrator-a",
+        ProjectUpdate {
+            paused: Some(true),
+            pause_reason: Some("the spending cap is reached".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let paused = ws.orchestrator_project("orchestrator-a");
+    assert!(paused.paused && paused.pause_reason == "the spending cap is reached");
+    assert_eq!(paused.policy, kept);
+    // A resume clears why it was paused.
+    ws.update_orchestrator_project(
+        "orchestrator-a",
+        ProjectUpdate {
+            paused: Some(false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        ws.orchestrator_project("orchestrator-a")
+            .pause_reason
+            .is_empty()
+    );
+    // A refused policy changes nothing.
+    assert!(
+        ws.update_orchestrator_project(
+            "orchestrator-a",
+            ProjectUpdate {
+                policy: Some(TreePolicy {
+                    heavy_command_limit: Some(0),
+                    ..TreePolicy::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(ws.orchestrator_project("orchestrator-a").policy, kept);
+    // Other trees are untouched.
+    assert!(
+        ws.orchestrator_project("orchestrator-b")
+            .policy
+            .is_default()
+    );
+}
+
+#[test]
 fn an_orchestrator_project_keeps_its_settings_and_memory_until_its_root_goes() {
     use zeron_proto::orchestrator_project::{MAX_NOTES, ProjectUpdate};
     let mut ws = RegistryDoc::new("dev-a");
@@ -2313,6 +2415,7 @@ fn an_orchestrator_project_keeps_its_settings_and_memory_until_its_root_goes() {
                 goal: Some(" Ship the parser ".into()),
                 instructions: Some("Run the tests.".into()),
                 paused: None,
+                ..Default::default()
             },
         )
         .unwrap();

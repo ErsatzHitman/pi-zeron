@@ -49,6 +49,12 @@ pub const ENV_PROJECT_PROMPT: &str = "ZERON_PROJECT_PROMPT";
 /// extension keeps every Pi of the session off them. Rides the MCP env like
 /// the fork; the Pi harness moves it into the process env.
 pub const ENV_MODEL_POLICY: &str = "ZERON_MODEL_POLICY";
+/// A Pi run in an orchestrator's tree: the file with the tree policy the
+/// guard enforces in every Pi of the tree (where tests run, how many heavy
+/// commands at once, which models, whether the spending cap halted it). Rides
+/// the MCP env like the model policy; the Pi harness moves it into the
+/// process env.
+pub const ENV_TREE_POLICY: &str = "ZERON_TREE_POLICY";
 /// Titles go into env and prompts as one short line.
 const MAX_LABEL_CHARS: usize = 120;
 

@@ -855,6 +855,7 @@ pub struct EngineRpc {
     previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
     github: GitHubCli,
+    preflight: std::sync::Arc<crate::github_preflight::GithubPreflight>,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
@@ -905,6 +906,7 @@ impl EngineRpc {
             previews: None,
             change_requests,
             github,
+            preflight: std::sync::Arc::new(crate::github_preflight::GithubPreflight::new()),
             diff_sync,
             uploads,
             agent_accounts,
@@ -1469,6 +1471,139 @@ impl EngineRpc {
         })
     }
 
+    /// Bring the policy file Pi's guard reads in line with the project, after
+    /// a change made here. A change made on another device reaches this one's
+    /// file within the policy watcher's next check.
+    fn sync_tree_policy(&self, root_id: &str) {
+        let Some(dir) = self.registry.data_dir() else {
+            return;
+        };
+        let project = self.workspace.orchestrator_project(root_id);
+        if let Err(error) = crate::tree_policy::sync(&dir, &project) {
+            tracing::warn!(%error, root = %root_id, "tree policy: file write failed");
+        }
+    }
+
+    /// A tree Zeron paused for its spending cap does not resume while it is
+    /// over the cap: the user raises the cap first (which starts a new budget).
+    async fn ensure_cap_allows_resume(&self, root_id: &str) -> Result<(), RpcError> {
+        let project = self.workspace.orchestrator_project(root_id);
+        let (Some(cap), Some(usage)) = (project.policy.spend_cap_cents, self.usage.as_ref()) else {
+            return Ok(());
+        };
+        if project.pause_reason.trim().is_empty() {
+            return Ok(());
+        }
+        let chats = self
+            .workspace
+            .read_chats()
+            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        let spend =
+            crate::tree_policy::tree_spend(usage, &project, &chats, self.doc_host.device_id())
+                .await;
+        if spend.spent_usd * 100.0 >= cap as f64 {
+            return Err(RpcError::BadParams(format!(
+                "The spending cap of {} is reached (${:.2} spent). Raise the cap in the orchestrator's settings first.",
+                zeron_proto::orchestrator_project::dollars(cap),
+                spend.spent_usd
+            )));
+        }
+        Ok(())
+    }
+
+    /// Register an existing folder of this device as a project (a space), found
+    /// from a path or a short name. It registers one unambiguous folder and
+    /// refuses to guess between several; a folder already registered is
+    /// returned as it is. The space is seeded as a repository when the folder
+    /// is one, so a writer's worktree can be made from it at once rather than
+    /// after the next git check.
+    async fn register_project(
+        &self,
+        query: &str,
+        name: Option<String>,
+        dry_run: bool,
+    ) -> Result<RpcReply, RpcError> {
+        let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
+        let device_id = self.doc_host.device_id().to_string();
+        let spaces = self.workspace.read_spaces().map_err(failed)?;
+        let known: Vec<crate::repos::KnownFolder> = spaces
+            .iter()
+            .filter(|space| space.device_id == device_id)
+            .map(|space| crate::repos::KnownFolder {
+                path: space.path.clone(),
+                name: space.name.clone(),
+            })
+            .collect();
+        let search = self
+            .repos
+            .resolve_project_folder(query, known)
+            .await
+            .map_err(RpcError::BadParams)?;
+        let candidates = serde_json::to_value(&search.candidates)
+            .map_err(|e| RpcError::Failed(e.to_string()))?;
+        if dry_run {
+            return RpcReply::value(&serde_json::json!({
+                "candidates": candidates,
+                "searched": search.searched,
+                "incomplete": search.incomplete,
+                "created": false,
+            }));
+        }
+        let [folder] = search.candidates.as_slice() else {
+            let listing = search
+                .candidates
+                .iter()
+                .map(|c| c.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(RpcError::BadParams(match search.candidates.len() {
+                0 if search.incomplete => format!(
+                    "No folder named {query:?} found yet, but the search of the home folder \
+                     had not finished. Try again in a moment, or pass the full path."
+                ),
+                0 => format!(
+                    "No folder matches {query:?}. Looked in: {}. Pass the full path of the \
+                     folder.",
+                    search.searched.join(", ")
+                ),
+                n => format!(
+                    "{n} folders match {query:?}: {listing}. Pass the full path of the one you \
+                     mean."
+                ),
+            }));
+        };
+        let key = crate::repos::path_key(std::path::Path::new(&folder.path));
+        let existing = spaces.iter().find(|space| {
+            space.device_id == device_id
+                && crate::repos::path_key(std::path::Path::new(&space.path)) == key
+        });
+        let (space, created) = match existing {
+            Some(space) => (space.clone(), false),
+            None => {
+                let id = crate::new_id();
+                let name = name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(|name| name.chars().take(80).collect::<String>());
+                self.workspace
+                    .create_space(&id, &device_id, &folder.path, name, folder.is_repo)
+                    .map_err(failed)?;
+                let space = self
+                    .workspace
+                    .space(&id)
+                    .map_err(failed)?
+                    .ok_or_else(|| RpcError::Failed("the new project was not saved".into()))?;
+                (space, true)
+            }
+        };
+        RpcReply::value(&serde_json::json!({
+            "space": space,
+            "created": created,
+            "candidates": candidates,
+        }))
+    }
+
     /// Drop one chat everywhere: its row, its doc and its live runtime.
     fn delete_one_chat(&self, chat_id: &str) -> Result<(), RpcError> {
         self.voice.retire_chat(chat_id);
@@ -1771,6 +1906,8 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // Runtimes come down in parallel, each allowed a few seconds, and the
         // report waits (bounded) for them to be gone.
         methods::STOP_TREE => Duration::from_secs(60),
+        // Several `gh` calls and a push probe, each bounded on its own.
+        methods::GITHUB_PREFLIGHT => Duration::from_secs(60),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -1848,6 +1985,9 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_DRIVES
             | methods::SEARCH_HOME_FOLDERS
             | methods::RELEASE_HOME_FOLDER_SEARCH
+            // The folder, and the credentials a writer pushes with, are the host's.
+            | methods::REGISTER_PROJECT
+            | methods::GITHUB_PREFLIGHT
             | methods::SEARCH_FILES
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
@@ -3205,6 +3345,32 @@ impl RpcService for EngineRpc {
                 };
                 RpcReply::value(&repository)
             }
+            methods::GITHUB_PREFLIGHT => {
+                #[derive(Deserialize)]
+                struct P {
+                    cwd: String,
+                    #[serde(default)]
+                    branch: Option<String>,
+                    #[serde(default)]
+                    force: bool,
+                }
+                let p: P = parse_params(params)?;
+                // Only a chat or project checkout on this device, as for the
+                // repository lookup: no probing arbitrary directories.
+                let cwd = self.change_request_root(&p.cwd).await?;
+                let resolver = crate::source_control::ChangeRequestResolver::new();
+                let report = match resolver.repository_for_checkout(&cwd).await {
+                    Some(repository) => {
+                        self.preflight
+                            .check(&cwd, &repository, p.branch.as_deref(), p.force)
+                            .await
+                    }
+                    None => crate::github_preflight::PreflightReport::unsupported(
+                        "this checkout's remote is not on GitHub",
+                    ),
+                };
+                RpcReply::value(&report)
+            }
             methods::LIST_CHANGE_REQUEST_PAGE => {
                 #[derive(Deserialize)]
                 struct P {
@@ -3801,6 +3967,19 @@ impl RpcService for EngineRpc {
             methods::RELEASE_HOME_FOLDER_SEARCH => {
                 self.repos.release_home_folder_search();
                 RpcReply::value(&serde_json::json!({}))
+            }
+            methods::REGISTER_PROJECT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    query: String,
+                    #[serde(default)]
+                    name: Option<String>,
+                    #[serde(default)]
+                    dry_run: bool,
+                }
+                let p: P = parse_params(params)?;
+                self.register_project(&p.query, p.name, p.dry_run).await
             }
             methods::LIST_DRIVES => {
                 let drives = self
@@ -4427,6 +4606,27 @@ impl RpcService for EngineRpc {
                     "memory": self.workspace.orchestrator_memory(&root),
                 }))
             }
+            methods::GET_TREE_SPEND => {
+                let p: OrchestratorChatParams = parse_params(params)?;
+                let chats = self
+                    .workspace
+                    .read_chats()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let (_, root) = board_member(&chats, &p.chat_id)?;
+                let usage = self
+                    .usage
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("usage unavailable".into()))?;
+                let project = self.workspace.orchestrator_project(&root);
+                let spend = crate::tree_policy::tree_spend(
+                    usage,
+                    &project,
+                    &chats,
+                    self.doc_host.device_id(),
+                )
+                .await;
+                RpcReply::value(&spend)
+            }
             methods::MERGE_PREVIEW => {
                 let p: MergePreviewParams = parse_params(params)?;
                 let chats = self
@@ -4500,6 +4700,7 @@ impl RpcService for EngineRpc {
                     .workspace
                     .update_orchestrator_project(&root, p.update)
                     .map_err(failed)?;
+                self.sync_tree_policy(&root);
                 RpcReply::value(&serde_json::json!({ "project": project }))
             }
             methods::ORCHESTRATOR_MEMORY => {
@@ -4523,8 +4724,14 @@ impl RpcService for EngineRpc {
             }
             methods::CONTROL_ORCHESTRATOR => {
                 let p: ControlOrchestratorParams = parse_params(params)?;
-                self.control_orchestrator(&p.root_id, p.action)
-                    .and_then(|reply| RpcReply::value(&reply))
+                if p.action == OrchestratorAction::Resume {
+                    self.ensure_cap_allows_resume(&p.root_id).await?;
+                }
+                let reply = self
+                    .control_orchestrator(&p.root_id, p.action)
+                    .and_then(|reply| RpcReply::value(&reply));
+                self.sync_tree_policy(&p.root_id);
+                reply
             }
             methods::STOP_TREE => {
                 let p: StopTreeParams = parse_params(params)?;
@@ -5294,6 +5501,10 @@ mod tests {
         assert!(!is_stream_method(methods::SEARCH_WORKSPACE_CONTENT));
         assert!(forwardable(methods::SEARCH_HOME_FOLDERS));
         assert!(forwardable(methods::RELEASE_HOME_FOLDER_SEARCH));
+        assert!(forwardable(methods::REGISTER_PROJECT));
+        assert!(forwardable(methods::GITHUB_PREFLIGHT));
+        assert!(!is_stream_method(methods::REGISTER_PROJECT));
+        assert!(!is_stream_method(methods::GITHUB_PREFLIGHT));
         assert!(!is_stream_method(methods::READ_WORKSPACE_FILE));
         assert!(!is_stream_method(methods::WRITE_WORKSPACE_FILE));
         assert!(is_stream_method(methods::WATCH_WORKSPACE_FILES));
@@ -5367,6 +5578,10 @@ mod tests {
         assert_eq!(
             forward_deadline(methods::CLONE_REPO),
             Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            forward_deadline(methods::GITHUB_PREFLIGHT),
+            Duration::from_secs(60)
         );
         assert_eq!(
             forward_deadline(methods::APPLY_HARNESS_UPDATE),

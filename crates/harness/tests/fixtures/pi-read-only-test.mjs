@@ -38,7 +38,7 @@ check('ps: Get-ChildItem', shellWrites('Get-ChildItem -Recurse', 'ps'), false);
 
 // Tools: Pi's own, extension and MCP tools.
 for (const [name, input] of [['write', {path: 'a', content: 'x'}], ['edit', {path: 'a'}], ['bash', {command: 'touch x'}],
-  ['zeron_create_chat', {}], ['zeron_archive_chat', {}], ['zeron_respond_to_input', {}],
+  ['zeron_create_chat', {}], ['zeron_archive_chat', {}], ['zeron_respond_to_input', {}], ['zeron_register_project', {}],
   ['mcp__fs__write_file', {}], ['apply_patch', {}], ['memory_save', {}], ['run_command', {}], ['git_commit', {}],
   ['subagent_start', {tasks: [{task: 'x', writeAccess: true}]}], ['subagent_start', {tasks: [{task: 'a'}, {task: 'b', writeAccess: true}]}],
   ['subagent_start', {tasks: [{task: 'x', writeAccess: 'yes'}]}], ['subagent_start', {}], ['subagent_start', {tasks: [null]}], ['workflow', {}], ['workflow_script', {}]])

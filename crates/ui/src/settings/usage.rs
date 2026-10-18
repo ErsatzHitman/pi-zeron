@@ -433,6 +433,7 @@ impl UsagePage {
             utc_offset_minutes: (offset_ms / 60_000) as i32,
             refresh,
             surface: self.surface.clone(),
+            sessions: None,
         };
         let params = serde_json::to_value(&query).unwrap_or_default();
         self.loading = true;

@@ -1918,6 +1918,75 @@ impl Repos {
             )),
         }
     }
+
+    // ── RegisterProject ─────────────────────────────────────────────────────
+
+    /// The folders a project `query` (a path, or a short name like `t3code`)
+    /// may mean on this device, see [`find_project_folders`]. The probing runs
+    /// in a disposable worker under the folder-listing ceiling, so a dead
+    /// mount fails this lookup and nothing else. `Err` is a message for the
+    /// caller: a refused folder, or a search that could not run.
+    pub async fn resolve_project_folder(
+        &self,
+        query: &str,
+        known: Vec<KnownFolder>,
+    ) -> Result<ProjectSearch, String> {
+        let home = session_home_dir().map_err(str::to_string)?;
+        // Projects sit at the top of a Windows drive; a Unix mount point is
+        // not somewhere to look for a name.
+        let drives: Vec<PathBuf> = if cfg!(windows) {
+            self.list_drives()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|drive| PathBuf::from(drive.path))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let owned = query.to_owned();
+        let at_home = home.clone();
+        let worker = disposable_worker("project-folder", move || {
+            find_project_folders(&owned, &known, &at_home, &drives)
+        });
+        let mut search = match tokio::time::timeout(FOLDER_LIST_TIMEOUT, worker).await {
+            Ok(Some(found)) => found?,
+            Ok(None) => return Err("the project folder search worker exited".into()),
+            Err(_) => return Err("the project folder search timed out on the device".into()),
+        };
+        // Last, the home index: a folder nested somewhere under home.
+        if search.candidates.is_empty() && !looks_like_path(query) {
+            let name = query.trim().to_lowercase();
+            if let Ok(found) = self.search_home_folders(query.trim().to_owned(), 8).await {
+                for hit in found.matches {
+                    let path = PathBuf::from(&hit.path);
+                    let same_name = hit
+                        .relative
+                        .trim_end_matches(['/', '\\'])
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .is_some_and(|last| last.to_lowercase() == name);
+                    if same_name
+                        && unsafe_project_root(&path, &home).is_none()
+                        && !search
+                            .candidates
+                            .iter()
+                            .any(|c| path_key(Path::new(&c.path)) == path_key(&path))
+                    {
+                        search.candidates.push(ProjectFolder {
+                            path: hit.path,
+                            source: "index",
+                            is_repo: hit.is_repo,
+                        });
+                    }
+                }
+                search.searched.push("the home folder index".into());
+                search.incomplete = found.indexing && search.candidates.is_empty();
+            }
+            self.release_home_folder_search();
+        }
+        Ok(search)
+    }
 }
 
 async fn disposable_worker<T: Send + 'static>(
@@ -2765,6 +2834,236 @@ fn absolutize(path: &Path) -> PathBuf {
     }
 }
 
+/// Folders under home that people keep projects in, tried for a bare name
+/// after the folders beside the projects this device already has.
+const PROJECT_ROOTS: &[&str] = &[
+    "codebase",
+    "code",
+    "projects",
+    "src",
+    "dev",
+    "repos",
+    "Documents/GitHub",
+    "GitHub",
+];
+/// Most candidates a registration lists.
+const PROJECT_CANDIDATES_MAX: usize = 8;
+/// System folders no project may be registered in, or below.
+const SYSTEM_FOLDERS: &[&str] = &[
+    "c:/windows",
+    "c:/program files",
+    "c:/program files (x86)",
+    "c:/programdata",
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/boot",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/system",
+    "/library",
+    "/applications",
+];
+
+/// A project this device already has: its folder and the name it was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownFolder {
+    pub path: String,
+    pub name: Option<String>,
+}
+
+/// A folder a project query may mean.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFolder {
+    pub path: String,
+    /// How it was found: `path`, `existing`, `sibling`, `drive`, `home` or
+    /// `index`.
+    pub source: &'static str,
+    pub is_repo: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSearch {
+    pub candidates: Vec<ProjectFolder>,
+    /// Where it looked, for a "not found" message.
+    pub searched: Vec<String>,
+    /// The search could not finish: the home index was still building.
+    pub incomplete: bool,
+}
+
+/// A path as a comparison key: one separator, no trailing one, lower case.
+pub(crate) fn path_key(path: &Path) -> String {
+    let key = path.to_string_lossy().replace('\\', "/");
+    key.trim_end_matches('/').to_lowercase()
+}
+
+/// A query that names a place, not a project: it has a separator, starts
+/// with `~` or a drive letter, or is absolute.
+fn looks_like_path(query: &str) -> bool {
+    let query = query.trim();
+    let bytes = query.as_bytes();
+    query.contains(['/', '\\'])
+        || query.starts_with('~')
+        || Path::new(query).is_absolute()
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// `~`, `~/x` and `~\x` against `home`; anything else as it is.
+fn expand_query_path(query: &str, home: &Path) -> PathBuf {
+    match query.strip_prefix('~') {
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with(['/', '\\']) => {
+            home.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(query),
+    }
+}
+
+/// Why `path` cannot be a project folder: the home folder itself, a drive or
+/// filesystem root, or a system folder.
+pub(crate) fn unsafe_project_root(path: &Path, home: &Path) -> Option<&'static str> {
+    if path.parent().is_none() {
+        return Some("a drive or filesystem root");
+    }
+    let key = path_key(path);
+    if key == path_key(home) {
+        return Some("the home folder");
+    }
+    SYSTEM_FOLDERS
+        .iter()
+        .any(|dir| key == *dir || key.starts_with(&format!("{dir}/")))
+        .then_some("a system folder")
+}
+
+/// The folders `query` may mean on this device, the first tier that finds any:
+/// a path (`~`, `~/x`, an absolute one); a project this device already has by
+/// that name; a folder of that name beside a project it has (this is how
+/// `t3code` is found next to `D:\zeron`); one at the top of a drive or in a
+/// folder people keep projects in. Never creates anything and never guesses:
+/// the caller registers only a single candidate. `Err` refuses a path that
+/// cannot be a project.
+pub(crate) fn find_project_folders(
+    query: &str,
+    known: &[KnownFolder],
+    home: &Path,
+    drives: &[PathBuf],
+) -> Result<ProjectSearch, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("name the project folder: a path, or a short name like \"t3code\"".into());
+    }
+    let is_dir = |path: &Path| std::fs::metadata(path).is_ok_and(|meta| meta.is_dir());
+    let mut search = ProjectSearch::default();
+    let add = |search: &mut ProjectSearch, path: &Path, source: &'static str| {
+        let key = path_key(path);
+        if search
+            .candidates
+            .iter()
+            .any(|c| path_key(Path::new(&c.path)) == key)
+            || search.candidates.len() >= PROJECT_CANDIDATES_MAX
+        {
+            return;
+        }
+        search.candidates.push(ProjectFolder {
+            path: folder_browser_path(path),
+            source,
+            is_repo: path.join(".git").exists(),
+        });
+    };
+    // Where this device's projects sit.
+    let mut parents: Vec<PathBuf> = Vec::new();
+    for folder in known {
+        if let Some(parent) = Path::new(&folder.path).parent()
+            && !parents
+                .iter()
+                .any(|seen| path_key(seen) == path_key(parent))
+        {
+            parents.push(parent.to_path_buf());
+        }
+    }
+
+    // 1. A path.
+    if looks_like_path(query) {
+        let given = expand_query_path(query, home);
+        let places: Vec<PathBuf> = if given.is_absolute() {
+            vec![given]
+        } else {
+            // Relative to home, then beside the projects it has.
+            std::iter::once(home.join(&given))
+                .chain(parents.iter().map(|parent| parent.join(&given)))
+                .collect()
+        };
+        for place in places {
+            search.searched.push(folder_browser_path(&place));
+            if !is_dir(&place) {
+                continue;
+            }
+            if let Some(why) = unsafe_project_root(&place, home) {
+                return Err(format!(
+                    "{} is {why}; register a project folder inside it instead",
+                    folder_browser_path(&place)
+                ));
+            }
+            add(&mut search, &place, "path");
+        }
+        return Ok(search);
+    }
+
+    // 2. A project it already has.
+    let name = query.to_lowercase();
+    let last = |path: &str| {
+        path.trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_lowercase()
+    };
+    for folder in known {
+        let named = folder
+            .name
+            .as_deref()
+            .is_some_and(|given| given.trim().to_lowercase() == name);
+        if named || last(&folder.path) == name {
+            add(&mut search, Path::new(&folder.path), "existing");
+        }
+    }
+    if !search.candidates.is_empty() {
+        return Ok(search);
+    }
+
+    // 3. Beside the projects it has.
+    for parent in &parents {
+        search.searched.push(folder_browser_path(parent));
+        let place = parent.join(query);
+        if is_dir(&place) && unsafe_project_root(&place, home).is_none() {
+            add(&mut search, &place, "sibling");
+        }
+    }
+    if !search.candidates.is_empty() {
+        return Ok(search);
+    }
+
+    // 4. The top of home and of each drive, and the usual project folders.
+    let mut roots: Vec<(PathBuf, &'static str)> = vec![(home.to_path_buf(), "home")];
+    roots.extend(PROJECT_ROOTS.iter().map(|root| (home.join(root), "home")));
+    roots.extend(drives.iter().map(|drive| (drive.clone(), "drive")));
+    for (root, source) in roots {
+        if !is_dir(&root) {
+            continue;
+        }
+        search.searched.push(folder_browser_path(&root));
+        let place = root.join(query);
+        if is_dir(&place) && unsafe_project_root(&place, home).is_none() {
+            add(&mut search, &place, source);
+        }
+    }
+    Ok(search)
+}
+
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -2811,6 +3110,173 @@ mod tests {
         );
         assert_eq!(expand_home("/abs/path").unwrap(), "/abs/path");
         assert_eq!(expand_home("~nope").unwrap(), "~nope");
+    }
+
+    fn make_folders(root: &Path, names: &[&str]) {
+        for name in names {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+    }
+
+    fn known(path: &Path, name: Option<&str>) -> KnownFolder {
+        KnownFolder {
+            path: path.to_string_lossy().into_owned(),
+            name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_short_name_is_found_beside_a_project_the_device_already_has() {
+        // The layout of a machine whose projects sit at a drive's top.
+        let drive = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        make_folders(drive.path(), &["zeron", "t3code"]);
+        let have = [known(&drive.path().join("zeron"), None)];
+        let found = find_project_folders("t3code", &have, home.path(), &[]).unwrap();
+        assert_eq!(found.candidates.len(), 1, "{found:?}");
+        assert_eq!(found.candidates[0].source, "sibling");
+        assert!(Path::new(&found.candidates[0].path).ends_with("t3code"));
+        assert!(!found.candidates[0].is_repo);
+        // The match ignores case.
+        let found = find_project_folders("T3Code", &have, home.path(), &[]).unwrap();
+        assert_eq!(found.candidates.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_short_name_is_found_in_the_usual_project_folders_and_drive_tops() {
+        let home = tempfile::tempdir().unwrap();
+        let drive = tempfile::tempdir().unwrap();
+        make_folders(
+            home.path(),
+            &["codebase/alpha", "beta", "Documents/GitHub/gamma"],
+        );
+        make_folders(drive.path(), &["delta"]);
+        let drives = [drive.path().to_path_buf()];
+        for (name, source) in [
+            ("alpha", "home"),
+            ("beta", "home"),
+            ("gamma", "home"),
+            ("delta", "drive"),
+        ] {
+            let found = find_project_folders(name, &[], home.path(), &drives).unwrap();
+            assert_eq!(found.candidates.len(), 1, "{name}: {found:?}");
+            assert_eq!(found.candidates[0].source, source, "{name}");
+        }
+        let none = find_project_folders("missing", &[], home.path(), &drives).unwrap();
+        assert!(none.candidates.is_empty());
+        assert!(!none.searched.is_empty(), "it says where it looked");
+    }
+
+    #[test]
+    fn a_project_the_device_has_wins_and_is_not_found_twice() {
+        let home = tempfile::tempdir().unwrap();
+        let drive = tempfile::tempdir().unwrap();
+        make_folders(drive.path(), &["zeron", "t3code"]);
+        make_folders(home.path(), &["codebase/t3code"]);
+        let have = [
+            known(&drive.path().join("t3code"), None),
+            known(&drive.path().join("zeron"), Some("Pi client")),
+        ];
+        let by_folder = find_project_folders("t3code", &have, home.path(), &[]).unwrap();
+        assert_eq!(by_folder.candidates.len(), 1, "{by_folder:?}");
+        assert_eq!(by_folder.candidates[0].source, "existing");
+        let by_name = find_project_folders("pi client", &have, home.path(), &[]).unwrap();
+        assert_eq!(by_name.candidates.len(), 1, "{by_name:?}");
+        assert!(Path::new(&by_name.candidates[0].path).ends_with("zeron"));
+    }
+
+    #[test]
+    fn two_folders_of_one_name_in_a_tier_are_both_offered() {
+        let home = tempfile::tempdir().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        make_folders(a.path(), &["app"]);
+        make_folders(b.path(), &["app"]);
+        let drives = [a.path().to_path_buf(), b.path().to_path_buf()];
+        let found = find_project_folders("app", &[], home.path(), &drives).unwrap();
+        assert_eq!(found.candidates.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn a_path_query_expands_home_with_either_separator_and_never_falls_back_to_a_name() {
+        let home = tempfile::tempdir().unwrap();
+        make_folders(home.path(), &["proj", "codebase/t3code"]);
+        for query in ["~/proj", "~\\proj"] {
+            let found = find_project_folders(query, &[], home.path(), &[]).unwrap();
+            assert_eq!(found.candidates.len(), 1, "{query}: {found:?}");
+            assert_eq!(found.candidates[0].source, "path");
+            assert!(Path::new(&found.candidates[0].path).ends_with("proj"));
+        }
+        let absolute = home.path().join("proj");
+        let found =
+            find_project_folders(&absolute.to_string_lossy(), &[], home.path(), &[]).unwrap();
+        assert_eq!(found.candidates.len(), 1);
+        // A path that is not a folder finds nothing, even though a folder
+        // of the last name exists elsewhere.
+        let missing = find_project_folders("~/elsewhere/t3code", &[], home.path(), &[]).unwrap();
+        assert!(missing.candidates.is_empty(), "{missing:?}");
+        assert_eq!(missing.searched.len(), 1);
+    }
+
+    #[test]
+    fn home_a_root_and_system_folders_are_refused() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(find_project_folders("~", &[], home.path(), &[]).is_err());
+        assert!(
+            find_project_folders(&home.path().to_string_lossy(), &[], home.path(), &[]).is_err()
+        );
+        assert_eq!(
+            unsafe_project_root(Path::new("/"), home.path()),
+            Some("a drive or filesystem root")
+        );
+        for system in ["/etc", "/usr/local", "C:\\Windows", "c:/Program Files/App"] {
+            assert_eq!(
+                unsafe_project_root(Path::new(system), home.path()),
+                Some("a system folder"),
+                "{system}"
+            );
+        }
+        assert_eq!(
+            unsafe_project_root(&home.path().join("proj"), home.path()),
+            None
+        );
+        // A name that is a system folder is skipped, not registered.
+        make_folders(home.path(), &["etc"]);
+        let found = find_project_folders("etc", &[], home.path(), &[]).unwrap();
+        assert_eq!(
+            found.candidates.len(),
+            1,
+            "a folder named etc under home is fine"
+        );
+        assert!(find_project_folders(" ", &[], home.path(), &[]).is_err());
+    }
+
+    #[test]
+    fn a_folder_with_git_metadata_reads_as_a_repository() {
+        let home = tempfile::tempdir().unwrap();
+        make_folders(home.path(), &["codebase/plain", "codebase/repo/.git"]);
+        std::fs::create_dir_all(home.path().join("codebase/linked")).unwrap();
+        // A linked worktree's `.git` is a file.
+        std::fs::write(home.path().join("codebase/linked/.git"), "gitdir: x").unwrap();
+        let is_repo = |name: &str| {
+            find_project_folders(name, &[], home.path(), &[])
+                .unwrap()
+                .candidates[0]
+                .is_repo
+        };
+        assert!(is_repo("repo"));
+        assert!(is_repo("linked"));
+        assert!(!is_repo("plain"));
+    }
+
+    #[test]
+    fn only_a_place_reads_as_a_path() {
+        for path in ["~", "~/x", "a/b", "a\\b", "D:\\x", "D:x", "/abs"] {
+            assert!(looks_like_path(path), "{path}");
+        }
+        for name in ["t3code", "my-app", "app.v2"] {
+            assert!(!looks_like_path(name), "{name}");
+        }
     }
 
     #[test]

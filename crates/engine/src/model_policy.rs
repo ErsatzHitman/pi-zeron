@@ -39,7 +39,7 @@ fn fnv1a(text: &str) -> u64 {
 }
 
 /// A chat id as a file name: itself when plainly safe, else its hash.
-fn stem(chat_id: &str) -> String {
+pub(crate) fn stem(chat_id: &str) -> String {
     let safe = !chat_id.is_empty()
         && chat_id.len() <= 128
         && chat_id

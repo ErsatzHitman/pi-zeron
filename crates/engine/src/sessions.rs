@@ -1062,9 +1062,10 @@ impl SessionsEngine {
             None
         } else {
             let depth = self.inner.member_depth(chat_id);
+            let tree = self.inner.writer_limit(chat_id);
             let cap = self.inner.max_running_turns();
             let mut gate = lock(&self.inner.admission);
-            match gate.admit(chat_id, depth, cap) {
+            match gate.admit_in(chat_id, depth, cap, tree) {
                 Admit::Now => None,
                 Admit::Queued(grant) => {
                     tracing::info!(
@@ -2072,6 +2073,29 @@ impl Inner {
         }
     }
 
+    /// The limit on concurrent writers of the orchestrator tree `chat_id`
+    /// writes in, when its user set one. Only a member that may write counts:
+    /// the root stays Working while it waits on its children, and a reader
+    /// changes nothing.
+    fn writer_limit(&self, chat_id: &str) -> Option<crate::admission::TreeLimit> {
+        self.member_depth(chat_id)?;
+        let workspace = self.workspace()?;
+        let chat = workspace.chat(chat_id).ok().flatten()?;
+        let writes = chat
+            .config
+            .as_ref()
+            .is_some_and(|config| config.sandbox != zeron_proto::SandboxLevel::ReadOnly);
+        if !writes {
+            return None;
+        }
+        let root = zeron_proto::orchestrator::Place::of(&self.lineage(chat_id), chat_id).root_id?;
+        let limit = workspace.orchestrator_project(&root).policy.writer_limit?;
+        Some(crate::admission::TreeLimit {
+            root,
+            limit: usize::from(limit),
+        })
+    }
+
     /// Keep the admission slots in step with a status transition; whether the
     /// queue changed (so its rows need republishing).
     fn account_slot(&self, chat_id: &str, status: SessionStatus) -> bool {
@@ -2079,7 +2103,8 @@ impl Inner {
             SessionStatus::Working => {
                 if !lock(&self.admission).tracks(chat_id) {
                     let depth = self.member_depth(chat_id);
-                    lock(&self.admission).mark_running(chat_id, depth);
+                    let tree = self.writer_limit(chat_id).map(|tree| tree.root);
+                    lock(&self.admission).mark_running_in(chat_id, depth, tree);
                 }
                 false
             }
@@ -2263,6 +2288,15 @@ impl Inner {
         workspace
             .orchestrator_project(&root)
             .prompt(&workspace.orchestrator_memory(&root))
+    }
+
+    /// The tree policy file of a run in an orchestrator's tree, brought up to
+    /// date with its project, for Pi's guard to enforce.
+    fn tree_policy_file(&self, chat_id: &str, data_dir: &std::path::Path) -> Option<String> {
+        let root = zeron_proto::orchestrator::Place::of(&self.lineage(chat_id), chat_id).root_id?;
+        let project = self.workspace()?.orchestrator_project(&root);
+        let file = crate::tree_policy::sync(data_dir, &project).ok()?;
+        Some(file.to_string_lossy().into_owned())
     }
 
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.
@@ -3337,6 +3371,11 @@ async fn drive_run(
                 zeron_proto::orchestrator::ENV_MODEL_POLICY.to_owned(),
                 files,
             );
+        }
+        // Every Pi of an orchestrator's tree is held to the tree's policy.
+        if let Some(file) = inner.tree_policy_file(&chat_id, &dir) {
+            mcp.env
+                .insert(zeron_proto::orchestrator::ENV_TREE_POLICY.to_owned(), file);
         }
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch

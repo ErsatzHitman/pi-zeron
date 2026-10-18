@@ -11,6 +11,11 @@
 //! they wait for. Tree members therefore queue ahead of everyone else (deeper
 //! first) and a member start is admitted over the cap while fewer than
 //! [`MEMBER_FLOOR`] member turns run.
+//!
+//! An orchestrator's user may also limit how many of its tree's writing
+//! sessions run a turn at once ([`TreeLimit`]). A writer over the limit
+//! queues like one over the cap, but it waits only for its own tree: a tree at
+//! its limit never holds up another tree's start behind it.
 
 use std::collections::HashMap;
 
@@ -18,6 +23,14 @@ use tokio::sync::oneshot;
 
 /// Member turns that may always start, cap or not.
 pub(crate) const MEMBER_FLOOR: usize = 2;
+
+/// A turn of a writing session in an orchestrator's tree, counted against the
+/// tree's limit on concurrent writers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeLimit {
+    pub(crate) root: String,
+    pub(crate) limit: usize,
+}
 
 /// What a start does about the cap.
 pub(crate) enum Admit {
@@ -32,6 +45,8 @@ struct Waiter {
     chat_id: String,
     /// `Some(depth)` for a tree member; members go before everyone else.
     depth: Option<usize>,
+    /// The tree limit it was admitted under, if it writes in a tree.
+    tree: Option<TreeLimit>,
     seq: u64,
     grant: oneshot::Sender<()>,
 }
@@ -51,6 +66,9 @@ impl Waiter {
 pub(crate) struct Admission {
     /// Chats holding a slot, with their member depth.
     running: HashMap<String, Option<usize>>,
+    /// The orchestrator root of each running writer that counts against a
+    /// tree's limit.
+    trees: HashMap<String, String>,
     /// Kept in grant order, so position = index + 1.
     waiters: Vec<Waiter>,
     seq: u64,
@@ -78,13 +96,38 @@ impl Admission {
             .map_or(0, |i| u32::try_from(i + 1).unwrap_or(u32::MAX))
     }
 
-    fn fits(&self, cap: usize, member: bool) -> bool {
+    fn tree_running(&self, root: &str) -> usize {
+        self.trees.values().filter(|r| r.as_str() == root).count()
+    }
+
+    fn fits_global(&self, cap: usize, member: bool) -> bool {
         cap == 0 || self.running.len() < cap || (member && self.member_running() < MEMBER_FLOOR)
     }
 
-    /// Ask for a slot for a fresh run. Idempotent: a chat that already holds
-    /// one is `Now`; one already queued keeps its place.
+    fn fits_tree(&self, tree: Option<&TreeLimit>) -> bool {
+        tree.is_none_or(|tree| self.tree_running(&tree.root) < tree.limit)
+    }
+
+    fn fits(&self, cap: usize, member: bool, tree: Option<&TreeLimit>) -> bool {
+        self.fits_global(cap, member) && self.fits_tree(tree)
+    }
+
+    /// [`Self::admit_in`] for a chat that is in no tree's limit.
+    #[cfg(test)]
     pub(crate) fn admit(&mut self, chat_id: &str, depth: Option<usize>, cap: usize) -> Admit {
+        self.admit_in(chat_id, depth, cap, None)
+    }
+
+    /// Ask for a slot for a fresh run. Idempotent: a chat that already holds
+    /// one is `Now`; one already queued keeps its place. `tree` is the limit
+    /// of the orchestrator tree a writer belongs to.
+    pub(crate) fn admit_in(
+        &mut self,
+        chat_id: &str,
+        depth: Option<usize>,
+        cap: usize,
+        tree: Option<TreeLimit>,
+    ) -> Admit {
         // A raised cap (or a freed floor) may have room the queue has not used.
         self.grant(cap);
         if self.running.contains_key(chat_id) {
@@ -93,18 +136,24 @@ impl Admission {
         let (tx, rx) = oneshot::channel();
         if let Some(waiter) = self.waiters.iter_mut().find(|w| w.chat_id == chat_id) {
             waiter.grant = tx;
+            // The limit as it stands now.
+            waiter.tree = tree;
             return Admit::Queued(rx);
         }
         // After the grant above, only a member over the floor can still fit
         // while others wait.
-        if self.fits(cap, depth.is_some()) {
+        if self.fits(cap, depth.is_some(), tree.as_ref()) {
             self.running.insert(chat_id.to_owned(), depth);
+            if let Some(tree) = tree {
+                self.trees.insert(chat_id.to_owned(), tree.root);
+            }
             return Admit::Now;
         }
         self.seq += 1;
         let waiter = Waiter {
             chat_id: chat_id.to_owned(),
             depth,
+            tree,
             seq: self.seq,
             grant: tx,
         };
@@ -116,17 +165,33 @@ impl Admission {
     /// A turn that must not wait (a steer into a live runtime, an un-park, an
     /// answered question) takes a slot even over the cap. A queued chat keeps
     /// waiting instead.
+    #[cfg(test)]
     pub(crate) fn mark_running(&mut self, chat_id: &str, depth: Option<usize>) {
+        self.mark_running_in(chat_id, depth, None);
+    }
+
+    /// [`Self::mark_running`] for a writer of the tree rooted at `tree_root`,
+    /// so it counts against the tree's limit.
+    pub(crate) fn mark_running_in(
+        &mut self,
+        chat_id: &str,
+        depth: Option<usize>,
+        tree_root: Option<String>,
+    ) {
         if self.waiters.iter().any(|w| w.chat_id == chat_id) {
             return;
         }
         self.running.entry(chat_id.to_owned()).or_insert(depth);
+        if let Some(root) = tree_root {
+            self.trees.entry(chat_id.to_owned()).or_insert(root);
+        }
     }
 
     /// Free `chat_id`'s slot and hand freed slots to the queue. Returns whether
     /// the queue changed.
     pub(crate) fn release(&mut self, chat_id: &str, cap: usize) -> bool {
         self.running.remove(chat_id);
+        self.trees.remove(chat_id);
         self.grant(cap)
     }
 
@@ -142,21 +207,33 @@ impl Admission {
     pub(crate) fn forget(&mut self, chat_id: &str, cap: usize) -> bool {
         let cancelled = self.cancel(chat_id);
         self.running.remove(chat_id);
+        self.trees.remove(chat_id);
         let granted = self.grant(cap);
         cancelled || granted
     }
 
     /// Wake waiters, best first, while they fit. A waiter whose run is gone
-    /// (receiver dropped) is discarded without taking a slot.
+    /// (receiver dropped) is discarded without taking a slot. One held back
+    /// only by its own tree's limit is passed over, so a tree at its limit
+    /// never holds up the starts behind it; one the cap holds back stops the
+    /// scan, as the cap holds back everyone after it.
     fn grant(&mut self, cap: usize) -> bool {
         let mut changed = false;
-        while let Some(head) = self.waiters.first() {
-            if !self.fits(cap, head.depth.is_some()) {
+        let mut at = 0;
+        while let Some(next) = self.waiters.get(at) {
+            if !self.fits_global(cap, next.depth.is_some()) {
                 break;
             }
-            let waiter = self.waiters.remove(0);
+            if !self.fits_tree(next.tree.as_ref()) {
+                at += 1;
+                continue;
+            }
+            let waiter = self.waiters.remove(at);
             changed = true;
             if waiter.grant.send(()).is_ok() {
+                if let Some(tree) = waiter.tree {
+                    self.trees.insert(waiter.chat_id.clone(), tree.root);
+                }
                 self.running.insert(waiter.chat_id, waiter.depth);
             }
         }
@@ -321,6 +398,63 @@ mod tests {
         assert!(!a.forget("b", 1));
         assert_eq!(a.running(), 0);
         assert!(!a.tracks("a") && !a.tracks("b"));
+    }
+
+    fn writer(root: &str, limit: usize) -> Option<TreeLimit> {
+        Some(TreeLimit {
+            root: root.into(),
+            limit,
+        })
+    }
+
+    #[test]
+    fn a_trees_writer_limit_queues_the_extra_writers_and_spares_everyone_else() {
+        let mut a = Admission::default();
+        // No global cap: only the tree's limit of 2 writers holds anyone back.
+        now(a.admit_in("w1", Some(1), 0, writer("orchestrator-a", 2)));
+        now(a.admit_in("w2", Some(1), 0, writer("orchestrator-a", 2)));
+        let mut w3 = queued(a.admit_in("w3", Some(1), 0, writer("orchestrator-a", 2)));
+        let mut w4 = queued(a.admit_in("w4", Some(2), 0, writer("orchestrator-a", 2)));
+        assert_eq!((a.position("w4"), a.position("w3")), (1, 2), "deeper first");
+        // A reader of the same tree, another tree's writer and a plain chat
+        // start at once.
+        now(a.admit_in("reader", Some(1), 0, None));
+        now(a.admit_in("other", Some(1), 0, writer("orchestrator-b", 1)));
+        now(a.admit_in("chat", None, 0, None));
+        // A freed writer slot goes to the next in line, one at a time.
+        assert!(a.release("w1", 0));
+        assert!(granted(&mut w4) && !granted(&mut w3));
+        assert!(a.release("w2", 0));
+        assert!(granted(&mut w3));
+        assert_eq!(a.position("w3") + a.position("w4"), 0);
+    }
+
+    #[test]
+    fn a_tree_at_its_limit_does_not_hold_up_another_trees_waiter_behind_it() {
+        let mut a = Admission::default();
+        now(a.admit_in("a1", Some(1), 0, writer("orchestrator-a", 1)));
+        now(a.admit_in("b1", Some(1), 0, writer("orchestrator-b", 1)));
+        let mut a2 = queued(a.admit_in("a2", Some(1), 0, writer("orchestrator-a", 1)));
+        let mut b2 = queued(a.admit_in("b2", Some(1), 0, writer("orchestrator-b", 1)));
+        // b's writer frees up while a's waiter is ahead of b2 in the queue.
+        assert!(a.release("b1", 0));
+        assert!(granted(&mut b2), "b2 is not stuck behind a2");
+        assert!(!granted(&mut a2));
+        assert_eq!(a.position("a2"), 1);
+        assert!(a.release("a1", 0));
+        assert!(granted(&mut a2));
+    }
+
+    #[test]
+    fn a_steered_writer_counts_against_its_tree_without_waiting() {
+        let mut a = Admission::default();
+        a.mark_running_in("steered", Some(1), Some("orchestrator-a".into()));
+        let mut next = queued(a.admit_in("next", Some(1), 0, writer("orchestrator-a", 1)));
+        assert!(a.release("steered", 0));
+        assert!(granted(&mut next));
+        // Finished writers hold nothing.
+        assert!(a.release("next", 0));
+        now(a.admit_in("again", Some(1), 0, writer("orchestrator-a", 1)));
     }
 
     #[test]

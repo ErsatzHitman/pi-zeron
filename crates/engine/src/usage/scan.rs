@@ -140,9 +140,11 @@ pub(super) struct FileState {
     pub started_ms: i64,
     /// The session header's id; a delegate's starts `dlg-`.
     pub session_id: String,
-    /// `[provider, model, surface]` triples the records point into. The
-    /// surface is empty where the record's source names it.
-    pub names: Vec<[String; 3]>,
+    /// `[provider, model, surface, session]` the records point into. The
+    /// surface is empty where the record's source names it; the session is
+    /// the Pi session that made a ledger call, empty elsewhere (a session
+    /// file's calls are its own session's).
+    pub names: Vec<[String; 4]>,
     pub records: Vec<Record>,
     /// The latest assistant's name: a summary ran on that model.
     pub last_assistant: Option<u32>,
@@ -161,6 +163,8 @@ struct Found {
     provider: String,
     model: String,
     surface: String,
+    /// The Pi session that made a ledger call.
+    sid: String,
     record: Record,
 }
 
@@ -175,25 +179,38 @@ impl FileState {
     pub fn name(&self, record: &Record) -> (&str, &str) {
         self.names
             .get(record.2 as usize)
-            .map_or(("", ""), |[provider, model, _]| (provider, model))
+            .map_or(("", ""), |[provider, model, _, _]| (provider, model))
     }
 
     pub fn surface(&self, record: &Record) -> &str {
         self.names
             .get(record.2 as usize)
-            .map_or("", |[_, _, surface]| surface)
+            .map_or("", |[_, _, surface, _]| surface)
     }
 
-    fn intern(&mut self, provider: &str, model: &str, surface: &str) -> u32 {
+    /// The Pi session a record belongs to: the one that made a ledger call,
+    /// else the session file's own.
+    pub fn session(&self, record: &Record) -> &str {
+        match self.names.get(record.2 as usize) {
+            Some([_, _, _, sid]) if !sid.is_empty() => sid,
+            _ => &self.session_id,
+        }
+    }
+
+    fn intern(&mut self, provider: &str, model: &str, surface: &str, sid: &str) -> u32 {
         if let Some(ix) = self
             .names
             .iter()
-            .position(|[p, m, s]| p == provider && m == model && s == surface)
+            .position(|[p, m, s, i]| p == provider && m == model && s == surface && i == sid)
         {
             return ix as u32;
         }
-        self.names
-            .push([provider.to_owned(), model.to_owned(), surface.to_owned()]);
+        self.names.push([
+            provider.to_owned(),
+            model.to_owned(),
+            surface.to_owned(),
+            sid.to_owned(),
+        ]);
         (self.names.len() - 1) as u32
     }
 
@@ -202,6 +219,7 @@ impl FileState {
             provider,
             model,
             surface,
+            sid,
             mut record,
         } = found;
         let summary = matches!(record.source(), Source::Compaction | Source::BranchSummary);
@@ -209,7 +227,7 @@ impl FileState {
         record.2 = match last {
             // Pi stores a summary's usage without its model.
             Some(name) if summary && provider.is_empty() && model.is_empty() => name,
-            _ => self.intern(&provider, &model, &surface),
+            _ => self.intern(&provider, &model, &surface, &sid),
         };
         if record.source() == Source::Assistant {
             self.last_assistant = Some(record.2);
@@ -339,6 +357,9 @@ struct LedgerLine {
     rmodel: Option<Value>,
     #[serde(default)]
     surface: Option<Value>,
+    /// The Pi session that made the call.
+    #[serde(default)]
+    sid: Option<Value>,
     #[serde(default)]
     u: Option<Value>,
     #[serde(default)]
@@ -467,6 +488,7 @@ fn found(
         provider: provider.to_owned(),
         model: model.to_owned(),
         surface: surface.to_owned(),
+        sid: String::new(),
         record: Record(key.finish(), ms, 0, tokens, recorded, source, matched),
     })
 }
@@ -662,6 +684,7 @@ fn subagent_result(content: &Value, details: Option<&Value>, ms: i64) -> Option<
 fn ledger_call(line: LedgerLine, ms: i64) -> Option<Found> {
     let usage = line.u.unwrap_or_default();
     let tokens = ["i", "o", "cr", "cw", "r"].map(|field| count(&usage, field));
+    let sid = text(&line.sid).unwrap_or_default().to_owned();
     found(
         Source::Ledger,
         text(&line.provider).unwrap_or_default(),
@@ -677,6 +700,7 @@ fn ledger_call(line: LedgerLine, ms: i64) -> Option<Found> {
             &line.id.map(|id| id.to_string()).unwrap_or_default(),
         ],
     )
+    .map(|found| Found { sid, ..found })
 }
 
 /// FNV-1a: stable across builds, unlike std's hasher, since keys persist.

@@ -69,3 +69,28 @@ async fn session_model_restrictions_hold_in_every_pi() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[tokio::test]
+async fn tree_policy_holds_every_pi_of_the_tree() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new("node")
+            .arg(root.join("tests/fixtures/pi-tree-policy-test.mjs"))
+            .arg(root.join("src/pi/guard.mjs"))
+            .env_remove("ZERON_TREE_POLICY")
+            .env_remove("ZERON_MODEL_POLICY")
+            .env_remove("PI_USAGE_SURFACE")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("the tree policy checks finish")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

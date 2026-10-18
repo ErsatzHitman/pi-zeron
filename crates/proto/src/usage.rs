@@ -30,6 +30,10 @@ pub struct UsageQuery {
     /// Only this surface's requests in `models` and `series`; `surfaces`
     /// always lists every one.
     pub surface: Option<String>,
+    /// Only the requests Pi sessions with these ids made, in everything the
+    /// report lists. None counts every session. A tree's spend is the
+    /// sessions of its chats.
+    pub sessions: Option<Vec<String>>,
 }
 
 /// Token counts. The total is `input + cache_read + cache_write + output`;

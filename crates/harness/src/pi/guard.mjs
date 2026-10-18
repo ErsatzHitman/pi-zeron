@@ -3,7 +3,7 @@
 // In a read-only session (`ZERON_READ_ONLY=1`, a delegated chat created with
 // `write: false`) it also blocks every edit, whatever the delete toggle says.
 // A guard against mistakes and model-driven changes, not a sandbox.
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
@@ -456,7 +456,7 @@ const GIT_LISTING = /^--?(a|r|v|vv|l|list|all|remotes|contains|no-contains|merge
 const FIND_WRITES = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"]);
 const RO_TOOL_WRITES = new Set([...WRITE, ...DEL, "edit", "patch", "apply", "replace", "insert", "append", "rename", "commit",
   "push", "merge", "install", "mkdir", "touch", "copy", "archive", "respond", "interrupt", "steer", "queue", "publish", "post",
-  "put", "schedule", "approve"]);
+  "put", "schedule", "approve", "register"]);
 const NULL_SINK = /^(\/dev\/null|&[0-9-]|\$null|nul)$/i;
 
 export function gitReadOnly(args) {
@@ -637,8 +637,24 @@ export function idDisabled(off, id) {
   for (const entry of off) if (entry.slice(entry.indexOf("/") + 1) === bare) return true;
   return false;
 }
-export const modelDisabled = (off, model) =>
-  Boolean(model) && off.has(modelKey(`${model.provider}/${model.id}`));
+/** `(provider, id)` of a model reference, lower case, without a thinking suffix. */
+const splitModelRef = (ref) => {
+  const bare = modelKey(ref).replace(THINKING_SUFFIX, "");
+  const cut = bare.indexOf("/");
+  return cut < 0 ? [undefined, bare] : [bare.slice(0, cut), bare.slice(cut + 1)];
+};
+/** Whether `entry` names `model` (a bare id or "provider/id", either side): a
+ * bare id names the model on any provider. */
+export function modelMatches(entry, model) {
+  const [entryProvider, entryId] = splitModelRef(entry), [provider, id] = splitModelRef(model);
+  return entryId === id && (!entryProvider || !provider || entryProvider === provider);
+}
+/** A model outside the tree's allow-list (an empty list allows any). */
+export const modelNotAllowed = (allowed, ref) =>
+  allowed.length > 0 && typeof ref === "string" && ref.trim() !== "" && !allowed.some((entry) => modelMatches(entry, ref));
+export const modelDisabled = (off, model, allowed = []) =>
+  Boolean(model) && (off.has(modelKey(`${model.provider}/${model.id}`))
+    || modelNotAllowed(allowed, `${model.provider}/${model.id}`));
 
 /** The first disabled model a tool call's input names (`model`, `models`, …). */
 export function disabledModelIn(input, off, depth = 0) {
@@ -654,17 +670,31 @@ export function disabledModelIn(input, off, depth = 0) {
   return undefined;
 }
 
+/** The first model a tool call's input names that the allow-list does not admit. */
+export function disallowedModelIn(input, allowed, depth = 0) {
+  if (!allowed.length || depth > 5 || !input || typeof input !== "object") return undefined;
+  for (const [key, value] of Object.entries(input)) {
+    if (/model/i.test(key))
+      for (const v of Array.isArray(value) ? value : [value]) if (modelNotAllowed(allowed, v)) return v;
+    if (value && typeof value === "object") {
+      const found = disallowedModelIn(value, allowed, depth + 1);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
 // The advisor's own `model` is the advisor's (global) choice.
 const POLICY_TOOLS_EXEMPT = new Set(["advisor"]);
 export const MODEL_REASON = (id) =>
   `Model ${id} is disabled in this session (Zeron). Use a different model.`;
 
 /** A session's allowed model to fall back to: same provider first. */
-export function allowedFallback(ctx, off, current) {
+export function allowedFallback(ctx, off, current, allowed = []) {
   let available = [];
   try { available = ctx.modelRegistry?.getAvailable?.() ?? []; } catch {}
   const pool = [...(ctx.scopedModels ?? []).map((s) => s?.model), ...available]
-    .filter((m) => m && !modelDisabled(off, m));
+    .filter((m) => m && !modelDisabled(off, m, allowed));
   return pool.find((m) => m.provider === current?.provider) ?? pool[0];
 }
 
@@ -672,10 +702,10 @@ function enforceModels(pi) {
   // Off the disabled model before the turn runs; the request check is the
   // backstop for anything that switched past this.
   const steer = async (ctx, model) => {
-    const off = disabledModels();
-    if (!modelDisabled(off, model)) return;
+    const off = disabledModels(), allowed = allowedModels();
+    if (!modelDisabled(off, model, allowed)) return;
     const name = `${model.provider}/${model.id}`;
-    const next = allowedFallback(ctx, off, model);
+    const next = allowedFallback(ctx, off, model, allowed);
     let switched = false;
     if (next) { try { switched = await pi.setModel(next); } catch {} }
     try {
@@ -688,7 +718,14 @@ function enforceModels(pi) {
   pi.on("model_select", (event, ctx) => steer(ctx, event?.model));
   pi.on("before_agent_start", async (_event, ctx) => { await steer(ctx, ctx.model); });
   pi.on("before_provider_request", (_event, ctx) => {
-    if (!modelDisabled(disabledModels(), ctx.model)) return;
+    const halted = treePolicy()?.halted;
+    if (halted) {
+      // The spending cap halted the tree: no further request is sent.
+      try { ctx.ui?.notify?.(`${TREE_MARK} rule=halted] The tree is paused (${halted.reason}); no further model request is made.`, "error"); } catch {}
+      ctx.abort();
+      return;
+    }
+    if (!modelDisabled(disabledModels(), ctx.model, allowedModels())) return;
     try { ctx.ui?.notify?.(MODEL_REASON(`${ctx.model.provider}/${ctx.model.id}`), "error"); } catch {}
     ctx.abort();
   });
@@ -834,6 +871,252 @@ export function usageWatcher(pi, { depth, env = process.env, intervalMs = 15000,
   return { check, told, model: () => model };
 }
 
+// ---- the tree policy. The rules the user set for the orchestrator tree this
+// Pi belongs to, in the file `ZERON_TREE_POLICY` names (the engine keeps it
+// current): builds and tests run on GitHub only, how many heavy commands run
+// at once, the models the tree may use, and whether the spending cap halted
+// it. Every Pi of the tree (sub-agents and workflows too) inherits the env
+// and this guard, so none of them gets around it. Re-read on change, so an
+// edit holds from the next call. Global helpers keep their own rules. Unknown
+// (no env, no file, a torn file) blocks nothing. Like the rest of the guard
+// this stops mistakes, it is not a sandbox: a script, a make target or an
+// interpreter running a build is not seen.
+export const TREE_MARK = "[zeron:tree-policy";
+let treeSeen = { file: "", mtimeMs: -1, size: -1, policy: undefined };
+export function treePolicy(env = process.env, fs = { statSync, readFileSync }) {
+  const file = env.ZERON_TREE_POLICY;
+  if (!file || policyExempt(env)) return undefined;
+  const last = () => (treeSeen.file === file ? treeSeen.policy : undefined);
+  let st;
+  try { st = fs.statSync(file); }
+  catch (e) {
+    // Gone: nothing set. Transient I/O (a Windows rename-over): the last read.
+    if (e?.code === "ENOENT") { treeSeen = { file: "", mtimeMs: -1, size: -1, policy: undefined }; return undefined; }
+    return last();
+  }
+  if (treeSeen.file === file && treeSeen.mtimeMs === st.mtimeMs && treeSeen.size === st.size) return treeSeen.policy;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    const limit = Number(raw?.heavyCommandLimit);
+    const policy = {
+      githubOnlyTests: raw?.githubOnlyTests === true,
+      heavyCommandLimit: Number.isInteger(limit) && limit > 0 ? limit : 0,
+      allowedModels: Array.isArray(raw?.allowedModels)
+        ? raw.allowedModels.filter((m) => typeof m === "string" && m.trim()).map((m) => m.trim()) : [],
+      halted: raw?.halted && typeof raw.halted === "object" ? { reason: String(raw.halted.reason ?? "") } : undefined,
+    };
+    treeSeen = { file, mtimeMs: st.mtimeMs, size: st.size, policy };
+    return policy;
+  } catch (e) {
+    if (e instanceof SyntaxError) { treeSeen = { file, mtimeMs: st.mtimeMs, size: st.size, policy: undefined }; return undefined; }
+    return last();
+  }
+}
+/** The models the tree may use; empty allows any. */
+export const allowedModels = (env = process.env) => treePolicy(env)?.allowedModels ?? [];
+
+// Heavy commands: compilers, bundlers and test runners.
+const HEAVY_WRAPPERS = new Set([...RO_WRAPPERS, "sudo", "doas", "setsid", "exec"]);
+const HEAVY_DIRECT = new Set(["rustc", "rustdoc", "tsc", "vitest", "jest", "mocha", "webpack", "pytest", "py.test", "tox", "nox",
+  "gradle", "gradlew", "mvn", "mvnw", "ant", "make", "gmake", "cmake", "ninja", "msbuild", "xcodebuild", "gcc", "g++", "cc", "c++",
+  "clang", "clang++", "cl", "javac", "kotlinc", "swiftc", "bazel", "bazelisk", "buck2", "sbt"]);
+const HEAVY_SUB = {
+  cargo: new Set(["build", "b", "check", "c", "test", "t", "clippy", "doc", "d", "bench", "run", "r", "nextest", "llvm-cov", "install",
+    "fix", "miri", "tarpaulin", "rustc", "rustdoc", "package"]),
+  dotnet: new Set(["build", "test", "publish", "pack", "msbuild", "run"]),
+  go: new Set(["build", "test", "vet", "install", "run"]),
+  deno: new Set(["test", "check", "compile", "bench"]),
+  zig: new Set(["build", "test"]),
+  vite: new Set(["build"]), next: new Set(["build"]), nuxt: new Set(["build"]),
+  nx: new Set(["build", "test", "lint", "e2e", "affected"]), turbo: new Set(["run", "build", "test", "lint"]),
+};
+const NODE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun"]);
+const NODE_RUNNERS = new Set(["npx", "pnpx", "bunx"]);
+const NODE_TOOLS = new Set(["tsc", "vitest", "jest", "mocha", "webpack"]);
+const NODE_DIRECT = new Set(["build", "test", "t", "tst", "typecheck", "lint", "check", "compile"]);
+const HEAVY_SCRIPT = /^(build|test|tests|typecheck|type-check|lint|check|compile|e2e|ci|coverage|bundle)(:.*|-.*)?$/i;
+const FLAG_VALUED = new Set(["--filter", "-F", "--workspace", "--prefix", "--cwd", "--dir", "-C", "--manifest-path"]);
+const PY_MODULES = new Set(["pytest", "unittest", "tox", "nox", "mypy"]);
+
+/** The arguments that are not flags (and not the value of one that takes a value). */
+function positional(args) {
+  const out = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === "--") break;
+    if (FLAG_VALUED.has(a)) { k++; continue; }
+    if (!a.startsWith("-")) out.push(a);
+  }
+  return out;
+}
+
+function nodeHeavy(name, args) {
+  const [first, second] = positional(args);
+  if (!first) return undefined;
+  if (name === "npm" ? /^(test|t|tst)$/.test(first) : NODE_DIRECT.has(first)) return { name: `${name} ${first}` };
+  if (/^(run|run-script|rum|urn)$/.test(first) && second && HEAVY_SCRIPT.test(second)) return { name: `${name} run ${second}` };
+  return undefined;
+}
+
+function heavySegment(words, dialect, depth) {
+  if (depth > 8) return undefined;
+  let i = 0;
+  while (i < words.length && /^[A-Za-z_]\w*=/.test(words[i].raw)) i++;
+  if (dialect === "ps") while (words[i] && (words[i].cooked === "&" || words[i].cooked === ".")) i++;
+  const head = words[i];
+  if (!head || head.dyn) return undefined;
+  const name = nameOf(head), rest = words.slice(i + 1), args = rest.map((w) => w.cooked);
+  if (HEAVY_WRAPPERS.has(name)) {
+    let k = 0;
+    while (k < args.length && (/^-/.test(args[k]) || /^[A-Za-z_]\w*=/.test(rest[k].raw) || /^\d+[smhd]?$/.test(args[k]))) k++;
+    return k < rest.length ? heavySegment(rest.slice(k), dialect, depth + 1) : undefined;
+  }
+  if (SHELLS.test(name)) {
+    const k = args.findIndex((a) => /^-[a-z]*c[a-z]*$/.test(a));
+    return k >= 0 && args[k + 1] ? heavyCommand(args[k + 1], "posix", depth + 1) : undefined;
+  }
+  if (name === "powershell" || name === "pwsh") {
+    const k = args.findIndex((a) => /^-(c|command|commandwithargs)$/i.test(a));
+    return k >= 0 && args[k + 1] ? heavyCommand(args.slice(k + 1).join(" "), "ps", depth + 1) : undefined;
+  }
+  if (name === "cmd") {
+    const k = args.findIndex((a) => /^\/[ck]$/i.test(a));
+    return k >= 0 ? heavyCommand(args.slice(k + 1).join(" "), "cmd", depth + 1) : undefined;
+  }
+  if (HEAVY_DIRECT.has(name)) return { name };
+  if (NODE_MANAGERS.has(name)) {
+    const found = nodeHeavy(name, args);
+    if (found) return found;
+  }
+  if (NODE_RUNNERS.has(name) || ((name === "pnpm" || name === "yarn") && args[0] === "dlx") || (name === "npm" && args[0] === "exec")) {
+    const tool = positional(args.filter((a, k) => !(k === 0 && /^(dlx|exec)$/.test(a))))[0];
+    const bare = tool?.replace(/@[^/]*$/, "");
+    if (bare && NODE_TOOLS.has(bare)) return { name: `${name} ${bare}` };
+  }
+  if (/^(python[\d.]*|py|pypy3?)$/.test(name)) {
+    const m = args.indexOf("-m");
+    if (m >= 0 && PY_MODULES.has(args[m + 1])) return { name: `${name} -m ${args[m + 1]}` };
+  }
+  const sub = HEAVY_SUB[name];
+  if (sub) {
+    const verb = positional(args).find((a) => !a.startsWith("+"));
+    if (verb && sub.has(verb)) return { name: `${name} ${verb}` };
+  }
+  return undefined;
+}
+
+/** The heavy command a shell line runs ({ name, seg }), looking through
+ * wrappers (`rtk`, `timeout`, `env`, `nohup`), nested shells and command
+ * substitutions. `cargo fmt`, git, gh and searches are not heavy. */
+export function heavyCommand(src, dialect = "posix", depth = 0) {
+  if (depth > 8 || typeof src !== "string" || src.length > 262144) return undefined;
+  let parsed;
+  try { parsed = split(src, dialect); } catch { return undefined; }
+  for (const words of parsed.segs) {
+    const found = heavySegment(words, dialect, depth);
+    if (found) return { ...found, seg: found.seg ?? words.map((w) => w.raw).join(" ") };
+  }
+  for (const n of parsed.nested) {
+    const found = heavyCommand(n.src, n.dialect, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+const SHELL_LIKE = /(bash|shell|exec|terminal|run_command|powershell|pwsh)/i;
+/** The shell line a tool call runs: Pi's `bash` and `powershell`, and any
+ * shell-like tool (the user's `bash_bg`) with a `command`. */
+export function shellCommandOf(event) {
+  const command = event?.input?.command;
+  const name = String(event?.toolName ?? "");
+  if (typeof command !== "string" || !command.trim()) return undefined;
+  if (!SHELL_TOOLS.has(name) && !SHELL_LIKE.test(name)) return undefined;
+  return { command, dialect: /powershell|pwsh/i.test(name) ? "ps" : "posix" };
+}
+
+// What a halted tree may still do: read. It starts nothing and changes nothing.
+const HALT_EXTRA = new Set(["zeron_send_message", "zeron_send_messages"]);
+
+/** Why the tree policy blocks this tool call, or undefined. The checks that
+ * need no waiting; the heavy-command limit is `heavySlot`. */
+export function treeBlock(event, policy, annotations) {
+  if (!policy) return undefined;
+  const tool = String(event?.toolName ?? "");
+  if (policy.halted) {
+    let writes;
+    try { writes = classifyReadOnly({ toolName: tool, input: event.input ?? {}, annotations }); }
+    catch { writes = hit("ro-error", "the check could not analyse this call"); }
+    if (NEW_WORK_TOOLS.has(tool) || HALT_EXTRA.has(tool) || writes)
+      return `${TREE_MARK} rule=halted] Blocked ${tool}: this orchestrator's tree is paused (${policy.halted.reason || "its spending cap"}). ` +
+        `Start nothing and change nothing: finish the step you are on safely, say where things stand in your final reply and end your turn.`;
+  }
+  if (policy.githubOnlyTests) {
+    const sh = shellCommandOf(event);
+    const heavy = sh && heavyCommand(sh.command, sh.dialect);
+    if (heavy)
+      return `${TREE_MARK} rule=github-only-tests] Blocked: ${heavy.name} would build or test on this machine, and this orchestrator runs builds ` +
+        `and tests on GitHub only. Push your branch, open a draft pull request and read CI with \`gh pr checks\` or \`gh run watch\`. ` +
+        `Do not retry or rephrase it. If CI is not an option, stop and tell your parent.`;
+  }
+  if (policy.allowedModels.length && !POLICY_TOOLS_EXEMPT.has(tool)) {
+    const model = disallowedModelIn(event.input, policy.allowedModels);
+    if (model)
+      return `${TREE_MARK} rule=allowed-models] Blocked ${tool}: model ${model} is not allowed in this orchestrator; only these are: ` +
+        `${policy.allowedModels.join(", ")}. Use one of them.`;
+  }
+  return undefined;
+}
+
+// The heavy-command limit: a slot is a file in `<policy file>.slots`, named
+// `<pid>-<tool call>`, so every Pi of the tree on this device counts the
+// same ones. A slot of a dead process, or older than half an hour, is
+// reaped; two Pis that count at once settle it by the order the files were
+// made, and the later one gives its file back.
+const SLOT_TTL_MS = 30 * 60 * 1000;
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === "EPERM"; } };
+export function slotsDir(env = process.env) {
+  const file = env.ZERON_TREE_POLICY;
+  return file ? file.replace(/\.json$/i, "") + ".slots" : undefined;
+}
+/** Take one of `limit` slots in `dir` for `id`, or undefined when all are held. */
+export function takeSlot(dir, limit, id, { pid = process.pid, now = Date.now(), alive = pidAlive } = {}) {
+  mkdirSync(dir, { recursive: true });
+  const held = () => {
+    const out = [];
+    for (const name of readdirSync(dir)) {
+      const owner = /^(\d+)-/.exec(name);
+      if (!owner) continue;
+      const file = join(dir, name);
+      let st;
+      try { st = statSync(file); } catch { continue; }
+      if (now - st.mtimeMs > SLOT_TTL_MS || !alive(Number(owner[1]))) { try { unlinkSync(file); } catch {} continue; }
+      out.push({ name, mtimeMs: st.mtimeMs });
+    }
+    return out.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : 1));
+  };
+  if (held().length >= limit) return undefined;
+  const name = `${pid}-${String(id).replace(/[^\w.-]/g, "_")}`;
+  const file = join(dir, name);
+  try { writeFileSync(file, String(now), { flag: "wx" }); } catch (e) { if (e?.code !== "EEXIST") throw e; }
+  const rank = held().findIndex((slot) => slot.name === name);
+  if (rank < 0 || rank >= limit) { try { unlinkSync(file); } catch {} return undefined; }
+  return file;
+}
+export function dropSlot(file) { try { unlinkSync(file); } catch {} }
+
+/** Wait for a slot: `{ file }` when taken, `{ busy: true }` when none freed in
+ * time, `{}` when the slots cannot be used at all (then nothing is held back). */
+export async function waitForSlot(dir, limit, id, signal, { pollMs = 500, waitMs = Number(process.env.ZERON_TREE_SLOT_WAIT_MS) || 90000 } = {}) {
+  const until = Date.now() + waitMs;
+  for (;;) {
+    let file;
+    try { file = takeSlot(dir, limit, id); } catch { return {}; }
+    if (file) return { file };
+    if (signal?.aborted || Date.now() >= until) return { busy: true };
+    await new Promise((resolve) => setTimeout(resolve, pollMs + Math.floor(Math.random() * 200)));
+  }
+}
+
 export default function deleteGuard(pi) {
   inheritIntoChildren();
   guardCompiledChildren();
@@ -841,8 +1124,19 @@ export default function deleteGuard(pi) {
   usageWatcher(pi, { depth });
   process.env.ZERON_PI_PID = String(process.pid);          // for the Pis this one starts
   process.env.ZERON_SUBAGENT_DEPTH = String(depth);
-  const policed = Boolean(process.env.ZERON_MODEL_POLICY) && !policyExempt();
+  const policed = Boolean(process.env.ZERON_MODEL_POLICY || process.env.ZERON_TREE_POLICY) && !policyExempt();
   if (policed) enforceModels(pi);
+  // Heavy-command slots this Pi holds, by tool call; freed when the call ends.
+  const slots = new Map();
+  const release = (id) => {
+    const file = slots.get(id);
+    if (file) { slots.delete(id); dropSlot(file); }
+  };
+  const releaseAll = () => { for (const id of [...slots.keys()]) release(id); };
+  pi.on("tool_result", (event) => { release(event?.toolCallId); });
+  pi.on("tool_execution_end", (event) => { release(event?.toolCallId); });
+  pi.on("agent_end", releaseAll);
+  pi.on("session_shutdown", releaseAll);
   pi.on("tool_call", (event, ctx) => {            // also fires for nested codemode calls (parentToolCallId)
     {
       let reason;
@@ -863,15 +1157,39 @@ export default function deleteGuard(pi) {
       catch { r = hit("ro-error", "the read-only check could not analyse this call"); }
       if (r) return { block: true, reason: READ_ONLY_REASON(r) };
     }
-    if (!guardOn()) return;
-    let h;
-    try {
-      const annotations = annotationsOf();     // name rules still apply without it
-      h = decide(event, annotations, ctx?.cwd);
-    } catch {
-      h = SHELL_TOOLS.has(event.toolName) ? hit("guard-error", "the guard could not analyse this command") : undefined;
+    let tree;
+    try { tree = treePolicy(); } catch {}
+    if (tree) {
+      let reason;
+      try { reason = treeBlock(event, tree, annotationsOf()); } catch {}
+      if (reason) return { block: true, reason };
     }
-    if (h) return { block: true, reason: REASON(h) };
+    if (guardOn()) {
+      let h;
+      try {
+        const annotations = annotationsOf();     // name rules still apply without it
+        h = decide(event, annotations, ctx?.cwd);
+      } catch {
+        h = SHELL_TOOLS.has(event.toolName) ? hit("guard-error", "the guard could not analyse this command") : undefined;
+      }
+      if (h) return { block: true, reason: REASON(h) };
+    }
+    // Last, so a call blocked above never holds a slot. The wait is the only
+    // time this handler answers late.
+    if (tree?.heavyCommandLimit && event.toolCallId) {
+      let sh, heavy;
+      try { sh = shellCommandOf(event); heavy = sh && heavyCommand(sh.command, sh.dialect); } catch {}
+      const dir = slotsDir();
+      if (heavy && dir) {
+        return waitForSlot(dir, tree.heavyCommandLimit, event.toolCallId, ctx?.signal).then(({ file, busy }) => {
+          if (file) { slots.set(event.toolCallId, file); return undefined; }
+          if (!busy) return undefined;
+          return { block: true, reason: `${TREE_MARK} rule=heavy-command-limit] Blocked: ${heavy.name} would be heavy command number ` +
+            `${tree.heavyCommandLimit + 1} in this orchestrator's tree, which allows ${tree.heavyCommandLimit} at once, and none finished in time. ` +
+            `Do not retry in a loop: do other work first, or push and read CI with gh instead.` };
+        });
+      }
+    }
   });
   if (depth === 0 && process.env.ZERON_PACKAGE_CHECK === "1") {
     delete process.env.ZERON_PACKAGE_CHECK;     // once: not on a reload, not in children

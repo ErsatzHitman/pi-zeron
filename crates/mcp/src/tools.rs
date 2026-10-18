@@ -53,6 +53,16 @@ pub struct Tools {
     reserved: std::sync::Mutex<HashMap<String, Slots>>,
 }
 
+/// The orchestrator tree the calling chat is in, as its project says.
+struct Tree {
+    root: Chat,
+    policy: zeron_proto::orchestrator_project::TreePolicy,
+}
+
+/// How long `create_chat` waits for a GitHub preflight before it starts a
+/// writer unchecked.
+const PREFLIGHT_WAIT: Duration = Duration::from_secs(20);
+
 #[derive(Default)]
 struct Slots {
     /// create_chat calls between their cap check and their return.
@@ -113,6 +123,33 @@ fn catalog() -> Vec<ToolDef> {
             name: "list_projects",
             description: "Projects: folders on specific devices. Filter by device (id or name); omit for all projects. Use ids when names or paths repeat.",
             input_schema: json!({ "type": "object", "properties": { "device": device_schema() } }),
+        },
+        ToolDef {
+            name: "register_project",
+            description: "Register an existing folder as a project, so sessions can work in it. Pass a path (absolute, or starting with ~) or a short name like \"t3code\": a short name is looked for beside the projects you already have, at the top of each drive, and in ~/codebase, ~/code, ~/projects, ~/src, ~/dev and ~/repos. It registers a folder only when exactly one matches and never creates one; with several matches it lists them, and you ask the user which. In a git folder every writing session gets its own worktree; a folder that is not a git repository is shared by its writers, so run one writer at a time. Returns the project: use its id as `project` in create_chat. dry_run lists the matches without registering.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "A path (absolute, or ~/...), or a short folder name such as t3code." },
+                    "device": device_schema(),
+                    "name": { "type": "string", "description": "Name to show for the project. Default: the folder's name." },
+                    "dry_run": { "type": "boolean", "default": false, "description": "List the folders that match, register nothing." }
+                },
+                "required": ["project"]
+            }),
+        },
+        ToolDef {
+            name: "github_preflight",
+            description: "Before a writing session starts in a GitHub project, check that it can push its branch and see CI: whether git's own credential may push (the one a writer pushes with), the gh login and its token's scopes, whether Actions is on, which workflows start for a push to a zeron/ branch (many start only for pull requests, so a draft pull request must be opened right after the first push), self-hosted runners, and a billing block on Actions that makes every job fail at once. Returns ok, blockers, warnings and a one-line verdict. Read-only; reports are reused for a few minutes (force: true checks again). Defaults to your own project.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Project id, path or name. Default: the project of your own chat." },
+                    "cwd": { "type": "string", "description": "A checkout of that project. Default: the project folder." },
+                    "branch": { "type": "string", "description": "The branch a writer would push; its triggers are checked. Default: a zeron/ branch." },
+                    "force": { "type": "boolean", "default": false, "description": "Check again instead of reusing a recent report." }
+                }
+            }),
         },
         ToolDef {
             name: "list_harnesses",
@@ -722,6 +759,26 @@ struct DeviceArgs {
     device: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterProjectArgs {
+    project: String,
+    device: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct GithubPreflightArgs {
+    project: Option<String>,
+    cwd: Option<String>,
+    branch: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
 /// Messages already in the transcript before a send. Replies are matched by
 /// id, not by time: `createdAt` is stamped on the host's clock, which can run
 /// behind the caller's when the chat lives on another device.
@@ -1082,6 +1139,8 @@ impl Tools {
                 self.list_devices().boxed().await
             }
             "list_projects" => self.list_projects(parse(args)?).boxed().await,
+            "register_project" => self.register_project(parse(args)?).boxed().await,
+            "github_preflight" => self.github_preflight(parse(args)?).boxed().await,
             "list_harnesses" => self.list_harnesses(parse(args)?).boxed().await,
             "list_models" => self.list_models(parse(args)?).boxed().await,
             "list_chats" => self.list_chats(parse(args)?).boxed().await,
@@ -1223,6 +1282,114 @@ impl Tools {
         }))
     }
 
+    /// Register an existing folder as a project on its device. The engine
+    /// resolves a path or a short name there and registers one unambiguous
+    /// folder; this waits for the new row so a `create_chat` right after finds
+    /// the project.
+    async fn register_project(&self, args: RegisterProjectArgs) -> anyhow::Result<Value> {
+        let device = self.zeron.resolve_device_id(args.device.as_deref()).await?;
+        let reply = self
+            .zeron
+            .call(
+                zeron_rpc::methods::REGISTER_PROJECT,
+                json!({
+                    "query": args.project,
+                    "name": args.name,
+                    "dryRun": args.dry_run,
+                    "targetDeviceId": device,
+                }),
+            )
+            .await?;
+        if args.dry_run {
+            return Ok(reply);
+        }
+        let space: Space = serde_json::from_value(reply["space"].clone())
+            .context("RegisterProject: unexpected reply")?;
+        self.wait_for_space(&space.id).await;
+        Ok(json!({
+            "project": {
+                "id": space.id,
+                "name": space.display_name(),
+                "path": space.path,
+                "deviceId": space.device_id,
+                "git": space.git_detected,
+                "created": reply["created"],
+            },
+            "workspace": if space.git_detected {
+                "each writing session gets its own worktree on a zeron/<name> branch"
+            } else {
+                "not a git repository: writing sessions would share this folder, so run one writer at a time"
+            },
+        }))
+    }
+
+    /// The registry row of a project just registered reaches the watch a
+    /// moment after the engine saved it.
+    async fn wait_for_space(&self, id: &str) {
+        for _ in 0..50 {
+            if self
+                .zeron
+                .spaces()
+                .await
+                .is_ok_and(|spaces| spaces.iter().any(|space| space.id == id))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The project (and so the checkout and device) a preflight is about:
+    /// the named one, else the calling chat's own.
+    async fn preflight_target(&self, project: Option<&str>) -> anyhow::Result<(Space, String)> {
+        if project.is_some() {
+            let (space, device) = self.zeron.resolve_target(project, None).await?;
+            let space = space.context("project is required")?;
+            return Ok((space, device));
+        }
+        let origin = self
+            .zeron
+            .origin()
+            .chat_id
+            .clone()
+            .context("name a project: this tool was not started from a chat with one")?;
+        let chat = self.zeron.resolve_chat(&origin).await?;
+        let space = self
+            .zeron
+            .spaces()
+            .await?
+            .into_iter()
+            .find(|space| chat.space_id.as_deref() == Some(space.id.as_str()))
+            .context("your chat has no project; name one")?;
+        let device = space.device_id.clone();
+        Ok((space, device))
+    }
+
+    async fn github_preflight(&self, args: GithubPreflightArgs) -> anyhow::Result<Value> {
+        let (space, device) = self.preflight_target(args.project.as_deref()).await?;
+        let cwd = args
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+            .map_or_else(|| space.path.clone(), str::to_owned);
+        let mut report = self
+            .zeron
+            .call(
+                zeron_rpc::methods::GITHUB_PREFLIGHT,
+                json!({
+                    "cwd": cwd,
+                    "branch": args.branch,
+                    "force": args.force,
+                    "targetDeviceId": device,
+                }),
+            )
+            .await?;
+        report["project"] =
+            json!({ "id": space.id, "name": space.display_name(), "path": space.path });
+        Ok(report)
+    }
+
     async fn list_harnesses(&self, args: DeviceArgs) -> anyhow::Result<Value> {
         let device = match args.device.as_deref() {
             Some(key) => Some(self.zeron.resolve_device_id(Some(key)).await?),
@@ -1323,7 +1490,10 @@ impl Tools {
         // An orchestrator's tree may grow sessions below sessions; elsewhere
         // only a top-level chat starts side chats.
         let chats = self.zeron.chats().await?;
-        self.ensure_not_paused(&chats).await?;
+        let tree = self.tree_gate(&chats).await?;
+        if let Some(tree) = &tree {
+            self.ensure_within_cap(tree).await?;
+        }
         // The models of the chats launching this one, for the reserved check.
         let mut launcher_models: Vec<String> = Vec::new();
         if let Some(origin) = self.zeron.origin().chat_id.as_deref() {
@@ -1388,10 +1558,33 @@ impl Tools {
             launcher_models.extend(chat_model(&chat));
         }
         ensure_model_not_reserved(args.model.as_deref(), &launcher_models)?;
-        let (mut space, device_id) = self
+        if let Some(tree) = &tree {
+            // The new session inherits the restrictions of the chat above it.
+            let holder = parent_chat_id
+                .as_deref()
+                .and_then(|id| chats.iter().find(|chat| chat.id == id))
+                .unwrap_or(&tree.root);
+            self.ensure_model_allowed(tree, holder, args.model.as_deref())
+                .await?;
+        }
+        let (mut space, device_id) = match self
             .zeron
             .resolve_target(args.project.as_deref(), args.device.as_deref())
-            .await?;
+            .await
+        {
+            Ok(found) => found,
+            // A folder that is not a project yet: a path or a short name
+            // registers it, when exactly one folder matches.
+            Err(error)
+                if error.to_string().starts_with(crate::zeron::NO_PROJECT)
+                    && args.project.is_some() =>
+            {
+                self.register_for_create(&args)
+                    .await
+                    .map_err(|register| register.context(format!("{error}")))?
+            }
+            Err(error) => return Err(error),
+        };
         // A cwd that is a project's folder joins that project.
         if space.is_none()
             && let Some(cwd) = args.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty())
@@ -1466,6 +1659,16 @@ impl Tools {
             "write {write} conflicts with sandbox {}; leave sandbox unset",
             args.sandbox.as_deref().unwrap_or_default()
         );
+        let mut preflight_note = None;
+        if write && let (Some(tree), Some(space)) = (&tree, &space) {
+            if space.git_detected {
+                if tree.policy.require_preflight {
+                    preflight_note = self.ensure_preflight(space, &device_id).await?;
+                }
+            } else {
+                self.ensure_folder_free(tree, &chats, space).await?;
+            }
+        }
         let config = ChatConfig {
             harness,
             model: args.model.clone(),
@@ -1557,6 +1760,9 @@ impl Tools {
             "write": write,
             "workspace": workspace,
         });
+        if let Some(note) = preflight_note {
+            result["preflight"] = note;
+        }
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
             // The row may not have folded into WatchChats yet; build the
             // chat locally from what we just wrote rather than re-reading.
@@ -1657,8 +1863,10 @@ impl Tools {
                 short(&chat.id)
             );
         }
-        if self.zeron.origin().chat_id.is_some() {
-            self.ensure_not_paused(&self.zeron.chats().await?).await?;
+        if self.zeron.origin().chat_id.is_some()
+            && let Some(tree) = self.tree_gate(&self.zeron.chats().await?).await?
+        {
+            self.ensure_within_cap(&tree).await?;
         }
         let (spaces, sessions, harnesses) = tokio::try_join!(
             self.zeron.spaces(),
@@ -1962,12 +2170,26 @@ impl Tools {
 
     async fn project_read(&self) -> anyhow::Result<Value> {
         let chat_id = self.tree_origin(PROJECT_READ)?;
-        self.zeron
+        let mut reply = self
+            .zeron
             .call(
                 zeron_rpc::methods::GET_ORCHESTRATOR_PROJECT,
                 json!({ "chatId": chat_id }),
             )
-            .await
+            .await?;
+        // With a spending cap, how much of it is used.
+        if reply["project"]["policy"]["spendCapCents"].is_u64()
+            && let Ok(spend) = self
+                .zeron
+                .call(
+                    zeron_rpc::methods::GET_TREE_SPEND,
+                    json!({ "chatId": chat_id }),
+                )
+                .await
+        {
+            reply["spend"] = spend;
+        }
+        Ok(reply)
     }
 
     async fn project_memory(&self, mut params: Value) -> anyhow::Result<Value> {
@@ -1994,14 +2216,17 @@ impl Tools {
             .await
     }
 
-    /// Refuse new work from an agent whose orchestrator the user paused.
-    async fn ensure_not_paused(&self, chats: &[Chat]) -> anyhow::Result<()> {
+    /// The gate every start of work passes. It refuses new work from an agent
+    /// whose orchestrator is paused, and returns the tree's policy (`None`
+    /// outside a tree).
+    async fn tree_gate(&self, chats: &[Chat]) -> anyhow::Result<Option<Tree>> {
         let Some(origin) = self.zeron.origin().chat_id.as_deref() else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(root) = zeron_proto::orchestrator::root_of(chats, origin) else {
-            return Ok(());
+            return Ok(None);
         };
+        let root = root.clone();
         // An engine that cannot say leaves the gate open; pausing also
         // interrupts every running turn in the tree.
         let Ok(reply) = self
@@ -2012,13 +2237,206 @@ impl Tools {
             )
             .await
         else {
+            return Ok(Some(Tree {
+                root,
+                policy: Default::default(),
+            }));
+        };
+        if reply["project"]["paused"] == true {
+            match reply["project"]["pauseReason"]
+                .as_str()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                Some(reason) => anyhow::bail!(
+                    "This orchestrator is paused: {reason}. Start and send nothing; end your turn and say so. The user resumes it from Zeron."
+                ),
+                None => anyhow::bail!(
+                    "The user paused this orchestrator. Start and send nothing; end your turn and say so. The user resumes it from Zeron."
+                ),
+            }
+        }
+        let policy = serde_json::from_value(reply["project"]["policy"].clone()).unwrap_or_default();
+        Ok(Some(Tree { root, policy }))
+    }
+
+    /// Refuse new work once the tree has spent its cap. An engine that cannot
+    /// say leaves the gate open.
+    async fn ensure_within_cap(&self, tree: &Tree) -> anyhow::Result<()> {
+        let Some(cap) = tree.policy.spend_cap_cents else {
+            return Ok(());
+        };
+        let Ok(spend) = self
+            .zeron
+            .call(
+                zeron_rpc::methods::GET_TREE_SPEND,
+                json!({ "chatId": tree.root.id }),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        let spent = spend["spentUsd"].as_f64().unwrap_or_default();
+        anyhow::ensure!(
+            spent * 100.0 < cap as f64,
+            "This orchestrator's spending cap of {} is reached ({:.2} spent). Start and send nothing; end your turn and say so. The user can raise the cap in the orchestrator's settings.",
+            zeron_proto::orchestrator_project::dollars(cap),
+            spent
+        );
+        Ok(())
+    }
+
+    /// Refuse a model the tree's policy does not allow, or that the chat the
+    /// new session is below (or the orchestrator above it) disabled. The
+    /// engine that cannot say leaves the disabled list open; Pi's guard
+    /// holds it inside the session either way.
+    async fn ensure_model_allowed(
+        &self,
+        tree: &Tree,
+        holder: &Chat,
+        model: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let allowed = &tree.policy.allowed_models;
+        let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+            // Without a model the session runs on Pi's default, which may be
+            // outside the allow-list; with only a deny-list that is Pi's
+            // guard's to steer.
+            anyhow::ensure!(
+                allowed.is_empty(),
+                "This orchestrator allows only these models: {}. Pass `model` with one of them (list_models shows what is offered).",
+                allowed.join(", ")
+            );
             return Ok(());
         };
         anyhow::ensure!(
-            reply["project"]["paused"] != true,
-            "The user paused this orchestrator. Start and send nothing; end your turn and say so. The user resumes it from Zeron."
+            tree.policy.allows_model(model),
+            "Model {model:?} is not allowed in this orchestrator; only these are: {}. Pass one of them as `model`.",
+            allowed.join(", ")
         );
+        let Ok(reply) = self
+            .zeron
+            .call(
+                zeron_rpc::methods::GET_SESSION_MODEL_POLICY,
+                json!({ "chatId": holder.id, "targetDeviceId": holder.device_id }),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        for list in ["disabled", "inherited"] {
+            let hit = reply[list]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(|entry| {
+                    entry.as_str().filter(|entry| {
+                        zeron_proto::orchestrator_project::model_matches(entry, model)
+                    })
+                });
+            if let Some(entry) = hit {
+                anyhow::bail!(
+                    "Model {model:?} is disabled for this session tree ({entry}). Pass a different model (list_models shows what is offered)."
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Before a writer starts in a GitHub project, the preflight must find no
+    /// blockers. The engine's report is reused for a few minutes, and a check
+    /// that cannot be made leaves the gate open. Warnings go back to the
+    /// caller with the new session.
+    async fn ensure_preflight(
+        &self,
+        space: &Space,
+        device_id: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let report = tokio::time::timeout(
+            PREFLIGHT_WAIT,
+            self.zeron.call(
+                zeron_rpc::methods::GITHUB_PREFLIGHT,
+                json!({ "cwd": space.path, "targetDeviceId": device_id }),
+            ),
+        )
+        .await;
+        let Ok(Ok(report)) = report else {
+            return Ok(Some(
+                json!({ "verdict": "not checked: the GitHub preflight did not answer" }),
+            ));
+        };
+        if report["supported"] == false {
+            return Ok(None);
+        }
+        let verdict = report["verdict"].as_str().unwrap_or_default().to_owned();
+        anyhow::ensure!(
+            report["ok"] != false,
+            "The GitHub preflight for {} found blockers, so no writing session starts there: {verdict}. Tell the user what to fix (ask_user), then run github_preflight with force to check again.",
+            space.display_name()
+        );
+        Ok(Some(
+            json!({ "verdict": verdict, "warnings": report["warnings"] }),
+        ))
+    }
+
+    /// A folder that is not a git repository is shared by its writers: a
+    /// second one is refused while another writer of the tree is working in
+    /// it. Writers that finished and are idle do not count.
+    async fn ensure_folder_free(
+        &self,
+        tree: &Tree,
+        chats: &[Chat],
+        space: &Space,
+    ) -> anyhow::Result<()> {
+        let sessions = self.zeron.sessions().await?;
+        for member in zeron_proto::orchestrator::tree_members(chats, &tree.root.id) {
+            let writes = member
+                .config
+                .as_ref()
+                .is_some_and(|config| config.sandbox != SandboxLevel::ReadOnly);
+            let here = member.space_id.as_deref() == Some(space.id.as_str())
+                && member
+                    .cwd
+                    .as_deref()
+                    .is_none_or(|cwd| same_folder(cwd, &space.path));
+            let busy = session_for(&sessions, member).is_some_and(|session| {
+                matches!(
+                    session.status,
+                    SessionStatus::Working | SessionStatus::AwaitingInput
+                ) && chrono::Utc::now() - session.updated_at <= SESSION_STALE
+            });
+            if writes && here && busy {
+                anyhow::bail!(
+                    "{} is not a git repository, so its writing sessions share one folder, and {} is writing in it now. Wait for it (wait_for_turn), or make the folder a git repository first.",
+                    space.display_name(),
+                    member.title.as_deref().unwrap_or(&member.id)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `create_chat` named a folder that is not a project yet: register it,
+    /// when the engine finds exactly one folder for the path or short name.
+    async fn register_for_create(
+        &self,
+        args: &CreateChatArgs,
+    ) -> anyhow::Result<(Option<Space>, String)> {
+        let project = args.project.clone().unwrap_or_default();
+        let registered = self
+            .register_project(RegisterProjectArgs {
+                project,
+                device: args.device.clone(),
+                name: None,
+                dry_run: false,
+            })
+            .await?;
+        let id = registered["project"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        self.zeron
+            .resolve_target(Some(&id), args.device.as_deref())
+            .await
     }
 
     /// The first of `chats` to stop working, and where the rest stand.
@@ -2610,6 +3028,22 @@ mod tests {
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
         paused: bool,
+        /// The orchestrator project's `policy`, `pauseReason` and spend so far.
+        policy: Value,
+        pause_reason: &'static str,
+        spent_usd: f64,
+        /// What `GithubPreflight` answers; ready when unset.
+        preflight: Option<Value>,
+        /// Set once `RegisterProject` has added its project to the list.
+        registered: std::sync::atomic::AtomicBool,
+    }
+
+    /// The project `RegisterProject` finds for "t3code".
+    fn new_space() -> Value {
+        json!({
+            "id": "space-new", "deviceId": "dev-local", "path": "/home/me/codebase/t3code",
+            "gitDetected": true, "createdAt": "2026-09-04T00:00:00Z"
+        })
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -2638,16 +3072,22 @@ mod tests {
                     "id": "dev-local", "name": "Laptop", "platform": "linux",
                     "lastSeenAt": null
                 }, {"id": "dev-remote", "name": "Worker", "platform": "linux", "lastSeenAt": null}])),
-                methods::WATCH_SPACES => stream(json!([{
-                    "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
-                    "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
-                }, {
-                    "id": "space-remote", "deviceId": "dev-remote", "path": "/repo/comet",
-                    "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
-                }, {
-                    "id": "space-unique", "deviceId": "dev-remote", "path": "/repo/unique",
-                    "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
-                }])),
+                methods::WATCH_SPACES => {
+                    let mut spaces = json!([{
+                        "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
+                        "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
+                    }, {
+                        "id": "space-remote", "deviceId": "dev-remote", "path": "/repo/comet",
+                        "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
+                    }, {
+                        "id": "space-unique", "deviceId": "dev-remote", "path": "/repo/unique",
+                        "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
+                    }]);
+                    if self.registered.load(std::sync::atomic::Ordering::SeqCst) {
+                        spaces.as_array_mut().unwrap().push(new_space());
+                    }
+                    stream(spaces)
+                }
                 methods::WATCH_CHATS => {
                     let mut chats = json!([
                     {
@@ -2699,11 +3139,44 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((method.to_owned(), params.clone()));
-                    RpcReply::Value(json!({
-                        "project": { "rootId": "orchestrator-root", "goal": "Ship it",
-                                     "instructions": "", "paused": self.paused, "updatedAt": 1 },
-                        "memory": [],
-                    }))
+                    let mut project = json!({
+                        "rootId": "orchestrator-root", "goal": "Ship it",
+                        "instructions": "", "paused": self.paused,
+                        "pauseReason": self.pause_reason, "updatedAt": 1,
+                    });
+                    if !self.policy.is_null() {
+                        project["policy"] = self.policy.clone();
+                    }
+                    RpcReply::Value(json!({ "project": project, "memory": [] }))
+                }
+                methods::GET_TREE_SPEND => {
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({ "spentUsd": self.spent_usd, "requests": 3 }))
+                }
+                methods::GITHUB_PREFLIGHT => {
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(self.preflight.clone().unwrap_or_else(
+                        || json!({ "ok": true, "verdict": "ready to push", "warnings": [] }),
+                    ))
+                }
+                methods::REGISTER_PROJECT => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    if params["dryRun"] == true {
+                        RpcReply::Value(json!({ "matches": [new_space()] }))
+                    } else {
+                        self.registered
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        RpcReply::Value(json!({ "space": new_space(), "created": true }))
+                    }
                 }
                 methods::MERGE_PREVIEW => {
                     self.reads
@@ -4150,6 +4623,307 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    fn policy_world(policy: Value, spent_usd: f64) -> World {
+        let world = Arc::try_unwrap(orchestrator_world(false, Vec::new()))
+            .ok()
+            .unwrap();
+        World {
+            policy,
+            spent_usd,
+            ..world
+        }
+    }
+
+    /// Chats created so far.
+    fn mutations(world: &Arc<World>) -> usize {
+        world
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, params)| method == methods::MUTATE && params["op"] == "createChat")
+            .count()
+    }
+
+    fn asked(world: &Arc<World>, method: &str) -> Vec<Value> {
+        world
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == method)
+            .map(|(_, params)| params.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reached_spending_cap_starts_and_sends_nothing() {
+        let args = [
+            (
+                "create_chat",
+                json!({ "project": "space-1", "title": "Sub" }),
+            ),
+            (
+                "send_message",
+                json!({ "chat": "member-b", "text": "go on" }),
+            ),
+        ];
+        let world = Arc::new(policy_world(json!({ "spendCapCents": 500 }), 5.0));
+        for (tool, args) in &args {
+            for chat in ["orchestrator-root", "member-a"] {
+                let refused = from(&world, chat)
+                    .call(tool, args.clone())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    refused.contains("spending cap of $5.00 is reached"),
+                    "{tool} from {chat}: {refused}"
+                );
+            }
+        }
+        assert_eq!(mutations(&world), 0);
+        let spend = asked(&world, methods::GET_TREE_SPEND);
+        assert!(
+            spend
+                .iter()
+                .all(|params| params["chatId"] == "orchestrator-root"),
+            "the spend of the whole tree is asked for, by its root: {spend:?}"
+        );
+        assert!(!spend.is_empty());
+        // Under the cap, and without one, work starts.
+        let under = Arc::new(policy_world(json!({ "spendCapCents": 500 }), 4.99));
+        from(&under, "orchestrator-root")
+            .call("create_chat", args[0].1.clone())
+            .await
+            .unwrap();
+        assert_eq!(mutations(&under), 1);
+        let uncapped = Arc::new(policy_world(json!({ "githubOnlyTests": true }), 99.0));
+        from(&uncapped, "orchestrator-root")
+            .call("create_chat", args[0].1.clone())
+            .await
+            .unwrap();
+        assert!(
+            asked(&uncapped, methods::GET_TREE_SPEND).is_empty(),
+            "no cap, no spend lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pause_the_cap_set_says_why() {
+        let mut world = Arc::try_unwrap(orchestrator_world(true, Vec::new()))
+            .ok()
+            .unwrap();
+        world.pause_reason = "the spending cap of $5.00 is reached ($5.12 spent)";
+        let world = Arc::new(world);
+        let refused = from(&world, "member-a")
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "title": "Sub" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("is paused: the spending cap of $5.00"),
+            "{refused}"
+        );
+        assert!(refused.contains("resumes it"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn create_chat_refuses_a_model_the_tree_does_not_allow() {
+        let world = Arc::new(policy_world(json!({ "allowedModels": ["opus"] }), 0.0));
+        let root = from(&world, "orchestrator-root");
+        let refused = root
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "title": "Sub", "model": "sonnet" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("not allowed in this orchestrator"),
+            "{refused}"
+        );
+        assert!(refused.contains("opus"), "{refused}");
+        let unnamed = root
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "title": "Sub" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            unnamed.contains("allows only these models: opus"),
+            "{unnamed}"
+        );
+        assert_eq!(mutations(&world), 0);
+        root.call(
+            "create_chat",
+            json!({ "project": "space-1", "title": "Sub", "model": "opus" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mutations(&world), 1);
+        // Outside a tree nothing is held to a policy.
+        tools(world.clone(), Origin::default())
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "title": "Solo", "model": "sonnet" }),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_writer_waits_for_a_clean_github_preflight_when_the_tree_asks() {
+        let mut blocked = policy_world(json!({ "requirePreflight": true }), 0.0);
+        blocked.preflight = Some(json!({
+            "ok": false, "verdict": "git cannot push to origin", "warnings": [],
+        }));
+        let world = Arc::new(blocked);
+        let root = from(&world, "orchestrator-root");
+        let refused = root
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "title": "Sub" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.contains("found blockers"), "{refused}");
+        assert!(refused.contains("git cannot push to origin"), "{refused}");
+        assert_eq!(mutations(&world), 0);
+        let call = asked(&world, methods::GITHUB_PREFLIGHT).remove(0);
+        assert_eq!(call["cwd"], "/repo/comet");
+        assert_eq!(call["targetDeviceId"], "dev-local");
+        // A reader pushes nothing, so it starts regardless.
+        root.call(
+            "create_chat",
+            json!({ "project": "space-1", "title": "Reader", "write": false }),
+        )
+        .await
+        .unwrap();
+        // A clean report starts the writer and travels back with it.
+        let ready = Arc::new(policy_world(json!({ "requirePreflight": true }), 0.0));
+        let created = from(&ready, "orchestrator-root")
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "title": "Sub" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["preflight"]["verdict"], "ready to push");
+        // Without the policy no preflight runs.
+        let plain = Arc::new(policy_world(Value::Null, 0.0));
+        from(&plain, "orchestrator-root")
+            .call(
+                "create_chat",
+                json!({ "project": "space-1", "title": "Sub" }),
+            )
+            .await
+            .unwrap();
+        assert!(asked(&plain, methods::GITHUB_PREFLIGHT).is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_preflight_checks_the_named_project_on_its_device() {
+        let world = Arc::new(World::default());
+        let report = tools(world.clone(), Origin::default())
+            .call(
+                "github_preflight",
+                json!({ "project": "space-unique", "branch": "zeron/x", "force": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["project"]["id"], "space-unique");
+        let params = asked(&world, methods::GITHUB_PREFLIGHT).remove(0);
+        assert_eq!(params["cwd"], "/repo/unique");
+        assert_eq!(params["branch"], "zeron/x");
+        assert_eq!(params["force"], true);
+        assert_eq!(params["targetDeviceId"], "dev-remote");
+        let unnamed = tools(world.clone(), Origin::default())
+            .call("github_preflight", json!({}))
+            .await
+            .unwrap_err();
+        assert!(unnamed.contains("name a project"), "{unnamed}");
+        // Inside a chat, it defaults to that chat's own project.
+        let own = from(&world, "chat-alpha-1")
+            .call("github_preflight", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(own["project"]["id"], "space-1");
+    }
+
+    #[tokio::test]
+    async fn register_project_registers_the_one_folder_the_engine_finds() {
+        let world = Arc::new(World::default());
+        let outside = tools(world.clone(), Origin::default());
+        let found = outside
+            .call(
+                "register_project",
+                json!({ "project": "t3code", "dry_run": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(found["matches"][0]["path"], "/home/me/codebase/t3code");
+        let registered = outside
+            .call(
+                "register_project",
+                json!({ "project": "t3code", "name": "T3" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered["project"]["id"], "space-new");
+        assert_eq!(registered["project"]["created"], true);
+        assert!(
+            registered["workspace"]
+                .as_str()
+                .unwrap()
+                .contains("own worktree")
+        );
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["dryRun"], true);
+        assert_eq!(writes[1].1["query"], "t3code");
+        assert_eq!(writes[1].1["name"], "T3");
+        assert_eq!(writes[1].1["targetDeviceId"], "dev-local");
+    }
+
+    #[tokio::test]
+    async fn create_chat_registers_a_folder_that_is_not_a_project_yet() {
+        let world = Arc::new(World::default());
+        tools(world.clone(), Origin::default())
+            .call(
+                "create_chat",
+                json!({ "project": "t3code", "title": "Port it" }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert!(
+            writes
+                .iter()
+                .any(|(method, params)| method == methods::REGISTER_PROJECT
+                    && params["query"] == "t3code")
+        );
+        assert!(writes.iter().any(|(method, _)| method == methods::MUTATE));
+    }
+
+    #[tokio::test]
+    async fn project_read_shows_how_much_of_the_cap_is_used() {
+        let capped = Arc::new(policy_world(json!({ "spendCapCents": 1000 }), 2.5));
+        let read = from(&capped, "member-a")
+            .call("project_read", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(read["spend"]["spentUsd"], 2.5);
+        let uncapped = Arc::new(policy_world(Value::Null, 2.5));
+        let read = from(&uncapped, "member-a")
+            .call("project_read", json!({}))
+            .await
+            .unwrap();
+        assert!(read.get("spend").is_none(), "{read}");
     }
 
     #[tokio::test]

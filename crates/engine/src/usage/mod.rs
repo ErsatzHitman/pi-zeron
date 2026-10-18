@@ -24,7 +24,7 @@ const FRESH: Duration = Duration::from_secs(60);
 /// How long the first report waits for the first scan before answering
 /// with what it has.
 const FIRST_SCAN_WAIT: Duration = Duration::from_secs(5);
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 
 /// Where Pi keeps sessions: `PI_CODING_AGENT_SESSION_DIR`, the agent
 /// directory's `sessions`, and a `sessionDir` from its global settings.
