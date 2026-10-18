@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use zeron_doc::SessionCommandPayload;
 use zeron_proto::Chat;
 use zeron_proto::orchestrator::{is_root_chat, tree_members};
 use zeron_proto::orchestrator_project::{OrchestratorProject, ProjectUpdate, dollars};
@@ -363,25 +362,14 @@ impl TreeWatcher {
             dollars(cap),
             project.policy.spend_warn_pct
         );
-        let working = self
+        // A working root takes it at its next step boundary, an idle one as
+        // a turn; a root the user stopped keeps it queued until resumed.
+        let status = self
             .inner
             .sessions
             .session_status(root_id)
-            .is_some_and(|session| session.status == zeron_proto::SessionStatus::Working);
-        let sent = if working {
-            self.inner
-                .doc_host
-                .queue_command(
-                    root_id,
-                    SessionCommandPayload::Steer {
-                        prompt: text,
-                        message_id: Some(crate::new_id()),
-                    },
-                )
-                .map(|_| ())
-        } else {
-            self.inner.doc_host.notify_parent(root_id, &text, false)
-        };
+            .map_or(zeron_proto::SessionStatus::Idle, |session| session.status);
+        let sent = self.inner.doc_host.notify_parent(root_id, &text, status);
         match sent {
             Ok(()) => tracing::info!(root = %root_id, "tree policy: spending cap warning sent"),
             Err(error) => {
