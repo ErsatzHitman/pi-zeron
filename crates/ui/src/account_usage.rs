@@ -85,9 +85,10 @@ pub fn active_account(
         .find(|account| account.harness == harness && account.active)
 }
 
-/// The signed-in (OAuth) accounts the session is using that report usage:
-/// for Pi, which keeps a login per provider, the one its model runs on.
-/// Pure.
+/// The accounts the session is using that report usage: for Pi, which
+/// keeps a login per provider, the one its model runs on, an OpenCode Go
+/// API key included (the key Pi uses now). An API key without a quota
+/// view has no windows and so no row. Pure.
 pub fn usage_accounts<'a>(
     snapshot: &'a AgentAccountsSnapshot,
     scope: UsageScope<'_>,
@@ -100,7 +101,6 @@ pub fn usage_accounts<'a>(
             account.harness == scope.harness
                 && account.active
                 && current_windows(account, now).next().is_some()
-                && account.auth_kind != Some(zeron_proto::AgentAuthKind::ApiKey)
                 && scope.covers(account)
         })
         .collect()
@@ -646,10 +646,19 @@ mod tests {
             usage_counters(&expired, on("openai-codex/gpt-5.5"), now),
             None
         );
-        // An API key is not a plan with limits.
-        let mut keyed = claude;
-        keyed.auth_kind = Some(zeron_proto::AgentAuthKind::ApiKey);
-        snapshot.accounts = vec![keyed];
+        // An OpenCode Go key in use reports its quota like a login; one
+        // without windows (an API key with no quota view) shows nothing.
+        let mut go = account(HarnessId::Pi, true, &[0.3, 0.6]);
+        go.usage_windows[1].label = "Week".into();
+        go.provider = Some("opencode-go".into());
+        go.auth_kind = Some(zeron_proto::AgentAuthKind::ApiKey);
+        snapshot.accounts = vec![go.clone()];
+        assert_eq!(
+            usage_counters(&snapshot, on("opencode-go/kimi-k2"), now).as_deref(),
+            Some("5h 70% · wk 40% left")
+        );
+        go.usage_windows.clear();
+        snapshot.accounts = vec![go];
         assert_eq!(usage_counters(&snapshot, pi, now), None);
     }
 

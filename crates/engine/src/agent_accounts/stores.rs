@@ -151,6 +151,7 @@ pub(super) fn upstream_vendor(store_key: &str) -> &'static str {
         "github-copilot" | "copilot" => "GitHub",
         "nous" => "Nous",
         "xai-oauth" | "xai" => "xAI",
+        "opencode-go" => "OpenCode",
         _ => "the provider",
     }
 }

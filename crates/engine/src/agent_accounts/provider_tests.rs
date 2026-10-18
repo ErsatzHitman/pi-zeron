@@ -138,6 +138,7 @@ fn mocked(base: &str) -> ProbeEndpoints {
         openai_auth: base.to_string(),
         openai_port: 0,
         nous_portal: base.to_string(),
+        opencode_go_usage: format!("{base}/zen/go/v1/usage"),
         allow_slot_refresh: true,
         allow_loopback_http: true,
     }
@@ -1210,6 +1211,115 @@ fn copilot_usage_reads_metered_quotas_and_the_plan() {
     assert!((snapshot.windows[0].used_fraction - 0.2).abs() < 1e-6);
     assert!((snapshot.windows[1].used_fraction - 0.75).abs() < 1e-6);
     assert!(copilot_usage_snapshot(&serde_json::json!({})).is_none());
+}
+
+#[test]
+fn opencode_go_usage_reads_every_window_in_either_shape() {
+    let now = Utc::now();
+    let current = serde_json::json!({ "usage": {
+        "rolling": { "status": "ok", "percent": 12, "resetsAt": "2030-01-01T05:00:00Z" },
+        "weekly": { "status": "ok", "percent": "40", "resetsAt": "2030-01-06T00:00:00Z" },
+        "monthly": { "status": "rate-limited", "percent": 100, "resetsAt": "2030-01-20T00:00:00Z" },
+    }});
+    let usage = opencode_go_usage_snapshot(&current, now).unwrap();
+    let read: Vec<(&str, f32)> = usage
+        .windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.used_fraction))
+        .collect();
+    assert_eq!(read, [("5h", 0.12), ("Week", 0.4), ("Month", 1.0)]);
+    assert_eq!(usage.plan_label.as_deref(), Some("OpenCode Go"));
+    assert_eq!(
+        usage.windows[0].resets_at,
+        Some("2030-01-01T05:00:00Z".parse().unwrap())
+    );
+    // The route's first shape: seconds until the reset.
+    let first = serde_json::json!({
+        "rollingUsage": { "status": "ok", "usagePercent": 50, "resetInSec": 3600 },
+    });
+    let usage = opencode_go_usage_snapshot(&first, now).unwrap();
+    assert_eq!(usage.windows.len(), 1);
+    assert_eq!(usage.windows[0].used_fraction, 0.5);
+    assert_eq!(
+        usage.windows[0].resets_at,
+        Some(now + chrono::TimeDelta::seconds(3600))
+    );
+    assert!(opencode_go_usage_snapshot(&serde_json::json!({ "usage": {} }), now).is_none());
+}
+
+#[tokio::test]
+async fn every_opencode_go_key_is_a_row_with_its_own_usage() {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", "/zen/go/v1/usage") => (
+            200,
+            r#"{"usage":{"rolling":{"status":"ok","percent":30,"resetsAt":"2030-01-01T05:00:00Z"},"weekly":{"status":"ok","percent":60,"resetsAt":"2030-01-06T00:00:00Z"}}}"#.into(),
+        ),
+        _ => (404, String::new()),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    let key = |id: &str, label: &str, secret: &str, disabled: bool| {
+        serde_json::json!({ "id": id, "label": label, "secret": secret, "addedAt": 1, "disabled": disabled })
+    };
+    write(
+        &config.pi_agent_dir.join(crate::api_keys::STORE_FILE),
+        &serde_json::json!({ "version": 1, "rev": 1, "providers": { "opencode-go": {
+            "active": "aaaa1111",
+            "keys": [
+                key("aaaa1111", "main", "sk-go-secret-one", false),
+                key("bbbb2222", "", "sk-go-secret-two", false),
+                key("cccc3333", "spare", "sk-go-secret-three", true),
+            ],
+        }}})
+        .to_string(),
+    );
+    // Pi's key router moved on to the second key.
+    write(
+        &config.pi_agent_dir.join(crate::api_keys::HEALTH_FILE),
+        r#"{"version":1,"providers":{"opencode-go":{"current":"bbbb2222","keys":{}}}}"#,
+    );
+    let pi = rows(&accounts.list(true).await.unwrap(), HarnessId::Pi);
+    let go: Vec<&AgentAccount> = pi
+        .iter()
+        .filter(|a| a.provider.as_deref() == Some("opencode-go"))
+        .collect();
+    assert_eq!(go.len(), 3, "disabled keys have a quota too");
+    assert_eq!(
+        go.iter().map(|a| a.active).collect::<Vec<_>>(),
+        [false, true, false],
+        "the router's key is the one in use"
+    );
+    for row in &go {
+        assert_eq!(row.auth_kind, Some(AgentAuthKind::ApiKey));
+        assert!(!row.switchable);
+        assert_eq!(row.plan_label.as_deref(), Some("OpenCode Go"));
+        let used: Vec<f32> = row.usage_windows.iter().map(|w| w.used_fraction).collect();
+        assert_eq!(used, [0.3, 0.6]);
+        assert!(!row.email.as_deref().unwrap().contains("secret"), "masked");
+    }
+    assert!(go[0].email.as_deref().unwrap().starts_with("main · "));
+    assert_eq!(server.hits("/zen/go/v1/usage"), 3);
+    // The cache keeps windows and digests, never a key.
+    let cache = std::fs::read_to_string(config.usage_cache_file()).unwrap();
+    assert!(!cache.contains("sk-go-secret"), "{cache}");
+    // A rejected key says so, in its own words.
+    let rejected = MockServer::start(|_, _, _| (401, String::new())).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&rejected.base));
+    write(
+        &config.pi_agent_dir.join(crate::api_keys::STORE_FILE),
+        &serde_json::json!({ "version": 1, "rev": 1, "providers": { "opencode-go": {
+            "keys": [key("dddd4444", "", "sk-go-secret-four", false)],
+        }}})
+        .to_string(),
+    );
+    let pi = rows(&accounts.list(true).await.unwrap(), HarnessId::Pi);
+    assert_eq!(
+        pi[0].usage_error.as_deref(),
+        Some("Key rejected — check it in Settings → API keys")
+    );
+    assert!(pi[0].active, "the only key is the one in use");
 }
 
 #[tokio::test]

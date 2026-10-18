@@ -16,6 +16,9 @@
 //! - **Copilot** (OpenCode / Pi `github-copilot`):
 //!   `api.github.com/copilot_internal/user` — premium-request quota.
 //! - **Nous** (Hermes `nous`): the portal's `/api/oauth/account` credits.
+//! - **OpenCode Go** (Pi's `opencode-go` API keys, every key in
+//!   `api-keys.json`): `GET opencode.ai/zen/go/v1/usage` with the key —
+//!   5-hour, weekly and monthly percentages. One row per key.
 //!
 //! A rejected ChatGPT login of OpenCode / Pi is refreshed once (single-flight,
 //! like Claude's): a saved slot in its own file, the live login in the
@@ -32,6 +35,11 @@ use super::*;
 
 pub(super) const GROK_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 pub(super) const NOUS_PORTAL: &str = "https://portal.nousresearch.com";
+/// OpenCode Go's usage of the key it is called with: 5-hour, weekly and
+/// monthly percentages with their reset times.
+pub(super) const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+/// Pi's provider id for OpenCode Go, and its key store's.
+pub(super) const OPENCODE_GO: &str = "opencode-go";
 const DEVIN_STATUS_RPC: &str = "exa.seat_management_pb.SeatManagementService/GetUserStatus";
 const DEVIN_DEFAULT_API_SERVER: &str = "https://server.codeium.com";
 /// The CLI version the status call identifies as (the server wants one).
@@ -228,6 +236,10 @@ impl AgentAccounts {
         };
         let key = slot.store_key.as_deref().ok_or(missing.clone())?;
         let creds = &slot.credentials;
+        if harness == HarnessId::Pi && key == OPENCODE_GO {
+            let api_key = str_field(creds, "key").ok_or(missing)?;
+            return self.opencode_go_usage(&api_key).await;
+        }
         if harness == HarnessId::Hermes {
             if str_field(creds, "auth_type").as_deref() == Some("api_key") {
                 return Err(ProbeError::NoCredentials {
@@ -417,6 +429,72 @@ impl AgentAccounts {
         )
         .await?;
         codex_usage_snapshot(&body).ok_or_else(|| schema_error(provider, &body))
+    }
+
+    async fn opencode_go_usage(&self, api_key: &str) -> Result<UsageSnapshot, ProbeError> {
+        let body = probe_json(
+            "opencode-go",
+            "usage",
+            self.inner
+                .http
+                .get(&self.inner.endpoints.opencode_go_usage)
+                .bearer_auth(api_key)
+                .header("Accept", "application/json")
+                .header("User-Agent", "zeron"),
+        )
+        .await?;
+        opencode_go_usage_snapshot(&body, Utc::now())
+            .ok_or_else(|| schema_error("opencode-go", &body))
+    }
+
+    /// Pi's OpenCode Go keys (`api-keys.json`, disabled ones too: each has
+    /// its own quota), as in-memory slots the usage probe takes, with
+    /// whether Pi uses that key now (the key router's pick, else the
+    /// store's current key). Never written to disk: the slot carries the
+    /// secret only for the probe; the cache keeps a digest.
+    pub(super) fn opencode_go_keys(&self) -> Vec<(Slot, bool)> {
+        let dir = &self.inner.config.pi_agent_dir;
+        let Ok(store) = crate::api_keys::Store::load(&dir.join(crate::api_keys::STORE_FILE)) else {
+            return Vec::new();
+        };
+        let Some(keys) = store.providers.get(OPENCODE_GO) else {
+            return Vec::new();
+        };
+        let routed = std::fs::read(dir.join(crate::api_keys::HEALTH_FILE))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .and_then(|health| str_field(&health["providers"][OPENCODE_GO], "current"))
+            .filter(|id| keys.keys.iter().any(|k| &k.id == id && !k.disabled));
+        let in_use = routed.or_else(|| keys.current().map(|k| k.id.clone()));
+        keys.keys
+            .iter()
+            .filter(|key| !key.secret.is_empty())
+            .map(|key| {
+                let shown = crate::api_keys::mask(&key.secret);
+                let email = match key.label.trim() {
+                    "" => format!("Key {shown}"),
+                    label => format!("{label} · {shown}"),
+                };
+                let slot = Slot {
+                    id: format!("pi-{OPENCODE_GO}-{}", key.id),
+                    harness: HarnessId::Pi,
+                    account_key: format!("{OPENCODE_GO}:key:{}", key.id),
+                    profile: SlotProfile {
+                        email,
+                        display_name: None,
+                        organization: None,
+                        plan: Some("OpenCode Go".into()),
+                        auth_kind: AgentAuthKind::ApiKey,
+                    },
+                    credentials: serde_json::json!({ "key": key.secret }),
+                    claude_config: None,
+                    saved_at: 0,
+                    created_at: None,
+                    store_key: Some(OPENCODE_GO.into()),
+                };
+                (slot, in_use.as_deref() == Some(key.id.as_str()))
+            })
+            .collect()
     }
 
     async fn copilot_usage(&self, api: &str, token: &str) -> Result<UsageSnapshot, ProbeError> {
@@ -683,6 +761,53 @@ pub(super) fn nous_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnaps
     (body.get("user").is_some() || subscription.is_some()).then_some(UsageSnapshot {
         windows,
         plan_label,
+    })
+}
+
+/// OpenCode Go's `/zen/go/v1/usage`: `{usage: {rolling, weekly, monthly}}`,
+/// each `{status, percent (0-100), resetsAt (ISO)}`. The route's first
+/// shape (`rollingUsage: {usagePercent, resetInSec}`, …) still reads, in
+/// case an older deployment answers. `None` when no window is there.
+pub(super) fn opencode_go_usage_snapshot(
+    body: &serde_json::Value,
+    now: DateTime<Utc>,
+) -> Option<UsageSnapshot> {
+    let current = body.get("usage").filter(|u| u.is_object());
+    let windows: Vec<AgentUsageWindow> = [
+        ("5h", "rolling", "rollingUsage"),
+        ("Week", "weekly", "weeklyUsage"),
+        ("Month", "monthly", "monthlyUsage"),
+    ]
+    .into_iter()
+    .filter_map(|(label, new, old)| {
+        let window = current
+            .and_then(|u| u.get(new))
+            .or_else(|| body.get(old))
+            .filter(|w| w.is_object())?;
+        let limited = str_field(window, "status").as_deref() == Some("rate-limited");
+        let percent = window
+            .get("percent")
+            .or_else(|| window.get("usagePercent"))
+            .and_then(json_f64)
+            .or(limited.then_some(100.0))?;
+        let resets_at = parse_when(window.get("resetsAt")).or_else(|| {
+            let secs = window.get("resetInSec").and_then(json_f64)?;
+            Some(now + chrono::TimeDelta::seconds(secs.max(0.0) as i64))
+        });
+        Some(AgentUsageWindow {
+            label: label.to_string(),
+            used_fraction: if limited {
+                1.0
+            } else {
+                (percent / 100.0).clamp(0.0, 1.0) as f32
+            },
+            resets_at,
+        })
+    })
+    .collect();
+    (!windows.is_empty()).then(|| UsageSnapshot {
+        windows,
+        plan_label: Some("OpenCode Go".into()),
     })
 }
 

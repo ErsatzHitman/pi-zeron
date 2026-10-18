@@ -691,6 +691,8 @@ struct ProbeEndpoints {
     openai_port: u16,
     /// The Nous portal (`/api/oauth/account`).
     nous_portal: String,
+    /// OpenCode Go's usage view for an API key (`/zen/go/v1/usage`).
+    opencode_go_usage: String,
     allow_slot_refresh: bool,
     /// Test seam: admit `http://127.0.0.1` for credential-DEFINED endpoints
     /// (Grok issuer, Devin server, …) so mock servers can stand in. Always
@@ -712,6 +714,7 @@ impl Default for ProbeEndpoints {
             openai_auth: oauth::OPENAI_AUTH.into(),
             openai_port: oauth::OPENAI_LOOPBACK_PORT,
             nous_portal: usage::NOUS_PORTAL.into(),
+            opencode_go_usage: usage::OPENCODE_GO_USAGE_URL.into(),
             allow_slot_refresh: true,
             allow_loopback_http: false,
         }
@@ -991,6 +994,7 @@ impl AgentAccounts {
         let (hermes, hermes_active) = self.hermes_slots();
         active_keys.insert(HarnessId::Hermes, hermes_active);
         providers.push((HarnessId::Hermes, hermes));
+        let go_keys = self.opencode_go_keys();
         if force_usage {
             let targets: Vec<(HarnessId, &Slot, bool)> = providers
                 .iter()
@@ -1004,6 +1008,7 @@ impl AgentAccounts {
                         )
                     })
                 })
+                .chain(go_keys.iter().map(|(slot, in_use)| (HarnessId::Pi, slot, *in_use)))
                 .collect();
             self.refresh_usage(&targets).await;
             // A probe can teach a slot who it is (Devin's key file names no
@@ -1081,6 +1086,39 @@ impl AgentAccounts {
                     provider: provider_group(harness, u.store_key.as_deref()),
                 });
             }
+        }
+        // Every OpenCode Go key, each with its own quota: the one Pi uses
+        // now is the active row (the footer reads it); none switches here.
+        for (slot, in_use) in &go_keys {
+            let entry = usage.get(&usage_key(HarnessId::Pi, &slot.account_key));
+            accounts.push(AgentAccount {
+                id: slot.id.clone(),
+                harness: HarnessId::Pi,
+                email: Some(slot.profile.email.clone()),
+                plan_label: Some("OpenCode Go".into()),
+                active: *in_use,
+                usage_windows: entry
+                    .and_then(|entry| entry.usage.as_ref())
+                    .map(|usage| usage.windows.clone())
+                    .unwrap_or_default(),
+                usage_fetched_at: entry.and_then(|entry| entry.fetched_at),
+                usage_error: entry.and_then(|entry| {
+                    usage_error_message(
+                        HarnessId::Pi,
+                        slot.store_key.as_deref(),
+                        *in_use,
+                        entry.error.as_ref()?,
+                        entry,
+                        now,
+                    )
+                }),
+                display_name: None,
+                organization: None,
+                auth_kind: Some(AgentAuthKind::ApiKey),
+                switchable: false,
+                saved_at: None,
+                provider: Some(usage::OPENCODE_GO.into()),
+            });
         }
         // Antigravity keeps exactly one login whose token zeron never reads:
         // one active, unswitchable row, and no usage (it has no quota view).
@@ -3547,6 +3585,13 @@ fn usage_error_message(
         .unwrap_or_default();
     Some(match error {
         ProbeError::RateLimited { .. } => format!("Rate limited by {provider}{retry}"),
+        // An OpenCode Go key: 403 is a key without the Go subscription.
+        ProbeError::Unauthorized { status: 403 } if store_key == Some(usage::OPENCODE_GO) => {
+            "No OpenCode Go subscription on this key".to_string()
+        }
+        ProbeError::Unauthorized { .. } if store_key == Some(usage::OPENCODE_GO) => {
+            "Key rejected — check it in Settings → API keys".to_string()
+        }
         // Devin's key never expires on its own: a rejection means it was
         // revoked, whichever login it is.
         ProbeError::Unauthorized { .. } if harness == HarnessId::Devin => {

@@ -1115,7 +1115,10 @@ impl AccountsPage {
         if !reports_usage(account.harness) {
             return None;
         }
-        let note = if !account.switchable && switches_accounts(account.harness) {
+        // An API key row (OpenCode Go) is never switched here: its reason
+        // is the probe's, not a login that couldn't be read.
+        let keyed = account.auth_kind == Some(zeron_proto::AgentAuthKind::ApiKey);
+        let note = if !account.switchable && switches_accounts(account.harness) && !keyed {
             match account.harness {
                 // Keychain denied: the login is there, its secret isn't.
                 HarnessId::ClaudeCode => "Credentials unavailable".to_string(),

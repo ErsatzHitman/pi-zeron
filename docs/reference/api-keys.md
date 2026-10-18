@@ -42,6 +42,8 @@ The page only ever shows a key's label, id and last four characters. Secrets go 
 
 On OpenCode Go, each key also shows what the key router last saw: Working, Out of quota (with when it resets), Cooling down, or Rejected. The key the router is on now is marked **In use now (rotated)**.
 
+Every OpenCode Go key, disabled ones too, is also an account row under Pi in Settings → Accounts, with its own 5-hour, weekly and monthly quota from `GET https://opencode.ai/zen/go/v1/usage` (the key as its bearer token). The key Pi uses now (the router's pick, else the active key) is the row in use, and the composer's usage ring and counters show it while the session runs an `opencode-go/…` model. A rejected key reads "Key rejected", one without the Go plan "No OpenCode Go subscription on this key". The usage cache keeps the windows and a digest, never the key.
+
 ## Where keys live
 
 The store is `<pi agent dir>/api-keys.json`, beside Pi's `auth.json`. The Pi agent directory is `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`. Only you can read the file (mode 0600), and the engine is its only writer. Each write goes to a new file that then replaces the old one, so a reader never sees a half-written store.
