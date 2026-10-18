@@ -85,6 +85,10 @@ pub mod methods {
     /// Rewind a main Pi chat to one of its user messages (code,
     /// conversation, or both). Runs on the chat's host.
     pub const REWIND_CHAT: &str = "RewindChat";
+    /// `{chatId, action: "get" | "generate", force?}`: the recap of a chat
+    /// for someone returning to it, written on the chat's host. Gated by
+    /// `RECAP_V1`.
+    pub const RECAP_CHAT: &str = "RecapChat";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";

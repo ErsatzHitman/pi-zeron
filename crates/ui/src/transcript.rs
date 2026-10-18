@@ -1232,6 +1232,12 @@ pub enum RowKind {
         source_chat_id: SharedString,
         source_title: SharedString,
     },
+    /// "※ Recap": where the conversation stands, for someone returning to it.
+    /// One row at the transcript's tail; plain text, never markdown.
+    Recap {
+        lines: Arc<Vec<SharedString>>,
+        generating: bool,
+    },
 }
 
 /// `rows` with each message's work left out: its tool groups (thinking
@@ -3362,7 +3368,7 @@ pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
-    last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
+    last_source: Option<(Option<String>, TranscriptReplayState, u64, u64)>,
     chat_id: Option<String>,
     /// The shell may retain this already-laid-out view briefly for its exit.
     /// Cleared as soon as the exit is invisible; never used for another chat.
@@ -5212,10 +5218,21 @@ impl Transcript {
             }
         };
 
+        // The recap row comes and goes with state the transcript revision does
+        // not cover (a reply landing, dismissal): its version rides the key.
+        let recap_version = if self.doc_override.is_none() && !self.answers_only {
+            selected
+                .as_deref()
+                .and_then(|chat_id| self.state.read(cx).recap_row(chat_id, chrono::Utc::now()))
+                .map_or(0, |recap| recap.version)
+        } else {
+            0
+        };
         let source = (
             selected.clone(),
             replay,
             self.state.read(cx).transcript_revision,
+            recap_version,
         );
         if self.last_source.as_ref() == Some(&source) {
             return;
@@ -5350,6 +5367,14 @@ impl Transcript {
         };
         if self.answers_only {
             new_rows = answer_rows(new_rows);
+        }
+        // Side-chat panes and subagent tabs have no returning reader.
+        if self.doc_override.is_none()
+            && !self.answers_only
+            && let Some(chat_id) = self.chat_id.clone()
+            && let Some(recap) = self.state.read(cx).recap_row(&chat_id, chrono::Utc::now())
+        {
+            new_rows.push(recap_row(&chat_id, recap));
         }
 
         let baseline = self
@@ -8183,6 +8208,9 @@ impl Transcript {
                 error_chip(message.clone(), hint.clone(), &theme)
             }
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::Recap { lines, generating } => {
+                self.render_recap(&row.id, lines, *generating, &theme, cx)
+            }
         };
         // Diagram fences this row just requested start rendering after layout.
         self.ensure_diagram_worker(cx);
@@ -8479,6 +8507,85 @@ impl Transcript {
             state.chats.iter().find(|chat| chat.id == chat_id),
             state.indicator_for(chat_id, chrono::Utc::now()),
         )
+    }
+
+    /// The "※ Recap" block: no card, a dim header and up to three dim plain
+    /// lines, with a close button that appears on hover or keyboard focus.
+    fn render_recap(
+        &self,
+        row_id: &SharedString,
+        lines: &Arc<Vec<SharedString>>,
+        generating: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat_id = self.chat_id.clone().unwrap_or_default();
+        let accent = theme.accent;
+        let header: SharedString = if generating {
+            "※ Recapping…".into()
+        } else {
+            "※ Recap".into()
+        };
+        let dismiss = (!generating).then(|| {
+            div()
+                .id(SharedString::from(format!("{row_id}-dismiss")))
+                .role(gpui::Role::Button)
+                .aria_label("Dismiss recap")
+                .tab_index(0)
+                .flex_none()
+                .size(px(20.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(Theme::CONTROL_RADIUS))
+                .cursor_pointer()
+                .opacity(0.0)
+                .group_hover("recap-block", |style| style.opacity(1.0))
+                .focus_visible(move |style| style.opacity(1.0).border_2().border_color(accent))
+                .hover(|style| style.bg(crate::theme::ink(0.08)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let chat_id = chat_id.clone();
+                    this.state
+                        .update(cx, |state, cx| state.dismiss_recap(&chat_id, cx));
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::CLOSE)
+                        .size(px(12.0))
+                        .text_color(theme.text_faint),
+                )
+        });
+        div()
+            .id(row_id.clone())
+            .group("recap-block")
+            .py(px(4.0))
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_faint)
+                            .child(header),
+                    )
+                    .children(lines.iter().map(|line| {
+                        div()
+                            .text_size(crate::typography::ui_rems(12.5))
+                            .text_color(theme.text_muted.opacity(0.85))
+                            .child(line.clone())
+                    })),
+            )
+            .children(dismiss)
+            .into_any_element()
     }
 
     /// The hover strip's rewind action: an icon that opens a three-item menu
@@ -9923,6 +10030,25 @@ fn error_chip(message: SharedString, hint: Option<SharedString>, theme: &Theme) 
                 }),
         )
         .into_any_element()
+}
+
+/// The recap row for `chat_id`. Its id is stable, so a new recap replaces the
+/// old row in place instead of splicing a second one.
+fn recap_row(chat_id: &str, recap: crate::recap::RecapRow) -> Row {
+    let id: SharedString = format!("recap:{chat_id}").into();
+    Row {
+        id: id.clone(),
+        version: recap.version,
+        turn_start: true,
+        kind: RowKind::Recap {
+            lines: Arc::new(recap.lines.into_iter().map(SharedString::from).collect()),
+            generating: recap.generating,
+        },
+        entry_id: id,
+        timestamp: None,
+        copy_text: None,
+        compact_fold: None,
+    }
 }
 
 /// A quiet fork seam. The source gets its own constrained line so long
@@ -13685,6 +13811,40 @@ mod tests {
     }
 
     #[test]
+    fn recap_rows_keep_one_id_per_chat_and_follow_the_recap_version() {
+        let row = |lines: &[&str], generating: bool, version: u64| {
+            recap_row(
+                "chat",
+                crate::recap::RecapRow {
+                    lines: lines.iter().map(|line| line.to_string()).collect(),
+                    generating,
+                    version,
+                },
+            )
+        };
+        let ready = row(&["Goal", "Done"], false, 7);
+        let again = row(&["Goal", "Done", "Next"], false, 9);
+        assert_eq!(ready.id, again.id, "a new recap replaces the row in place");
+        assert_eq!(ready.id.as_ref(), "recap:chat");
+        assert_ne!(ready.version, again.version);
+        assert!(ready.turn_start);
+        assert!(ready.timestamp.is_none() && ready.copy_text.is_none());
+        let RowKind::Recap { lines, generating } = &ready.kind else {
+            panic!("expected a recap row");
+        };
+        assert_eq!(lines.len(), 2);
+        assert!(!generating);
+        let progress = row(&[], true, 2);
+        assert!(matches!(
+            progress.kind,
+            RowKind::Recap {
+                generating: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn compact_mode_keeps_input_and_error_chips_visible() {
         // Interactive/error rows are not work steps — they stay outside the
         // fold so a blocking question or a failure still surfaces.
@@ -14864,6 +15024,88 @@ mod tests {
                 state.transcript_revision += 1;
             });
             this.sync(cx);
+        }
+
+        #[test]
+        fn recap_row_trails_the_entries_and_follows_its_state() {
+            with_transcript(|this, cx| {
+                let entries = vec![
+                    prompt("u1"),
+                    assistant(
+                        "a1",
+                        MessageStatus::Complete,
+                        vec![text_part("t1", "Done.")],
+                    ),
+                    prompt("u2"),
+                    assistant(
+                        "a2",
+                        MessageStatus::Complete,
+                        vec![text_part("t2", "Again.")],
+                    ),
+                ];
+                this.state.update(cx, |state, _| {
+                    state.chats.push(crate::recap::test_chat("chat", None));
+                });
+                feed(this, entries, cx);
+                let recap_rows = |this: &Transcript| {
+                    this.rows
+                        .iter()
+                        .filter(|row| matches!(row.kind, RowKind::Recap { .. }))
+                        .count()
+                };
+                assert_eq!(recap_rows(this), 0);
+
+                // A recap that matches the end of the transcript is appended
+                // after the entries, and moves the sync key by itself.
+                this.state.update(cx, |state, _| {
+                    let key = zeron_doc::recap::recap_key(&state.transcript).unwrap();
+                    let token = state.recaps.begin("chat", false);
+                    state.recaps.finish(
+                        "chat",
+                        token,
+                        Ok(crate::recap::Outcome {
+                            status: "ready".into(),
+                            recap: Some(crate::recap::WireRecap {
+                                text: "Goal\nDone".into(),
+                                key: key.clone(),
+                            }),
+                        }),
+                        Some(&key),
+                        chrono::Utc::now(),
+                    );
+                });
+                this.sync(cx);
+                assert_eq!(recap_rows(this), 1);
+                let last = this.rows.last().unwrap();
+                assert!(matches!(
+                    &last.kind,
+                    RowKind::Recap { lines, generating: false } if lines.len() == 2
+                ));
+
+                // Side-chat panes never show it.
+                this.answers_only = true;
+                this.sync(cx);
+                assert_eq!(recap_rows(this), 0);
+                this.answers_only = false;
+                this.sync(cx);
+                assert_eq!(recap_rows(this), 1);
+
+                // A message still on its way hides it until it lands.
+                this.state
+                    .update(cx, |state, _| state.push_echo("chat", prompt("echo")));
+                this.sync(cx);
+                assert_eq!(recap_rows(this), 0);
+                this.state
+                    .update(cx, |state, _| state.remove_echo("chat", "echo"));
+                this.sync(cx);
+                assert_eq!(recap_rows(this), 1);
+
+                // Dismissing removes it without touching the transcript.
+                this.state
+                    .update(cx, |state, cx| state.dismiss_recap("chat", cx));
+                this.sync(cx);
+                assert_eq!(recap_rows(this), 0);
+            });
         }
 
         fn prompt(id: &str) -> SessionMessageEntry {

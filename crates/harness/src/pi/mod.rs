@@ -561,7 +561,19 @@ impl Harness for PiHarness {
     async fn run_title(
         &self,
         request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run_isolated(request, controls, crate::TITLE_INSTRUCTIONS, "zeron-titles")
+            .await
+    }
+    /// Same bare process as titles with the caller's instructions as the
+    /// whole system prompt; `usage_surface` attributes the call in the ledger.
+    async fn run_isolated(
+        &self,
+        request: RunRequest,
         _controls: RunControls,
+        instructions: &'static str,
+        usage_surface: &'static str,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let mut args: Vec<String> = [
             "--no-session",
@@ -573,7 +585,7 @@ impl Harness for PiHarness {
             "--thinking",
             "off",
             "--system-prompt",
-            crate::TITLE_INSTRUCTIONS,
+            instructions,
         ]
         .map(String::from)
         .into();
@@ -590,7 +602,7 @@ impl Harness for PiHarness {
             &args,
             None,
             false,
-            Some("zeron-titles"),
+            Some(usage_surface),
             false,
         )?;
         let grace = self.kill_grace;

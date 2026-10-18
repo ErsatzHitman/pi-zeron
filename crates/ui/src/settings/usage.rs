@@ -262,6 +262,7 @@ pub fn surface_label(surface: &str) -> String {
         "handoff" => "Handoff",
         "loop" => "Loop",
         "zeron-titles" => "Zeron titles",
+        "zeron-recap" => "Zeron recaps",
         _ => {
             return match surface.strip_prefix("ext:") {
                 Some(name) => format!("{name} extension"),

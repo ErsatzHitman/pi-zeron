@@ -5908,6 +5908,7 @@ pub enum WorkspaceCommand {
     Terminal,
     Rename,
     Stop,
+    Recap,
 }
 
 impl WorkspaceCommand {
@@ -5937,6 +5938,12 @@ impl WorkspaceCommand {
                 true,
             ),
             (Self::Stop, "stop", "Zeron: stop the active run", true),
+            (
+                Self::Recap,
+                "recap",
+                "Zeron: recap where this conversation stands",
+                true,
+            ),
         ]
     }
 }
@@ -13419,7 +13426,7 @@ mod tests {
             vec![],
         );
         let rows = with_workspace_commands(native, true);
-        assert_eq!(rows.len(), 11);
+        assert_eq!(rows.len(), 12);
         assert!(rows[0].workspace_command.is_none());
         assert_eq!(rows[0].input_hint.as_deref(), Some("model id"));
         assert_eq!(workspace_command_for_text("/model", &rows), None);
@@ -13428,10 +13435,19 @@ mod tests {
             workspace_command_for_text("/zeron:zeron:model", &rows),
             Some(WorkspaceCommand::Model)
         );
-        assert_eq!(with_workspace_commands(rows, true).len(), 11);
+        assert_eq!(
+            workspace_command_for_text("/recap", &rows),
+            Some(WorkspaceCommand::Recap)
+        );
+        assert_eq!(with_workspace_commands(rows, true).len(), 12);
         let draft_rows = with_workspace_commands(vec![], false);
         assert_eq!(draft_rows.len(), 4);
         assert_eq!(workspace_command_for_text("/diff", &draft_rows), None);
+        assert_eq!(
+            workspace_command_for_text("/recap", &draft_rows),
+            None,
+            "a recap needs a conversation"
+        );
         assert_eq!(
             workspace_command_for_text("/model  ", &draft_rows),
             Some(WorkspaceCommand::Model)

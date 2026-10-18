@@ -32,12 +32,14 @@ pub mod harness_updates;
 pub(crate) mod home_index;
 mod http_error;
 pub mod instance_lock;
+mod isolated;
 pub mod lag_monitor;
 pub mod local_import;
 mod model_catalogs;
 pub mod model_policy;
 pub mod profile;
 pub mod project_actions;
+pub mod recap;
 pub mod registry;
 pub mod repos;
 pub mod rewind;
@@ -69,6 +71,7 @@ pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use project_actions::ProjectActionsStore;
+pub use recap::RecapGenerator;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry, register_other_harnesses};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -159,6 +162,8 @@ pub struct EngineCore {
     pub usage_alerts: usage_alerts::UsageAlerts,
     /// Tokens and spend per Pi provider and model, from Pi's session files.
     pub usage: usage::UsageTracker,
+    /// "Where this chat stands" summaries for someone returning to it.
+    pub recaps: RecapGenerator,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
@@ -405,6 +410,13 @@ impl EngineCore {
             workspace.clone(),
         );
         usage_alerts.start();
+        let recaps = RecapGenerator::new(
+            workspace.clone(),
+            doc_host.clone(),
+            sessions.clone(),
+            registry.clone(),
+            Some(profile.store_root().join("recaps.json")),
+        );
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -435,6 +447,7 @@ impl EngineCore {
             harness_updates,
             usage_alerts,
             usage,
+            recaps,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -570,7 +583,8 @@ impl EngineCore {
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
         .with_harness_updates(self.harness_updates.clone())
-        .with_usage(self.usage.clone());
+        .with_usage(self.usage.clone())
+        .with_recaps(self.recaps.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
