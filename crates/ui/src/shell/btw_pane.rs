@@ -202,7 +202,7 @@ impl Shell {
 
     /// The engine chat id behind side chat tab `id`, when it is a minted btw
     /// chat no right-pane tab shows: the one a closing pane may delete.
-    fn deletable_btw_chat(&self, id: u64, cx: &App) -> Option<String> {
+    pub(super) fn deletable_btw_chat(&self, id: u64, cx: &App) -> Option<String> {
         let attached = self
             .right_tabs
             .values()
