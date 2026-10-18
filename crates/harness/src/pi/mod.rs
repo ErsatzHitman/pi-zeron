@@ -248,7 +248,8 @@ impl PiHarness {
             .env_remove("PI_ZERON_SESSION_PID");
         // A chat run's model restrictions come from its MCP config (below);
         // nothing else inherits them.
-        cmd.env_remove(zeron_proto::orchestrator::ENV_MODEL_POLICY);
+        cmd.env_remove(zeron_proto::orchestrator::ENV_MODEL_POLICY)
+            .env_remove(zeron_proto::orchestrator::ENV_TREE_POLICY);
         // The guard checks the installed Pi packages for updates when asked,
         // at most twice a day across this engine's runs.
         if guarded && package_check_due() {

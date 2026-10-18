@@ -42,6 +42,14 @@ pub(super) fn configure(
     {
         cmd.env(orchestrator::ENV_MODEL_POLICY, policy);
     }
+    // And the tree's policy, which the guard enforces in each of them.
+    if let Some(policy) = config
+        .env
+        .remove(orchestrator::ENV_TREE_POLICY)
+        .filter(|file| !file.is_empty())
+    {
+        cmd.env(orchestrator::ENV_TREE_POLICY, policy);
+    }
     for arg in role_args(&place, project.as_deref(), scratch.path())? {
         cmd.arg(arg);
     }
@@ -431,6 +439,8 @@ mod tests {
             "project_forget",
             "project_update",
             "merge_preview",
+            "register_project",
+            "github_preflight",
         ];
         for prompt in prompts {
             for word in prompt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {

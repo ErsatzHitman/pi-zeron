@@ -1093,7 +1093,7 @@ impl GitHubCli {
 }
 
 /// Board requests run against GitHub.com without a checkout or interactive prompts.
-fn github_request() -> ProcessRequest {
+pub(crate) fn github_request() -> ProcessRequest {
     ProcessRequest {
         program: "gh".into(),
         args: Vec::new(),
@@ -2007,38 +2007,38 @@ fn classify_run_error(error: ProcessRunError) -> ChangeRequestError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcessRequest {
-    program: String,
-    args: Vec<String>,
+pub(crate) struct ProcessRequest {
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
     /// Written to the child's standard input, which is then closed.
-    stdin: Option<Vec<u8>>,
-    cwd: Option<PathBuf>,
-    env: Vec<(String, String)>,
-    timeout: Duration,
-    output_limit: usize,
+    pub(crate) stdin: Option<Vec<u8>>,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) timeout: Duration,
+    pub(crate) output_limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcessOutput {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    stdout_truncated: bool,
+pub(crate) struct ProcessOutput {
+    pub(crate) success: bool,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessRunError {
+pub(crate) enum ProcessRunError {
     Spawn(io::ErrorKind),
     Timeout,
     Io,
 }
 
 #[async_trait]
-trait ProcessRunner: Send + Sync {
+pub(crate) trait ProcessRunner: Send + Sync {
     async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError>;
 }
 
-struct SystemProcessRunner;
+pub(crate) struct SystemProcessRunner;
 
 #[async_trait]
 impl ProcessRunner for SystemProcessRunner {
