@@ -61,6 +61,26 @@ fn custom_failed(details: &Value) -> bool {
 /// The error text of an assistant message that failed without saying why.
 const GENERIC_FAILURE: &str = "Pi provider failed";
 
+/// How a Pi launch gate (the decisions extension) opens its answer when it
+/// holds a sub-agent launch for one consultation. Pi reports that answer as a
+/// failed tool call, so the model reads the reason and retries; for the user
+/// it is a hold, not a failure. The marker text is the gate's, kept in one
+/// place on each side: the first line starts with one of these, or is a Jev
+/// line (the gate's former name) saying it is held for one consult.
+const GATE_HOLD_MARKERS: [&str; 2] = ["[decisions] HELD", "[decisions] Pre-launch consultation"];
+const GATE_HOLD_LEGACY: (&str, &str) = ("[jev]", "HELD for one consult");
+
+/// Whether a failed tool call's text is a launch gate's hold.
+fn is_gate_hold(output: Option<&str>) -> bool {
+    let first = output.and_then(|text| text.trim_start().lines().next());
+    first.is_some_and(|line| {
+        GATE_HOLD_MARKERS
+            .iter()
+            .any(|marker| line.starts_with(marker))
+            || (line.starts_with(GATE_HOLD_LEGACY.0) && line.contains(GATE_HOLD_LEGACY.1))
+    })
+}
+
 /// The text of a message's `content` (a string, or text parts).
 fn content_text(content: &Value) -> String {
     match content {
@@ -292,9 +312,13 @@ impl Normalizer {
                         })
                     })
                     .collect();
+                // A launch gate's hold reaches the model as an error so it
+                // reads the reason, but the row is a hold, not a failed call.
+                let is_error =
+                    frame["isError"].as_bool().unwrap_or(false) && !is_gate_hold(output.as_deref());
                 events.push(AgentEvent::ToolResult {
                     id,
-                    is_error: frame["isError"].as_bool().unwrap_or(false),
+                    is_error,
                     output: output.map(|s| cap(&s, 16384)),
                     diff,
                 });
@@ -1084,5 +1108,45 @@ mod tests {
             "result":{"content":[],"details":{"images":[{"path":"/w/a.png","name":"a.png"}]}}}),
         );
         assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn a_launch_gate_hold_is_not_a_failed_tool_call() {
+        let end = |id: &str, is_error: bool, text: &str| {
+            json!({"type":"tool_execution_end","toolCallId":id,"isError":is_error,
+            "result":{"content":[{"type":"text","text":text}]}})
+        };
+        let mut n = Normalizer::default();
+        for (text, held) in [
+            (
+                "[decisions] HELD for one consult: two writers overlap",
+                true,
+            ),
+            ("[decisions] Pre-launch consultation\nnot a failure", true),
+            ("[jev] Fix Auth and Fix Billing HELD for one consult", true),
+            ("\n[decisions] HELD", true),
+            ("Error: subagent_start failed", false),
+            ("[jev] consult failed", false),
+            ("the decisions gate said [decisions] HELD", false),
+            ("", false),
+        ] {
+            n.map(&json!({"type":"tool_execution_start","toolCallId":"h","toolName":"subagent_start","args":{}}));
+            let events = n.map(&end("h", true, text));
+            assert!(
+                matches!(&events[0], AgentEvent::ToolResult { is_error, output, .. }
+                    if *is_error != held && output.as_deref() == Some(text)),
+                "{text:?}: {events:?}"
+            );
+        }
+        // Only a failed call is changed: a result that was no error stays one.
+        n.map(&json!({"type":"tool_execution_start","toolCallId":"k","toolName":"subagent_start","args":{}}));
+        let events = n.map(&end("k", false, "[decisions] HELD"));
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolResult {
+                is_error: false,
+                ..
+            }
+        ));
     }
 }

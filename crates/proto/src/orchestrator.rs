@@ -257,7 +257,7 @@ fn label(text: String) -> Option<String> {
 pub fn member_prompt(place: &Place) -> String {
     let depth = place.depth().unwrap_or(1);
     let sessions = if depth >= MAX_DEPTH {
-        "You cannot start sessions; do the work here."
+        "You cannot start sessions; do the work here, but research still goes to read-only sub-agents."
     } else {
         "Start a sub-session with zeron_create_chat only for an independent task in a \
          different folder, or when parallel work clearly pays."
@@ -538,6 +538,44 @@ mod tests {
             .collect();
         assert_eq!(ids, ["a", "a1"]);
         assert!(live_members(&chats, "plain").is_empty());
+    }
+
+    #[test]
+    fn every_orchestrator_prompt_sends_research_to_subagents() {
+        let at = |depth| Place {
+            role: Role::Member { depth },
+            chat_id: "c".into(),
+            title: Some("Task".into()),
+            parent_id: Some("p".into()),
+            parent_title: None,
+            root_id: Some("orchestrator-r".into()),
+        };
+        assert!(ROOT_SYSTEM_PROMPT.contains("Research is never yours"));
+        assert!(ROOT_SYSTEM_PROMPT.contains("write false session"));
+        for depth in 1..=MAX_DEPTH {
+            let member = member_prompt(&at(depth));
+            for rule in [
+                "never explore the codebase",
+                "read-only sub-agents (subagent_start)",
+                "This holds in a read-only session too",
+                "One named file or one grep that answers a precise question",
+                "reading the files you are about to change is part of your task",
+            ] {
+                assert!(
+                    member.contains(rule),
+                    "depth {depth} lacks {rule:?}: {member}"
+                );
+            }
+            assert!(!member.contains('{'), "{member}");
+            // A workflow is offered for multi-phase research only, never to a read-only session.
+            assert!(
+                member.contains("never from a read-only session"),
+                "{member}"
+            );
+        }
+        let last = member_prompt(&at(MAX_DEPTH));
+        assert!(last.contains("You cannot start sessions"));
+        assert!(last.contains("research still goes to read-only sub-agents"));
     }
 
     #[test]

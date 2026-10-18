@@ -269,6 +269,25 @@ mod tests {
     }
 
     #[test]
+    fn the_root_and_every_member_depth_carry_the_research_rule() {
+        let (_scratch, args) = args(Role::Root);
+        let root = std::fs::read_to_string(flag(&args, "--system-prompt").unwrap()).unwrap();
+        assert!(root.contains("Research is never yours"), "{root}");
+        assert!(root.contains("write false session"), "{root}");
+        for depth in 1..=orchestrator::MAX_DEPTH {
+            let (_scratch, args) = args_at(&at(Role::Member { depth }, Some("parent-1")));
+            let member = args
+                .iter()
+                .find(|arg| arg.ends_with("zeron-member.md"))
+                .expect("the member prompt");
+            let member = std::fs::read_to_string(member).unwrap();
+            assert!(member.contains("never explore the codebase"), "{member}");
+            assert!(member.contains("read-only sub-agents"), "{member}");
+            assert!(member.contains("One named file or one grep"), "{member}");
+        }
+    }
+
+    #[test]
     fn a_tree_s_runs_get_their_project_and_a_plain_chat_does_not() {
         let project = "# Project\n\n## Goal\n\nShip the parser\n";
         for role in [Role::Root, Role::Member { depth: 1 }] {

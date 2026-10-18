@@ -92,7 +92,12 @@ for a change (`delete`, `create`, `push`, ...), and bash that writes (redirects,
 installs, git commands other than read-only ones, and any command not on its
 read-only list). Zeron's board and messaging tools (`zeron_board_post`,
 `zeron_board_read`, `zeron_send_message(s)`) stay usable; starting sessions
-does not. `web_search` and `web_fetch` stay usable too: they come from the
+does not. Research goes to sub-agents in a read-only session too, so
+`subagent_start` passes while every task only reads (`writeAccess` absent or
+`false`); a task with any other `writeAccess` is refused (`ro-subagent-writer`),
+and the sub-agents inherit the flag. `workflow` and `workflow_script` are
+refused (`ro-workflow`): workflow agents run in the Pi process with tools this
+guard does not see. `web_search` and `web_fetch` stay usable too: they come from the
 web-tools extension and call DeepSeek's Search and Fetch APIs with the DeepSeek key from
 Settings → API keys. Child Pi processes inherit it through the env and the
 preload. A read-only run without the guard extension fails to start rather
@@ -260,6 +265,15 @@ away or the turn ends. An element left up unchanged across turns (a card
 until dismissed) gets no new row; one that changes does. Only the title and
 up to 60 lines enter the chat document.
 
+A tool call that Pi reports as failed can be a hold: the decisions extension
+holds a launch of writing sub-agents once per intent, for one consultation, and
+says so in a result starting `[decisions] HELD` (or the older
+`[decisions] Pre-launch consultation`, or `[jev] ... HELD for one consult`).
+The model still gets it as an error and reads the reason, but Zeron shows the
+call as done with that text, not as failed. The marker is one constant in
+`crates/harness/src/pi/normalize.rs`; keep it in step with the extension.
+Read-only research launches are never held.
+
 A dialog Pi raises between turns has no turn to ask in; for a watching UI it
 becomes a `pi:dialog-N` sheet (timeouts honoured), otherwise it is cancelled.
 
@@ -303,7 +317,10 @@ profile instead of the coding one:
 
 - `--system-prompt` with `crates/proto/src/orchestrator_root.md` in place of
   Pi's coding prompt: it hands each task to a Pi session in the right folder
-  through `zeron_create_chat` and follows it with the other `zeron_*` tools;
+  through `zeron_create_chat` and follows it with the other `zeron_*` tools.
+  Research is never the root's own: exploring code, docs or the web and
+  investigating go to `write: false` sessions, started together when
+  independent;
 - `--tools` limited to `orchestrator::ROOT_TOOLS` (the `zeron_*` tools,
   read-only `read`/`ls`/`find`/`grep`, `web_search`/`web_fetch`, `ask_user`,
   `todo`, `goal_*` and the memory reads): no bash, edits or extension
@@ -313,7 +330,13 @@ profile instead of the coding one:
 
 A session in an orchestrator's tree keeps Pi's coding prompt and every tool,
 and also gets `crates/proto/src/orchestrator_member.md`: report in the final
-reply, the tree's depth limit and the board. The engine marks each run with
+reply, the tree's depth limit and the board, and the research rule: a member
+never explores the codebase, reads docs or the web or investigates in its own
+context but sends it to read-only sub-agents (several at once when independent),
+in a read-only session too, down to the last tree level. One named file or one
+grep is a lookup, and reading the files it is about to change is its task. A
+plain or side chat has no Zeron prompt of its own; it gets the rule from the Pi
+capability map, gated on the sub-agent tools. The engine marks each run with
 `ZERON_ROLE` (`orchestrator` or `member`, unset for a plain chat) and, for a
 member, `ZERON_TREE_DEPTH`, in both the Zeron MCP server's env and Pi's own,
 so extensions can change their behaviour too. A run in a tree whose orchestrator has a goal,
