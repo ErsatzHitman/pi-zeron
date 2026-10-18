@@ -1,18 +1,27 @@
 //! An orchestrator's settings dialog: its name, the goal and standing
 //! instructions every session of its tree gets, the memory it keeps between
-//! turns, and the controls that pause or archive the whole tree
+//! turns, the rules every session of the tree is held to (where tests run,
+//! heavy-command and writer limits, allowed models, a spending cap), and the
+//! controls that pause or archive the whole tree
 //! (`zeron_proto::orchestrator_project`).
 
 use super::*;
 use std::collections::{HashMap, HashSet};
 use zeron_proto::orchestrator;
-use zeron_proto::orchestrator_project::{MemoryNote, OrchestratorProject};
+use zeron_proto::orchestrator_project::{MemoryNote, OrchestratorProject, TreePolicy, dollars};
 
 pub(super) struct OrchestratorSettingsDialog {
     root_id: String,
     name: Entity<ComposerInput>,
     goal: Entity<ComposerInput>,
     instructions: Entity<ComposerInput>,
+    heavy: Entity<ComposerInput>,
+    writers: Entity<ComposerInput>,
+    models: Entity<ComposerInput>,
+    cap: Entity<ComposerInput>,
+    /// The policy as loaded: what the form leaves out (the warning
+    /// percentage) is saved unchanged.
+    policy: TreePolicy,
     original_name: String,
     memory: Vec<MemoryNote>,
     loaded: bool,
@@ -21,6 +30,57 @@ pub(super) struct OrchestratorSettingsDialog {
     focus_pending: bool,
     _load: Option<Task<()>>,
     _events: Vec<Subscription>,
+}
+
+/// The policy the dialog's form describes, or what to fix in it.
+fn policy_from_form(
+    dialog: &OrchestratorSettingsDialog,
+    cx: &mut Context<Shell>,
+) -> Result<TreePolicy, String> {
+    let limit = |input: &Entity<ComposerInput>, what: &str, cx: &mut Context<Shell>| {
+        let text = input.read(cx).text().trim().to_owned();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        text.parse::<u8>()
+            .map(Some)
+            .map_err(|_| format!("{what}: enter a whole number, or leave it empty for no limit"))
+    };
+    let heavy_command_limit = limit(&dialog.heavy, "Heavy commands", cx)?;
+    let writer_limit = limit(&dialog.writers, "Writing sessions", cx)?;
+    let cap_text = dialog
+        .cap
+        .read(cx)
+        .text()
+        .trim()
+        .trim_start_matches('$')
+        .to_owned();
+    let spend_cap_cents = if cap_text.is_empty() {
+        None
+    } else {
+        let dollars: f64 = cap_text
+            .parse()
+            .map_err(|_| "Spending cap: enter dollars such as 25 or 12.50".to_owned())?;
+        if !dollars.is_finite() || dollars <= 0.0 {
+            return Err("Spending cap: enter more than 0 dollars".into());
+        }
+        Some((dollars * 100.0).round() as u64)
+    };
+    let allowed_models = dialog
+        .models
+        .read(cx)
+        .text()
+        .split([',', '\n'])
+        .map(|model| model.trim().to_owned())
+        .filter(|model| !model.is_empty())
+        .collect();
+    Ok(TreePolicy {
+        heavy_command_limit,
+        writer_limit,
+        allowed_models,
+        spend_cap_cents,
+        ..dialog.policy.clone()
+    })
 }
 
 /// What the sidebar knows of each orchestrator's project, filled as the
@@ -127,6 +187,13 @@ impl Shell {
                 cx,
             )
         });
+        let rule = |placeholder: &'static str, cx: &mut Context<Self>| {
+            cx.new(|cx| ComposerInput::new(placeholder, cx).with_single_line())
+        };
+        let heavy = rule("No limit", cx);
+        let writers = rule("No limit", cx);
+        let models = rule("Any model, or ids separated by commas", cx);
+        let cap = rule("No cap, or dollars such as 25", cx);
         let events = [&name, &goal]
             .into_iter()
             .map(|input| {
@@ -162,6 +229,27 @@ impl Shell {
                         dialog.instructions.update(cx, |input, cx| {
                             input.set_text(reply.project.instructions.clone(), cx)
                         });
+                        let policy = &reply.project.policy;
+                        let text = |value: Option<String>| value.unwrap_or_default();
+                        dialog.heavy.update(cx, |input, cx| {
+                            input.set_text(
+                                text(policy.heavy_command_limit.map(|n| n.to_string())),
+                                cx,
+                            )
+                        });
+                        dialog.writers.update(cx, |input, cx| {
+                            input.set_text(text(policy.writer_limit.map(|n| n.to_string())), cx)
+                        });
+                        dialog.models.update(cx, |input, cx| {
+                            input.set_text(policy.allowed_models.join(", "), cx)
+                        });
+                        dialog.cap.update(cx, |input, cx| {
+                            input.set_text(
+                                text(policy.spend_cap_cents.map(|c| dollars(c).replace('$', ""))),
+                                cx,
+                            )
+                        });
+                        dialog.policy = policy.clone();
                         dialog.memory = reply.memory;
                         dialog.loaded = true;
                         shell
@@ -180,6 +268,11 @@ impl Shell {
             name,
             goal,
             instructions,
+            heavy,
+            writers,
+            models,
+            cap,
+            policy: TreePolicy::default(),
             original_name,
             memory: Vec::new(),
             loaded: false,
@@ -206,11 +299,20 @@ impl Shell {
         let name = dialog.name.read(cx).text().trim().to_owned();
         let rename = (!name.is_empty() && name != dialog.original_name)
             .then(|| serde_json::json!({ "op": "renameChat", "chatId": root_id, "title": name }));
+        let policy = match policy_from_form(dialog, cx) {
+            Ok(policy) => policy,
+            Err(error) => {
+                dialog.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
         let update = serde_json::json!({
             "chatId": root_id,
             "update": {
                 "goal": dialog.goal.read(cx).text(),
                 "instructions": dialog.instructions.read(cx).text(),
+                "policy": policy,
             },
         });
         dialog.saving = true;
@@ -248,6 +350,19 @@ impl Shell {
             .ok();
         })
         .detach();
+    }
+
+    /// Flip one of the rules that is a plain switch.
+    fn toggle_orchestrator_rule(&mut self, rule: &'static str, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.orchestrator_settings.as_mut() {
+            match rule {
+                "github-only-tests" => {
+                    dialog.policy.github_only_tests = !dialog.policy.github_only_tests
+                }
+                _ => dialog.policy.require_preflight = !dialog.policy.require_preflight,
+            }
+            cx.notify();
+        }
     }
 
     fn forget_orchestrator_note(&mut self, note_id: String, cx: &mut Context<Self>) {
@@ -358,6 +473,72 @@ impl Shell {
         );
         let (loaded, saving, error) = (dialog.loaded, dialog.saving, dialog.error.clone());
         let notes: Vec<MemoryNote> = dialog.memory.clone();
+        let (heavy, writers, models, cap) = (
+            dialog.heavy.clone(),
+            dialog.writers.clone(),
+            dialog.models.clone(),
+            dialog.cap.clone(),
+        );
+        let (github_only, preflight) = (
+            dialog.policy.github_only_tests,
+            dialog.policy.require_preflight,
+        );
+        let switch = |title: &'static str,
+                      hint: &'static str,
+                      on: bool,
+                      rule: &'static str,
+                      cx: &mut Context<Self>| {
+            div()
+                .id(SharedString::from(format!("orchestrator-rule-{rule}")))
+                .mt(px(8.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .cursor_pointer()
+                .role(gpui::Role::Button)
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.toggle_orchestrator_rule(rule, cx)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(12.5))
+                                .text_color(theme.text)
+                                .child(SharedString::from(title)),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(hint)),
+                        ),
+                )
+                .child(crate::settings::widgets::toggle_switch(
+                    &theme,
+                    on,
+                    format!("orchestrator-rule-{rule}"),
+                ))
+        };
+        let github_switch = switch(
+            "Build and test on GitHub only",
+            "Compilers and test runners are refused in its sessions; they push and read CI",
+            github_only,
+            "github-only-tests",
+            cx,
+        );
+        let preflight_switch = switch(
+            "Check GitHub before a writer starts",
+            "Push access, token scopes, CI triggers and runners must pass first",
+            preflight,
+            "require-preflight",
+            cx,
+        );
         let label = |text: &str| {
             div()
                 .mt(px(14.0))
@@ -447,6 +628,17 @@ impl Shell {
                     .child(instructions)
                     .into_any_element(),
             ))
+            .child(label("Rules for every session"))
+            .child(github_switch)
+            .child(preflight_switch)
+            .child(label("Heavy commands at once (1-8)"))
+            .child(popover::dialog_field(heavy.into_any_element()))
+            .child(label("Writing sessions at once (1-16)"))
+            .child(popover::dialog_field(writers.into_any_element()))
+            .child(label("Allowed models"))
+            .child(popover::dialog_field(models.into_any_element()))
+            .child(label("Spending cap in dollars, all sessions together"))
+            .child(popover::dialog_field(cap.into_any_element()))
             .child(label("Memory"))
             .child(memory)
             .when_some(error, |el, error| {

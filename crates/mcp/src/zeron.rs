@@ -655,8 +655,13 @@ pub fn resolve_space_in(spaces: &[Space], key: &str) -> anyhow::Result<Space> {
                 .join(", ")
         );
     }
-    bail!("no project matches {key:?} (id, path, or name); try list_projects")
+    bail!(
+        "{NO_PROJECT} {key:?} (id, path, or name); try list_projects, or register_project to add an existing folder"
+    )
 }
+
+/// How the error of an unknown project starts.
+pub const NO_PROJECT: &str = "no project matches";
 
 /// Eight-char id prefix, the sidebar's convention.
 pub fn short(id: &str) -> &str {

@@ -165,6 +165,8 @@ name (default: the local engine's device).
 | `whoami`           | `LocalDevice`, `EngineInfo`, origin chat summary          |
 | `list_devices`     | `WatchDevices` snapshot                                   |
 | `list_projects`    | `WatchSpaces` snapshot                                    |
+| `register_project` | `RegisterProject {query, name?, dryRun?, targetDeviceId}`: register an existing folder, by path or short name, as a project |
+| `github_preflight` | `GithubPreflight {cwd, branch?, force?, targetDeviceId}`: can a writer push and see CI here (read-only) |
 | `list_harnesses`   | `ListHarnesses {targetDeviceId?}`                          |
 | `list_models`      | `ListModels {harness, targetDeviceId?}`                                    |
 | `list_chats`       | `WatchChats` + `WatchSessions` snapshots (status merged)  |
@@ -182,7 +184,7 @@ name (default: the local engine's device).
 | `board_post`       | `PostBoard {chatId, kind, text}`, then a `send_message`-style delivery to each other session that sees the post (origin chat only) |
 | `board_read`       | `ListBoard {chatId, since?, limit?}` (origin chat only)    |
 | `wait_for_turns`   | `wait_for_turn` on up to 32 chats at once (default: the caller's working children); returns the first to settle and where the rest stand |
-| `project_read`     | `GetOrchestratorProject {chatId}`: the tree's goal, instructions, paused flag and memory (any chat of the tree) |
+| `project_read`     | `GetOrchestratorProject {chatId}`: the tree's goal, instructions, paused flag, policy and memory, plus `GetTreeSpend` when a spending cap is set (any chat of the tree) |
 | `project_remember` / `project_forget` | `OrchestratorMemory {chatId, text}` / `{chatId, forget}` (root only) |
 | `project_update`   | `UpdateOrchestratorProject {chatId, update: {goal?, instructions?}}` (root only) |
 | `merge_preview`    | `MergePreview {chatId, member, base?, targetDeviceId}`: read-only merge preview of a session's worktree branch (root only) |
@@ -196,7 +198,40 @@ held queued message on one awaiting input, never to a working or paused one
 
 `create_chat`, `create_chats`, `send_message` and `send_messages` refuse from a
 chat in a paused orchestrator's tree; see
-[orchestrator projects](reference/orchestrator-projects.md).
+[orchestrator projects](reference/orchestrator-projects.md). The same four
+also refuse once the tree has spent its spending cap, and `create_chat(s)`
+refuses a model the tree's policy does not allow.
+
+## Registering a project and checking GitHub
+
+`register_project {project, device?, name?, dry_run?}` takes a path (absolute
+or `~/...`) or a short folder name such as `t3code`. A short name is looked
+for in tiers, and the first tier with a match decides: a project already
+registered under that name, then a folder of that name beside the registered
+projects (this is how `t3code` is found next to the checkout it was cloned
+beside), then the top of the home folder and of each drive and the usual
+project folders (`~/codebase`, `~/code`, `~/projects`, ...). It registers a folder only when exactly one matches and never creates
+one: with several matches it returns the list and the agent asks the user.
+`dry_run` lists the matches without registering. Folders that are not a safe
+place for an agent (a filesystem root, the home folder itself, system folders)
+are refused. `create_chat {project: "t3code"}` registers the folder the same
+way when no project matches. In a git folder every writing session gets its
+own worktree (`zeron/<name>` branch); a folder that is not a git repository
+is shared by its writers, so in an orchestrator's tree a second writer is
+refused while another is working in it.
+
+`github_preflight {project?, cwd?, branch?, force?}` answers, before a writer
+starts: does git's own credential allow a push (a `git push --dry-run` probe,
+because git and `gh` use different credentials), what scopes the `gh` token
+has (`repo`, `workflow`), whether Actions is enabled, which workflows start for
+a push to the writer's branch (many start only for pull requests, so a draft
+pull request must be opened right after the first push), whether self-hosted
+runners are online, and whether a billing block makes every job fail at once.
+It returns `ok`, `blockers`, `warnings` and a one-line `verdict`. Reports are
+reused for a few minutes; `force` checks again. In an orchestrator whose policy
+requires it, `create_chat` runs it before every writer in a GitHub project
+and refuses on blockers; warnings come back with the new session as
+`preflight`.
 
 ### Message board
 
