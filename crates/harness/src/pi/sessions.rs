@@ -203,40 +203,77 @@ impl Store {
                 return Ok(file.canonicalize()?);
             }
         }
+        let mut truncated = false;
         for root in roots {
-            // Pi stores session files under per-project directories. No symlink traversal.
-            let mut dirs = vec![(root, 0)];
-            let mut seen = 0;
-            while let Some((dir, depth)) = dirs.pop() {
-                let Ok(entries) = std::fs::read_dir(dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    seen += 1;
-                    if seen > 20000 {
-                        return Err(HarnessError::Protocol(
-                            "Pi session search exceeded 20000 entries".into(),
-                        ));
+            if let Some(file) = find_in_root(root, id, &mut truncated)? {
+                return Ok(file.canonicalize()?);
+            }
+        }
+        Err(HarnessError::Protocol(if truncated {
+            format!(
+                "native session file for {id} was not found (only the first {HEADER_SCAN_LIMIT} session files were opened)"
+            )
+        } else {
+            format!("native session file for {id} was not found")
+        }))
+    }
+}
+
+/// Session files whose headers are opened when no file name carries the id.
+const HEADER_SCAN_LIMIT: usize = 20_000;
+/// Directory entries listed under one root before the search gives up.
+const WALK_LIMIT: usize = 200_000;
+
+/// The session `id` under `root`. Pi names its files `<timestamp>_<id>.jsonl`,
+/// so a file whose name carries the id is opened first, and only when none
+/// does are the other files' headers read (a file renamed by hand still
+/// resolves). The walk lists directories, which is cheap; opening a file is
+/// not, so the opens are what stay bounded. Sets `truncated` when the header
+/// scan left files unopened.
+fn find_in_root(
+    root: PathBuf,
+    id: &str,
+    truncated: &mut bool,
+) -> Result<Option<PathBuf>, HarnessError> {
+    // Pi stores session files under per-project directories. No symlink traversal.
+    let mut dirs = vec![(root, 0)];
+    let mut seen = 0;
+    let mut others = Vec::new();
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > WALK_LIMIT {
+                return Err(HarnessError::Protocol(format!(
+                    "Pi session search exceeded {WALK_LIMIT} entries"
+                )));
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() && depth < 2 {
+                dirs.push((path, depth + 1));
+            } else if kind.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+                let named = path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(id));
+                if named {
+                    // Its header was just asked; the fallback need not repeat it.
+                    if matches_id(&path, id) {
+                        return Ok(Some(path));
                     }
-                    let Ok(kind) = entry.file_type() else {
-                        continue;
-                    };
-                    let path = entry.path();
-                    if kind.is_dir() && depth < 2 {
-                        dirs.push((path, depth + 1));
-                    } else if kind.is_file()
-                        && path.extension().is_some_and(|e| e == "jsonl")
-                        && matches_id(&path, id)
-                    {
-                        return Ok(path.canonicalize()?);
-                    }
+                } else if others.len() < HEADER_SCAN_LIMIT {
+                    others.push(path);
+                } else {
+                    *truncated = true;
                 }
             }
         }
-        Err(HarnessError::Protocol(format!(
-            "native session file for {id} was not found"
-        )))
     }
+    Ok(others.into_iter().find(|path| matches_id(path, id)))
 }
 /// Pi's own reserve when no setting names one (`compaction.ts`).
 const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
@@ -388,6 +425,80 @@ mod tests {
         std::fs::remove_file(cwd.join(".pi/settings.json")).unwrap();
         std::fs::write(agent.join("settings.json"), r#"{"steeringMode":"all"}"#).unwrap();
         assert!(store.steering_mode_configured(&cwd));
+    }
+
+    /// A store whose native sessions live under `<dir>/agent/sessions`.
+    fn store_with_sessions(dir: &Path) -> (Store, PathBuf) {
+        let mut store = Store::new(Some(dir.join("index")), None);
+        store.agent = dir.join("agent");
+        store.legacy = dir.join("legacy.json");
+        let project = store.agent.join("sessions/--project--");
+        std::fs::create_dir_all(&project).unwrap();
+        (store, project)
+    }
+
+    fn write_session(path: &Path, id: &str) {
+        std::fs::write(path, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
+    }
+
+    #[test]
+    fn resolve_prefers_files_whose_name_contains_the_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, project) = store_with_sessions(dir.path());
+        for n in 0..300 {
+            write_session(
+                &project.join(format!("2026-01-01T00_{n}-decoy.jsonl")),
+                &format!("decoy-{n}"),
+            );
+        }
+        // A copy under another name carries the id in its header only: the
+        // file named for the id is the one to find, whatever the listing order.
+        write_session(&project.join("copy.jsonl"), "wanted-id");
+        let named = project.join("2026-10-18T09-00-00_wanted-id.jsonl");
+        write_session(&named, "wanted-id");
+        assert_eq!(
+            store.resolve("wanted-id", dir.path()).unwrap(),
+            named.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_the_header_when_no_name_carries_the_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, project) = store_with_sessions(dir.path());
+        write_session(&project.join("a.jsonl"), "other");
+        let renamed = project.join("renamed-by-hand.jsonl");
+        write_session(&renamed, "wanted-id");
+        assert_eq!(
+            store.resolve("wanted-id", dir.path()).unwrap(),
+            renamed.canonicalize().unwrap()
+        );
+        // The name alone proves nothing: its header must name the id too.
+        write_session(&project.join("2026_liar-id.jsonl"), "someone-else");
+        assert!(store.resolve("liar-id", dir.path()).is_err());
+    }
+
+    #[test]
+    fn resolve_over_the_header_limit_still_finds_a_name_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, project) = store_with_sessions(dir.path());
+        for n in 0..HEADER_SCAN_LIMIT + 50 {
+            std::fs::write(project.join(format!("{n}.jsonl")), "{}\n").unwrap();
+        }
+        let named = project.join("2026_wanted-id.jsonl");
+        write_session(&named, "wanted-id");
+        assert_eq!(
+            store.resolve("wanted-id", dir.path()).unwrap(),
+            named.canonicalize().unwrap()
+        );
+        // With no name to go by, the search says what it did not open instead
+        // of failing as a protocol breach.
+        let message = store
+            .resolve("unknown-id", dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("was not found"), "{message}");
+        assert!(message.contains("first 20000"), "{message}");
     }
 
     #[test]
