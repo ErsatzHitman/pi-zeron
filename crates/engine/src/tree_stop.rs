@@ -204,10 +204,13 @@ pub async fn stop_tree(
         .iter()
         .map(|chat| (chat.id.clone(), sessions.session_status(&chat.id)))
         .collect();
+    // Owned ids: an iterator over borrowed chats cannot be held across the
+    // awaits below in a future the RPC server requires to be Send.
+    let target_ids: Vec<String> = local.iter().map(|chat| chat.id.clone()).collect();
     let outcomes: Vec<(
         String,
         Result<crate::doc_host::ChatStop, crate::EngineError>,
-    )> = futures::stream::iter(local.iter().map(|chat| chat.id.clone()))
+    )> = futures::stream::iter(target_ids)
         .map(|id| async move {
             let outcome = doc_host.stop_chat_work(sessions, &id).await;
             (id, outcome)
