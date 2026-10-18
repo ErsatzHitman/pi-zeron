@@ -38,12 +38,23 @@ struct JournalLine {
     event: AgentEvent,
 }
 
+/// [`JournalLine`] as it is written: the event is borrowed, so appending does
+/// not clone it (a text delta is cloned once per token otherwise). The two
+/// serialise to the same bytes.
+#[derive(Serialize)]
+struct JournalLineRef<'a> {
+    seq: u64,
+    event: &'a AgentEvent,
+}
+
 struct ChatJournal {
     file: File,
     next_seq: u64,
     /// True when the file ends without a newline (torn write) — the next append
     /// starts with one so the torn line stays isolated.
     needs_newline: bool,
+    /// The line being written, kept to spare an allocation per event.
+    scratch: Vec<u8>,
 }
 
 /// What one [`RunJournal::compact`] pass reclaimed.
@@ -59,6 +70,9 @@ pub struct CompactStats {
 /// not end in `.jsonl`, so journal scans never mistake one for a chat.
 const COMPACT_TMP_PREFIX: &str = ".compact-";
 const COMPACT_TMP_SUFFIX: &str = ".tmp";
+
+/// The largest line buffer a journal keeps between appends.
+const SCRATCH_KEEP_BYTES: usize = 64 * 1024;
 
 /// Append-only JSONL journal store, one file per chat.
 pub struct RunJournal {
@@ -146,6 +160,7 @@ impl RunJournal {
                     file,
                     next_seq,
                     needs_newline,
+                    scratch: Vec::new(),
                 },
             );
         }
@@ -156,18 +171,19 @@ impl RunJournal {
             )));
         };
         let seq = journal.next_seq;
-        let line = serde_json::to_string(&JournalLine {
-            seq,
-            event: event.clone(),
-        })?;
-        let mut buf = Vec::with_capacity(line.len() + 2);
+        let buf = &mut journal.scratch;
+        buf.clear();
         if journal.needs_newline {
             buf.push(b'\n');
         }
-        buf.extend_from_slice(line.as_bytes());
+        serde_json::to_writer(&mut *buf, &JournalLineRef { seq, event })?;
         buf.push(b'\n');
-        journal.file.write_all(&buf)?;
+        journal.file.write_all(buf)?;
         journal.file.flush()?;
+        // One huge event must not pin its buffer for the journal's lifetime.
+        if buf.capacity() > SCRATCH_KEEP_BYTES {
+            *buf = Vec::new();
+        }
         journal.needs_newline = false;
         journal.next_seq = seq + 1;
         Ok(seq)
@@ -658,6 +674,60 @@ mod tests {
         assert!(matches!(after[0].1, AgentEvent::Done { .. }));
         // Era fallback: cursor ahead of last seq replays everything.
         assert_eq!(journal.replay("chat-1", 99).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn borrowed_line_serialises_identically_to_owned_line() {
+        let events = [
+            text("héllo \"quoted\"\nline"),
+            AgentEvent::ReasoningDelta { text: "hmm".into() },
+            AgentEvent::SessionStarted {
+                harness: zeron_proto::HarnessId::Mock,
+                model: "m".into(),
+                tools: vec!["bash".into()],
+                cwd: "/work".into(),
+                session_id: "s".into(),
+                assistant_message_id: "a1".into(),
+            },
+            AgentEvent::ToolResult {
+                id: "t1".into(),
+                is_error: true,
+                output: Some("out".into()),
+                diff: None,
+            },
+            AgentEvent::Usage {
+                input_tokens: 3,
+                output_tokens: 4,
+            },
+            done(),
+        ];
+        for (seq, event) in (1u64..).zip(events) {
+            let owned = serde_json::to_string(&JournalLine {
+                seq,
+                event: event.clone(),
+            })
+            .unwrap();
+            let mut borrowed = Vec::new();
+            serde_json::to_writer(&mut borrowed, &JournalLineRef { seq, event: &event }).unwrap();
+            assert_eq!(String::from_utf8(borrowed).unwrap(), owned);
+        }
+    }
+
+    #[test]
+    fn an_oversized_line_does_not_stay_buffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append("chat-1", &text(&"x".repeat(2 * SCRATCH_KEEP_BYTES)))
+            .unwrap();
+        journal.append("chat-1", &text("small")).unwrap();
+        assert!(
+            journal
+                .lock()
+                .get("chat-1")
+                .is_some_and(|open| open.scratch.capacity() <= SCRATCH_KEEP_BYTES)
+        );
+        assert_eq!(journal.replay("chat-1", 0).unwrap().len(), 2);
     }
 
     #[test]

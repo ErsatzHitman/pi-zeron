@@ -378,6 +378,42 @@ fn is_dialog(frame: &Value) -> bool {
         Some("select" | "confirm" | "input" | "editor")
     )
 }
+/// The session arguments of a run, and a notice when the session it names
+/// could not be reopened. Blocking: finding a session's file reads the disk.
+///
+/// `fork` is a parent chat's session, for a side chat's first run; `resume`
+/// is this chat's own.
+fn launch_args(
+    store: &sessions::Store,
+    resume: Option<&str>,
+    fork: Option<&str>,
+    cwd: &Path,
+) -> (Vec<String>, Option<String>) {
+    match (resume, fork) {
+        (None, Some(parent)) => match store.resolve(parent, cwd) {
+            Ok(file) => (vec!["--fork".into(), file.display().to_string()], None),
+            Err(error) => (
+                vec![],
+                Some(format!(
+                    "Pi could not fork the parent chat's session {parent}; this side chat starts without its context: {error}"
+                )),
+            ),
+        },
+        (Some(id), _) => match store.resume_args(id, cwd) {
+            Ok(args) => (args, None),
+            // Like every other harness, a session that can no longer be
+            // reopened starts fresh with a visible notice. Failing instead
+            // would strand the chat: the engine resumes the same id forever.
+            Err(error) => (
+                vec![],
+                Some(format!(
+                    "Pi could not restore session {id}; starting a new session without the previous context: {error}"
+                )),
+            ),
+        },
+        (None, None) => (vec![], None),
+    }
+}
 /// Whether `request` picks a thinking level (an effort, or thinking off).
 fn thinking_selected(request: &RunRequest) -> bool {
     request.reasoning.is_some()
@@ -622,7 +658,6 @@ impl Harness for PiHarness {
         }
         let mut request = request;
         let store = sessions::Store::new(self.session_store.clone(), self.agent_dir.clone());
-        let mut lost_context = None;
         // A side chat's first run forks its parent's session: a new session
         // file holding the parent's conversation; the parent's stays as is.
         // The id is for this process's arguments only, not the MCP server.
@@ -631,29 +666,16 @@ impl Harness for PiHarness {
             .as_mut()
             .and_then(|mcp| mcp.env.remove(zeron_proto::orchestrator::ENV_FORK_SESSION))
             .filter(|id| !id.is_empty() && request.resume.is_none());
-        let args = match (&request.resume, &fork) {
-            (None, Some(parent)) => match store.resolve(parent, Path::new(&request.cwd)) {
-                Ok(file) => vec!["--fork".into(), file.display().to_string()],
-                Err(error) => {
-                    lost_context = Some(format!(
-                        "Pi could not fork the parent chat's session {parent}; this side chat starts without its context: {error}"
-                    ));
-                    vec![]
-                }
-            },
-            (Some(id), _) => match store.resume_args(id, Path::new(&request.cwd)) {
-                Ok(args) => args,
-                // Like every other harness, a session that can no longer be
-                // reopened starts fresh with a visible notice. Failing instead
-                // would strand the chat: the engine resumes the same id forever.
-                Err(error) => {
-                    lost_context = Some(format!(
-                        "Pi could not restore session {id}; starting a new session without the previous context: {error}"
-                    ));
-                    vec![]
-                }
-            },
-            (None, None) => vec![],
+        // Finding a session's file lists directories and opens files: not on
+        // an async worker.
+        let (args, lost_context) = {
+            let (store, resume) = (store.clone(), request.resume.clone());
+            let cwd = PathBuf::from(&request.cwd);
+            tokio::task::spawn_blocking(move || {
+                launch_args(&store, resume.as_deref(), fork.as_deref(), &cwd)
+            })
+            .await
+            .map_err(|error| HarnessError::Protocol(format!("Pi session lookup failed: {error}")))?
         };
         if lost_context.is_some() {
             request.resume = None;

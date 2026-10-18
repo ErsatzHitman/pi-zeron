@@ -7846,12 +7846,11 @@ impl Transcript {
                 .gap(px(Theme::SPACE_SM))
                 .pt(px(Theme::SPACE_LG))
                 .text_size(crate::typography::ui_rems(11.0))
-                .child(crate::loaders::gradient_spinner(
-                    "working-indicator",
-                    &theme,
+                // Its own view takes the pulse clock's 15Hz ticks, so they
+                // do not land on the transcript entity.
+                .child(crate::loaders::gradient_spinner_view(
+                    format!("working-indicator-{}", cx.entity_id()),
                     2.5,
-                    cx.entity_id(),
-                    cx,
                 ))
                 .child(
                     // The flavour word rotates every 7s; roll it as it turns.

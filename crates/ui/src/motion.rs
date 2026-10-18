@@ -220,6 +220,19 @@ pub fn pulse_lease(view: EntityId, cx: &mut App) {
     pulse_lease_every(view, 1, cx);
 }
 
+/// Drop every lease, so a test sees only what its next paint renews.
+#[cfg(test)]
+pub(crate) fn pulse_forget_leases(cx: &mut App) {
+    cx.default_global::<PulseClock>().leases.clear();
+}
+
+/// Whether `view` is on the pulse clock's tick list right now.
+#[cfg(test)]
+pub(crate) fn pulse_leased(view: EntityId, cx: &App) -> bool {
+    cx.try_global::<PulseClock>()
+        .is_some_and(|clock| clock.leases.contains_key(&view))
+}
+
 fn pulse_lease_every(view: EntityId, stride: u64, cx: &mut App) {
     if cx.reduce_motion() {
         return;
@@ -1574,6 +1587,112 @@ mod tests {
                 "a working indicator must keep receiving ticks with system reduced motion"
             );
         });
+    }
+
+    #[gpui::test]
+    fn a_spinner_view_leases_its_own_entity_not_the_callers(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Context, ParentElement as _, Render};
+
+        struct Host;
+        impl Render for Host {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().child(crate::loaders::gradient_spinner_view("host-spinner", 2.5))
+            }
+        }
+
+        let window = cx.add_window(|_, _| Host);
+        let host = cx
+            .update_window(window.into(), |root, window, cx| {
+                window.draw(cx).clear();
+                root.entity_id()
+            })
+            .unwrap();
+        for _ in 0..6 {
+            cx.background_executor.advance_clock(PULSE_TICK);
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+        }
+        cx.update(|cx| {
+            let clock = cx.global::<PulseClock>();
+            assert!(clock.tick >= 1, "the spinner keeps the clock running");
+            assert_eq!(clock.leases.len(), 1);
+            assert!(
+                !clock.leases.contains_key(&host),
+                "the pulse must not notify the view that mounts the spinner"
+            );
+            assert!(
+                clock.leases.values().all(|lease| lease.stride == 2),
+                "the working trailer renews at 15Hz"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn parked_clock_schedules_no_frames(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Context, Render};
+
+        struct Still;
+        impl Render for Still {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div()
+            }
+        }
+
+        let window = cx.add_window(|_, _| Still);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+            assert_eq!(window.simulate_next_frame(cx), 0);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                cx.try_global::<PulseClock>()
+                    .is_none_or(|clock| !clock.running),
+                "no spinner mounted, so no clock runs"
+            );
+        });
+    }
+
+    /// A repeating `with_animation` asks for a frame at the display's refresh
+    /// rate for as long as it is mounted (60-240Hz, whole-window redraws). All
+    /// repeating motion goes through the pulse clock above instead.
+    #[test]
+    fn repeating_animations_live_only_in_motion_rs() {
+        fn visit(dir: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && path.file_name().is_some_and(|name| name != "motion.rs")
+                {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    if source.contains(".repeat()") || source.contains(".repeating(") {
+                        found.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        visit(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(
+            found.is_empty(),
+            "a repeating animation pins the window at display rate; use the pulse clock: {found:?}"
+        );
     }
 
     #[test]

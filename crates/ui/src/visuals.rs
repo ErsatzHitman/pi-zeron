@@ -1281,7 +1281,7 @@ impl VisualFrame {
         let geometry_key = key.clone();
         el.child(
             canvas(
-                move |bounds, window, _| {
+                move |bounds, window, cx| {
                     let mut state = local.borrow_mut();
                     state
                         .charts
@@ -1306,7 +1306,7 @@ impl VisualFrame {
                     }
                     drop(state);
                     if animate {
-                        window.request_animation_frame();
+                        drive_frame(window, cx);
                     }
                     let drawn = runtime.borrow_mut().draw_canvas(
                         draw,
@@ -1453,6 +1453,17 @@ fn paint_text(
     };
     let _ = line.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
     width
+}
+
+/// Keep an animated visual repainting. Its next frame comes from the shared
+/// 30Hz pulse clock, not `request_animation_frame`, which redraws the whole
+/// window at the display's refresh rate (60-240Hz) for as long as the visual
+/// stays on screen. A window the user is not in gets no frames at all (it
+/// repaints when activated), and reduced motion leaves the visual still.
+fn drive_frame(window: &Window, cx: &mut App) {
+    if window.is_window_active() {
+        crate::motion::pulse_lease(window.current_view(), cx);
+    }
 }
 
 fn paint_commands(
@@ -1667,7 +1678,7 @@ impl VisualFrame {
             canvas(
                 move |bounds, window, cx| {
                     if moving {
-                        window.request_animation_frame();
+                        drive_frame(window, cx);
                     }
                     let scale = window.scale_factor();
                     let size = (
@@ -1861,7 +1872,7 @@ impl VisualFrame {
                 move |bounds, window, cx| {
                     let paint_palette = &render_palette;
                     if moving {
-                        window.request_animation_frame();
+                        drive_frame(window, cx);
                     }
                     let mut state = local.borrow_mut();
                     let fresh = state
@@ -2744,6 +2755,53 @@ fn dot(center: Point<Pixels>, radius: f32) -> Vec<Point<Pixels>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drives its frames from a canvas prepaint, as the animated visuals do.
+    struct Animated;
+
+    impl Render for Animated {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            canvas(|_, window, cx| drive_frame(window, cx), |_, _, _, _| {}).size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn animated_visuals_lease_the_pulse_clock_only_while_the_window_is_active(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (host, cx) = cx.add_window_view(|_, _| Animated);
+        let view = host.entity_id();
+        cx.update(|window, _| window.activate_window());
+        cx.deactivate_window();
+        cx.update(|window, cx| {
+            assert!(!window.is_window_active());
+            // The window's first paint, while it was still active, leased.
+            crate::motion::pulse_forget_leases(cx);
+            window.refresh();
+            window.draw(cx).clear();
+            assert_eq!(window.simulate_next_frame(cx), 0);
+            assert!(
+                !crate::motion::pulse_leased(view, cx),
+                "a background window animates nothing"
+            );
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(window.is_window_active());
+            window.refresh();
+            window.draw(cx).clear();
+            assert_eq!(
+                window.simulate_next_frame(cx),
+                0,
+                "the visual no longer asks for display-rate frames"
+            );
+            assert!(
+                crate::motion::pulse_leased(view, cx),
+                "an active window animates on the pulse clock"
+            );
+        });
+    }
 
     #[test]
     fn chart_series_drops_the_fixed_hue_nearest_the_accent() {

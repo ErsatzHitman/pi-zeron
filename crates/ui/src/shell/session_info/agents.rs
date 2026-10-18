@@ -154,13 +154,110 @@ pub(super) fn background_since(rows: &[AgentRow]) -> Option<DateTime<Utc>> {
         .min()
 }
 
+/// The panel renders far more often than the chat list or the transcript
+/// change, so what the Sub-agents list derives from them alone is kept
+/// between renders (as `TodoCache` keeps the checklist). Only clock- and
+/// session-free data lives here: a row's status and "5m ago" are read fresh
+/// every render, since sessions have no revision to key on.
+#[derive(Default)]
+pub(super) struct AgentListCache {
+    links: Option<(LinksKey, ChatLinks)>,
+    subagents: Option<(SubagentsKey, Vec<SubagentRow>)>,
+}
+
+/// The chat, `AppState::link_roots_revision` and the chat count (the
+/// revision moves whenever the list is replaced).
+type LinksKey = (String, u64, usize);
+/// The chat, `AppState::transcript_revision`, the entry count, and whether
+/// the chat is the selected one (the transcript is only ever its).
+type SubagentsKey = (String, u64, usize, bool);
+
+/// Where a chat sits among the others, from the chat list alone.
+struct ChatLinks {
+    /// The orchestrator above a chat in a tree, when it is not the chat.
+    root: Option<String>,
+    /// How far below that orchestrator the chat is.
+    level: usize,
+    /// The chat's live side chats, most recent activity first.
+    children: Vec<String>,
+}
+
+impl ChatLinks {
+    fn scan(state: &AppState, chat_id: &str) -> Self {
+        let root = zeron_proto::orchestrator::root_of(&state.chats, chat_id)
+            .filter(|root| root.id != chat_id)
+            .map(|root| root.id.clone());
+        let level = zeron_proto::orchestrator::depth(&state.chats, chat_id).unwrap_or(0);
+        let mut children: Vec<(DateTime<Utc>, &str)> = state
+            .chats
+            .iter()
+            .filter(|chat| !chat.archived && chat.parent_chat_id.as_deref() == Some(chat_id))
+            .filter(|chat| !chat.is_btw() && !tree_member(state, &chat.id))
+            .map(|chat| {
+                (
+                    chat.last_message_at.unwrap_or(chat.created_at),
+                    chat.id.as_str(),
+                )
+            })
+            .collect();
+        children.sort_by_key(|(activity, _)| std::cmp::Reverse(*activity));
+        Self {
+            root,
+            level,
+            children: children.into_iter().map(|(_, id)| id.to_owned()).collect(),
+        }
+    }
+}
+
+impl AgentListCache {
+    fn links(&mut self, state: &AppState, chat_id: &str) -> &ChatLinks {
+        let key = (
+            chat_id.to_owned(),
+            state.link_roots_revision,
+            state.chats.len(),
+        );
+        let kept = self.links.take().filter(|(cached, _)| *cached == key);
+        let (_, links) = self
+            .links
+            .insert(kept.unwrap_or_else(|| (key, ChatLinks::scan(state, chat_id))));
+        links
+    }
+
+    fn subagents(&mut self, state: &AppState, chat_id: &str) -> &[SubagentRow] {
+        let key = (
+            chat_id.to_owned(),
+            state.transcript_revision,
+            state.transcript.len(),
+            state.selected_chat.as_deref() == Some(chat_id),
+        );
+        let kept = self.subagents.take().filter(|(cached, _)| *cached == key);
+        let (_, rows) = self
+            .subagents
+            .insert(kept.unwrap_or_else(|| (key, subagent_rows(state, chat_id))));
+        rows
+    }
+}
+
 pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> AgentList {
+    agent_list_in(&mut AgentListCache::default(), state, chat, now)
+}
+
+/// [`agent_list`], reusing what `cache` kept from the last render.
+pub(super) fn agent_list_in(
+    cache: &mut AgentListCache,
+    state: &AppState,
+    chat: &Chat,
+    now: DateTime<Utc>,
+) -> AgentList {
     let mut list = AgentList::default();
     // In an orchestrator's tree, the way up names the orchestrator too, and
     // where this session sits below it.
-    let root = zeron_proto::orchestrator::root_of(&state.chats, &chat.id)
-        .filter(|root| root.id != chat.id);
-    let level = zeron_proto::orchestrator::depth(&state.chats, &chat.id).unwrap_or(0);
+    let links = cache.links(state, &chat.id);
+    let level = links.level;
+    let root = links
+        .root
+        .as_deref()
+        .and_then(|id| state.chats.iter().find(|c| c.id == id));
     let way_up = |row: &Chat, label: String| AgentRow {
         kind: AgentKind::Parent {
             chat_id: row.id.clone(),
@@ -190,7 +287,13 @@ pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> A
         };
         list.sessions.push(way_up(parent, label));
     }
-    list.sessions.extend(child_chat_rows(state, &chat.id, now));
+    list.sessions.extend(
+        links
+            .children
+            .iter()
+            .filter_map(|id| state.chats.iter().find(|c| c.id == *id))
+            .map(|child| child_chat_row(state, child, now)),
+    );
     if let Some(ui) = state.extension_ui.of(&chat.id) {
         let elements = ui.typed_elements();
         for row in roster_agent_rows(ui, &elements, FLEET_NS, FLEET_CHANNEL, false) {
@@ -202,14 +305,14 @@ pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> A
         }
         list.background = roster_agent_rows(ui, &elements, BASH_NS, BASH_CHANNEL, true);
     }
-    for row in subagent_rows(state, &chat.id) {
+    for row in cache.subagents(state, &chat.id) {
         let running = row.status == Some(SubagentStatus::Running);
         let agent = AgentRow {
             kind: AgentKind::Subagent {
                 frozen: row.frozen(),
-                doc_id: row.doc_id,
+                doc_id: row.doc_id.clone(),
             },
-            title: row.title,
+            title: row.title.clone(),
             status: match row.status {
                 Some(SubagentStatus::Running) => ChatIndicator::Working,
                 Some(SubagentStatus::Done) => ChatIndicator::Completed,
@@ -345,6 +448,9 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
         return Vec::new();
     }
     let mut rows: Vec<SubagentRow> = Vec::new();
+    // Each doc's slot in `rows`: a long transcript can steer the same
+    // subagent many times.
+    let mut slots: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for entry in &state.transcript {
         let spawned_at =
             DateTime::<Utc>::from_timestamp_millis(entry.created_at).unwrap_or_else(Utc::now);
@@ -367,10 +473,13 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
                 status: *subagent_status,
                 spawned_at,
             };
-            match rows.iter_mut().find(|r| r.doc_id == row.doc_id) {
+            match slots.get(&row.doc_id) {
                 // A reopened (steered) subagent updates its row in place.
-                Some(existing) => *existing = row,
-                None => rows.push(row),
+                Some(&slot) => rows[slot] = row,
+                None => {
+                    slots.insert(row.doc_id.clone(), rows.len());
+                    rows.push(row);
+                }
             }
         }
     }
@@ -390,36 +499,26 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
     running
 }
 
-/// The live (unarchived) children of `chat_id`, most recent activity first —
-/// the same order the sidebar's Sessions list keeps. An orchestrator's
-/// members are its tree (the Orchestrator tab), not sub-agents of the
-/// session that started them. A btw aside is the user's own question beside
-/// the chat, not work under it, so it is never listed.
-fn child_chat_rows(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<AgentRow> {
-    let mut rows: Vec<(DateTime<Utc>, AgentRow)> = state
-        .chats
-        .iter()
-        .filter(|chat| !chat.archived && chat.parent_chat_id.as_deref() == Some(chat_id))
-        .filter(|chat| !chat.is_btw() && !tree_member(state, &chat.id))
-        .map(|chat| {
-            let activity = chat.last_message_at.unwrap_or(chat.created_at);
-            let row = AgentRow {
-                kind: AgentKind::SideChat {
-                    chat_id: chat.id.clone(),
-                    device_id: chat.device_id.clone(),
-                    change_request: state.change_request_for_chat(chat).cloned(),
-                },
-                title: child_chat_title(chat, "btw").into(),
-                status: state.display_status_for(chat, now),
-                started: None,
-                trailing: Some(zeron_proto::view::format_time_ago(activity, now).into()),
-                detail: None,
-            };
-            (activity, row)
-        })
-        .collect();
-    rows.sort_by_key(|(activity, _)| std::cmp::Reverse(*activity));
-    rows.into_iter().map(|(_, row)| row).collect()
+/// A side chat's row. Which chats are listed, and in what order, is
+/// [`ChatLinks::scan`]: the live (unarchived) children of the open chat, most
+/// recent activity first — the same order the sidebar's Sessions list keeps.
+/// An orchestrator's members are its tree (the Orchestrator tab), not
+/// sub-agents of the session that started them. A btw aside is the user's own
+/// question beside the chat, not work under it, so it is never listed.
+fn child_chat_row(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> AgentRow {
+    let activity = chat.last_message_at.unwrap_or(chat.created_at);
+    AgentRow {
+        kind: AgentKind::SideChat {
+            chat_id: chat.id.clone(),
+            device_id: chat.device_id.clone(),
+            change_request: state.change_request_for_chat(chat).cloned(),
+        },
+        title: child_chat_title(chat, "btw").into(),
+        status: state.display_status_for(chat, now),
+        started: None,
+        trailing: Some(zeron_proto::view::format_time_ago(activity, now).into()),
+        detail: None,
+    }
 }
 
 /// A session in an orchestrator's tree, below its root.
@@ -622,6 +721,129 @@ mod tests {
             ["chat-side"],
             "the side chat is listed, the btw aside is not"
         );
+    }
+
+    #[test]
+    fn the_agent_cache_rescans_only_when_a_revision_moves() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![
+            chat("main", None, 60),
+            chat("a", Some("main"), 5),
+            chat("b", Some("main"), 30),
+        ]);
+        let main = state.chats.iter().find(|c| c.id == "main").unwrap().clone();
+        let keys = |list: &AgentList| list.sessions.iter().map(AgentRow::key).collect::<Vec<_>>();
+        let mut cache = AgentListCache::default();
+        let now = Utc::now();
+        assert_eq!(
+            keys(&agent_list_in(&mut cache, &state, &main, now)),
+            ["chat-a", "chat-b"]
+        );
+        // Archiving without republishing the chat list: the kept links answer.
+        state
+            .chats
+            .iter_mut()
+            .find(|c| c.id == "a")
+            .unwrap()
+            .archived = true;
+        assert_eq!(
+            keys(&agent_list_in(&mut cache, &state, &main, now)),
+            ["chat-a", "chat-b"]
+        );
+        // A republished list moves the revision, and the links are rescanned.
+        state.link_roots_revision += 1;
+        assert_eq!(
+            keys(&agent_list_in(&mut cache, &state, &main, now)),
+            ["chat-b"]
+        );
+        // The cache answers exactly what a fresh scan does.
+        assert_eq!(
+            agent_list_in(&mut cache, &state, &main, now),
+            agent_list(&state, &main, now)
+        );
+    }
+
+    #[test]
+    fn the_agent_cache_keeps_titles_and_clocks_outside_the_kept_links() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("main", None, 60), chat("b", Some("main"), 5)]);
+        let main = state.chats.iter().find(|c| c.id == "main").unwrap().clone();
+        let mut cache = AgentListCache::default();
+        let now = Utc::now();
+        let before = agent_list_in(&mut cache, &state, &main, now);
+        assert_eq!(before.sessions[0].title.as_ref(), "btw");
+        // Renamed with the revision unmoved, and an hour later: the row is
+        // still read fresh from the chat and the clock.
+        state.chats.iter_mut().find(|c| c.id == "b").unwrap().title = Some("Renamed".into());
+        let later = agent_list_in(&mut cache, &state, &main, now + chrono::Duration::hours(2));
+        assert_eq!(later.sessions[0].title.as_ref(), "Renamed");
+        assert_ne!(later.sessions[0].trailing, before.sessions[0].trailing);
+    }
+
+    #[test]
+    fn the_agent_cache_rescans_the_transcript_only_when_it_changes() {
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("main", None, 10)]);
+        state.selected_chat = Some("main".into());
+        let spawned = |status| {
+            vec![entry(
+                "e1",
+                3,
+                vec![spawn(
+                    "t1",
+                    "Agent: verify",
+                    Some("main--sub--t1"),
+                    Some(status),
+                )],
+            )]
+        };
+        let main = state.chats[0].clone();
+        let mut cache = AgentListCache::default();
+        state.transcript = spawned(SubagentStatus::Running);
+        let list = agent_list_in(&mut cache, &state, &main, Utc::now());
+        assert_eq!((list.active.len(), list.previous.len()), (1, 0));
+        // Same revision and length: the kept rows answer.
+        state.transcript = spawned(SubagentStatus::Done);
+        let list = agent_list_in(&mut cache, &state, &main, Utc::now());
+        assert_eq!((list.active.len(), list.previous.len()), (1, 0));
+        state.transcript_revision += 1;
+        let list = agent_list_in(&mut cache, &state, &main, Utc::now());
+        assert_eq!((list.active.len(), list.previous.len()), (0, 1));
+    }
+
+    #[test]
+    fn subagent_rows_dedupe_reopened_spawns_in_place() {
+        let doc = |n: usize| format!("main--sub--t{n}");
+        let mut state = AppState::new();
+        state.selected_chat = Some("main".into());
+        // 200 subagents, each steered up to 24 more times across 5,000
+        // turns: the last write to a doc is the one that shows.
+        state.transcript = (0..5_000)
+            .map(|n| {
+                let status = if n < 4_800 {
+                    SubagentStatus::Running
+                } else {
+                    SubagentStatus::Done
+                };
+                entry(
+                    &format!("e{n}"),
+                    10_000 - n as i64,
+                    vec![spawn(
+                        &format!("t{n}"),
+                        "Agent: verify",
+                        Some(&doc(n % 200)),
+                        Some(status),
+                    )],
+                )
+            })
+            .collect();
+        let rows = subagent_rows(&state, "main");
+        assert_eq!(rows.len(), 200);
+        let mut docs: Vec<_> = rows.iter().map(|row| row.doc_id.clone()).collect();
+        docs.sort();
+        docs.dedup();
+        assert_eq!(docs.len(), 200);
+        assert!(rows.iter().all(SubagentRow::frozen));
     }
 
     #[test]

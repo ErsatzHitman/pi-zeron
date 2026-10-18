@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -71,6 +72,8 @@ pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_DIFF_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 /// Trailing debounce after a filesystem event burst.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
+/// The longest a checkout rests between two syncs, however slow they get.
+const MAX_SYNC_COOLDOWN: Duration = Duration::from_secs(30);
 /// Slow repair pass: re-reconcile + re-sync every checkout.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 /// How long an archived chat stays tracked after its last viewer leaves —
@@ -823,11 +826,13 @@ fn build_watchers(
     kick_tx: &mpsc::UnboundedSender<()>,
 ) -> Vec<FsWatch> {
     let mut watchers = Vec::new();
+    let filter = Arc::new(ChangeFilter::new(identity));
     for target in watch_targets(identity) {
         let tx = kick_tx.clone();
+        let filter = filter.clone();
         watchers.push(
             hub.watch(&target, notify::RecursiveMode::Recursive, move |event| {
-                if is_checkout_change(event) {
+                if filter.admits(event) {
                     let _ = tx.send(());
                 }
             }),
@@ -844,14 +849,106 @@ fn is_checkout_change(event: &notify::Event) -> bool {
     !matches!(event.kind, notify::EventKind::Access(_))
 }
 
-/// Per-checkout task: trailing-debounce fs kicks, then compute + publish. Runs
-/// syncs sequentially — kicks during a sync accumulate and trigger another pass.
-async fn entry_task(
-    inner: Weak<DiffSyncInner>,
-    entry: Weak<CheckoutEntry>,
+/// Which watch events kick a sync: [`is_checkout_change`], and not only paths
+/// the checkout's own ignore rules hide. A build rewrites `target/` or
+/// `node_modules/` constantly, none of it can reach the diff, and each event
+/// burst used to cost a full capture (six git runs and untracked hashing).
+///
+/// Only the checkout's root `.gitignore` and `.git/info/exclude` are read, so
+/// a path ignored by a nested or global rule still kicks: the filter can
+/// only miss a saving, never a change. Anything inside the git dir kicks
+/// whatever the rules say (`HEAD`, `index` and `refs` are real signal), and a
+/// change to an ignore file reloads the rules. An ignored path that is
+/// tracked anyway waits for the repair tick.
+struct ChangeFilter {
+    root: PathBuf,
+    git_dir: PathBuf,
+    ignored: Mutex<Gitignore>,
+}
+
+impl ChangeFilter {
+    fn new(identity: &CheckoutIdentity) -> Self {
+        Self {
+            ignored: Mutex::new(Self::load(&identity.root, &identity.git_dir)),
+            root: identity.root.clone(),
+            git_dir: identity.git_dir.clone(),
+        }
+    }
+
+    fn load(root: &Path, git_dir: &Path) -> Gitignore {
+        let mut rules = GitignoreBuilder::new(root);
+        // A missing file is no rules; the builder reports it, which is fine.
+        let _ = rules.add(root.join(".gitignore"));
+        let _ = rules.add(git_dir.join("info").join("exclude"));
+        rules.build().unwrap_or_else(|_| Gitignore::empty())
+    }
+
+    fn is_rules_file(&self, path: &Path) -> bool {
+        path == self.root.join(".gitignore") || path == self.git_dir.join("info").join("exclude")
+    }
+
+    fn hides(&self, rules: &Gitignore, path: &Path) -> bool {
+        if path.starts_with(&self.git_dir) {
+            return false;
+        }
+        path.strip_prefix(&self.root).is_ok_and(|relative| {
+            !relative.as_os_str().is_empty()
+                && rules
+                    .matched_path_or_any_parents(relative, false)
+                    .is_ignore()
+        })
+    }
+
+    fn admits(&self, event: &notify::Event) -> bool {
+        if !is_checkout_change(event) {
+            return false;
+        }
+        if event.paths.is_empty() {
+            return true;
+        }
+        if event.paths.iter().any(|path| self.is_rules_file(path)) {
+            *lock(&self.ignored) = Self::load(&self.root, &self.git_dir);
+            return true;
+        }
+        let rules = lock(&self.ignored);
+        event.paths.iter().any(|path| !self.hides(&rules, path))
+    }
+}
+
+/// How long a checkout waits after a sync that took `last` before the next
+/// one may start. Syncs are pure git work, so a checkout that is slow to
+/// capture (a big tree under a build) must not be re-captured as fast as it
+/// churns: the wait is four times the capture, never under the debounce nor
+/// over [`MAX_SYNC_COOLDOWN`]. Kicks that arrive meanwhile coalesce into the
+/// one sync that follows.
+fn sync_cooldown(last: Duration) -> Duration {
+    last.saturating_mul(4)
+        .max(WATCH_DEBOUNCE)
+        .min(MAX_SYNC_COOLDOWN)
+}
+
+/// What a paced sync round came to.
+enum SyncRound {
+    /// A capture ran: the next one waits out its cooldown.
+    Ran,
+    /// Nothing was captured (no chats want it).
+    Skipped,
+    /// The entry or the service is gone.
+    Closed,
+}
+
+/// Trailing-debounce fs kicks, then `round` — and between rounds the
+/// cooldown of [`sync_cooldown`]. Rounds run one at a time; kicks during one
+/// accumulate and trigger one more.
+async fn paced_syncs<F, Fut>(
     mut kick_rx: mpsc::UnboundedReceiver<()>,
-    cancel: CancellationToken,
-) {
+    cancel: &CancellationToken,
+    mut round: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = SyncRound>,
+{
+    let mut ready_at = tokio::time::Instant::now();
     while kick_rx.recv().await.is_some() {
         // Trailing debounce: wait for the burst to settle.
         loop {
@@ -861,23 +958,52 @@ async fn entry_task(
                 Err(_) => break,
             }
         }
-        let (Some(inner), Some(entry)) = (inner.upgrade(), entry.upgrade()) else {
-            return;
-        };
-        // No chats (deleted / moved away; teardown pending the orphan grace):
-        // nobody consumes this checkout's diff, so skip the capture — repair
-        // ticks and fs churn included. Reconcile re-kicks if chats return.
-        if lock(&entry.orphaned_since).is_some() {
-            entry.skipped_while_orphaned.store(true, Ordering::Release);
-            continue;
-        }
-        // The upgraded Arc would let a sync outlive shutdown — race the token
-        // so an in-flight sidecar POST is dropped, not completed.
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = sync_entry(&inner, &entry) => {}
+            _ = tokio::time::sleep_until(ready_at) => {}
+        }
+        let started = tokio::time::Instant::now();
+        match round().await {
+            SyncRound::Ran => {
+                ready_at = tokio::time::Instant::now() + sync_cooldown(started.elapsed());
+            }
+            SyncRound::Skipped => {}
+            SyncRound::Closed => return,
         }
     }
+}
+
+/// Per-checkout task: paced syncs (see [`paced_syncs`]) that compute and
+/// publish the checkout's diff.
+async fn entry_task(
+    inner: Weak<DiffSyncInner>,
+    entry: Weak<CheckoutEntry>,
+    kick_rx: mpsc::UnboundedReceiver<()>,
+    cancel: CancellationToken,
+) {
+    paced_syncs(kick_rx, &cancel, || {
+        let (inner, entry, cancel) = (inner.clone(), entry.clone(), cancel.clone());
+        async move {
+            let (Some(inner), Some(entry)) = (inner.upgrade(), entry.upgrade()) else {
+                return SyncRound::Closed;
+            };
+            // No chats (deleted / moved away; teardown pending the orphan
+            // grace): nobody consumes this checkout's diff, so skip the
+            // capture — repair ticks and fs churn included. Reconcile
+            // re-kicks if chats return.
+            if lock(&entry.orphaned_since).is_some() {
+                entry.skipped_while_orphaned.store(true, Ordering::Release);
+                return SyncRound::Skipped;
+            }
+            // The upgraded Arc would let a sync outlive shutdown — race the
+            // token so an in-flight sidecar POST is dropped, not completed.
+            tokio::select! {
+                _ = cancel.cancelled() => SyncRound::Closed,
+                _ = sync_entry(&inner, &entry) => SyncRound::Ran,
+            }
+        }
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,6 +1573,17 @@ pub async fn working_diff_base(root: &Path) -> Result<String, EngineError> {
     })
 }
 
+/// The arguments of one tracked-files `git diff` of a capture. Read-only:
+/// `diff` refreshes a stat-dirty index on its own, and the rewrite would
+/// land under the watched checkout and kick the sync that caused it (the
+/// status call below takes the same flag).
+fn tracked_diff_args<'a>(mode: &[&'a str], base: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["--no-optional-locks", "diff"];
+    args.extend_from_slice(mode);
+    args.extend([base, "--"]);
+    args
+}
+
 /// One bounded atomic snapshot: tracked diff vs HEAD (or the empty tree) with
 /// renames, plus untracked files (via `git status --porcelain`, index untouched)
 /// as synthesized new-file hunks. 3MiB patch cap with a `truncated` flag; sha256
@@ -1481,27 +1618,27 @@ pub async fn capture_diff_against(
 
     let names = capture_git(
         root,
-        &["diff", "--name-status", "-z", "--find-renames", base, "--"],
+        &tracked_diff_args(&["--name-status", "-z", "--find-renames"], base),
         2 * 1024 * 1024,
     )
     .await?;
     let nums = capture_git(
         root,
-        &["diff", "--numstat", "-z", "--find-renames", base, "--"],
+        &tracked_diff_args(&["--numstat", "-z", "--find-renames"], base),
         2 * 1024 * 1024,
     )
     .await?;
     let tracked = capture_git(
         root,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-color",
-            "--find-renames",
-            "--unified=3",
+        &tracked_diff_args(
+            &[
+                "--no-ext-diff",
+                "--no-color",
+                "--find-renames",
+                "--unified=3",
+            ],
             base,
-            "--",
-        ],
+        ),
         MAX_PATCH_BYTES,
     )
     .await?;
@@ -2094,9 +2231,149 @@ pub async fn capture_turn_diff(
 #[cfg(test)]
 mod watch_budget_tests {
     use super::{
-        CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, has_non_utf8_status_path,
-        is_checkout_change, path_batches, watch_targets,
+        ChangeFilter, CheckoutIdentity, MAX_WATCH_DIRS, SyncRound, exceeds_watch_budget,
+        has_non_utf8_status_path, is_checkout_change, paced_syncs, path_batches, sync_cooldown,
+        tracked_diff_args, watch_targets,
     };
+    use std::time::Duration;
+
+    #[test]
+    fn a_slow_capture_earns_a_longer_rest_up_to_a_cap() {
+        let ms = Duration::from_millis;
+        // Fast captures keep the debounce as their floor.
+        assert_eq!(sync_cooldown(Duration::ZERO), ms(500));
+        assert_eq!(sync_cooldown(ms(100)), ms(500));
+        assert_eq!(sync_cooldown(ms(125)), ms(500));
+        // Four times the capture beyond that.
+        assert_eq!(sync_cooldown(ms(2_000)), ms(8_000));
+        assert_eq!(sync_cooldown(ms(7_000)), ms(28_000));
+        // Capped, however slow (and without overflowing).
+        assert_eq!(sync_cooldown(ms(8_000)), ms(30_000));
+        assert_eq!(sync_cooldown(Duration::MAX), ms(30_000));
+    }
+
+    /// Kicks arrive every 600ms for ten seconds against a capture that takes
+    /// a second: the checkout rests four seconds after each, and the kicks
+    /// that pile up meanwhile coalesce into the one capture that follows.
+    #[tokio::test(start_paused = true)]
+    async fn kicks_during_a_cooldown_coalesce_into_one_sync() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let (kick_tx, kick_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let rounds = rounds.clone();
+            async move {
+                paced_syncs(kick_rx, &cancel, || {
+                    let rounds = rounds.clone();
+                    async move {
+                        rounds.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        SyncRound::Ran
+                    }
+                })
+                .await;
+            }
+        });
+        for _ in 0..16 {
+            kick_tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        let seen = rounds.load(Ordering::SeqCst);
+        assert!(
+            (2..=3).contains(&seen),
+            "{seen} captures in ten seconds of steady churn"
+        );
+        drop(kick_tx);
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn tracked_diffs_are_read_only() {
+        let args = tracked_diff_args(&["--numstat", "-z"], "abc123");
+        assert_eq!(
+            args,
+            [
+                "--no-optional-locks",
+                "diff",
+                "--numstat",
+                "-z",
+                "abc123",
+                "--"
+            ]
+        );
+    }
+
+    fn change(kind: notify::EventKind, paths: &[std::path::PathBuf]) -> notify::Event {
+        let mut event = notify::Event::new(kind);
+        event.paths = paths.to_vec();
+        event
+    }
+
+    #[test]
+    fn events_inside_ignored_paths_do_not_kick_a_sync() {
+        use notify::EventKind;
+        use notify::event::{CreateKind, ModifyKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n*.log\n").unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "scratch/\n").unwrap();
+        let filter = ChangeFilter::new(&identity(&root, &root.join(".git")));
+        let touched = |path: &str| change(EventKind::Modify(ModifyKind::Any), &[root.join(path)]);
+        // Hidden by the checkout's rules: build output, logs, local excludes.
+        assert!(!filter.admits(&touched("target/debug/app")));
+        assert!(!filter.admits(&touched("target/debug/deps/x.rlib")));
+        assert!(!filter.admits(&touched("build.log")));
+        assert!(!filter.admits(&touched("scratch/notes.txt")));
+        // Real changes, and a tracked `dist/` the rules never mention.
+        assert!(filter.admits(&touched("src/lib.rs")));
+        assert!(filter.admits(&touched("dist/bundle.js")));
+        assert!(filter.admits(&touched(".git/HEAD")));
+        assert!(filter.admits(&touched(".git/index")));
+        assert!(filter.admits(&touched(".git/refs/heads/main")));
+        // One visible path among ignored ones is enough.
+        assert!(filter.admits(&change(
+            EventKind::Create(CreateKind::File),
+            &[root.join("target/x"), root.join("src/new.rs")]
+        )));
+        // A path outside the checkout (a linked worktree's git dir) kicks.
+        assert!(filter.admits(&change(
+            EventKind::Any,
+            &[std::path::PathBuf::from("/linked/elsewhere/HEAD")]
+        )));
+        // No path at all (a rescan): kick.
+        assert!(filter.admits(&notify::Event::new(EventKind::Any)));
+    }
+
+    #[test]
+    fn the_git_dir_kicks_even_under_a_dot_rule_and_new_rules_take_effect() {
+        use notify::EventKind;
+        use notify::event::{AccessKind, ModifyKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), ".*\n!.gitignore\n").unwrap();
+        let filter = ChangeFilter::new(&identity(&root, &root.join(".git")));
+        let modified = |path: &str| change(EventKind::Modify(ModifyKind::Any), &[root.join(path)]);
+        assert!(
+            filter.admits(&modified(".git/HEAD")),
+            "a rule never hides the git dir"
+        );
+        assert!(!filter.admits(&modified(".cache/x")));
+        assert!(filter.admits(&modified("dist/a.js")));
+        // Editing the rules reloads them: `dist/` is hidden from then on.
+        std::fs::write(root.join(".gitignore"), "dist/\n").unwrap();
+        assert!(filter.admits(&modified(".gitignore")));
+        assert!(!filter.admits(&modified("dist/a.js")));
+        assert!(filter.admits(&modified(".cache/x")));
+        // Reads never kick, ignored or not.
+        assert!(!filter.admits(&change(
+            EventKind::Access(AccessKind::Any),
+            &[root.join("src/lib.rs")]
+        )));
+    }
 
     /// End to end through a real watcher: opening a file under a watched
     /// checkout raises access events on Linux, and before the filter each one

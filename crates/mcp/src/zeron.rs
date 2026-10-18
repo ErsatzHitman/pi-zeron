@@ -26,7 +26,7 @@ use zeron_rpc::{RpcClient, RpcError, RpcSubscription, connect_ws, methods};
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Gap between resubscribes when a watch stream ends at a lifecycle
 /// boundary (chat2 cutover etc.) — the same contract the UI follows.
-const RESUBSCRIBE_DELAY: Duration = Duration::from_millis(300);
+pub(crate) const RESUBSCRIBE_DELAY: Duration = Duration::from_millis(300);
 
 /// Which chat this server speaks for, when the engine injected it into a
 /// harness. Unset when a human runs `zeron mcp` from a terminal.
@@ -102,6 +102,36 @@ pub enum TurnOutcome {
     Errored,
     /// The deadline passed with the chat still working (or never starting).
     TimedOut,
+}
+
+/// A chat's transcript and the live `WatchDocMessages` stream behind it.
+pub struct TranscriptWatch {
+    entries: Vec<SessionMessageEntry>,
+    rx: RpcSubscription,
+}
+
+impl TranscriptWatch {
+    /// The transcript as of the last frame folded in.
+    pub fn entries(&self) -> &[SessionMessageEntry] {
+        &self.entries
+    }
+
+    /// Wait for the next frame and fold it in. `Ok(false)` when the engine
+    /// ended the stream (a lifecycle boundary): the entries stand as they
+    /// were, and the caller attaches again. Safe to drop mid-wait.
+    pub async fn changed(&mut self) -> anyhow::Result<bool> {
+        let Some(item) = self.rx.recv().await else {
+            return Ok(false);
+        };
+        apply_item(&mut self.entries, item)?;
+        Ok(true)
+    }
+}
+
+fn apply_item(entries: &mut Vec<SessionMessageEntry>, item: Value) -> anyhow::Result<()> {
+    let frame: TranscriptFrame =
+        serde_json::from_value(item).context("WatchDocMessages: bad frame")?;
+    apply_transcript_frame(entries, frame).map_err(|e| anyhow!("transcript: {e}"))
 }
 
 pub struct Zeron {
@@ -299,6 +329,18 @@ impl Zeron {
         chat_id: &str,
         device: Option<&str>,
     ) -> anyhow::Result<Vec<SessionMessageEntry>> {
+        Ok(self.watch_transcript(chat_id, device).await?.entries)
+    }
+
+    /// The transcript, kept current: attach, take the opening `reset` frame,
+    /// and keep the subscription for the frames that follow. A caller waiting
+    /// on a reply folds those in as they arrive rather than re-attaching (and
+    /// being sent the whole transcript again) to look.
+    pub async fn watch_transcript(
+        &self,
+        chat_id: &str,
+        device: Option<&str>,
+    ) -> anyhow::Result<TranscriptWatch> {
         let mut params = json!({ "chatId": chat_id });
         if let Some(device) = device {
             params["targetDeviceId"] = json!(device);
@@ -323,11 +365,9 @@ impl Zeron {
                 ),
             };
             let is_reset = item.get("reset").is_some();
-            let frame: TranscriptFrame =
-                serde_json::from_value(item).context("WatchDocMessages: bad frame")?;
-            apply_transcript_frame(&mut entries, frame).map_err(|e| anyhow!("transcript: {e}"))?;
+            apply_item(&mut entries, item)?;
             if is_reset {
-                return Ok(entries);
+                return Ok(TranscriptWatch { entries, rx });
             }
         }
     }
