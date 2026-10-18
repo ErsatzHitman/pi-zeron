@@ -338,6 +338,85 @@ impl Shell {
         .detach();
     }
 
+    /// Stop `root_id`'s whole tree for good: every session's process with its
+    /// background jobs and sub-agents, every queued message, and hold the tree
+    /// so nothing restarts. Sessions on other devices are stopped there.
+    pub(super) fn stop_orchestrator(&mut self, root_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.show_notice(crate::toast::ToastKind::Error, "Engine not connected", cx);
+            cx.notify();
+            return;
+        };
+        self.show_notice(
+            crate::toast::ToastKind::Info,
+            "Stopping every session of the orchestrator…",
+            cx,
+        );
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let params = serde_json::json!({ "chatId": root_id, "scope": "tree", "hold": true });
+            let reply = engine
+                .client()
+                .call(methods::STOP_TREE, params.clone())
+                .await;
+            let reply = match reply {
+                Ok(mut report) => {
+                    for (device, chats) in remote_stop_targets(&report) {
+                        let mut follow_up = params.clone();
+                        follow_up["only"] = serde_json::json!(chats);
+                        follow_up["targetDeviceId"] = serde_json::json!(device);
+                        match engine.client().call(methods::STOP_TREE, follow_up).await {
+                            Ok(more) => fold_stop_report(&mut report, more),
+                            Err(err) => {
+                                for chat in &chats {
+                                    fold_stop_report(
+                                        &mut report,
+                                        serde_json::json!({ "remaining": [{
+                                            "chatId": chat,
+                                            "reason": format!("device {device} unreachable: {err}"),
+                                        }] }),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    report["remote"] = serde_json::json!([]);
+                    Ok(report)
+                }
+                Err(err) => Err(err),
+            };
+            this.update(cx, |shell, cx| {
+                match reply {
+                    Ok(report) => {
+                        if report["held"] == true
+                            && let Some(project) =
+                                shell.orchestrator_projects.known.get_mut(&root_id)
+                        {
+                            project.paused = true;
+                        }
+                        let kind = if report["remaining"]
+                            .as_array()
+                            .is_some_and(|remaining| !remaining.is_empty())
+                        {
+                            crate::toast::ToastKind::Error
+                        } else {
+                            crate::toast::ToastKind::Info
+                        };
+                        shell.show_notice(kind, stop_notice(&report), cx);
+                    }
+                    Err(err) => shell.show_notice(
+                        crate::toast::ToastKind::Error,
+                        format!("Could not stop the orchestrator: {err}"),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(super) fn render_orchestrator_settings_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
@@ -419,6 +498,7 @@ impl Shell {
         };
         let pause_root = root_id.clone();
         let archive_root = root_id.clone();
+        let stop_root = root_id.clone();
         let card = popover::dialog_card(&theme)
             .w(px(460.0))
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
@@ -486,6 +566,16 @@ impl Shell {
                         })),
                     )
                     .child(
+                        popover::btn_danger(&theme, "Stop all")
+                            .id("orchestrator-stop-all")
+                            .tooltip(crate::settings::widgets::text_tooltip(
+                                "Stop every session, background job and queued message, and hold the tree",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.stop_orchestrator(stop_root.clone(), cx)
+                            })),
+                    )
+                    .child(
                         popover::btn_danger(&theme, "Archive all")
                             .id("orchestrator-archive")
                             .tooltip(crate::settings::widgets::text_tooltip(
@@ -519,5 +609,124 @@ impl Shell {
             viewport,
             card,
         ))
+    }
+}
+
+/// What a stop report says, for the toast.
+fn stop_notice(report: &serde_json::Value) -> String {
+    let stopped = report["stopped"].as_array().map_or(0, Vec::len);
+    let cleared = report["queuedCleared"].as_u64().unwrap_or(0);
+    let remaining = report["remaining"].as_array().map_or(0, Vec::len);
+    let mut text = match stopped {
+        0 => "Nothing was running".to_owned(),
+        1 => "Stopped 1 session".to_owned(),
+        n => format!("Stopped {n} sessions"),
+    };
+    if cleared > 0 {
+        text.push_str(&format!(
+            ", cleared {cleared} queued message{}",
+            if cleared == 1 { "" } else { "s" }
+        ));
+    }
+    if remaining > 0 {
+        text.push_str(&format!(". Still running: {remaining}"));
+    }
+    if report["held"] == true {
+        text.push_str(". The orchestrator is held until you resume it");
+    }
+    text
+}
+
+/// The sessions a stop reported as hosted elsewhere, by device.
+fn remote_stop_targets(report: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    let mut by_device: Vec<(String, Vec<String>)> = Vec::new();
+    for remote in report["remote"].as_array().into_iter().flatten() {
+        let (Some(chat), Some(device)) = (remote["chatId"].as_str(), remote["deviceId"].as_str())
+        else {
+            continue;
+        };
+        match by_device.iter_mut().find(|(known, _)| known == device) {
+            Some((_, chats)) => chats.push(chat.to_owned()),
+            None => by_device.push((device.to_owned(), vec![chat.to_owned()])),
+        }
+    }
+    by_device
+}
+
+/// Add the report of a follow-up stop on another device to `report`.
+fn fold_stop_report(report: &mut serde_json::Value, more: serde_json::Value) {
+    for key in ["stopped", "alreadyIdle", "remaining"] {
+        let Some(items) = more[key].as_array() else {
+            continue;
+        };
+        if let Some(list) = report[key].as_array_mut() {
+            list.extend(items.iter().cloned());
+        } else {
+            report[key] = serde_json::Value::Array(items.clone());
+        }
+    }
+    let cleared =
+        report["queuedCleared"].as_u64().unwrap_or(0) + more["queuedCleared"].as_u64().unwrap_or(0);
+    report["queuedCleared"] = serde_json::json!(cleared);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_stop_toast_says_what_stopped_and_what_did_not() {
+        let report = json!({
+            "stopped": [{"chatId": "a"}, {"chatId": "b"}], "queuedCleared": 3,
+            "remaining": [], "held": true,
+        });
+        assert_eq!(
+            stop_notice(&report),
+            "Stopped 2 sessions, cleared 3 queued messages. The orchestrator is held until you resume it"
+        );
+        let stuck = json!({
+            "stopped": [{"chatId": "a"}], "queuedCleared": 1,
+            "remaining": [{"chatId": "b", "reason": "its runtime is still shutting down"}],
+            "held": false,
+        });
+        assert_eq!(
+            stop_notice(&stuck),
+            "Stopped 1 session, cleared 1 queued message. Still running: 1"
+        );
+        assert_eq!(
+            stop_notice(&json!({"stopped": [], "remaining": []})),
+            "Nothing was running"
+        );
+    }
+
+    #[test]
+    fn remote_sessions_are_grouped_by_device_and_their_reports_folded_in() {
+        let mut report = json!({
+            "stopped": [{"chatId": "a"}], "queuedCleared": 2, "remaining": [],
+            "remote": [
+                {"chatId": "x", "deviceId": "d1"},
+                {"chatId": "y", "deviceId": "d2"},
+                {"chatId": "z", "deviceId": "d1"},
+            ],
+        });
+        assert_eq!(
+            remote_stop_targets(&report),
+            vec![
+                ("d1".to_owned(), vec!["x".to_owned(), "z".to_owned()]),
+                ("d2".to_owned(), vec!["y".to_owned()]),
+            ]
+        );
+        fold_stop_report(
+            &mut report,
+            json!({"stopped": [{"chatId": "x"}], "queuedCleared": 1}),
+        );
+        assert_eq!(report["stopped"].as_array().unwrap().len(), 2);
+        assert_eq!(report["queuedCleared"], 3);
+        fold_stop_report(
+            &mut report,
+            json!({"remaining": [{"chatId": "y", "reason": "unreachable"}]}),
+        );
+        assert_eq!(report["remaining"].as_array().unwrap().len(), 1);
     }
 }

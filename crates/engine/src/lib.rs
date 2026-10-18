@@ -51,6 +51,7 @@ pub mod spaces;
 pub mod terminals;
 pub mod titles;
 mod transcript_history;
+pub mod tree_stop;
 pub mod uploads;
 pub mod usage;
 pub mod usage_alerts;

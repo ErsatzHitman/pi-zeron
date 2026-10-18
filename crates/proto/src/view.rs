@@ -628,6 +628,147 @@ pub fn chat_location(chat: &Chat) -> Option<String> {
     }
 }
 
+/// What kind of folder a session works in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CwdKind {
+    /// A folder other than its project's: the linked worktree an orchestrator's
+    /// writing session gets.
+    Worktree,
+    /// The project's own folder (or a subfolder of it).
+    ProjectFolder,
+    /// A projectless chat's own scratch folder.
+    Scratch,
+    /// A writing session of an orchestrator in a git project that has not run
+    /// yet: its worktree is made on its first run.
+    PendingWorktree,
+}
+
+impl CwdKind {
+    /// The words for the kind, in lists and tooltips.
+    pub fn label(self) -> &'static str {
+        match self {
+            CwdKind::Worktree => "worktree",
+            CwdKind::ProjectFolder => "project folder",
+            CwdKind::Scratch => "scratch",
+            CwdKind::PendingWorktree => "pending worktree",
+        }
+    }
+}
+
+/// Where a session's branch comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchSource {
+    /// Captured when the run started ([`crate::ConversationSourceContext`]).
+    RunStart,
+    /// Stamped on the chat when its worktree was made.
+    Stamped,
+}
+
+impl BranchSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            BranchSource::RunStart => "run start",
+            BranchSource::Stamped => "worktree",
+        }
+    }
+}
+
+/// The folder and branch a session actually works in, as opposed to the
+/// project folder it belongs to.
+///
+/// The branch is the conversation's own, never the live branch of a checkout
+/// it shares: one checkout change must not relabel every chat in that folder
+/// (see `diff_sync`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLocation {
+    pub cwd: Option<String>,
+    pub cwd_kind: CwdKind,
+    pub branch: Option<String>,
+    pub branch_source: Option<BranchSource>,
+    pub repo_root: Option<String>,
+}
+
+impl SessionLocation {
+    /// The session works in a worktree, made or yet to be.
+    pub fn is_worktree(&self) -> bool {
+        matches!(self.cwd_kind, CwdKind::Worktree | CwdKind::PendingWorktree)
+    }
+}
+
+fn nonblank(text: Option<&str>) -> Option<&str> {
+    text.filter(|text| !text.trim().is_empty())
+}
+
+/// A path for comparison only: one separator, no trailing one, and a drive
+/// letter in lower case.
+fn comparable_path(path: &str) -> String {
+    let mut path = path.trim().replace('\\', "/");
+    while path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+    if path.as_bytes().get(1) == Some(&b':') {
+        path = path.to_ascii_lowercase();
+    }
+    path
+}
+
+/// The session's working folder and branch from what the chat already
+/// carries: its cwd (stamped when its worktree is made), the source context
+/// captured at each run start, and the project's folder as the last resort.
+/// Pure.
+pub fn session_location(chat: &Chat, space: Option<&Space>) -> SessionLocation {
+    let source = chat.source_context.as_ref();
+    let cwd = nonblank(chat.cwd.as_deref())
+        .or_else(|| nonblank(source.map(|s| s.cwd.as_str())))
+        .or_else(|| nonblank(chat.harness_session_cwd.as_deref()))
+        .or_else(|| space.map(|s| s.path.as_str()))
+        .map(str::to_owned);
+    let ran = chat.cwd.is_some() || source.is_some() || chat.harness_session_cwd.is_some();
+    let writes = chat
+        .config
+        .as_ref()
+        .is_some_and(|c| c.sandbox != crate::SandboxLevel::ReadOnly);
+    let cwd_kind = match (cwd.as_deref(), space) {
+        (Some(cwd), _) if crate::projectless::is_scratch_cwd(cwd) => CwdKind::Scratch,
+        (Some(cwd), Some(space)) => {
+            let (cwd, project) = (comparable_path(cwd), comparable_path(&space.path));
+            if cwd == project || cwd.starts_with(&format!("{project}/")) {
+                if !ran
+                    && space.git_detected
+                    && writes
+                    && chat.parent_chat_id.is_some()
+                    && !chat.is_btw()
+                {
+                    CwdKind::PendingWorktree
+                } else {
+                    CwdKind::ProjectFolder
+                }
+            } else {
+                CwdKind::Worktree
+            }
+        }
+        _ => CwdKind::ProjectFolder,
+    };
+    let (branch, branch_source) = match (
+        source.map(|s| s.branch.trim()).filter(|b| !b.is_empty()),
+        chat.branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty()),
+    ) {
+        (Some(branch), _) => (Some(branch.to_owned()), Some(BranchSource::RunStart)),
+        (None, Some(branch)) => (Some(branch.to_owned()), Some(BranchSource::Stamped)),
+        (None, None) => (None, None),
+    };
+    SessionLocation {
+        cwd,
+        cwd_kind,
+        branch,
+        branch_source,
+        repo_root: source.map(|s| s.repo_root.clone()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool summaries (pure)
 // ---------------------------------------------------------------------------
@@ -1088,5 +1229,188 @@ mod pi_extension_tests {
             }),
             ("MCP", "gh · issues".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+    use crate::{ChatConfig, ConversationSourceContext, HarnessId, SandboxLevel};
+
+    fn space(path: &str, git: bool) -> Space {
+        Space {
+            id: "space".into(),
+            device_id: "dev".into(),
+            path: path.into(),
+            name: None,
+            git_detected: git,
+            git_checked_at: None,
+            checkout_id: None,
+            repository_id: None,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        }
+    }
+
+    fn chat() -> Chat {
+        serde_json::from_value(serde_json::json!({
+            "id": "c", "deviceId": "dev", "title": null, "archived": false,
+            "cwd": null, "branch": null, "checkoutId": null, "config": null,
+            "lastMessagePreview": null, "lastMessageAt": null,
+            "createdAt": "2026-10-14T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    fn context(cwd: &str, branch: &str) -> ConversationSourceContext {
+        ConversationSourceContext {
+            checkout_id: "checkout".into(),
+            repo_root: "/repo/comet".into(),
+            cwd: cwd.into(),
+            branch: branch.into(),
+            head_sha: None,
+            observed_at: DateTime::<Utc>::UNIX_EPOCH,
+        }
+    }
+
+    fn writer() -> ChatConfig {
+        ChatConfig {
+            harness: HarnessId::Pi,
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+        }
+    }
+
+    #[test]
+    fn the_worktree_wins_over_the_project_folder() {
+        let mut chat = chat();
+        chat.cwd = Some("/repo/comet-wt/x".into());
+        chat.source_context = Some(context("/repo/comet-wt/x", "feature/x"));
+        let location = session_location(&chat, Some(&space("/repo/comet", true)));
+        assert_eq!(location.cwd.as_deref(), Some("/repo/comet-wt/x"));
+        assert_eq!(location.cwd_kind, CwdKind::Worktree);
+        assert!(location.is_worktree());
+        assert_eq!(location.branch.as_deref(), Some("feature/x"));
+        assert_eq!(location.branch_source, Some(BranchSource::RunStart));
+        assert_eq!(location.repo_root.as_deref(), Some("/repo/comet"));
+    }
+
+    #[test]
+    fn cwd_falls_back_from_the_chat_to_its_run_context_to_the_project() {
+        let project = space("/repo/comet", true);
+        let mut chat = chat();
+        assert_eq!(
+            session_location(&chat, Some(&project)).cwd.as_deref(),
+            Some("/repo/comet")
+        );
+        chat.harness_session_cwd = Some("/repo/comet-wt/h".into());
+        assert_eq!(
+            session_location(&chat, Some(&project)).cwd.as_deref(),
+            Some("/repo/comet-wt/h")
+        );
+        chat.source_context = Some(context("/repo/comet-wt/s", "s"));
+        assert_eq!(
+            session_location(&chat, Some(&project)).cwd.as_deref(),
+            Some("/repo/comet-wt/s")
+        );
+        chat.cwd = Some("/repo/comet-wt/c".into());
+        assert_eq!(
+            session_location(&chat, Some(&project)).cwd.as_deref(),
+            Some("/repo/comet-wt/c")
+        );
+        chat.cwd = Some("   ".into());
+        assert_eq!(
+            session_location(&chat, Some(&project)).cwd.as_deref(),
+            Some("/repo/comet-wt/s"),
+            "a blank cwd is no cwd"
+        );
+    }
+
+    #[test]
+    fn a_main_checkout_chat_reports_its_run_start_branch() {
+        let mut chat = chat();
+        chat.cwd = Some("/repo/comet/".into());
+        chat.source_context = Some(context("/repo/comet", "main"));
+        let location = session_location(&chat, Some(&space("/repo/comet", true)));
+        assert_eq!(location.cwd_kind, CwdKind::ProjectFolder, "trailing slash");
+        assert_eq!(location.branch.as_deref(), Some("main"));
+        // The stamped worktree branch stands in only without a run context.
+        chat.source_context = None;
+        chat.branch = Some("zeron/x".into());
+        let location = session_location(&chat, Some(&space("/repo/comet", true)));
+        assert_eq!(location.branch.as_deref(), Some("zeron/x"));
+        assert_eq!(location.branch_source, Some(BranchSource::Stamped));
+    }
+
+    #[test]
+    fn a_subfolder_or_a_drive_spelling_is_still_the_project_folder() {
+        let mut chat = chat();
+        chat.cwd = Some("/repo/comet/crates/ui".into());
+        let project = space("/repo/comet", true);
+        assert_eq!(
+            session_location(&chat, Some(&project)).cwd_kind,
+            CwdKind::ProjectFolder
+        );
+        chat.cwd = Some("C:\\Repo\\Comet\\".into());
+        assert_eq!(
+            session_location(&chat, Some(&space("c:/repo/comet", true))).cwd_kind,
+            CwdKind::ProjectFolder
+        );
+        chat.cwd = Some("/repo/comet-other".into());
+        assert_eq!(
+            session_location(&chat, Some(&project)).cwd_kind,
+            CwdKind::Worktree,
+            "a sibling folder with the same prefix is not inside it"
+        );
+    }
+
+    #[test]
+    fn a_writer_before_its_first_run_reads_as_a_pending_worktree() {
+        let project = space("/repo/comet", true);
+        let mut chat = chat();
+        chat.parent_chat_id = Some("orchestrator-r".into());
+        chat.config = Some(writer());
+        let location = session_location(&chat, Some(&project));
+        assert_eq!(location.cwd_kind, CwdKind::PendingWorktree);
+        assert!(location.is_worktree());
+        // Not for a reader, a plain chat, a non-git project or one that ran.
+        let mut reader = chat.clone();
+        reader.config = Some(ChatConfig {
+            sandbox: SandboxLevel::ReadOnly,
+            ..writer()
+        });
+        assert_eq!(
+            session_location(&reader, Some(&project)).cwd_kind,
+            CwdKind::ProjectFolder
+        );
+        let mut plain = chat.clone();
+        plain.parent_chat_id = None;
+        assert_eq!(
+            session_location(&plain, Some(&project)).cwd_kind,
+            CwdKind::ProjectFolder
+        );
+        assert_eq!(
+            session_location(&chat, Some(&space("/repo/comet", false))).cwd_kind,
+            CwdKind::ProjectFolder
+        );
+        chat.harness_session_cwd = Some("/repo/comet".into());
+        assert_eq!(
+            session_location(&chat, Some(&project)).cwd_kind,
+            CwdKind::ProjectFolder
+        );
+    }
+
+    #[test]
+    fn a_scratch_chat_and_a_missing_project_are_survived() {
+        let mut chat = chat();
+        chat.cwd = Some("~/.zeron/scratch/2026-10-14-abc12345".into());
+        assert_eq!(session_location(&chat, None).cwd_kind, CwdKind::Scratch);
+        let bare = session_location(&self::chat(), None);
+        assert_eq!(bare.cwd, None);
+        assert_eq!(bare.cwd_kind, CwdKind::ProjectFolder);
+        assert_eq!(bare.branch, None);
+        assert_eq!(CwdKind::PendingWorktree.label(), "pending worktree");
+        assert_eq!(BranchSource::RunStart.label(), "run start");
     }
 }

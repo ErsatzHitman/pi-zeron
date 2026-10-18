@@ -35,6 +35,13 @@ const CHAT: &str = "chat-restart";
 
 type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 
+/// The prompt a revived run starts from: the recovery notice quoting the
+/// request that was interrupted, not the request itself.
+fn is_recovery_of(prompt: &str, request: &str) -> bool {
+    prompt.starts_with("[Message from Zeron (automatic recovery notice)")
+        && prompt.contains(&format!("> {request}"))
+}
+
 fn run_request(prompt: &str, cwd: &str) -> RunRequest {
     RunRequest {
         mcp: None,
@@ -846,20 +853,26 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
         )),
         "aborted entry carries the visible interruption note"
     );
-    // Re-dispatch reuses the original user message id — never a duplicate.
-    assert_eq!(
-        entries
-            .iter()
-            .filter(|e| e.role == MessageRole::User)
-            .count(),
-        1
-    );
+    // The interrupted request is continued, not replayed: the user's own
+    // message stays the one they sent, and the recovery notice that follows
+    // it is a new message of its own.
+    let users: Vec<_> = entries
+        .iter()
+        .filter(|e| e.role == MessageRole::User)
+        .collect();
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].id, "msg-user-1");
+    assert_ne!(users[1].id, "msg-user-1");
     // The revived run continues the journal-recovered harness conversation.
     // (An auto-title request may precede it — titling fires at dispatch.)
     let recorded = requests.lock().unwrap().clone();
+    assert!(
+        recorded.iter().all(|r| r.prompt != "long task"),
+        "the interrupted request is never run again as if it were new"
+    );
     let revived = recorded
         .iter()
-        .find(|r| r.prompt == "long task")
+        .find(|r| is_recovery_of(&r.prompt, "long task"))
         .expect("auto-resumed dispatch reached the harness");
     assert_eq!(
         revived.resume.as_deref(),
@@ -1109,7 +1122,7 @@ async fn a_crash_before_the_reply_reached_disk_still_auto_resumes() {
     let recorded = requests.lock().unwrap().clone();
     let revived = recorded
         .iter()
-        .find(|r| r.prompt == "long task")
+        .find(|r| is_recovery_of(&r.prompt, "long task"))
         .expect("auto-resumed dispatch reached the harness");
     assert_eq!(revived.resume.as_deref(), Some("hs-crash"));
     core.shutdown().await;
@@ -1206,7 +1219,7 @@ async fn a_crash_recovers_the_conversation_through_a_symlinked_folder() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|r| r.prompt == "long task")
+                .any(|r| is_recovery_of(&r.prompt, "long task"))
         },
         "the crashed turn to be picked back up",
     )
@@ -1215,7 +1228,7 @@ async fn a_crash_recovers_the_conversation_through_a_symlinked_folder() {
         .lock()
         .unwrap()
         .iter()
-        .find(|r| r.prompt == "long task")
+        .find(|r| is_recovery_of(&r.prompt, "long task"))
         .cloned()
         .unwrap();
     assert_eq!(revived.cwd, link, "the chat's own folder");
@@ -1517,5 +1530,230 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
             "steer-turned-run must resume the stored harness session"
         );
     }
+    core.shutdown().await;
+}
+
+const TREE_ROOT: &str = "orchestrator-recovery";
+const TREE_MEMBER: &str = "member-recovery";
+
+/// A root and one member below it, as an orchestrator leaves them.
+fn create_tree(core: &EngineCore, paused: bool) {
+    for (id, parent) in [(TREE_ROOT, None), (TREE_MEMBER, Some(TREE_ROOT))] {
+        core.workspace
+            .create_chat_with_parent(
+                id,
+                None,
+                Some(&core.device_id),
+                None,
+                Some("/tmp".into()),
+                parent.map(str::to_owned),
+            )
+            .expect("create chat row");
+        core.workspace.rename_chat(id, id).expect("rename chat");
+    }
+    if paused {
+        core.workspace
+            .update_orchestrator_project(
+                TREE_ROOT,
+                zeron_proto::orchestrator_project::ProjectUpdate {
+                    paused: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("pause the tree");
+    }
+}
+
+/// What a kill -9 a minute into a turn leaves behind for `chat`: the user's
+/// message and a streaming reply in the doc, a journal that never reached Done.
+fn manufacture_fresh_crash(dir: &std::path::Path, chat: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+    let doc = SessionDoc::init(chat).unwrap();
+    for (id, role, text, at, status) in [
+        (
+            "msg-user-1",
+            MessageRole::User,
+            "long task",
+            now - 60_000,
+            MessageStatus::Complete,
+        ),
+        (
+            "msg-assistant-1",
+            MessageRole::Assistant,
+            "partial",
+            now - 30_000,
+            MessageStatus::Streaming,
+        ),
+    ] {
+        doc.push_message(&SessionMessageEntry {
+            id: id.into(),
+            role,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.into(),
+            }],
+            created_at: at,
+            device_id: "dev-crash".into(),
+            status: Some(status),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+    }
+    store
+        .save_snapshot(chat, &doc.export_snapshot().unwrap())
+        .unwrap();
+    let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+    journal
+        .append(
+            chat,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: "/tmp".into(),
+                session_id: "hs-crash".into(),
+                assistant_message_id: "msg-assistant-1".into(),
+            },
+        )
+        .unwrap();
+    journal
+        .append(
+            chat,
+            &AgentEvent::TextDelta {
+                text: "partial".into(),
+            },
+        )
+        .unwrap();
+}
+
+fn recovery_runs(requests: &RequestLog) -> usize {
+    requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.prompt
+                .starts_with("[Message from Zeron (automatic recovery notice)")
+        })
+        .count()
+}
+
+fn member_entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
+    core.doc_host
+        .open(TREE_MEMBER)
+        .ok()
+        .and_then(|h| h.doc().read_entries().ok())
+        .unwrap_or_default()
+}
+
+/// A tree its owner paused or stopped stays down after a crash: the revival
+/// would start work nobody wants running.
+#[tokio::test]
+async fn a_paused_tree_member_is_not_revived_on_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let harness = || RecordingHarness {
+        requests: requests.clone(),
+        session_id: "hs-after-crash".into(),
+        fail_starts: Default::default(),
+    };
+    {
+        let core = assemble(&dir, harness());
+        create_tree(&core, true);
+        core.shutdown().await;
+    }
+    manufacture_fresh_crash(&dir, TREE_MEMBER);
+
+    let core = assemble(&dir, harness());
+    // Give a (wrongly) spawned revival time to reach the harness.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        recovery_runs(&requests),
+        0,
+        "{:?}",
+        requests.lock().unwrap()
+    );
+    let entries = member_entries(&core);
+    let aborted = entries
+        .iter()
+        .find(|e| e.status == Some(MessageStatus::Aborted))
+        .expect("the crashed reply is stamped aborted");
+    assert!(
+        aborted.parts.iter().any(|p| matches!(
+            p,
+            MessagePart::Error { message, .. }
+                if message.contains("not resumed") && message.contains("paused or stopped")
+        )),
+        "the note says why it stayed down: {aborted:?}"
+    );
+    assert_eq!(
+        core.sessions.session_status(TREE_MEMBER).map(|s| s.status),
+        Some(zeron_proto::SessionStatus::Idle),
+        "held on purpose, not failed"
+    );
+    core.shutdown().await;
+}
+
+/// A member whose turn cannot be continued failed, as far as the orchestrator
+/// above it is concerned: it must hear so rather than wait for silence.
+#[tokio::test]
+async fn a_member_that_cannot_be_resumed_tells_its_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let harness = || RecordingHarness {
+        requests: requests.clone(),
+        session_id: "hs-after-crash".into(),
+        fail_starts: Default::default(),
+    };
+    {
+        let core = assemble(&dir, harness());
+        create_tree(&core, false);
+        core.shutdown().await;
+    }
+    manufacture_fresh_crash(&dir, TREE_MEMBER);
+    // Recovery has already revived it three times in a row.
+    let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+    for _ in 0..3 {
+        journal.note_resume_attempt(TREE_MEMBER);
+    }
+    drop(journal);
+
+    let core = assemble(&dir, harness());
+    wait_for(
+        || {
+            requests.lock().unwrap().iter().any(|r| {
+                r.prompt
+                    .starts_with("[Message from Zeron (automatic child-outcome notice)")
+            })
+        },
+        "the orchestrator to be told",
+    )
+    .await;
+    let note = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.prompt.contains("automatic child-outcome notice"))
+        .map(|r| r.prompt.clone())
+        .unwrap();
+    assert!(note.contains(TREE_MEMBER), "{note}");
+    assert!(note.contains("failed (process lost)"), "{note}");
+    assert!(note.contains("engine stopped unexpectedly"), "{note}");
+    assert_eq!(recovery_runs(&requests), 0, "not resumed");
+    assert_eq!(
+        core.sessions.session_status(TREE_MEMBER).map(|s| s.status),
+        Some(zeron_proto::SessionStatus::Errored)
+    );
     core.shutdown().await;
 }

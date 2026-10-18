@@ -55,6 +55,9 @@ struct ProcessHarness {
     /// Takes input only between turns (Hermes, Antigravity): the engine
     /// holds sends made mid-turn for the turn's end.
     turn_boundary: bool,
+    /// The runtime outlives its turns, as Pi's does: a Stop ends the turn
+    /// and leaves the process (and its background work) up.
+    keeps_alive: bool,
 }
 
 fn done(status: DoneStatus) -> AgentEvent {
@@ -90,6 +93,9 @@ impl Harness for ProcessHarness {
     }
     fn deterministic_turn_end(&self) -> bool {
         true
+    }
+    fn keeps_runtime_alive(&self) -> bool {
+        self.keeps_alive
     }
     fn stops_turn_in_place(&self) -> bool {
         true
@@ -214,12 +220,17 @@ fn rig_with(adopts_config: bool) -> Rig {
 }
 
 fn rig_full(adopts_config: bool, turn_boundary: bool) -> Rig {
+    rig_keeping(adopts_config, turn_boundary, false)
+}
+
+fn rig_keeping(adopts_config: bool, turn_boundary: bool, keeps_alive: bool) -> Rig {
     let ledger = Arc::new(Ledger::default());
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(ProcessHarness {
         ledger: ledger.clone(),
         adopts_config,
         turn_boundary,
+        keeps_alive,
     }));
     let dir = tempfile::tempdir().unwrap();
     let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
@@ -1037,5 +1048,205 @@ async fn the_idle_reaper_spares_a_runtime_holding_background_work() {
         "the idle runtime to be reaped",
     )
     .await;
+    rig.core.sessions.shutdown().await;
+}
+
+const TREE_ROOT: &str = "orchestrator-survival";
+const SIBLING: &str = "chat-runtime-sibling";
+
+/// An orchestrator root with `members` below it, all hosted here.
+fn grow_tree(rig: &Rig, members: &[&str]) {
+    for (id, parent) in std::iter::once((TREE_ROOT, None))
+        .chain(members.iter().map(|member| (*member, Some(TREE_ROOT))))
+    {
+        rig.core
+            .workspace
+            .create_chat_with_parent(
+                id,
+                None,
+                Some(&rig.core.device_id),
+                None,
+                Some("/tmp".into()),
+                parent.map(str::to_owned),
+            )
+            .unwrap();
+    }
+}
+
+fn stop_request(
+    chat: &str,
+    scope: zeron_engine::tree_stop::StopScope,
+    caller: Option<&str>,
+) -> zeron_engine::tree_stop::StopTreeRequest {
+    zeron_engine::tree_stop::StopTreeRequest {
+        chat_id: chat.into(),
+        scope,
+        hold: true,
+        only: None,
+        caller: caller.map(str::to_owned),
+    }
+}
+
+async fn stop_tree(
+    rig: &Rig,
+    request: &zeron_engine::tree_stop::StopTreeRequest,
+) -> zeron_engine::tree_stop::StopTreeReport {
+    zeron_engine::tree_stop::stop_tree(
+        &rig.core.workspace,
+        &rig.core.doc_host,
+        &rig.core.sessions,
+        request,
+    )
+    .await
+    .expect("the tree stops")
+}
+
+/// What the Stop button does to a runtime that lives as long as the app: it
+/// ends the turn and leaves the process, and the work it holds, running. That
+/// is why stopping a whole tree is a separate operation.
+#[tokio::test]
+async fn stop_on_a_pi_like_parked_runtime_does_not_end_background_work() {
+    let rig = rig_keeping(false, false, true);
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request("launch a scout"), None)
+        .await
+        .unwrap();
+    settle(&rig, 1).await;
+    let turn = rig.ledger.turn.lock().unwrap().clone().unwrap();
+    turn.set_background(2);
+    assert!(!rig.core.sessions.interrupt(CHAT).await.unwrap());
+    rig.core
+        .doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 0);
+    assert!(rig.core.sessions.has_run(CHAT), "the runtime is still up");
+    rig.core.sessions.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_tree_ends_parked_runtimes_with_background_work() {
+    use zeron_engine::tree_stop::StopScope;
+    let rig = rig_keeping(false, false, true);
+    grow_tree(&rig, &[CHAT]);
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request("launch a scout"), None)
+        .await
+        .unwrap();
+    settle(&rig, 1).await;
+    let turn = rig.ledger.turn.lock().unwrap().clone().unwrap();
+    turn.set_background(2);
+
+    let report = stop_tree(&rig, &stop_request(TREE_ROOT, StopScope::Tree, None)).await;
+    assert_eq!(report.stopped.len(), 1, "{report:?}");
+    assert_eq!(report.stopped[0].chat_id, CHAT);
+    assert!(report.remaining.is_empty(), "{report:?}");
+    assert!(report.remote.is_empty());
+    assert!(report.held);
+    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 1);
+    assert!(!rig.core.sessions.has_run(CHAT));
+    assert!(
+        rig.core.workspace.orchestrator_project(TREE_ROOT).paused,
+        "the tree is held so nothing restarts it"
+    );
+    // The root had nothing running.
+    assert!(report.already_idle.iter().any(|id| id == TREE_ROOT));
+    rig.core.sessions.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_tree_clears_queued_messages_and_a_later_message_still_runs() {
+    use zeron_engine::tree_stop::StopScope;
+    let rig = rig_keeping(false, true, true);
+    grow_tree(&rig, &[CHAT]);
+    rig.core
+        .sessions
+        .dispatch(CHAT, HarnessId::Mock, request("wait: first"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 1,
+        "the first turn to run",
+    )
+    .await;
+    for text in ["queued one", "queued two"] {
+        rig.core.doc_host.queue_message(CHAT, text, vec![]).unwrap();
+    }
+    wait_for(|| queued(&rig).len() == 2, "the rows to be held").await;
+
+    let report = stop_tree(&rig, &stop_request(TREE_ROOT, StopScope::Tree, None)).await;
+    assert_eq!(report.queued_cleared, 2, "{report:?}");
+    assert!(queued(&rig).is_empty());
+    assert_eq!(rig.ledger.spawns.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !rig.ledger
+            .prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _)| p.contains("queued")),
+        "a cleared message ran anyway"
+    );
+
+    // The user's own next message is not swallowed by the hold.
+    rig.core
+        .doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Run {
+                request: request("after the stop"),
+                message_id: "m-after".into(),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || {
+            rig.ledger
+                .prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _)| p == "after the stop")
+        },
+        "the next message to run",
+    )
+    .await;
+    rig.core.sessions.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_tree_on_a_branch_spares_the_caller_and_the_other_branches() {
+    use zeron_engine::tree_stop::StopScope;
+    let rig = rig_keeping(false, false, true);
+    grow_tree(&rig, &[CHAT, SIBLING]);
+    for chat in [CHAT, SIBLING] {
+        rig.core
+            .sessions
+            .dispatch(chat, HarnessId::Mock, request("hold: working"), None)
+            .await
+            .unwrap();
+    }
+    wait_for(
+        || rig.ledger.prompts.lock().unwrap().len() == 2,
+        "both members to be working",
+    )
+    .await;
+
+    let mut ask = stop_request(CHAT, StopScope::Subtree, Some(TREE_ROOT));
+    ask.hold = false;
+    let report = stop_tree(&rig, &ask).await;
+    assert_eq!(report.stopped.len(), 1, "{report:?}");
+    assert_eq!(report.stopped[0].chat_id, CHAT);
+    assert!(!report.held, "stopping one branch does not hold the tree");
+    assert!(!rig.core.sessions.has_run(CHAT));
+    assert!(
+        rig.core.sessions.has_run(SIBLING),
+        "the other branch runs on"
+    );
+    assert!(!rig.core.workspace.orchestrator_project(TREE_ROOT).paused);
     rig.core.sessions.shutdown().await;
 }

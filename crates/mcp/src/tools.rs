@@ -133,7 +133,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_chats",
-            description: "Chats with their project, host device, harness/model, live status, and last activity. Newest activity first.",
+            description: "Chats with their project, host device, harness/model, live status, and last activity. Newest activity first. cwd is the folder the agent actually works in (its own worktree for a writing session; cwdKind says which), project is the original project folder, and branch is the branch it ran on.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -219,7 +219,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "interrupt_chat",
-            description: "Stop the chat's running turn. Only the current turn ends and its queued messages are cleared; its sub-agents and background shells keep running.",
+            description: "Stop the chat's running turn. Only the current turn ends and its queued messages are cleared; its sub-agents and background shells keep running. To end a session AND its background work, or a whole subtree, use stop_tree.",
             input_schema: chat_key_schema(json!({})),
         },
         ToolDef {
@@ -365,10 +365,47 @@ fn catalog() -> Vec<ToolDef> {
             }
         })),
     });
+    tools.push(ToolDef {
+        name: STOP_TREE,
+        description: "Stops every session below you (or below one session) completely: ends their turns, kills their Pi processes with all background shells and sub-agents, clears their queued messages and holds the tree so nothing restarts or wakes you by itself. Returns what was stopped, what was cleared and anything still running. interrupt_chat only ends one turn; use this to stop a runaway subtree before replanning, and tell the user.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "chat": {
+                    "type": "string",
+                    "description": "One session (chat id, unique id prefix or exact title) to stop together with everything below it. Omit, as the orchestrator, to stop every session of your tree."
+                },
+                "hold": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Hold the tree afterwards (whole-tree stops): you start and send nothing until the user resumes it from Zeron."
+                }
+            }
+        }),
+    });
     for tool in &mut tools {
         forbid_extra(&mut tool.input_schema);
     }
     tools
+}
+
+fn push_to(list: &mut Value, item: Value) {
+    match list.as_array_mut() {
+        Some(list) => list.push(item),
+        None => *list = json!([item]),
+    }
+}
+
+/// Fold the report of a follow-up call on another device into `report`.
+fn merge_stop_reports(report: &mut Value, more: Value) {
+    for key in ["stopped", "alreadyIdle", "remaining"] {
+        for item in more[key].as_array().into_iter().flatten() {
+            push_to(&mut report[key], item.clone());
+        }
+    }
+    let cleared =
+        report["queuedCleared"].as_u64().unwrap_or(0) + more["queuedCleared"].as_u64().unwrap_or(0);
+    report["queuedCleared"] = json!(cleared);
 }
 
 /// Make every object schema with `properties` closed (`additionalProperties:
@@ -398,13 +435,15 @@ const PROJECT_FORGET: &str = "project_forget";
 const PROJECT_UPDATE: &str = "project_update";
 /// Read-only merge preview of one of the orchestrator's sessions.
 const MERGE_PREVIEW: &str = "merge_preview";
+/// Stops a subtree for good: runtimes, background work, queues.
+const STOP_TREE: &str = "stop_tree";
 
 /// The message board of the CALLING chat's orchestrator tree, offered only
 /// to an agent Zeron launched (`ZERON_CHAT_ID` set).
 const BOARD_POST: &str = "board_post";
 const BOARD_READ: &str = "board_read";
 /// Tools that act for the calling chat.
-const IN_CHAT_ONLY: [&str; 8] = [
+const IN_CHAT_ONLY: [&str; 9] = [
     SHOW_VISUAL,
     BOARD_POST,
     BOARD_READ,
@@ -413,6 +452,7 @@ const IN_CHAT_ONLY: [&str; 8] = [
     PROJECT_FORGET,
     PROJECT_UPDATE,
     MERGE_PREVIEW,
+    STOP_TREE,
 ];
 
 /// Shows a page in the CALLING chat, so it is offered only to an agent that
@@ -635,6 +675,13 @@ struct BatchArgs {
 #[serde(deny_unknown_fields)]
 struct ChatArgs {
     chat: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopTreeArgs {
+    chat: Option<String>,
+    hold: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -924,6 +971,8 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
         .and_then(|id| spaces.iter().find(|s| s.id == id));
     let session = session_for(sessions, chat);
     let (status, status_age) = status_of(session.as_ref());
+    // Where the agent actually works: its worktree, not the project folder.
+    let location = zeron_proto::view::session_location(chat, space);
     json!({
         "id": chat.id,
         "title": chat.title,
@@ -933,8 +982,12 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
             "path": s.path,
         })),
         "deviceId": chat.device_id,
-        "cwd": chat.cwd.clone().or_else(|| space.map(|s| s.path.clone())),
-        "branch": chat.branch,
+        "cwd": location.cwd,
+        "cwdKind": location.cwd_kind.label(),
+        "worktree": location.is_worktree(),
+        "branch": location.branch,
+        "branchSource": location.branch_source.map(|source| source.label()),
+        "repoRoot": location.repo_root,
         "harness": chat.config.as_ref().map(|c| c.harness),
         "model": chat.config.as_ref().and_then(|c| c.model.clone()),
         "reasoning": chat.config.as_ref().and_then(|c| c.reasoning),
@@ -1060,6 +1113,7 @@ impl Tools {
             }
             PROJECT_UPDATE => self.project_update(parse(args)?).boxed().await,
             MERGE_PREVIEW => self.merge_preview(parse(args)?).boxed().await,
+            STOP_TREE => self.stop_tree(parse(args)?).boxed().await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
@@ -1825,6 +1879,87 @@ impl Tools {
             .await
     }
 
+    /// Stop the calling orchestrator's whole tree, or the branch of one of
+    /// its sessions. The engine stops what its device hosts and names the
+    /// rest; those are stopped on their own devices.
+    async fn stop_tree(&self, args: StopTreeArgs) -> anyhow::Result<Value> {
+        let caller = self.tree_origin(STOP_TREE)?;
+        let (chat_id, scope) = match args.chat.as_deref() {
+            None => {
+                anyhow::ensure!(
+                    zeron_proto::orchestrator::is_root_chat(&caller),
+                    "Only the orchestrator can stop its whole tree. Name a session below you with chat."
+                );
+                (caller.clone(), "tree")
+            }
+            Some(key) => {
+                let chat = self.zeron.resolve_chat(key).await?;
+                anyhow::ensure!(chat.id != caller, "You cannot stop yourself.");
+                (chat.id, "subtree")
+            }
+        };
+        let params = json!({
+            "chatId": chat_id,
+            "scope": scope,
+            "hold": args.hold.unwrap_or(true),
+            "caller": caller,
+        });
+        let mut report = self
+            .zeron
+            .call(zeron_rpc::methods::STOP_TREE, params.clone())
+            .await?;
+        // Sessions another device hosts are stopped there, one call per device.
+        let mut by_device: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for remote in report["remote"].as_array().into_iter().flatten() {
+            if let (Some(chat), Some(device)) =
+                (remote["chatId"].as_str(), remote["deviceId"].as_str())
+            {
+                by_device
+                    .entry(device.to_owned())
+                    .or_default()
+                    .push(chat.to_owned());
+            }
+        }
+        report["remote"] = json!([]);
+        for (device, chats) in by_device {
+            let mut follow_up = params.clone();
+            follow_up["only"] = json!(chats);
+            follow_up["targetDeviceId"] = json!(device);
+            match self
+                .zeron
+                .call(zeron_rpc::methods::STOP_TREE, follow_up)
+                .await
+            {
+                Ok(more) => merge_stop_reports(&mut report, more),
+                Err(error) => {
+                    for chat in chats {
+                        push_to(
+                            &mut report["remaining"],
+                            json!({
+                                "chatId": chat,
+                                "reason": format!("device {device} could not be reached: {error}"),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+        let count = |key: &str| report[key].as_array().map_or(0, Vec::len);
+        let summary = format!(
+            "Stopped {} session(s), cleared {} queued message(s); {} still running.{}",
+            count("stopped"),
+            report["queuedCleared"].as_u64().unwrap_or(0),
+            count("remaining"),
+            if report["held"] == true {
+                " The tree is held: start and send nothing until the user resumes it."
+            } else {
+                ""
+            }
+        );
+        report["summary"] = json!(summary);
+        Ok(report)
+    }
+
     async fn project_read(&self) -> anyhow::Result<Value> {
         let chat_id = self.tree_origin(PROJECT_READ)?;
         self.zeron
@@ -2580,6 +2715,31 @@ mod tests {
                         "ahead": 1, "behind": 0, "conflictCheck": "clean", "conflicts": [],
                     }))
                 }
+                methods::STOP_TREE => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    if params["targetDeviceId"].is_null() {
+                        // This engine stops what its device hosts and names the rest.
+                        let remote: Vec<Value> = self
+                            .extra_chats
+                            .iter()
+                            .filter(|chat| chat["deviceId"] == "dev-remote")
+                            .map(|chat| json!({ "chatId": chat["id"], "deviceId": "dev-remote" }))
+                            .collect();
+                        RpcReply::Value(json!({
+                            "stopped": [{ "chatId": "member-a" }], "alreadyIdle": [],
+                            "queuedCleared": 2, "held": params["hold"],
+                            "remaining": [], "remote": remote,
+                        }))
+                    } else {
+                        RpcReply::Value(json!({
+                            "stopped": [{ "chatId": params["only"][0] }], "alreadyIdle": [],
+                            "queuedCleared": 1, "held": true, "remaining": [], "remote": [],
+                        }))
+                    }
+                }
                 methods::ORCHESTRATOR_MEMORY | methods::UPDATE_ORCHESTRATOR_PROJECT => {
                     self.writes
                         .lock()
@@ -2947,6 +3107,67 @@ mod tests {
         assert_eq!(read["returned"], 1);
         assert_eq!(read["olderRemaining"], 1);
         assert_eq!(read["messages"][0]["id"], "a1");
+    }
+
+    #[tokio::test]
+    async fn list_chats_reports_the_worktree_the_agent_runs_in_not_the_project_folder() {
+        let world = Arc::new(World {
+            extra_chats: vec![
+                json!({
+                    "id": "wt-writer", "deviceId": "dev-local", "title": "Writer",
+                    "archived": false, "spaceId": "space-1",
+                    "cwd": "/repo/comet-wt/x", "branch": "zeron/x",
+                    "createdAt": "2026-09-04T00:00:00Z",
+                    "sourceContext": {
+                        "checkoutId": "c1", "repoRoot": "/repo/comet-wt/x",
+                        "cwd": "/repo/comet-wt/x", "branch": "feature/x",
+                        "observedAt": "2026-09-04T00:00:00Z",
+                    },
+                }),
+                json!({
+                    "id": "main-reader", "deviceId": "dev-local", "title": "Reader",
+                    "archived": false, "spaceId": "space-1",
+                    "createdAt": "2026-09-04T00:00:00Z",
+                    "sourceContext": {
+                        "checkoutId": "c2", "repoRoot": "/repo/comet", "cwd": "/repo/comet",
+                        "branch": "main", "observedAt": "2026-09-04T00:00:00Z",
+                    },
+                }),
+            ],
+            ..Default::default()
+        });
+        let listed = tools(world, Origin::default())
+            .call("list_chats", json!({}))
+            .await
+            .unwrap();
+        let find = |id: &str| {
+            listed["chats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|chat| chat["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let writer = find("wt-writer");
+        assert_eq!(writer["cwd"], "/repo/comet-wt/x");
+        assert_eq!(writer["cwdKind"], "worktree");
+        assert_eq!(writer["worktree"], true);
+        assert_eq!(writer["branch"], "feature/x");
+        assert_eq!(writer["branchSource"], "run start");
+        assert_eq!(
+            writer["project"]["path"], "/repo/comet",
+            "the original folder"
+        );
+        // A chat in the main checkout used to list no branch at all.
+        let reader = find("main-reader");
+        assert_eq!(reader["cwdKind"], "project folder");
+        assert_eq!(reader["worktree"], false);
+        assert_eq!(reader["branch"], "main");
+        // One that has not run has only its project folder to show.
+        let alpha = find("chat-alpha-1");
+        assert_eq!(alpha["cwd"], "/repo/comet");
+        assert_eq!(alpha["branch"], Value::Null);
     }
 
     #[tokio::test]
@@ -3791,6 +4012,112 @@ mod tests {
         assert_eq!(calls[2]["member"], "member-b");
         assert_eq!(calls[2]["base"], "dev");
         assert!(world.writes.lock().unwrap().is_empty(), "read-only");
+    }
+
+    fn stop_calls(world: &Arc<World>) -> Vec<Value> {
+        world
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == methods::STOP_TREE)
+            .map(|(_, params)| params.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stop_tree_is_offered_only_inside_a_chat() {
+        let world = orchestrator_world(false, Vec::new());
+        assert!(!tools(world.clone(), Origin::default()).has("stop_tree"));
+        assert!(from(&world, "orchestrator-root").has("stop_tree"));
+        let outside = tools(world.clone(), Origin::default())
+            .call("stop_tree", json!({}))
+            .await
+            .unwrap_err();
+        assert!(outside.contains("orchestrator's tree"), "{outside}");
+    }
+
+    #[tokio::test]
+    async fn only_an_orchestrator_stops_its_whole_tree_and_a_member_only_a_branch() {
+        let world = orchestrator_world(false, Vec::new());
+        let refused = from(&world, "member-a")
+            .call("stop_tree", json!({}))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("Only the orchestrator"), "{refused}");
+        assert!(stop_calls(&world).is_empty(), "refused before any call");
+
+        let root = from(&world, "orchestrator-root");
+        let report = root.call("stop_tree", json!({})).await.unwrap();
+        assert!(
+            report["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stopped 1 session(s), cleared 2 queued message(s); 0 still running."),
+            "{report}"
+        );
+        root.call("stop_tree", json!({ "chat": "member-b", "hold": false }))
+            .await
+            .unwrap();
+        let calls = stop_calls(&world);
+        assert_eq!(
+            calls[0],
+            json!({
+                "chatId": "orchestrator-root", "scope": "tree", "hold": true,
+                "caller": "orchestrator-root",
+            })
+        );
+        assert_eq!(
+            calls[1],
+            json!({
+                "chatId": "member-b", "scope": "subtree", "hold": false,
+                "caller": "orchestrator-root",
+            })
+        );
+        // Never itself.
+        let itself = from(&world, "member-a")
+            .call("stop_tree", json!({ "chat": "member-a" }))
+            .await
+            .unwrap_err();
+        assert!(itself.contains("cannot stop yourself"), "{itself}");
+        assert_eq!(stop_calls(&world).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stop_tree_follows_up_on_each_remote_device_once() {
+        let config = json!({ "harness": "claude-code", "model": null, "reasoning": null, "sandbox": "workspace-write" });
+        let chat = |id: &str, parent: Option<&str>, device: &str| {
+            json!({
+                "id": id, "deviceId": device, "title": id, "archived": false,
+                "spaceId": "space-1", "createdAt": "2026-09-03T00:00:00Z",
+                "parentChatId": parent, "config": config,
+            })
+        };
+        let world = Arc::new(World {
+            extra_chats: vec![
+                chat("orchestrator-root", None, "dev-local"),
+                chat("member-a", Some("orchestrator-root"), "dev-local"),
+                chat("far-1", Some("orchestrator-root"), "dev-remote"),
+                chat("far-2", Some("far-1"), "dev-remote"),
+            ],
+            ..Default::default()
+        });
+        let report = from(&world, "orchestrator-root")
+            .call("stop_tree", json!({}))
+            .await
+            .unwrap();
+        let calls = stop_calls(&world);
+        assert_eq!(calls.len(), 2, "this engine, then the remote device once");
+        assert!(calls[0]["targetDeviceId"].is_null());
+        assert_eq!(calls[1]["targetDeviceId"], "dev-remote");
+        assert_eq!(calls[1]["only"], json!(["far-1", "far-2"]));
+        assert_eq!(report["stopped"].as_array().unwrap().len(), 2);
+        assert_eq!(report["queuedCleared"], 3);
+        assert_eq!(
+            report["remote"],
+            json!([]),
+            "followed up, nothing left to do"
+        );
     }
 
     #[tokio::test]

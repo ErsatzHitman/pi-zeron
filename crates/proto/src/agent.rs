@@ -713,6 +713,14 @@ pub enum ErrorClass {
     },
     ProviderOverloaded,
     SessionGone,
+    /// The agent process was ended by a signal it did not choose. SIGKILL
+    /// (`signal` 9) is `oom_suspected`: the out-of-memory killer, or a memory
+    /// limit, is how a process most often dies that way.
+    #[serde(rename_all = "camelCase")]
+    ProcessKilled {
+        signal: i32,
+        oom_suspected: bool,
+    },
     Other,
 }
 
@@ -725,6 +733,7 @@ impl ErrorClass {
             ErrorClass::AuthRequired { .. } => "authRequired",
             ErrorClass::ProviderOverloaded => "providerOverloaded",
             ErrorClass::SessionGone => "sessionGone",
+            ErrorClass::ProcessKilled { .. } => "processKilled",
             ErrorClass::Other => "other",
         }
     }
@@ -770,6 +779,14 @@ impl ErrorClass {
             }
             ErrorClass::SessionGone => {
                 "Pi no longer has this session; start a new chat".to_string()
+            }
+            ErrorClass::ProcessKilled {
+                oom_suspected: true,
+                ..
+            } => "Pi was killed by the system (SIGKILL), most likely out of memory.                   Free memory or raise the limit, then ask it to continue."
+                .to_string(),
+            ErrorClass::ProcessKilled { signal, .. } => {
+                format!("Pi was ended by signal {signal}; ask it to continue")
             }
             ErrorClass::Other => return None,
         })
@@ -1026,6 +1043,31 @@ mod tests {
         assert!(ErrorClass::ProviderOverloaded.hint().is_some());
         assert!(ErrorClass::SessionGone.hint().is_some());
         assert_eq!(ErrorClass::Other.hint(), None);
+    }
+
+    #[test]
+    fn a_killed_process_class_round_trips_and_says_what_to_do() {
+        let killed = ErrorClass::ProcessKilled {
+            signal: 9,
+            oom_suspected: true,
+        };
+        assert_eq!(killed.slug(), "processKilled");
+        let json = serde_json::to_value(&killed).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "processKilled", "signal": 9, "oomSuspected": true})
+        );
+        assert_eq!(serde_json::from_value::<ErrorClass>(json).unwrap(), killed);
+        assert!(killed.hint().unwrap().contains("out of memory"));
+        let crash = ErrorClass::ProcessKilled {
+            signal: 11,
+            oom_suspected: false,
+        };
+        let hint = crash.hint().unwrap();
+        assert!(
+            hint.contains("signal 11") && !hint.contains("memory"),
+            "{hint}"
+        );
     }
 
     #[test]

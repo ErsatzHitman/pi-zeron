@@ -736,7 +736,20 @@ impl Shell {
         let now = Utc::now();
         let todo_cache = &mut self.session_panel.todo_cache;
         let agent_cache = &mut self.session_panel.agent_cache;
-        let (chat, device, local, online, project, branch, status, started, goal, agents, todos) = {
+        let (
+            chat,
+            device,
+            local,
+            online,
+            project,
+            branch,
+            location,
+            status,
+            started,
+            goal,
+            agents,
+            todos,
+        ) = {
             let state = self.state.read(cx);
             let chat = state.selected_chat_row()?.clone();
             let device: SharedString = state
@@ -756,10 +769,18 @@ impl Shell {
                         space.path.clone(),
                     )
                 });
-            let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
-                .map(str::trim)
-                .filter(|branch| !branch.is_empty())
-                .map(|branch| SharedString::from(branch.to_owned()));
+            let location = zeron_proto::view::session_location(&chat, state.space_for_chat(&chat));
+            // Only the conversation's own branch: the run's, or the one its
+            // worktree was made on. A scalar branch from a shared checkout may
+            // describe another chat's state.
+            let branch = location
+                .branch
+                .clone()
+                .filter(|_| {
+                    location.branch_source == Some(zeron_proto::view::BranchSource::RunStart)
+                        || location.is_worktree()
+                })
+                .map(SharedString::from);
             let status = state.display_status_for(&chat, now);
             let started = state.session_for(&chat.id).and_then(|s| s.started_at);
             let goal = state
@@ -783,7 +804,8 @@ impl Shell {
                 || todos::written_this_turn(&state.transcript),
             );
             (
-                chat, device, local, online, project, branch, status, started, goal, agents, todos,
+                chat, device, local, online, project, branch, location, status, started, goal,
+                agents, todos,
             )
         };
         self.ensure_session_diff_watch(&chat, cx);
@@ -805,7 +827,6 @@ impl Shell {
                     .text_color(theme.warning.opacity(0.8)),
             )
         });
-        let project_path = project.as_ref().map(|(_, path)| path.clone());
         let project_row = match project {
             Some((name, path)) => info_row(
                 &theme,
@@ -818,9 +839,12 @@ impl Shell {
             None => info_row(&theme, row_glyph(icons::HOME, &theme), "No project".into())
                 .into_any_element(),
         };
-        // The folder the agent works in; a worktree says so.
-        let directory_row = chat.cwd.clone().or(project_path.clone()).map(|cwd| {
-            let worktree = project_path.as_deref().is_some_and(|path| path != cwd);
+        // The folder the agent works in, not the project's; a worktree says so
+        // (a writer's is made on its first run, and until then it is the
+        // project folder it will branch from).
+        let directory_row = location.cwd.clone().map(|cwd| {
+            let worktree = location.is_worktree();
+            let pending = location.cwd_kind == zeron_proto::view::CwdKind::PendingWorktree;
             info_row(
                 &theme,
                 row_glyph(
@@ -837,7 +861,14 @@ impl Shell {
             .debug_selector(|| "session-info-directory".into())
             .tooltip(crate::settings::widgets::text_tooltip(cwd))
             .when(worktree, |row| {
-                row.child(trailing_text("Worktree", theme.text_muted.opacity(0.7)))
+                row.child(trailing_text(
+                    if pending {
+                        "Worktree on first run"
+                    } else {
+                        "Worktree"
+                    },
+                    theme.text_muted.opacity(0.7),
+                ))
             })
         });
         let session_row = self.render_session_row(&chat, status, started, &theme, cx);

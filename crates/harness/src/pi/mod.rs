@@ -272,6 +272,9 @@ impl PiHarness {
             guard::configure(&mut cmd, &setting())?;
         }
         let mut child = Child::new(cmd.spawn()?);
+        // Read now, while /proc/<pid> exists: it tells an out-of-memory kill
+        // from any other SIGKILL once this Pi dies.
+        let oom = child.id().and_then(crate::process::exit::OomWatch::start);
         let tail = crate::StderrTail::default();
         let mut lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
         let stderr = tail.clone();
@@ -300,6 +303,9 @@ impl PiHarness {
             stderr_task,
             dialogs: Default::default(),
             exit_deadline: None,
+            exit: None,
+            oom,
+            started: tokio::time::Instant::now(),
         })
     }
 }
@@ -320,6 +326,10 @@ struct Process {
     stderr_task: tokio::task::JoinHandle<()>,
     dialogs: ui::Dialogs,
     exit_deadline: Option<tokio::time::Instant>,
+    /// How the child ended, once it was reaped.
+    exit: Option<std::process::ExitStatus>,
+    oom: Option<crate::process::exit::OomWatch>,
+    started: tokio::time::Instant,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -340,12 +350,27 @@ impl Process {
                     }
                 } => return Err(HarnessError::Protocol("Pi exited".into())),
                 status = self.child.wait(), if self.exit_deadline.is_none() => {
-                    status?;
+                    self.exit = Some(status?);
                     self.exit_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(100));
                 }
                 frame = self.transport.incoming.recv() => return frame.unwrap_or_else(|| Err(HarnessError::Protocol("Pi disconnected".into()))),
             }
         }
+    }
+    /// How the child ended. A death seen only as a closed pipe may not be
+    /// reaped yet, so `settle` allows it a moment to be.
+    async fn exit_status(&mut self, settle: Duration) -> Option<std::process::ExitStatus> {
+        if self.exit.is_none() {
+            self.exit = match self.child.try_wait() {
+                Ok(Some(status)) => Some(status),
+                _ if settle.is_zero() => None,
+                _ => tokio::time::timeout(settle, self.child.wait())
+                    .await
+                    .ok()
+                    .and_then(Result::ok),
+            };
+        }
+        self.exit
     }
     async fn query(
         &mut self,
@@ -783,16 +808,53 @@ impl Harness for PiHarness {
                 _=consumer.closed()=>Ok(()),
             };
             if let Err(error) = result {
-                let status = runner.process.child.try_wait().ok().flatten();
-                let crashed = status.is_some();
-                runner.norm.fail(if crashed {
-                    crate::crash_message("Pi", status, &runner.process.tail)
-                } else {
-                    error.to_string()
-                });
-                // A process exit says nothing about Pi's session.
-                if crashed && runner.norm.class == Some(zeron_proto::ErrorClass::SessionGone) {
+                // A pipe that closed under us is usually a death not reaped yet.
+                let settle = match &error {
+                    HarnessError::Io(_) => Duration::from_millis(300),
+                    HarnessError::Protocol(text)
+                        if text == "Pi disconnected" || text == "Pi stdout closed" =>
+                    {
+                        Duration::from_millis(300)
+                    }
+                    _ => Duration::ZERO,
+                };
+                let death = runner
+                    .process
+                    .exit_status(settle)
+                    .await
+                    .map(crate::process::exit::Termination::of);
+                let message = match death {
+                    Some(death) => {
+                        let kills = runner.process.oom.as_ref().and_then(|watch| watch.kills());
+                        tracing::warn!(
+                            target: "pi_exit",
+                            signal = ?death.signal,
+                            code = ?death.code,
+                            uptime_secs = runner.process.started.elapsed().as_secs(),
+                            oom_kills = ?kills,
+                            "Pi exited unexpectedly"
+                        );
+                        crate::crash_message_with("Pi", &death.explain(kills), &runner.process.tail)
+                    }
+                    None => error.to_string(),
+                };
+                runner.norm.fail(message.clone());
+                if let Some(signal) = death.and_then(|death| death.fatal_signal()) {
+                    runner.norm.class = Some(zeron_proto::ErrorClass::ProcessKilled {
+                        signal,
+                        oom_suspected: signal == 9,
+                    });
+                } else if death.is_some()
+                    && runner.norm.class == Some(zeron_proto::ErrorClass::SessionGone)
+                {
+                    // A process exit says nothing about Pi's session.
                     runner.norm.class = Some(zeron_proto::ErrorClass::Other);
+                }
+                // Parked between turns there is no Done to carry the failure
+                // (`finish` has nothing to settle), so the stream itself says
+                // the process was lost and the engine decides what that cost.
+                if !runner.active {
+                    let _ = runner.tx.send(Err(HarnessError::Protocol(message))).await;
                 }
             }
             runner.process.shutdown(kill_grace).await;

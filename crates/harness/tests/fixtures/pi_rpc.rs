@@ -379,6 +379,13 @@ fn main() {
                     eprintln!("mock crash diagnostic");
                     std::process::exit(7);
                 }
+                // The out-of-memory killer's death: a signal, not an exit code.
+                #[cfg(unix)]
+                if text == "sigkill" {
+                    eprintln!("mock memory diagnostic");
+                    // SAFETY: signals this process only.
+                    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+                }
                 let mut queued = queue.lock().unwrap();
                 if active.load(Ordering::SeqCst) {
                     queued.push_back(text);
@@ -561,6 +568,15 @@ fn main() {
                                 std::thread::sleep(Duration::from_millis(30));
                                 emit(json!({"type":"extension_ui_request","id":"idle","method":"select",
                                     "title":"Keep the worktree?","options":["Keep","Remove"]}));
+                            });
+                        }
+                        // Dies while parked, with the turn long finished.
+                        #[cfg(unix)]
+                        if text == "idle-sigkill" {
+                            std::thread::spawn(|| {
+                                std::thread::sleep(Duration::from_millis(50));
+                                // SAFETY: signals this process only.
+                                unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
                             });
                         }
                         if text == "late-notify" {

@@ -87,6 +87,16 @@ name, goal, instructions, the memory (each note can be forgotten), and:
   waiting session of the tree. While paused, `create_chat(s)` and
   `send_message(s)` from any chat of the tree fail with a message telling the
   agent to stop and say so. **Resume** lifts it.
+- **Stop all**: stops the whole tree for good. A Stop only ends a turn; a Pi
+  runtime outlives it with its background shells and sub-agents, so this tears
+  every session's Pi process down together with those, clears every queued
+  message, and holds the tree (the pause flag) so nothing restarts or wakes by
+  itself: not the orchestrator's tools, not an outcome note, not a revival
+  after a crash. The toast says what stopped and what is still running.
+  Sessions on other devices are stopped on their devices. **Resume** lifts the
+  hold and restarts nothing; a stopped session picks its conversation up from
+  its session file on its next message. The orchestrator can do the same for
+  its own tree or one branch with `zeron_stop_tree`.
 - **Archive all**: interrupts the tree, then archives the root and every
   session it started.
 
@@ -96,4 +106,12 @@ root's row in the sidebar summarises its tree, most urgent first:
 
 RPC: `GetOrchestratorProject`, `UpdateOrchestratorProject`,
 `OrchestratorMemory`, `ControlOrchestrator {rootId, action: pause | resume |
-archive | unarchive}`.
+archive | unarchive}`, `StopTree {chatId, scope: tree | subtree, hold, only?,
+caller?}` (device-addressable; reports `stopped`, `alreadyIdle`,
+`queuedCleared`, `held`, `remaining` and `remote`).
+
+After an engine crash or reboot, a tree member whose turn was interrupted is
+continued, never replayed: its next run starts from a recovery notice that
+quotes the interrupted request and tells it to check the repository state and
+not to repeat finished steps. A held tree stays down, and a member that is not
+resumed fails and tells its parent.

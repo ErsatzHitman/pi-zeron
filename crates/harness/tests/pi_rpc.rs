@@ -102,6 +102,75 @@ async fn terminal_contract_handles_normal_errors_retries_compaction_and_consumed
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sigkilled_pi_reports_the_signal_and_an_out_of_memory_hint() {
+    use zeron_proto::ErrorClass;
+    let events = collect("sigkill").await;
+    let dones: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Done {
+                status,
+                error,
+                class,
+                ..
+            } => Some((*status, error.clone(), class.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dones.len(), 1, "{events:?}");
+    let (status, error, class) = &dones[0];
+    assert_eq!(*status, DoneStatus::Errored);
+    let error = error.as_deref().unwrap();
+    assert!(
+        error.contains("SIGKILL") && error.contains("signal 9") && error.contains("out of memory"),
+        "{error}"
+    );
+    assert_eq!(
+        *class,
+        Some(ErrorClass::ProcessKilled {
+            signal: 9,
+            oom_suspected: true
+        })
+    );
+}
+
+/// A Pi that dies between turns has no Done to carry the failure: the stream
+/// itself must say so, or the engine sees a clean end and never learns that
+/// the background work it held is gone.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pi_killed_between_turns_surfaces_an_error_event() {
+    let dir = tempfile::tempdir().unwrap();
+    // The steering sender stays open, so the runtime parks after its turn.
+    let (c, _steering, _) = controls();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "idle-sigkill"), c)
+        .await
+        .unwrap();
+    let mut finished = false;
+    let failure = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(AgentEvent::Done { .. }) => finished = true,
+                Ok(_) => {}
+                Err(error) => return Some(error.to_string()),
+            }
+        }
+        None
+    })
+    .await
+    .unwrap();
+    assert!(finished, "the turn itself completed");
+    let failure = failure.expect("the death is reported, not a silent end of the stream");
+    assert!(
+        failure.contains("SIGKILL") && failure.contains("signal 9"),
+        "{failure}"
+    );
+}
+
 #[tokio::test]
 async fn failed_runs_carry_a_failure_class() {
     use zeron_proto::ErrorClass;

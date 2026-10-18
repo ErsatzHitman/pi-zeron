@@ -60,18 +60,15 @@ pub(super) fn tree_caption(statuses: &[ChatIndicator], paused: bool) -> String {
     parts.join(" · ")
 }
 
-/// A chat's folder: its cwd, else its project's.
+/// The folder a chat works in: its worktree once it has one, else its
+/// project's.
 fn chat_folder(chat: &Chat, spaces: &[Space]) -> String {
-    chat.cwd
-        .clone()
-        .filter(|cwd| !cwd.trim().is_empty())
-        .or_else(|| {
-            let id = chat.space_id.as_deref()?;
-            spaces
-                .iter()
-                .find(|space| space.id == id)
-                .map(|space| space.path.clone())
-        })
+    let space = chat
+        .space_id
+        .as_deref()
+        .and_then(|id| spaces.iter().find(|space| space.id == id));
+    zeron_proto::view::session_location(chat, space)
+        .cwd
         .unwrap_or_default()
 }
 
@@ -813,6 +810,40 @@ mod tests {
         assert_eq!(
             tree_caption(&[AwaitingInput, AwaitingInput, Completed], false),
             "2 need you · 3 sessions"
+        );
+    }
+
+    #[test]
+    fn a_writers_worktree_gets_its_own_group_and_a_pending_one_sits_with_its_project() {
+        let root = "orchestrator-w";
+        let project: Space = serde_json::from_value(serde_json::json!({
+            "id": "space-1", "deviceId": "dev", "path": "/repo/comet", "gitDetected": true,
+            "createdAt": "2026-10-14T00:00:00Z",
+        }))
+        .unwrap();
+        let mut chats = vec![
+            chat(root, None, "/scratch", 0),
+            chat("writer-wt", Some(root), "/repo/comet-wt/x", 1),
+            chat("writer-pending", Some(root), "", 2),
+            chat("reader", Some(root), "/repo/comet", 3),
+        ];
+        for chat in &mut chats[1..] {
+            chat.space_id = Some("space-1".into());
+        }
+        let trees = orchestrator_trees(&chats, std::slice::from_ref(&project));
+        let group_of = |id: &str| {
+            trees[0]
+                .groups
+                .iter()
+                .find(|group| group.rows.iter().any(|(row, _)| row == id))
+                .map(|group| group.path.as_str())
+        };
+        assert_eq!(group_of("writer-wt"), Some("/repo/comet-wt/x"));
+        assert_eq!(group_of("writer-pending"), Some("/repo/comet"));
+        assert_eq!(group_of("reader"), Some("/repo/comet"));
+        assert_eq!(
+            folder_label("/repo/comet-wt/x", std::slice::from_ref(&project)),
+            "x"
         );
     }
 

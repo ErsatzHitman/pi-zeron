@@ -172,6 +172,7 @@ mod tests {
     }
 }
 
+pub(crate) mod exit;
 pub(crate) mod orphans;
 pub(crate) mod owned;
 pub use orphans::reap_orphans;
