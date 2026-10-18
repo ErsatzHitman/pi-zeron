@@ -124,8 +124,7 @@ impl SessionDoc {
             return Err(DocError::Schema("queued message text required".into()));
         }
         let queue = self.doc().get_movable_list("queue");
-        let map = queue.push_container(loro::LoroMap::new())?;
-        write_queued_map(&map, item)?;
+        queue.push_container(filled_queued_map(item)?)?;
         self.doc().commit();
         Ok(())
     }
@@ -142,8 +141,7 @@ impl SessionDoc {
             return Err(DocError::Schema("queued message text required".into()));
         }
         let queue = self.doc().get_movable_list("queue");
-        let map = queue.insert_container(index.min(queue.len()), loro::LoroMap::new())?;
-        write_queued_map(&map, item)?;
+        queue.insert_container(index.min(queue.len()), filled_queued_map(item)?)?;
         self.doc().commit();
         Ok(())
     }
@@ -334,6 +332,15 @@ fn index_of(queue: &loro::LoroMovableList, id: &str) -> Option<usize> {
                 )
         )
     })
+}
+
+/// The row, written before it joins the queue: attaching an empty map and
+/// filling it after would let a drain on another thread take the row in
+/// between, and the fill then fails on a deleted container.
+fn filled_queued_map(item: &QueuedMessage) -> Result<loro::LoroMap, DocError> {
+    let map = loro::LoroMap::new();
+    write_queued_map(&map, item)?;
+    Ok(map)
 }
 
 fn write_queued_map(map: &loro::LoroMap, item: &QueuedMessage) -> Result<(), DocError> {
