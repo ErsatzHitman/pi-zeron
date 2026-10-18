@@ -774,8 +774,12 @@ impl Harness for PiHarness {
                 _=consumer.closed()=>Ok(()),
             };
             if let Err(error) = result {
+                // A pipe that closed under us is usually a death not reaped yet.
                 let settle = match &error {
-                    HarnessError::Protocol(text) if text == "Pi disconnected" => {
+                    HarnessError::Io(_) => Duration::from_millis(300),
+                    HarnessError::Protocol(text)
+                        if text == "Pi disconnected" || text == "Pi stdout closed" =>
+                    {
                         Duration::from_millis(300)
                     }
                     _ => Duration::ZERO,

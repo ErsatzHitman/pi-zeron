@@ -4742,9 +4742,9 @@ mod tests {
             prompt.ends_with("> deploy the thing\n> then tag it"),
             "{prompt}"
         );
-        let long = recovery_prompt(&"x".repeat(RECOVERY_QUOTE_MAX_CHARS + 50));
+        let long = recovery_prompt(&"q".repeat(RECOVERY_QUOTE_MAX_CHARS + 50));
         assert!(long.ends_with("\n> [cut]"));
-        assert_eq!(long.matches('x').count(), RECOVERY_QUOTE_MAX_CHARS);
+        assert_eq!(long.matches('q').count(), RECOVERY_QUOTE_MAX_CHARS);
     }
 
     fn sub(title: &str, at: i64, fleet_row: Option<&str>) -> zeron_proto::RunningSubagent {
