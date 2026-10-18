@@ -21,7 +21,7 @@
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath, force?}` (refuses with `worktree_unsafe: …` unless forced); `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//!   {repoPath, worktreePath, force?}` (refuses with `worktree_unsafe: …` unless forced); `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`, then one `CheckoutDiff` per changed checkout (the array again when a checkout appears or goes)
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
 //!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows, cwd?}` → `TerminalSession`,
@@ -57,7 +57,7 @@ use base64::Engine as _;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -1931,6 +1931,73 @@ where
     .boxed()
 }
 
+/// What a `WatchCheckoutDiffs` subscriber has been sent per checkout: its
+/// checksum and when it was published.
+type SentDiffs = HashMap<String, (String, chrono::DateTime<chrono::Utc>)>;
+
+/// The frames that bring a subscriber from what it was `sent` to `next`, the
+/// watch's whole snapshot. The first frame is every checkout (an array, as
+/// ever); after it, a checkout that changed is sent alone as a single
+/// `CheckoutDiff`, and only a checkout appearing or going away resends the
+/// array, so a subscriber's copy follows removals too. Every consumer folds
+/// either shape. A snapshot that changed nothing yields no frame.
+///
+/// The watch carries every checkout's patch (up to 3 MiB each): serialising
+/// all of it for each subscriber on each change made the cost grow with
+/// checkouts times patch bytes, the way the transcript watch once did.
+fn checkout_diff_frames(
+    sent: &mut Option<SentDiffs>,
+    next: &[zeron_proto::CheckoutDiff],
+) -> Vec<serde_json::Value> {
+    let marks: SentDiffs = next
+        .iter()
+        .map(|diff| {
+            (
+                diff.checkout_id.clone(),
+                (diff.checksum.clone(), diff.updated_at),
+            )
+        })
+        .collect();
+    let frames: Vec<serde_json::Value> = match sent.as_ref() {
+        None => serde_json::to_value(next).into_iter().collect(),
+        Some(before)
+            if before.len() != marks.len() || !before.keys().all(|id| marks.contains_key(id)) =>
+        {
+            serde_json::to_value(next).into_iter().collect()
+        }
+        Some(before) => next
+            .iter()
+            .filter(|diff| before.get(&diff.checkout_id) != marks.get(&diff.checkout_id))
+            .filter_map(|diff| serde_json::to_value(diff).ok())
+            .collect(),
+    };
+    *sent = Some(marks);
+    frames
+}
+
+/// `WatchCheckoutDiffs`: the current diffs first, then one frame per change
+/// (see [`checkout_diff_frames`]).
+fn checkout_diff_stream(
+    rx: watch::Receiver<Vec<zeron_proto::CheckoutDiff>>,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold((rx, None::<SentDiffs>), |(mut rx, mut sent)| async move {
+        loop {
+            if sent.is_some() {
+                rx.changed().await.ok()?;
+            }
+            let frames = {
+                let borrowed = rx.borrow_and_update();
+                checkout_diff_frames(&mut sent, &borrowed)
+            };
+            if !frames.is_empty() {
+                return Some((frames, (rx, sent)));
+            }
+        }
+    })
+    .flat_map(futures::stream::iter)
+    .boxed()
+}
+
 /// The transcript watch as delta frames (`zeron_doc::transcript_delta`): a
 /// full `reset` first, then only changed entries per commit — the whole-Vec
 /// serialization here was the per-tick cost that scaled with transcript size.
@@ -2998,9 +3065,9 @@ impl RpcService for EngineRpc {
                 }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
-            methods::WATCH_CHECKOUT_DIFFS => {
-                Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
-            }
+            methods::WATCH_CHECKOUT_DIFFS => Ok(RpcReply::Stream(checkout_diff_stream(
+                self.diff_sync.watch_diffs(),
+            ))),
             methods::WATCH_WORKSPACE_GIT_STATUS => {
                 let request: zeron_proto::WatchWorkspaceFilesRequest = parse_params(params)?;
                 let workspace = self.workspace_files.resolve_target(&request.target).await?;
@@ -4476,6 +4543,110 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checkout_diff(id: &str, checksum: &str, published: i64) -> zeron_proto::CheckoutDiff {
+        zeron_proto::CheckoutDiff {
+            checkout_id: id.into(),
+            device_id: "dev".into(),
+            cwd: format!("/work/{id}"),
+            patch: format!("diff --git a/{id} b/{id}\n+line\n"),
+            files: Vec::new(),
+            additions: 1,
+            deletions: 0,
+            truncated: false,
+            checksum: checksum.into(),
+            updated_at: chrono::DateTime::from_timestamp(1_800_000_000 + published, 0).unwrap(),
+        }
+    }
+
+    fn three_checkouts() -> Vec<zeron_proto::CheckoutDiff> {
+        vec![
+            checkout_diff("a", "a1", 0),
+            checkout_diff("b", "b1", 0),
+            checkout_diff("c", "c1", 0),
+        ]
+    }
+
+    #[test]
+    fn checkout_diffs_open_with_every_checkout_as_one_array() {
+        let mut sent = None;
+        let frames = checkout_diff_frames(&mut sent, &three_checkouts());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].as_array().map(Vec::len), Some(3));
+        // An empty set still opens the stream.
+        let frames = checkout_diff_frames(&mut None, &[]);
+        assert_eq!(frames, [serde_json::json!([])]);
+    }
+
+    #[test]
+    fn a_changed_checkout_is_sent_alone() {
+        let mut sent = None;
+        let mut diffs = three_checkouts();
+        checkout_diff_frames(&mut sent, &diffs);
+        diffs[1] = checkout_diff("b", "b2", 5);
+        let frames = checkout_diff_frames(&mut sent, &diffs);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_object(), "one CheckoutDiff, not the array");
+        assert_eq!(frames[0]["checkoutId"], "b");
+        assert_eq!(frames[0]["checksum"], "b2");
+        // Two at once: one frame each, in the snapshot's order.
+        diffs[0] = checkout_diff("a", "a2", 6);
+        diffs[2] = checkout_diff("c", "c2", 6);
+        let frames = checkout_diff_frames(&mut sent, &diffs);
+        let ids: Vec<_> = frames.iter().map(|f| f["checkoutId"].clone()).collect();
+        assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn an_unchanged_republish_sends_nothing() {
+        let mut sent = None;
+        let diffs = three_checkouts();
+        checkout_diff_frames(&mut sent, &diffs);
+        assert!(checkout_diff_frames(&mut sent, &diffs).is_empty());
+    }
+
+    #[test]
+    fn a_checkout_appearing_or_going_resends_the_array() {
+        let mut sent = None;
+        let mut diffs = three_checkouts();
+        checkout_diff_frames(&mut sent, &diffs);
+        diffs.remove(1);
+        let frames = checkout_diff_frames(&mut sent, &diffs);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].as_array().map(Vec::len), Some(2), "a removal");
+        diffs.push(checkout_diff("d", "d1", 9));
+        let frames = checkout_diff_frames(&mut sent, &diffs);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].as_array().map(Vec::len), Some(3), "an addition");
+        // After the array, deltas resume from it.
+        diffs[0] = checkout_diff("a", "a2", 10);
+        let frames = checkout_diff_frames(&mut sent, &diffs);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_object());
+    }
+
+    #[tokio::test]
+    async fn the_checkout_diff_stream_follows_the_watch_in_deltas() {
+        let (tx, rx) = watch::channel(three_checkouts());
+        let mut stream = checkout_diff_stream(rx);
+        async fn next_frame(
+            stream: &mut BoxStream<'static, serde_json::Value>,
+        ) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("a frame in time")
+                .expect("the stream is alive")
+        }
+        let first = next_frame(&mut stream).await;
+        assert_eq!(first.as_array().map(Vec::len), Some(3));
+        // A republish of the same snapshot wakes the watch but sends nothing;
+        // the next real change is the next frame, and only that checkout.
+        tx.send_modify(|_| {});
+        tx.send_modify(|diffs| diffs[2] = checkout_diff("c", "c2", 3));
+        let frame = next_frame(&mut stream).await;
+        assert!(frame.is_object());
+        assert_eq!(frame["checkoutId"], "c");
+    }
 
     #[tokio::test]
     async fn voice_owner_is_shared_across_services_and_shutdown_retires_it() {

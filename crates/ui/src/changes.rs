@@ -964,20 +964,42 @@ pub fn clean_message(scope: DiffScope, base: Option<&str>) -> String {
     }
 }
 
-/// Fold a `WatchCheckoutDiffs` frame into the diff set. Accepts either a full
-/// list (replace) or a single `CheckoutDiff` (upsert by checkout id) — the
-/// contract streams `CheckoutDiff` items, but list frames cost nothing to
-/// support. Returns whether anything changed.
-pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value) -> bool {
-    if let Ok(all) = serde_json::from_value::<Vec<CheckoutDiff>>(value.clone()) {
-        if *diffs != all {
-            *diffs = all;
-            return true;
-        }
-        return false;
+/// One `WatchCheckoutDiffs` frame, parsed: every checkout (replace), or one
+/// (upsert by checkout id). The engine opens with the full list and then sends
+/// each changed checkout alone; an older engine sends the list every time.
+pub enum DiffFrame {
+    All(Vec<CheckoutDiff>),
+    One(CheckoutDiff),
+}
+
+impl DiffFrame {
+    /// Parse a frame. Patches run to megabytes: call this off the foreground
+    /// thread. `None` for a frame that is neither shape.
+    pub fn decode(value: serde_json::Value) -> Option<Self> {
+        let parsed = if value.is_array() {
+            serde_json::from_value(value).map(Self::All)
+        } else {
+            serde_json::from_value(value).map(Self::One)
+        };
+        parsed
+            .inspect_err(
+                |err| tracing::warn!(error = %err, "changes: dropping malformed diff frame"),
+            )
+            .ok()
     }
-    match serde_json::from_value::<CheckoutDiff>(value) {
-        Ok(one) => {
+}
+
+/// Fold a parsed frame into the diff set. Returns whether anything changed.
+pub fn apply_diff(diffs: &mut Vec<CheckoutDiff>, frame: DiffFrame) -> bool {
+    match frame {
+        DiffFrame::All(all) => {
+            if *diffs != all {
+                *diffs = all;
+                return true;
+            }
+            false
+        }
+        DiffFrame::One(one) => {
             if let Some(existing) = diffs.iter_mut().find(|d| d.checkout_id == one.checkout_id) {
                 if *existing == one {
                     return false;
@@ -987,10 +1009,6 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
                 diffs.push(one);
             }
             true
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "changes: dropping malformed diff frame");
-            false
         }
     }
 }
@@ -1886,9 +1904,17 @@ impl Changes {
                 match subscribed {
                     Ok(mut rx) => {
                         while let Some(value) = rx.recv().await {
+                            // A frame can carry megabytes of patch: parse it
+                            // off the foreground thread.
+                            let frame = cx
+                                .background_executor()
+                                .spawn(async move { DiffFrame::decode(value) })
+                                .await;
                             let alive = this.update(cx, |changes, cx| {
                                 changes.error = None;
-                                if apply_diff_frame(&mut changes.diffs, value) {
+                                if let Some(frame) = frame
+                                    && apply_diff(&mut changes.diffs, frame)
+                                {
                                     changes.sync(cx);
                                     cx.notify();
                                 }
@@ -6274,6 +6300,38 @@ rename to new_name.rs
             ]
         );
         assert!(!DiffScope::ALL.contains(&DiffScope::History));
+    }
+
+    /// A raw watch frame, decoded and folded in as the pane does.
+    fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value) -> bool {
+        DiffFrame::decode(value).is_some_and(|frame| apply_diff(diffs, frame))
+    }
+
+    #[test]
+    fn a_diff_frame_is_an_array_or_one_checkout() {
+        let one = diff("co-1", "d", "/w", "p1");
+        assert!(matches!(
+            DiffFrame::decode(serde_json::to_value(&one).unwrap()),
+            Some(DiffFrame::One(parsed)) if parsed == one
+        ));
+        assert!(matches!(
+            DiffFrame::decode(serde_json::to_value(vec![one.clone()]).unwrap()),
+            Some(DiffFrame::All(all)) if all == [one.clone()]
+        ));
+        assert!(DiffFrame::decode(serde_json::json!([{"nope": true}])).is_none());
+        assert!(DiffFrame::decode(serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn a_three_megabyte_patch_frame_folds_in_and_repeats_as_a_no_op() {
+        let patch = "+a line of a very large patch\n".repeat(3 * 1024 * 1024 / 30);
+        let big = diff("co-big", "d", "/w", &patch);
+        let mut diffs = vec![diff("co-small", "d", "/x", "q")];
+        let frame = serde_json::to_value(&big).unwrap();
+        assert!(apply_diff_frame(&mut diffs, frame.clone()));
+        assert_eq!(diffs.len(), 2);
+        assert_eq!(diffs[1].patch.len(), patch.len());
+        assert!(!apply_diff_frame(&mut diffs, frame));
     }
 
     #[test]
