@@ -1022,13 +1022,19 @@ async fn a_crash_redispatches_every_unconsumed_steered_message_in_order() {
         .expect("engine core assembles");
 
     // An auto-title request may also reach the harness; only the user
-    // messages matter here.
+    // messages matter here. The revived turn starts from the recovery notice
+    // quoting the first unconsumed message, never that message as if new.
     let sent = |log: &Arc<Mutex<Vec<String>>>| -> Vec<String> {
         log.lock()
             .unwrap()
             .iter()
-            .filter(|p| matches!(p.as_str(), "first" | "second" | "third"))
-            .cloned()
+            .filter_map(|p| match p.as_str() {
+                "first" | "second" | "third" => Some(p.clone()),
+                _ => ["first", "second", "third"]
+                    .into_iter()
+                    .find(|request| is_recovery_of(p, request))
+                    .map(|request| format!("recovery of {request}")),
+            })
             .collect()
     };
     wait_for(
@@ -1039,7 +1045,7 @@ async fn a_crash_redispatches_every_unconsumed_steered_message_in_order() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         sent(&log),
-        ["second", "third"],
+        ["recovery of second", "third"],
         "the first restarts the turn, the second steers in behind it"
     );
     let ids: Vec<String> = entries_now(&core)
@@ -1048,10 +1054,11 @@ async fn a_crash_redispatches_every_unconsumed_steered_message_in_order() {
         .map(|e| e.id)
         .collect();
     assert_eq!(
-        ids,
+        ids[..3],
         ["msg-user-1", "msg-user-2", "msg-user-3"],
         "re-sending reuses the transcript entries"
     );
+    assert_eq!(ids.len(), 4, "the recovery notice is the one new message");
     core.shutdown().await;
 }
 
