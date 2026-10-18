@@ -540,8 +540,10 @@ the advisor or a fallback.
 
 Settings → General → Default subagent picks the agent every child an agent
 starts runs on when the call names none of its own: `subagent_start` tasks,
-dynamic-workflow agents (an `agent()` with neither `model` nor `tier`) and
-delegated sessions. It applies in every session: a plain chat, an
+dynamic-workflow agents (an `agent()` with neither `model` nor `tier`),
+delegated sessions, and Pi sessions an orchestrator or agent creates with
+`zeron_create_chat` without a `model` (when the device offers that model;
+`reasoning` falls back to the thinking row the same way). It applies in every session: a plain chat, an
 orchestrator's root, its members and their sub-sessions. The model row uses
 the composer's model picker held to Pi; the thinking row offers Pi's levels or
 the model's own default. The engine writes `defaultModel` and

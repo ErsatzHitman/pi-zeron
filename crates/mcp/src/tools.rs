@@ -1485,7 +1485,7 @@ impl Tools {
         Ok(summary)
     }
 
-    async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+    async fn create_chat(&self, mut args: CreateChatArgs) -> anyhow::Result<Value> {
         ensure_prompt_fits("prompt", args.prompt.as_deref().unwrap_or_default())?;
         // An orchestrator's tree may grow sessions below sessions; elsewhere
         // only a top-level chat starts side chats.
@@ -1615,6 +1615,24 @@ impl Tools {
                 }
             },
         };
+        // A Pi session that names no model is a child like any other: it runs
+        // on the device's default subagent (Settings → General), when one is
+        // set and offered there.
+        if args.model.is_none()
+            && harness == HarnessId::Pi
+            && let Some((model, thinking)) = self.default_subagent(&device_id).await
+            && self
+                .zeron
+                .models_on(harness, Some(&device_id))
+                .await?
+                .iter()
+                .any(|m| m.id == model)
+        {
+            args.model = Some(model);
+            if args.reasoning.is_none() {
+                args.reasoning = thinking;
+            }
+        }
         if let Some(model) = args.model.as_deref() {
             let models = self.zeron.models_on(harness, Some(&device_id)).await?;
             anyhow::ensure!(
@@ -2417,6 +2435,24 @@ impl Tools {
 
     /// `create_chat` named a folder that is not a project yet: register it,
     /// when the engine finds exactly one folder for the path or short name.
+    /// The device's default subagent (`GetSubagentSettings`): its model and
+    /// thinking level. None when unset or unreadable; a device that cannot
+    /// say leaves the harness default in place.
+    async fn default_subagent(&self, device_id: &str) -> Option<(String, Option<String>)> {
+        let reply = self
+            .zeron
+            .call(
+                zeron_rpc::methods::GET_SUBAGENT_SETTINGS,
+                json!({ "targetDeviceId": device_id }),
+            )
+            .await
+            .inspect_err(|error| tracing::debug!(%error, "default subagent unavailable"))
+            .ok()?;
+        let model = reply["model"].as_str()?.to_owned();
+        let thinking = reply["thinking"].as_str().map(str::to_owned);
+        Some((model, thinking))
+    }
+
     async fn register_for_create(
         &self,
         args: &CreateChatArgs,
@@ -3036,6 +3072,8 @@ mod tests {
         preflight: Option<Value>,
         /// Set once `RegisterProject` has added its project to the list.
         registered: std::sync::atomic::AtomicBool,
+        /// What `GetSubagentSettings` answers; set, Pi is offered too.
+        subagent_default: Option<Value>,
     }
 
     /// The project `RegisterProject` finds for "t3code".
@@ -3231,12 +3269,25 @@ mod tests {
                     {"id":"codex", "name":"Remote Codex", "installed":true},
                     {"id":"cursor", "name":"Disabled Cursor", "installed":true, "enabled":false}
                 ])),
-                methods::LIST_HARNESSES => RpcReply::Value(json!([
-                    { "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
-                      "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true },
-                    { "id": "codex", "name": "Codex", "supportsSteering": true,
-                      "steeringMode": "turn-boundary", "reasoningLevels": [], "installed": false, "enabled": true }
-                ])),
+                methods::LIST_HARNESSES => {
+                    let mut harnesses = json!([
+                        { "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
+                          "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true },
+                        { "id": "codex", "name": "Codex", "supportsSteering": true,
+                          "steeringMode": "turn-boundary", "reasoningLevels": [], "installed": false, "enabled": true }
+                    ]);
+                    if self.subagent_default.is_some() {
+                        harnesses.as_array_mut().unwrap().push(json!(
+                            { "id": "pi", "name": "Pi", "supportsSteering": true,
+                              "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true }
+                        ));
+                    }
+                    RpcReply::Value(harnesses)
+                }
+                methods::GET_SUBAGENT_SETTINGS => match &self.subagent_default {
+                    Some(settings) => RpcReply::Value(settings.clone()),
+                    None => return Err(RpcError::UnknownMethod(method.into())),
+                },
                 methods::LIST_MODELS if remote => RpcReply::Value(json!([
                     {"id":"remote-model", "label":"Remote model"}
                 ])),
@@ -4861,6 +4912,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(own["project"]["id"], "space-1");
+    }
+
+    #[tokio::test]
+    async fn a_pi_session_without_a_model_runs_on_the_default_subagent() {
+        let create = |world: &Arc<World>, args: Value| {
+            let tools = tools(world.clone(), Origin::default());
+            async move { tools.call("create_chat", args).await.unwrap() }
+        };
+        let world = Arc::new(World {
+            subagent_default: Some(json!({ "model": "sonnet", "thinking": "high" })),
+            ..World::default()
+        });
+        let created = create(&world, json!({ "harness": "pi" })).await;
+        assert_eq!(created["model"], "sonnet");
+        assert_eq!(created["reasoning"], "high");
+        // What the caller names wins.
+        let created = create(
+            &world,
+            json!({ "harness": "pi", "model": "opus", "reasoning": "low" }),
+        )
+        .await;
+        assert_eq!(created["model"], "opus");
+        assert_eq!(created["reasoning"], "low");
+        let created = create(&world, json!({ "harness": "pi", "reasoning": "minimal" })).await;
+        assert_eq!(created["model"], "sonnet");
+        assert_eq!(created["reasoning"], "minimal");
+        // Another harness keeps its own default.
+        let created = create(&world, json!({})).await;
+        assert_eq!(created["harness"], "claude-code");
+        assert!(created["model"].is_null(), "{created}");
+        // A default the device does not offer, or none at all, is no default.
+        for default in [json!({ "model": "x/gone" }), json!({ "model": null })] {
+            let world = Arc::new(World {
+                subagent_default: Some(default),
+                ..World::default()
+            });
+            let created = create(&world, json!({ "harness": "pi" })).await;
+            assert!(created["model"].is_null(), "{created}");
+        }
     }
 
     #[tokio::test]
