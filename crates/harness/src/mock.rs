@@ -99,6 +99,15 @@ impl Harness for MockHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.run(request, controls).await
     }
+    async fn run_isolated(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+        _instructions: &'static str,
+        _usage_surface: &'static str,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run(request, controls).await
+    }
 
     async fn run(
         &self,

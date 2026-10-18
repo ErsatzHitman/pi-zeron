@@ -842,6 +842,7 @@ pub struct EngineRpc {
     updater: Option<zeron_update::Updater>,
     harness_updates: Option<crate::harness_updates::HarnessUpdateCoordinator>,
     usage: Option<crate::usage::UsageTracker>,
+    recaps: Option<crate::recap::RecapGenerator>,
     local_import: Option<crate::local_import::LocalImporter>,
     engine_info: EngineInfo,
 }
@@ -891,9 +892,16 @@ impl EngineRpc {
             updater: None,
             harness_updates: None,
             usage: None,
+            recaps: None,
             local_import: None,
             engine_info,
         }
+    }
+
+    /// Attach the recap generator (RecapChat).
+    pub fn with_recaps(mut self, recaps: crate::recap::RecapGenerator) -> Self {
+        self.recaps = Some(recaps);
+        self
     }
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
@@ -1447,6 +1455,9 @@ impl EngineRpc {
             .delete_chat(chat_id)
             .map_err(|e| RpcError::Failed(e.to_string()))?;
         self.doc_host.purge_chat(chat_id);
+        if let Some(recaps) = &self.recaps {
+            recaps.forget(chat_id);
+        }
         // Its live runtime goes with it: one that lives as long as the app
         // (Pi) is never reaped idle and would outlive it.
         let sessions = self.sessions.clone();
@@ -1514,9 +1525,13 @@ impl EngineRpc {
                 // write into an orphaned session doc).
                 let sessions = self.sessions.clone();
                 let doc_host = self.doc_host.clone();
+                let recaps = self.recaps.clone();
                 let chat_ids = deleted.chat_ids;
                 tokio::spawn(async move {
                     for chat_id in chat_ids {
+                        if let Some(recaps) = &recaps {
+                            recaps.forget(&chat_id);
+                        }
                         if let Err(err) = sessions.terminate(&chat_id).await {
                             tracing::debug!(chat = %chat_id, error = %err, "deleteSpace teardown skipped");
                         }
@@ -1772,6 +1787,8 @@ fn forwardable(method: &str) -> bool {
             | methods::EXTENSION_UI_ACTION
             // Pi's session and its file snapshots live on the host.
             | methods::REWIND_CHAT
+            // A recap is written by, and cached on, the chat's host.
+            | methods::RECAP_CHAT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
@@ -2588,6 +2605,33 @@ impl RpcService for EngineRpc {
                     crate::rewind::rewind(&self.workspace, &self.sessions, &self.doc_host, p)
                         .await
                         .map_err(RpcError::Failed)?;
+                RpcReply::value(&outcome)
+            }
+            methods::RECAP_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    chat_id: String,
+                    action: String,
+                    #[serde(default)]
+                    force: bool,
+                }
+                let p: P = parse_params(params)?;
+                let action = match p.action.as_str() {
+                    "get" => crate::recap::RecapAction::Get,
+                    "generate" => crate::recap::RecapAction::Generate { force: p.force },
+                    other => {
+                        return Err(RpcError::Failed(format!("unknown recap action: {other}")));
+                    }
+                };
+                let recaps = self
+                    .recaps
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("recaps are not available".into()))?;
+                let outcome = recaps
+                    .handle(&p.chat_id, action)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&outcome)
             }
             methods::EXTENSION_UI_ACTION => {
@@ -5041,6 +5085,7 @@ mod tests {
         assert!(is_stream_method(methods::WATCH_EXTENSION_UI));
         assert!(forwardable(methods::EXTENSION_UI_ACTION));
         assert!(forwardable(methods::REWIND_CHAT));
+        assert!(forwardable(methods::RECAP_CHAT));
         assert!(!is_stream_method(methods::EXTENSION_UI_ACTION));
         assert!(forwardable(methods::CHECK_HARNESS_UPDATES));
         assert!(forwardable(methods::GET_USAGE_REPORT));

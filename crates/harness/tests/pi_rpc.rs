@@ -1187,6 +1187,47 @@ async fn titles_run_in_a_bare_process_and_complete() {
 }
 
 #[tokio::test]
+async fn recap_run_uses_recap_instructions_in_a_bare_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, _tx, _) = controls();
+    let events: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness()
+            .with_delete_guard(guard(dir.path()))
+            .run_isolated(
+                request(dir.path(), "args"),
+                c,
+                zeron_harness::RECAP_INSTRUCTIONS,
+                zeron_harness::RECAP_USAGE_SURFACE,
+            )
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .unwrap();
+    let AgentEvent::TextDelta { text } = &events[0] else {
+        panic!("{events:?}");
+    };
+    for flag in ["--no-session", "--no-tools", "--no-extensions"] {
+        assert!(text.contains(flag), "{flag} missing from {text}");
+    }
+    assert!(
+        text.contains("You write a recap"),
+        "the recap instructions are the system prompt: {text}"
+    );
+    assert!(
+        !text.contains("You generate session titles"),
+        "the title instructions are not used: {text}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done { status: DoneStatus::Completed, .. })
+    ));
+}
+
+#[tokio::test]
 async fn displayed_custom_messages_become_transcript_chips() {
     let events = collect("custom").await;
     let chips: Vec<_> = events

@@ -5,15 +5,10 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use futures::StreamExt;
-
-use zeron_harness::{CancellationToken, RunControls, SteerMessage};
-use zeron_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    UserInputAnswer, UserInputQuestion,
-};
+use zeron_proto::HarnessId;
 
 use crate::EngineError;
+use crate::isolated::{IsolatedRunner, IsolatedSpec};
 use crate::registry::HarnessRegistry;
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
@@ -151,108 +146,25 @@ impl TitleGenerator {
         prompt: &str,
         _cwd: &str,
     ) -> Option<String> {
-        let settings = self.inner.registry.title_settings();
-        let enabled = self.inner.registry.enabled_set();
-        let harness_id = settings.harness.or_else(|| {
-            if zeron_harness::supports_titles(harness_id) {
-                Some(harness_id)
-            } else {
-                enabled
-                    .iter()
-                    .copied()
-                    .find(|id| zeron_harness::supports_titles(*id))
-            }
-        })?;
-        if !zeron_harness::supports_titles(harness_id) {
-            return None;
-        }
-        // Order this entire isolated subprocess against a queued update for
-        // the same CLI. The fair registry gate prevents late title work from
-        // jumping ahead of an accepted writer.
-        let execution_lease = Arc::new(self.inner.registry.execution_lease(harness_id).await);
-        // No repository instructions, files, or active coding-session context.
-        let scratch = tempfile::tempdir().ok()?;
-        let harness = match self.inner.registry.resolve(harness_id) {
-            Ok(harness) => harness,
-            Err(err) => {
-                tracing::debug!(error = %err, "titling harness unavailable");
-                return None;
-            }
-        };
-        let model = match settings.model {
-            Some(model) => Some(model),
-            None => cheapest_model(
-                &tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    self.inner
-                        .registry
-                        .discover_models_with_lease(harness_id, execution_lease.clone()),
-                )
-                .await
-                .ok()?
-                .unwrap_or_default(),
-            ),
-        };
         let title_prompt = format!(
             "{}\n\nSession request (JSON string):\n{}",
             zeron_harness::TITLE_INSTRUCTIONS,
             serde_json::to_string(prompt).ok()?
         );
-        for attempt in 0..=RETRY_DELAYS_MS.len() {
-            let request = RunRequest {
-                mcp: None,
-                prompt: title_prompt.clone(),
-                harness: Some(harness_id),
-                model: model.clone(),
-                reasoning: Some(ReasoningLevel::Minimal),
-                model_options: serde_json::Map::new(),
-                cwd: scratch.path().to_string_lossy().into_owned(),
-                sandbox: SandboxLevel::ReadOnly,
-                auto_approve: false,
-                attachments: Vec::new(),
-                resume: None,
-                worktree: None,
-            };
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                collect_text(harness.as_ref(), request, Some(execution_lease.clone())),
-            )
+        IsolatedRunner::new(self.inner.registry.clone())
+            .run(IsolatedSpec {
+                preferred: harness_id,
+                supports: zeron_harness::supports_titles,
+                instructions: zeron_harness::TITLE_INSTRUCTIONS,
+                usage_surface: "zeron-titles",
+                prompt: title_prompt,
+                timeout: std::time::Duration::from_secs(30),
+                retry_delays_ms: RETRY_DELAYS_MS,
+                noun: "title",
+                clean: clean_title,
+            })
             .await
-            .unwrap_or_else(|_| Err(EngineError::Other("title generation timed out".into())))
-            {
-                Ok(raw) => {
-                    let candidate = clean_title(&raw);
-                    if !candidate.is_empty() {
-                        return Some(candidate);
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(attempt = attempt + 1, error = %err,
-                        "automatic chat title generation attempt failed");
-                }
-            }
-            if let Some(delay) = RETRY_DELAYS_MS.get(attempt) {
-                tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
-            }
-        }
-        None
     }
-}
-
-/// The cheapest model a harness offers (zeron's `cheapestModel` heuristic):
-/// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
-/// listed model; `None` when the catalog is empty (harness picks its default).
-fn cheapest_model(models: &[Model]) -> Option<String> {
-    if models.is_empty() {
-        return None;
-    }
-    let small = models.iter().find(|m| {
-        let haystack = format!("{} {}", m.id, m.label).to_lowercase();
-        ["haiku", "mini", "nano", "flash", "small", "lite"]
-            .iter()
-            .any(|tier| haystack.contains(tier))
-    });
-    small.or(models.last()).map(|m| m.id.clone())
 }
 
 /// First line, stripped of quote/heading dressing, capped at 60 chars.
@@ -266,132 +178,12 @@ fn clean_title(raw: &str) -> String {
         .collect()
 }
 
-/// Drive one titling run through the harness: no steering, questions resolved
-/// empty immediately (a titling prompt must never block on input).
-async fn collect_text(
-    harness: &dyn zeron_harness::Harness,
-    request: RunRequest,
-    execution_lease: Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
-) -> Result<String, EngineError> {
-    let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
-    let interrupt = CancellationToken::new();
-    let _cancel_on_drop = interrupt.clone().drop_guard();
-    let controls = RunControls {
-        realtime: None,
-        execution_lease,
-        request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
-            let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
-            let _ = tx.send(Vec::new());
-            rx
-        }),
-        steering: steer_rx,
-        interrupt: interrupt.clone(),
-        turn: Default::default(),
-        extension_ui: Default::default(),
-    };
-    let mut stream = harness.run_title(request, controls).await?;
-    let mut text = String::new();
-    let mut completed = false;
-    while let Some(event) = stream.next().await {
-        match event? {
-            AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-            AgentEvent::ToolCall { .. } => {
-                return Err(EngineError::Other(
-                    "title generation attempted to use a tool".into(),
-                ));
-            }
-            AgentEvent::Error { message } => {
-                return Err(EngineError::Other(format!("titling run error: {message}")));
-            }
-            AgentEvent::Done { status, error, .. } => {
-                if status == DoneStatus::Completed {
-                    completed = true;
-                    break;
-                }
-                return Err(EngineError::Other(format!(
-                    "titling run ended {status:?}: {}",
-                    error.unwrap_or_default()
-                )));
-            }
-            _ => {}
-        }
-    }
-    drop(steer_tx); // keep the mailbox open for the run's whole lifetime
-    if completed {
-        Ok(text)
-    } else {
-        Err(EngineError::Other(
-            "title stream ended without completion".into(),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_proto::Model;
-
-    fn model(id: &str, label: &str) -> Model {
-        Model {
-            id: id.into(),
-            label: label.into(),
-            description: None,
-            reasoning_levels: vec![],
-            options: vec![],
-        }
-    }
-
-    #[test]
-    fn cheapest_prefers_small_tier_then_last() {
-        let models = vec![
-            model("opus-4", "Opus"),
-            model("haiku-3", "Haiku"),
-            model("sonnet-4", "Sonnet"),
-        ];
-        assert_eq!(cheapest_model(&models).as_deref(), Some("haiku-3"));
-        let no_small = vec![model("opus-4", "Opus"), model("sonnet-4", "Sonnet")];
-        assert_eq!(cheapest_model(&no_small).as_deref(), Some("sonnet-4"));
-        assert_eq!(cheapest_model(&[]), None);
-    }
-
-    #[tokio::test]
-    async fn tool_use_rejects_the_title_instead_of_accepting_coding_output() {
-        let harness = zeron_harness::mock::MockHarness {
-            script: vec![
-                AgentEvent::TextDelta {
-                    text: "I will change your code".into(),
-                },
-                AgentEvent::ToolCall {
-                    id: "tool".into(),
-                    call: zeron_proto::ToolCall::Unknown {
-                        name: "write".into(),
-                        input: None,
-                    },
-                },
-            ],
-        };
-        let request = RunRequest {
-            mcp: None,
-            prompt: "Title only".into(),
-            harness: None,
-            model: None,
-            reasoning: None,
-            model_options: Default::default(),
-            cwd: String::new(),
-            sandbox: SandboxLevel::ReadOnly,
-            auto_approve: false,
-            resume: None,
-            attachments: vec![],
-            worktree: None,
-        };
-        let result = collect_text(&harness, request, None).await;
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("attempted to use a tool")
-        );
-    }
+    use futures::StreamExt;
+    use zeron_harness::RunControls;
+    use zeron_proto::{AgentEvent, DoneStatus, Model, ReasoningLevel, RunRequest, SandboxLevel};
 
     struct RecordingTitleHarness(std::sync::Mutex<Vec<RunRequest>>);
 

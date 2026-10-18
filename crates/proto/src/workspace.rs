@@ -21,6 +21,9 @@ pub mod capabilities {
     /// The host serves `WatchExtensionUi`/`ExtensionUiAction` (live harness
     /// extension UI, `crate::extension_ui`).
     pub const EXTENSION_UI_V1: &str = "extension-ui-v1";
+    /// The host serves `RecapChat` (a returning reader's summary of a chat,
+    /// `crate::recap`).
+    pub const RECAP_V1: &str = "recap-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -32,6 +35,7 @@ pub mod capabilities {
         HARNESS_UPDATES_V1,
         PROJECTLESS_SCRATCH_V1,
         EXTENSION_UI_V1,
+        RECAP_V1,
         crate::voice::remote::CAPABILITY,
     ];
 
@@ -115,6 +119,7 @@ mod tests {
                     "harness-updates-v1",
                     "projectless-scratch-v1",
                     "extension-ui-v1",
+                    "recap-v1",
                     "voice-client-media-v1"
                 ],
             })

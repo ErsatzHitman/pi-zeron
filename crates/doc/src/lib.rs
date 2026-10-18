@@ -13,6 +13,7 @@ pub mod constants;
 pub mod parts;
 pub mod queue;
 pub mod rebuild;
+pub mod recap;
 pub mod registry;
 pub mod schema;
 pub mod transcript_delta;
