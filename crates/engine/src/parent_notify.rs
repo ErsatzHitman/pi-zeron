@@ -889,7 +889,7 @@ mod tests {
             error: lost.lost.clone(),
             question: None,
         };
-        let text = render_batch(&[lost_report]);
+        let (text, _) = render_batch(&[lost_report]);
         assert!(text.contains("(chat c): failed (process lost)"), "{text}");
         assert!(text.contains("Error: Pi exited unexpectedly"), "{text}");
     }
