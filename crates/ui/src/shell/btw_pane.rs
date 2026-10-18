@@ -58,6 +58,8 @@ pub(super) struct BtwPane {
     bar_height: Rc<Cell<f32>>,
     /// While the header is held: the press's offset into the pane.
     grab: Option<(f32, f32)>,
+    /// Closed by its cross: the side chat goes with it, Pi process and all.
+    delete_on_close: bool,
 }
 
 /// A fresh side chat off `parent`. Nothing is written until its first send
@@ -163,6 +165,7 @@ impl Shell {
             history_open: false,
             bar_height: Rc::new(Cell::new(0.0)),
             grab: None,
+            delete_on_close: false,
         });
         self.focus_btw(id, cx);
     }
@@ -185,6 +188,45 @@ impl Shell {
         pane.open = false;
         cx.notify();
         true
+    }
+
+    /// Close the pane for good (its cross): once the exit has played, its
+    /// side chat is deleted, which also ends its Pi process and takes it off
+    /// the session lists. One kept as a right-pane tab stays.
+    pub(super) fn delete_btw_pane(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(pane) = self.btw.as_mut().filter(|pane| pane.open) {
+            pane.delete_on_close = true;
+        }
+        self.close_btw_pane(cx)
+    }
+
+    /// The engine chat id behind side chat tab `id`, when it is a minted btw
+    /// chat no right-pane tab shows: the one a closing pane may delete.
+    fn deletable_btw_chat(&self, id: u64, cx: &App) -> Option<String> {
+        let attached = self
+            .right_tabs
+            .values()
+            .any(|tabs| tabs.contains(&RightSurface::SideChat(id)));
+        let state = self.side_chats.get(&id)?.state.read(cx);
+        (!attached && !state.side_chat_unsaved())
+            .then(|| state.selected_chat.clone())
+            .flatten()
+            .filter(|chat| chat.starts_with(zeron_proto::BTW_CHAT_PREFIX))
+    }
+
+    /// Delete btw chat `chat_id` on the engine: its row, its transcript and
+    /// its Pi process. Detached, so a mutate in flight is not cancelled.
+    fn delete_btw_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            let params = serde_json::json!({ "op": "deleteChat", "chatId": chat_id });
+            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                tracing::warn!(error = %err, "btw: deleting the closed side chat failed");
+            }
+        })
+        .detach();
     }
 
     /// Whether the pane holds side chat `id`.
@@ -294,8 +336,18 @@ impl Shell {
             .filter(|pane| pane.key == key)
             .map(|pane| (pane.side_chat, pane.open))?;
         if !open && reveal <= 0.001 {
-            self.btw = None;
-            self.release_btw_chat(id, cx);
+            let delete = self.btw.take().is_some_and(|pane| pane.delete_on_close);
+            let doomed = if delete {
+                self.deletable_btw_chat(id, cx)
+            } else {
+                None
+            };
+            if let Some(chat_id) = doomed {
+                self.side_chats.remove(&id);
+                self.delete_btw_chat(chat_id, cx);
+            } else {
+                self.release_btw_chat(id, cx);
+            }
             return None;
         }
         (reveal > 0.001).then_some((id, reveal))
@@ -440,7 +492,7 @@ impl Shell {
             .child(
                 header_button("session-btw-close", icons::CLOSE, "Close", false, &theme).on_click(
                     cx.listener(|this, _, _, cx| {
-                        this.close_btw_pane(cx);
+                        this.delete_btw_pane(cx);
                     }),
                 ),
             );

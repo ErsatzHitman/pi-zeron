@@ -521,7 +521,26 @@ impl ExtensionUiState {
         }
         jobs
     }
+
+    /// Background bash jobs (tests, builds, CI watches) running now, from
+    /// [`BASH_BG_CHANNEL`]. Their results wake the chat by themselves.
+    pub fn running_background_jobs(&self) -> u32 {
+        let running = self
+            .channels
+            .get(BASH_BG_CHANNEL)
+            .and_then(|fleet| fleet["entries"].as_array())
+            .map_or(0, |entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry["state"] == "running")
+                    .count()
+            });
+        u32::try_from(running).unwrap_or(u32::MAX)
+    }
 }
+
+/// Pi's background-bash roster channel: each job's `key`, `label` and `state`.
+pub const BASH_BG_CHANNEL: &str = "bash-bg:fleet";
 
 /// The Pi extension that publishes the sub-agent fleet roster.
 pub const FLEET_NS: &str = "subagents";
@@ -1354,6 +1373,21 @@ mod tests {
         );
         assert!(jobs.iter().all(|job| job.started_at_ms.is_none()));
         assert!(ExtensionUiState::default().running_fleet().is_empty());
+    }
+
+    #[test]
+    fn running_background_jobs_count_only_running_bash_entries() {
+        let mut ui = ExtensionUiState::default();
+        assert_eq!(ui.running_background_jobs(), 0);
+        ui.channels.insert(
+            BASH_BG_CHANNEL.into(),
+            serde_json::json!({"entries": [
+                {"key": "bg-1", "state": "running"},
+                {"key": "bg-2", "state": "completed"},
+                {"key": "bg-3", "state": "running"},
+            ]}),
+        );
+        assert_eq!(ui.running_background_jobs(), 2);
     }
 
     #[test]

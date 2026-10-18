@@ -217,6 +217,24 @@ async fn two_children_finishing_together_wake_an_idle_root_once() {
 }
 
 #[tokio::test]
+async fn a_btw_aside_does_not_notify_its_parent() {
+    let f = Fixture::new();
+    f.chat("child-a", Some(ROOT), "Fix parser");
+    f.chat("btw-aside", Some("child-a"), "Aside");
+    f.chat("btw-root", Some(ROOT), "Root aside");
+    f.run("btw-aside", "q").await;
+    f.run("btw-root", "q").await;
+    f.settle().await;
+    assert!(f.notices().is_empty(), "{:?}", f.notices());
+    // Nor does it start a turn on the member it sits beside.
+    assert!(
+        !f.prompts.lock().unwrap().iter().any(|p| p.contains("btw-aside")),
+        "{:?}",
+        f.prompts.lock().unwrap()
+    );
+}
+
+#[tokio::test]
 async fn a_paused_tree_is_not_woken() {
     let f = Fixture::new();
     f.chat("child-a", Some(ROOT), "Fix parser");

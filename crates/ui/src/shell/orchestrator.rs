@@ -103,7 +103,7 @@ pub(super) fn orchestrator_trees(chats: &[Chat], spaces: &[Space]) -> Vec<Orches
     let children = |parent: &str| -> Vec<&Chat> {
         let mut kids: Vec<&Chat> = chats
             .iter()
-            .filter(|c| !c.archived && c.parent_chat_id.as_deref() == Some(parent))
+            .filter(|c| !c.archived && !c.is_btw() && c.parent_chat_id.as_deref() == Some(parent))
             .collect();
         kids.sort_by(|a, b| {
             a.created_at

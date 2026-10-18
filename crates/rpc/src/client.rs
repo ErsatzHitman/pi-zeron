@@ -154,10 +154,17 @@ impl RpcClient {
             cancel: false,
         })
         .await
-        .inspect_err(|_| {
+        .inspect_err(|err| {
             self.shared.lock().remove(&id);
+            tracing::warn!(%method, error = %err, "rpc: request not sent");
         })?;
-        rx.await.map_err(|_| RpcError::Closed)?
+        rx.await.map_err(|_| RpcError::Closed)?.inspect_err(|err| match err {
+            // The engine logged its own failure; the connection's end is ours.
+            RpcError::Transport(_) | RpcError::Closed => {
+                tracing::warn!(%method, error = %err, "rpc: call failed");
+            }
+            _ => tracing::debug!(%method, error = %err, "rpc: call failed"),
+        })
     }
 
     /// Typed unary request.

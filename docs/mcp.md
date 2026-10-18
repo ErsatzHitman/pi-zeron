@@ -85,7 +85,11 @@ carries `write` and `workspace`. A delegated chat created without a prompt gets
 its worktree on its first `send_message`.
 
 For children, `parent` (id, prefix, or title) overrides the origin (`ZERON_CHAT_ID`).
-`list_chats { parent }` returns children, and chat summaries carry `parentChatId`.
+`list_chats { parent }` returns children, and chat summaries carry `parentChatId`,
+`runningSubagents` and `backgroundJobs` (Pi's running background shells, from
+the `bash-bg:fleet` channel). btw side chats are never listed. A child's
+outcome note is held while it is idle on background jobs: the note comes when
+they settle, and a btw aside never notifies its parent.
 Rows from older engines read as parentless; a dangling parent id is tolerated.
 
 The sidebar's Sessions list holds top-level chats only (`AppState::visible_chats`);
@@ -208,6 +212,12 @@ before boards were per folder (empty `folder`) are the root's alone. A
 different tree never sees them: the engine derives the tree from the calling
 chat (`root_of`), never from the caller.
 
+The session panel's Board section shows a folder's posts only while a session
+of the tree in that folder is still at work (a turn, a question, a place in
+the start queue, sub-agents or background jobs). Once every session there has
+finished, that folder's board leaves the panel; the posts stay in the
+registry and `board_read` still returns them.
+
 `PostBoard` stores the post as a registry row (kind `boardPosts`, id an HLC,
 so posts sort in order and sync to other devices; at most 200 per tree, the
 oldest dropped; text 1 to 2000 characters; deleted with the root).
@@ -229,7 +239,10 @@ cancels server-side, exactly what the sidebar does on attach.
 their live mailbox without interrupting tools or child processes. Providers
 consume it at their next supported input boundary. Only explicit `queue` mode
 creates a held queue row. `awaitingInput` refuses and points at
-`respond_to_input`. Quiet, long-running turns still receive steering; the host
+`respond_to_input`. An idle chat still running its own background jobs (tests,
+builds, a CI watch; `backgroundJobs` above 0 in `list_chats`) refuses `auto`
+too: its job results wake it, and a "continue" only repeats work. `queue` or
+`run` still reach it when the caller means it. Quiet, long-running turns still receive steering; the host
 falls back to starting a turn if the live runtime has already exited.
 
 Claude uses `priority: "next"` and confirms consumption through replayed user

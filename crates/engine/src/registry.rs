@@ -110,6 +110,12 @@ struct HarnessPrefsFile {
     /// 0 disables. Hand-edited; no Settings UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     member_idle_secs: Option<u64>,
+    /// Idle seconds before any Pi chat's runtime that finished its work (no
+    /// background jobs, sub-agents or workflow left) is stopped, restarted
+    /// on its next message; `None` is the engine default, 0 disables.
+    /// Hand-edited; no Settings UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_idle_secs: Option<u64>,
     /// Global cap on concurrently running turns; `None` is the engine
     /// default, 0 is unlimited. Hand-edited; no Settings UI.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,10 +127,11 @@ struct HarnessPrefsFile {
 }
 
 /// Capacity knobs from `harness-prefs.json` (`memberIdleSecs`,
-/// `maxRunningTurns`); `None` means "use the engine default".
+/// `finishedIdleSecs`, `maxRunningTurns`); `None` means "use the engine default".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CapacityPrefs {
     pub member_idle_secs: Option<u64>,
+    pub finished_idle_secs: Option<u64>,
     pub max_running_turns: Option<usize>,
 }
 
@@ -359,6 +366,7 @@ impl HarnessRegistry {
         let prefs = self.prefs();
         CapacityPrefs {
             member_idle_secs: prefs.member_idle_secs,
+            finished_idle_secs: prefs.finished_idle_secs,
             max_running_turns: prefs.max_running_turns,
         }
     }

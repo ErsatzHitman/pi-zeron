@@ -17,9 +17,12 @@
 //!   `api.github.com/copilot_internal/user` — premium-request quota.
 //! - **Nous** (Hermes `nous`): the portal's `/api/oauth/account` credits.
 //!
-//! None of these refresh a per-provider store's tokens: those rotate, and
-//! the agent (or Hermes' pool) owns them — a rejected token reads "switch to
-//! it to refresh" / "refreshes next time" instead.
+//! A rejected ChatGPT login of OpenCode / Pi is refreshed once (single-flight,
+//! like Claude's): a saved slot in its own file, the live login in the
+//! agent's store under the agent's own lock, which Pi re-reads before it
+//! refreshes. Otherwise the session stayed "expired" until the agent ran.
+//! Other per-provider tokens are left to the agent (or Hermes' pool) — a
+//! rejected one reads "switch to it to refresh" / "refreshes next time".
 
 use super::stores::{
     DEVIN_SERVERS, GROK_ISSUERS, NOUS_PORTALS, Upstream, copilot_api_base, devin_api_key,
@@ -218,6 +221,7 @@ impl AgentAccounts {
         &self,
         harness: HarnessId,
         slot: &Slot,
+        is_active: bool,
     ) -> Result<UsageSnapshot, ProbeError> {
         let missing = ProbeError::NoCredentials {
             why: NoCredentials::Missing,
@@ -265,8 +269,23 @@ impl AgentAccounts {
             Some(Upstream::OpenAi) => {
                 let access = str_field(creds, "access").ok_or(missing)?;
                 let account = str_field(creds, "accountId").unwrap_or_default();
-                self.openai_usage(stores::cli_name(harness), &access, &account)
-                    .await
+                let cli = stores::cli_name(harness);
+                match self.openai_usage(cli, &access, &account).await {
+                    Err(ProbeError::Unauthorized { status })
+                        if self.inner.endpoints.allow_slot_refresh =>
+                    {
+                        match self
+                            .refresh_openai_login(harness, key, slot, &access, is_active)
+                            .await?
+                        {
+                            Some((fresh, account)) => {
+                                self.openai_usage(cli, &fresh, &account).await
+                            }
+                            None => Err(ProbeError::Unauthorized { status }),
+                        }
+                    }
+                    result => result,
+                }
             }
             Some(Upstream::Anthropic) => {
                 let access = str_field(creds, "access").ok_or(missing)?;
@@ -287,6 +306,98 @@ impl AgentAccounts {
                 why: NoCredentials::Unsupported,
             }),
         }
+    }
+
+    /// A rejected ChatGPT login's fresh `(access, accountId)`, or `None`
+    /// while another refresh of it is in flight. The live login is re-read
+    /// first: when the agent already rotated it, its new token is used as
+    /// is. A refused refresh (400) means the login is dead.
+    async fn refresh_openai_login(
+        &self,
+        harness: HarnessId,
+        store_key: &str,
+        slot: &Slot,
+        rejected: &str,
+        is_active: bool,
+    ) -> Result<Option<(String, String)>, ProbeError> {
+        let flight = format!("{}:{store_key}:{}", harness_slug(harness), slot.id);
+        if !lock(&self.inner.inflight_refreshes).insert(flight.clone()) {
+            return Ok(None);
+        }
+        let _release = InflightGuard {
+            set: &self.inner.inflight_refreshes,
+            keys: vec![flight],
+        };
+        let missing = ProbeError::NoCredentials {
+            why: NoCredentials::Missing,
+        };
+        let entry = if is_active {
+            self.live_keyed_entry(harness, store_key)
+                .ok_or(missing.clone())?
+        } else {
+            slot.credentials.clone()
+        };
+        let account = |entry: &serde_json::Value| {
+            str_field(entry, "accountId").unwrap_or_default()
+        };
+        if let Some(current) = str_field(&entry, "access").filter(|a| a != rejected) {
+            return Ok(Some((current, account(&entry))));
+        }
+        let refresh_token = str_field(&entry, "refresh").ok_or(missing)?;
+        let body = probe_json(
+            stores::cli_name(harness),
+            "refresh",
+            self.inner
+                .http
+                .post(format!(
+                    "{}/oauth/token",
+                    self.inner.endpoints.openai_auth.trim_end_matches('/')
+                ))
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token.as_str()),
+                    ("client_id", oauth::OPENAI_CLIENT_ID),
+                ]),
+        )
+        .await
+        .map_err(|error| match error {
+            ProbeError::Http { status: 400, .. } => ProbeError::Unauthorized { status: 400 },
+            other => other,
+        })?;
+        let access = str_field(&body, "access_token")
+            .ok_or_else(|| schema_error(stores::cli_name(harness), &body))?;
+        let expires_in = body
+            .get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+        let mut fresh = entry.clone();
+        if let Some(map) = fresh.as_object_mut() {
+            map.insert("access".into(), serde_json::json!(access));
+            map.insert(
+                "refresh".into(),
+                serde_json::json!(str_field(&body, "refresh_token").unwrap_or(refresh_token)),
+            );
+            map.insert("expires".into(), serde_json::json!(now_ms() + expires_in * 1000));
+            let claimed = jwt_claims(&access).and_then(|c| {
+                c.get("https://api.openai.com/auth")
+                    .and_then(|a| str_field(a, "chatgpt_account_id"))
+            });
+            if let Some(id) = claimed {
+                map.insert("accountId".into(), serde_json::json!(id));
+            }
+        }
+        let written = if is_active {
+            self.write_keyed_entry(harness, store_key, Some(&fresh))
+        } else {
+            let mut refreshed = slot.clone();
+            refreshed.credentials = fresh.clone();
+            refreshed.saved_at = now_ms();
+            self.write_slot(&refreshed)
+        };
+        if let Err(err) = written {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed chatgpt login write failed");
+        }
+        Ok(Some((access, account(&fresh))))
     }
 
     async fn openai_usage(

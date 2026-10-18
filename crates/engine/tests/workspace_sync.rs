@@ -729,6 +729,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 retry: None,
                 running_subagents: 0,
                 queue_position: 0,
+                background_jobs: 0,
                 subagents: Vec::new(),
                 chat_id: "chat-legacy".into(),
                 device_id: "dev-a".into(),

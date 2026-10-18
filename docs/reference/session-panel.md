@@ -83,7 +83,8 @@ The Session row's `+` opens a side chat in a small floating pane (360 × 460, sm
 - The pane keeps its size: the thread scrolls inside it, with faded edges once it does. A send reserves no blank space for the reply, unlike the main transcript.
 - The prompt bar grows to more lines as the prompt does (no attachment button or microphone).
 - The side chat sees its parent's conversation so far (a fork of its Pi session) and has only `read`, `grep`, `find`, `ls`, `web_search` and `web_fetch` (DeepSeek's Search and Fetch APIs, with the DeepSeek key from [Settings → API keys](api-keys.md)) and no MCP servers: no commands, edits, agents or sessions, and nothing it does reaches the main conversation.
-- A closed pane's side chat is dropped unless it has an unsent draft, as when its tab closes. An untitled one has no row until its first send.
+- Close (the X) deletes a sent side chat: its Pi session stops and it leaves the sidebar, the task manager and the Sub-agents section. Escape only hides the pane; that side chat stays in the Side chats list. An unsent one is dropped unless it has a draft, as when its tab closes. An untitled one has no row until its first send.
+- A btw side chat is never shown as a sub-agent, in this panel or nested under a session in the sidebar, and an orchestrator never sees it as a member.
 - **Send to /btw**: selecting text in the conversation shows a small bar just above the selection, like Claude Code's "Send to side chat". Its button opens the pane (or brings the open one forward) with the selection quoted in the prompt, after anything already typed there, and the caret below it, ready for the question. Only the main conversation offers it, not a side chat's own transcript or a subagent tab.
 
 Fork chat is gone. The Files panel no longer has Subagents or Chats sections; this section replaces both.

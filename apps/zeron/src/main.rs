@@ -217,17 +217,18 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Finder launches have no visible stderr. Mirror the panic location and
+    // backtrace into the same rotating log as engine diagnostics; one-shot
+    // commands and `zeron mcp` log theirs too.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(panic = %info,
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "application panic");
+        default_hook(info);
+    }));
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     if long_running {
-        // Finder launches have no visible stderr. Mirror the panic location
-        // and backtrace into the same rotating log as engine diagnostics.
-        let default_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            tracing::error!(panic = %info,
-                backtrace = %std::backtrace::Backtrace::force_capture(),
-                "application panic");
-            default_hook(info);
-        }));
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
         spawn_malloc_trimmer();
     }
 
@@ -511,7 +512,12 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
 /// launch sweeps pid-suffixed files older than a week.
 fn open_log_file(mode: &str) -> Option<std::fs::File> {
     let dir = paths::data_dir().join("logs");
-    open_log_file_in(&dir, mode)
+    let file = open_log_file_in(&dir, mode);
+    if file.is_none() {
+        // Logging is not up yet: say so where a terminal can see it.
+        eprintln!("zeron: cannot open a log file in {}; logging to stdout only", dir.display());
+    }
+    file
 }
 
 /// Dir-parameterized body of [`open_log_file`] (unit-testable without env).

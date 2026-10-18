@@ -125,6 +125,9 @@ async fn handle_request(
             .await;
         }
         Err(err) => {
+            // The one place every engine RPC failure passes: log it here, so
+            // a failure the caller drops is still on record.
+            tracing::warn!(%method, error = %err, "rpc: handler failed");
             let _ = send(ServerFrame {
                 id,
                 err: Some(err.to_string()),

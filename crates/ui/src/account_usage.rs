@@ -10,7 +10,8 @@ use gpui::{
     Context, Entity, IntoElement, Render, SharedString, Subscription, Task, Window, div,
     prelude::*, px,
 };
-use zeron_proto::{AgentAccount, AgentAccountsSnapshot, HarnessId};
+use chrono::{DateTime, Utc};
+use zeron_proto::{AgentAccount, AgentAccountsSnapshot, AgentUsageWindow, HarnessId};
 use zeron_rpc::methods;
 
 use crate::popover;
@@ -28,13 +29,49 @@ const FORCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// Background re-probe while a composer is alive: usage moves as turns run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// The binding limit: the most-used window of the account. Pure.
-pub fn used_fraction(account: &AgentAccount) -> Option<f32> {
+/// The binding limit: the most-used window of the account still current
+/// at `now`. Pure.
+pub fn used_fraction(account: &AgentAccount, now: DateTime<Utc>) -> Option<f32> {
+    current_windows(account, now)
+        .map(|window| window.used_fraction.clamp(0.0, 1.0))
+        .reduce(f32::max)
+}
+
+/// The windows still current at `now`: one whose reset time has passed
+/// holds the last period's figure until the next probe, not this one's.
+fn current_windows(
+    account: &AgentAccount,
+    now: DateTime<Utc>,
+) -> impl Iterator<Item = &AgentUsageWindow> {
     account
         .usage_windows
         .iter()
-        .map(|window| window.used_fraction.clamp(0.0, 1.0))
-        .reduce(f32::max)
+        .filter(move |window| window.resets_at.is_none_or(|at| at > now))
+}
+
+/// What the footer reads usage for: the session's harness and, for an
+/// agent with a login per provider (Pi), the provider of the session's
+/// model (`openai-codex` of `openai-codex/gpt-5.5`).
+#[derive(Debug, Clone, Copy)]
+pub struct UsageScope<'a> {
+    pub harness: HarnessId,
+    pub model: Option<&'a str>,
+}
+
+impl UsageScope<'_> {
+    /// Whether `account` is the login the session's model runs on. A model
+    /// whose provider has no login here (OpenRouter, ClinePass) shows none
+    /// of the others' plans; an unknown model shows them all.
+    fn covers(&self, account: &AgentAccount) -> bool {
+        let provider = self
+            .model
+            .and_then(|model| model.split_once('/'))
+            .map(|(provider, _)| provider);
+        match (provider, account.provider.as_deref()) {
+            (Some(model), Some(login)) => model == login,
+            _ => true,
+        }
+    }
 }
 
 /// The harness's live account, when it reports usage. Pure.
@@ -48,17 +85,23 @@ pub fn active_account(
         .find(|account| account.harness == harness && account.active)
 }
 
-/// The signed-in (OAuth) accounts the harness is using that report usage:
-/// one per provider for Pi, which keeps a login per provider. Pure.
-pub fn usage_accounts(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> Vec<&AgentAccount> {
+/// The signed-in (OAuth) accounts the session is using that report usage:
+/// for Pi, which keeps a login per provider, the one its model runs on.
+/// Pure.
+pub fn usage_accounts<'a>(
+    snapshot: &'a AgentAccountsSnapshot,
+    scope: UsageScope<'_>,
+    now: DateTime<Utc>,
+) -> Vec<&'a AgentAccount> {
     snapshot
         .accounts
         .iter()
         .filter(|account| {
-            account.harness == harness
+            account.harness == scope.harness
                 && account.active
-                && !account.usage_windows.is_empty()
+                && current_windows(account, now).next().is_some()
                 && account.auth_kind != Some(zeron_proto::AgentAuthKind::ApiKey)
+                && scope.covers(account)
         })
         .collect()
 }
@@ -77,8 +120,12 @@ fn window_name(label: &str) -> String {
 /// The footer's usage counters: what is left of each limit window of every
 /// signed-in account in use ("5h 98% · wk 90% left"), each account named by
 /// its provider when there are several. Pure.
-pub fn usage_counters(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> Option<String> {
-    let accounts = usage_accounts(snapshot, harness);
+pub fn usage_counters(
+    snapshot: &AgentAccountsSnapshot,
+    scope: UsageScope<'_>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let accounts = usage_accounts(snapshot, scope, now);
     if accounts.is_empty() {
         return None;
     }
@@ -86,9 +133,7 @@ pub fn usage_counters(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> O
     let parts: Vec<String> = accounts
         .iter()
         .map(|account| {
-            let windows = account
-                .usage_windows
-                .iter()
+            let windows = current_windows(account, now)
                 .map(|window| {
                     let left = ((1.0 - window.used_fraction.clamp(0.0, 1.0)) * 100.0).round() as u32;
                     format!("{} {left}%", window_name(&window.label))
@@ -113,6 +158,8 @@ pub struct AccountUsage {
     /// `None` = this device, as in [`AccountsSnapshotCache`].
     target: Option<String>,
     harness: Option<HarnessId>,
+    /// The session's model (`provider/id`), which picks Pi's login.
+    model: Option<String>,
     /// Once any list has been asked for the current target.
     loaded: bool,
     last_forced: Option<Instant>,
@@ -147,6 +194,7 @@ impl AccountUsage {
             state,
             target: None,
             harness: None,
+            model: None,
             loaded: false,
             last_forced: None,
             error: None,
@@ -164,11 +212,13 @@ impl AccountUsage {
     pub fn track(
         &mut self,
         harness: Option<HarnessId>,
+        model: Option<String>,
         target: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let harness = harness.filter(|h| signs_in(*h) && reports_usage(*h));
         self.harness = harness;
+        self.model = model;
         if self.target != target {
             self.target = target;
             self.loaded = false;
@@ -297,14 +347,22 @@ impl AccountUsage {
     /// The ring's reading: the live account's most-used window, when the
     /// harness has a live account with usage to show.
     fn fraction(&self, cx: &gpui::App) -> Option<f32> {
-        usage_accounts(self.snapshot(cx)?, self.harness?)
+        let now = Utc::now();
+        usage_accounts(self.snapshot(cx)?, self.scope()?, now)
             .into_iter()
-            .filter_map(used_fraction)
+            .filter_map(|account| used_fraction(account, now))
             .reduce(f32::max)
     }
 
     fn counters(&self, cx: &gpui::App) -> Option<String> {
-        usage_counters(self.snapshot(cx)?, self.harness?)
+        usage_counters(self.snapshot(cx)?, self.scope()?, Utc::now())
+    }
+
+    fn scope(&self) -> Option<UsageScope<'_>> {
+        Some(UsageScope {
+            harness: self.harness?,
+            model: self.model.as_deref(),
+        })
     }
 
     /// A trigger click: open this ring's popover, or close it when the
@@ -552,8 +610,13 @@ mod tests {
         let mut snapshot: AgentAccountsSnapshot =
             serde_json::from_value(serde_json::json!({ "accounts": [], "warnings": [] })).unwrap();
         snapshot.accounts = vec![claude.clone(), account(HarnessId::Pi, false, &[0.9])];
+        let now = Utc::now();
+        let pi = UsageScope {
+            harness: HarnessId::Pi,
+            model: None,
+        };
         assert_eq!(
-            usage_counters(&snapshot, HarnessId::Pi).as_deref(),
+            usage_counters(&snapshot, pi, now).as_deref(),
             Some("5h 98% · wk 90% left")
         );
         let mut codex = account(HarnessId::Pi, true, &[0.5]);
@@ -561,14 +624,33 @@ mod tests {
         codex.provider = Some("openai-codex".into());
         codex.id = "codex".into();
         snapshot.accounts.push(codex);
-        let both = usage_counters(&snapshot, HarnessId::Pi).unwrap();
+        let both = usage_counters(&snapshot, pi, now).unwrap();
         assert!(both.starts_with("Anthropic 5h 98% · wk 90% | "), "{both}");
         assert!(both.ends_with("mo 50% left"), "{both}");
+        // A session names its model: only that provider's plan is shown,
+        // and none for a provider without a login here.
+        let on = |model| UsageScope {
+            harness: HarnessId::Pi,
+            model: Some(model),
+        };
+        assert_eq!(
+            usage_counters(&snapshot, on("openai-codex/gpt-5.5"), now).as_deref(),
+            Some("mo 50% left")
+        );
+        assert_eq!(usage_counters(&snapshot, on("cline/claude-sonnet"), now), None);
+        // A window past its reset holds the last period's figure: dropped.
+        let mut expired = snapshot.clone();
+        expired.accounts[2].usage_windows[0].resets_at =
+            Some(now - chrono::TimeDelta::minutes(1));
+        assert_eq!(
+            usage_counters(&expired, on("openai-codex/gpt-5.5"), now),
+            None
+        );
         // An API key is not a plan with limits.
         let mut keyed = claude;
         keyed.auth_kind = Some(zeron_proto::AgentAuthKind::ApiKey);
         snapshot.accounts = vec![keyed];
-        assert_eq!(usage_counters(&snapshot, HarnessId::Pi), None);
+        assert_eq!(usage_counters(&snapshot, pi, now), None);
     }
 
     fn account(harness: HarnessId, active: bool, used: &[f32]) -> AgentAccount {
@@ -593,13 +675,13 @@ mod tests {
 
     #[test]
     fn ring_shows_the_most_used_window() {
-        assert_eq!(used_fraction(&account(HarnessId::Codex, true, &[])), None);
+        assert_eq!(used_fraction(&account(HarnessId::Codex, true, &[]), Utc::now()), None);
         assert_eq!(
-            used_fraction(&account(HarnessId::Codex, true, &[0.12, 0.64])),
+            used_fraction(&account(HarnessId::Codex, true, &[0.12, 0.64]), Utc::now()),
             Some(0.64)
         );
         assert_eq!(
-            used_fraction(&account(HarnessId::Codex, true, &[1.4])),
+            used_fraction(&account(HarnessId::Codex, true, &[1.4]), Utc::now()),
             Some(1.0)
         );
     }

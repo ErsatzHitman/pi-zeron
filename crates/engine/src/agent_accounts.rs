@@ -2690,7 +2690,7 @@ impl AgentAccounts {
             HarnessId::Grok => self.grok_usage(slot, is_active).await,
             HarnessId::Devin => self.devin_usage(slot).await,
             HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes => {
-                self.keyed_usage(harness, slot).await
+                self.keyed_usage(harness, slot, is_active).await
             }
             _ => Err(ProbeError::NoCredentials {
                 why: NoCredentials::Missing,

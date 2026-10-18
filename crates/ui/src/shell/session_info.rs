@@ -860,7 +860,15 @@ impl Shell {
             let feed = &self.session_panel.board;
             (feed.chat_id.as_deref() == Some(chat.id.as_str()))
                 .then(|| {
-                    board::BoardView::of(&feed.entries, |folder| {
+                    // A folder's board goes once all its sessions are done.
+                    let root = zeron_proto::orchestrator::root_of(&state.chats, &chat.id)
+                        .map_or(chat.id.as_str(), |root| root.id.as_str());
+                    let members: Vec<&Chat> =
+                        zeron_proto::orchestrator::live_members(&state.chats, root);
+                    let live = board::live_posts(&feed.entries, &members, |member| {
+                        state.at_work(member, now)
+                    });
+                    board::BoardView::of(&live, |folder| {
                         board::folder_label(folder, &state.spaces, &state.chats)
                     })
                 })

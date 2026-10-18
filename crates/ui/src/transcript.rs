@@ -14998,6 +14998,7 @@ mod tests {
                             retry: None,
                             running_subagents: 0,
                             queue_position: 0,
+                            background_jobs: 0,
                             subagents: Vec::new(),
                             chat_id: "chat".into(),
                             device_id: "test".into(),

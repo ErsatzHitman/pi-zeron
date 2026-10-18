@@ -1213,6 +1213,89 @@ fn copilot_usage_reads_metered_quotas_and_the_plan() {
 }
 
 #[tokio::test]
+async fn a_rejected_pi_chatgpt_login_refreshes_once_into_pis_store() {
+    let usage_hits = Arc::new(AtomicUsize::new(0));
+    let token_hits = Arc::new(AtomicUsize::new(0));
+    let (usage, tokens) = (usage_hits.clone(), token_hits.clone());
+    let fresh = chatgpt_access("a@example.com", "acct-a", "plus");
+    let issued = fresh.clone();
+    let server = MockServer::start(move |method, path, body| match (method, path) {
+        // The stale token is rejected; the next call (after refresh) passes.
+        ("GET", "/backend-api/wham/usage") if usage.fetch_add(1, Ordering::SeqCst) == 0 => {
+            (401, String::new())
+        }
+        ("GET", "/backend-api/wham/usage") => (
+            200,
+            r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}"#.into(),
+        ),
+        ("POST", "/oauth/token") => {
+            tokens.fetch_add(1, Ordering::SeqCst);
+            assert!(body.contains("grant_type=refresh_token"), "{body}");
+            assert!(body.contains("refresh_token=refresh-acct-a"), "{body}");
+            (
+                200,
+                serde_json::json!({
+                    "access_token": issued,
+                    "refresh_token": "rotated",
+                    "expires_in": 3600,
+                })
+                .to_string(),
+            )
+        }
+        _ => (404, String::new()),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    let file = config.pi_agent_dir.join("auth.json");
+    let mut stale = openai_entry("a@example.com", "acct-a");
+    stale["access"] = "stale".into();
+    write(
+        &file,
+        &serde_json::json!({
+            "openai-codex": stale,
+            "anthropic": { "type": "api", "key": "sk-ant-keep" },
+        })
+        .to_string(),
+    );
+    let slot = Slot {
+        id: "0123456789abcdef".into(),
+        harness: HarnessId::Pi,
+        account_key: "openai-codex:acct-a".into(),
+        profile: SlotProfile {
+            email: "a@example.com".into(),
+            display_name: None,
+            organization: None,
+            plan: None,
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: stale,
+        claude_config: None,
+        saved_at: 1,
+        created_at: None,
+        store_key: Some("openai-codex".into()),
+    };
+    let usage = accounts
+        .keyed_usage(HarnessId::Pi, &slot, true)
+        .await
+        .unwrap();
+    assert!((usage.windows[0].used_fraction - 0.25).abs() < 1e-6);
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+    // The rotated pair is in Pi's store; the other providers are untouched.
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(written["openai-codex"]["access"], fresh.as_str());
+    assert_eq!(written["openai-codex"]["refresh"], "rotated");
+    assert_eq!(written["openai-codex"]["accountId"], "acct-a");
+    assert_eq!(written["anthropic"]["key"], "sk-ant-keep");
+    // Pi rotated it meanwhile: its new token is used, nothing is refreshed.
+    usage_hits.store(0, Ordering::SeqCst);
+    let again = accounts.keyed_usage(HarnessId::Pi, &slot, true).await;
+    assert!(again.is_ok(), "{again:?}");
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn keyed_logins_probe_the_vendor_behind_them() {
     let server = MockServer::start(|method, path, _| match (method, path) {
         ("GET", "/backend-api/wham/usage") => (
@@ -1254,7 +1337,10 @@ async fn keyed_logins_probe_the_vendor_behind_them() {
         created_at: None,
         store_key: Some("github-copilot".into()),
     };
-    let usage = accounts.keyed_usage(HarnessId::Pi, &copilot).await.unwrap();
+    let usage = accounts
+        .keyed_usage(HarnessId::Pi, &copilot, false)
+        .await
+        .unwrap();
     assert_eq!(usage.plan_label.as_deref(), Some("Copilot Business"));
     assert!((usage.windows[0].used_fraction - 0.1).abs() < 1e-6);
 }

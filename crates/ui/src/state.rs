@@ -2334,6 +2334,23 @@ impl AppState {
         running_subagents(self.session_for(chat_id), now)
     }
 
+    /// Background jobs `chat_id`'s runtime is running (0 once its row goes
+    /// stale): an idle chat holding one is waiting on it, not finished.
+    pub fn background_jobs_for(&self, chat_id: &str, now: DateTime<Utc>) -> u32 {
+        zeron_proto::view::background_jobs(self.session_for(chat_id), now)
+    }
+
+    /// Whether `chat` still has work going: a turn, a question, a place in
+    /// the start queue, sub-agents or background jobs.
+    pub fn at_work(&self, chat: &Chat, now: DateTime<Utc>) -> bool {
+        matches!(
+            self.display_status_for(chat, now),
+            ChatIndicator::Working | ChatIndicator::AwaitingInput
+        ) || self.queue_position_for(&chat.id, now) > 0
+            || self.running_subagents_for(&chat.id, now) > 0
+            || self.background_jobs_for(&chat.id, now) > 0
+    }
+
     /// `chat_id`'s place in the engine's start queue (1-based; 0 = not
     /// waiting on capacity, or the row went stale).
     pub fn queue_position_for(&self, chat_id: &str, now: DateTime<Utc>) -> u32 {
@@ -4301,6 +4318,7 @@ mod tests {
             retry: None,
             running_subagents: 0,
             queue_position: 0,
+            background_jobs: 0,
             subagents: Vec::new(),
             chat_id: chat_id.into(),
             device_id: "dev".into(),
@@ -4549,6 +4567,7 @@ mod tests {
             retry: None,
             running_subagents: 0,
             queue_position: 0,
+            background_jobs: 0,
             subagents: Vec::new(),
             chat_id: "chat".into(),
             device_id: "host".into(),
@@ -4584,6 +4603,7 @@ mod tests {
             retry: None,
             running_subagents: 0,
             queue_position: 0,
+            background_jobs: 0,
             subagents: Vec::new(),
             chat_id: "chat".into(),
             device_id: "host".into(),
@@ -4624,6 +4644,7 @@ mod tests {
             retry: None,
             running_subagents: 0,
             queue_position: 0,
+            background_jobs: 0,
             subagents: Vec::new(),
             chat_id: "chat".into(),
             device_id: "host".into(),

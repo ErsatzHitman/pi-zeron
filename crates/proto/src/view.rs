@@ -75,6 +75,14 @@ pub fn running_subagents(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
         .map_or(0, |s| s.running_subagents)
 }
 
+/// Background jobs (tests, builds, CI watches) the chat's runtime runs right
+/// now, under the same staleness gate as [`running_subagents`]. Pure.
+pub fn background_jobs(session: Option<&Session>, now: DateTime<Utc>) -> u32 {
+    session
+        .filter(|s| now.signed_duration_since(s.updated_at).num_milliseconds() <= SESSION_STALE_MS)
+        .map_or(0, |s| s.background_jobs)
+}
+
 /// A chat's place in the engine's start queue (1-based), or 0 when it is not
 /// waiting on capacity, under the same staleness gate as [`running_subagents`].
 /// Only a `Working` row can be queued. Pure.
@@ -348,6 +356,7 @@ mod gate_tests {
             retry: None,
             running_subagents: running,
             queue_position: 0,
+            background_jobs: 0,
             subagents: (0..running)
                 .map(|ix| RunningSubagent {
                     doc_id: format!("sub-{ix}"),

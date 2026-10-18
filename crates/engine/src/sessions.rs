@@ -373,14 +373,18 @@ impl SessionsEngine {
         tokio::spawn(async move {
             let mut seen = HashMap::new();
             loop {
-                let jobs = state.borrow_and_update().running_fleet();
+                let (jobs, background) = {
+                    let ui = state.borrow_and_update();
+                    (ui.running_fleet(), ui.running_background_jobs())
+                };
                 let list = fleet_list(jobs, &mut seen, Utc::now());
-                let busy = !list.is_empty();
+                let busy = !list.is_empty() || background > 0;
                 {
                     let Some(inner) = inner.upgrade() else {
                         return;
                     };
                     inner.set_running_fleet(&chat_id, list);
+                    inner.set_background_jobs(&chat_id, background);
                     if busy {
                         inner.touch_session(&chat_id);
                     }
@@ -1769,6 +1773,31 @@ impl Inner {
         self.publish_subagents(chat_id, true, list);
     }
 
+    /// Publish how many background jobs `chat_id`'s runtime is running, so
+    /// a parent sees an idle chat that is still waiting on tests or CI. An
+    /// unchanged count is a no-op, mirrored like any status change.
+    fn set_background_jobs(&self, chat_id: &str, jobs: u32) {
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            if entry.background_jobs == jobs {
+                return;
+            }
+            entry.background_jobs = jobs;
+            entry.updated_at = Utc::now();
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
     /// Replace one source's part (the fleet's, or the harness's) of the
     /// subagents `chat_id`'s session row carries. A change is mirrored like
     /// any status transition (it doubles as a heartbeat); an unchanged list
@@ -1868,6 +1897,7 @@ impl Inner {
                     retry: None,
                     running_subagents: 0,
                     queue_position: 0,
+                    background_jobs: 0,
                     subagents: Vec::new(),
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
@@ -2941,6 +2971,29 @@ struct RunResumeState {
 /// reaper already holds off while any of them report live work.
 const DEFAULT_MEMBER_IDLE: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
+/// Default idle window of any parked Pi runtime that finished its work.
+/// Short on purpose: an idle Pi holds a process and its extensions, while
+/// the next message restarts it with the session resumed.
+const DEFAULT_FINISHED_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a parked Pi runtime with nothing left running may sit idle
+/// before it is stopped: `ZERON_FINISHED_IDLE_MS` (0 disables) >
+/// `finishedIdleSecs` in `harness-prefs.json` (0 disables) >
+/// [`DEFAULT_FINISHED_IDLE`]. `None` = never.
+fn finished_idle_ttl(registry: &HarnessRegistry) -> Option<std::time::Duration> {
+    let window = match std::env::var("ZERON_FINISHED_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => registry
+            .capacity_prefs()
+            .finished_idle_secs
+            .map_or(DEFAULT_FINISHED_IDLE, std::time::Duration::from_secs),
+    };
+    (!window.is_zero()).then_some(window)
+}
+
 /// How long a parked Pi tree member's runtime may sit idle before it is
 /// stopped: `ZERON_MEMBER_IDLE_MS` (0 disables) > `memberIdleSecs` in
 /// `harness-prefs.json` (0 disables) > [`DEFAULT_MEMBER_IDLE`]. `None` = never.
@@ -3338,22 +3391,32 @@ async fn drive_run(
                 30 * 60
             },
         ));
-    // A Pi runtime is never idle-reaped (it lives as long as the app) except a
-    // tree MEMBER's: workers finish and are rarely messaged again, and each
-    // parked one holds a Pi process. Its window is the member TTL; the next
-    // message restarts it through the normal resume path. Read once, here:
-    // the chat's place cannot change under a live run. Roots and plain chats
-    // stay warm.
-    let member_ttl = if harness.keeps_runtime_alive()
-        && harness_id == HarnessId::Pi
-        && matches!(
+    // A parked Pi runtime that finished its work (the reaper below holds off
+    // while it reports background jobs, sub-agents or a workflow) is stopped
+    // after the finished TTL: each one holds a Pi process, and the next
+    // message restarts it through the normal resume path, history intact. A
+    // tree MEMBER's window is also capped by the member TTL. Read once, here:
+    // the chat's place cannot change under a live run.
+    let member_ttl = if harness.keeps_runtime_alive() && harness_id == HarnessId::Pi {
+        let member = matches!(
             zeron_proto::orchestrator::Place::of(&inner.lineage(&chat_id), &chat_id).role,
             zeron_proto::orchestrator::Role::Member { .. }
-        ) {
-        member_idle_ttl(&inner.registry)
+        );
+        let member = if member {
+            member_idle_ttl(&inner.registry)
+        } else {
+            None
+        };
+        match (finished_idle_ttl(&inner.registry), member) {
+            (Some(finished), Some(member)) => Some(finished.min(member)),
+            (finished, member) => finished.or(member),
+        }
     } else {
         None
     };
+    // A lost subagent signal is judged on the chat's own window, not the
+    // short finished TTL.
+    let subagent_silence = session_idle * 8;
     let session_idle = member_ttl.unwrap_or(session_idle);
     // A live subagent stretches the window, but never unbounded: every
     // driver's subagent terminal is a best-effort vendor signal (claude's
@@ -3361,8 +3424,7 @@ async fn drive_run(
     // closure), and one lost signal would otherwise pin the child — and this
     // loop's registry heartbeat — until the chat is archived. A subagent
     // silent this long (4h by default) is presumed lost; the reap stamps its
-    // chip failed.
-    let subagent_silence = session_idle * 8;
+    // chip failed. (`subagent_silence` is set above.)
     let mut idle_since: Option<tokio::time::Instant> =
         resume_state.idle.then(tokio::time::Instant::now);
     // A parked runtime whose agent reports background work (see
@@ -3530,7 +3592,9 @@ async fn drive_run(
                     // lists every task the process still runs — so it holds
                     // the runtime for as long as that work lives.
                     if turn.background_live() {
-                        tracing::info!(chat = %chat_id, "idle reaper deferred: the agent reports background work");
+                        if !held_for_background {
+                            tracing::info!(chat = %chat_id, "idle reaper deferred: the agent reports background work");
+                        }
                         reap_deferred_until = Some(tokio::time::Instant::now() + session_idle);
                         held_for_background = true;
                         continue;
@@ -3544,7 +3608,7 @@ async fn drive_run(
                         tracing::info!(
                             chat = %chat_id,
                             live_subagents = subagents.len(),
-                            "reaping idle tree-member runtime (restarts on its next message)"
+                            "stopping a finished Pi runtime (restarts on its next message)"
                         );
                     } else {
                         tracing::info!(
@@ -4411,6 +4475,8 @@ async fn drive_run(
         }
     }
     inner.set_running_subagents(&chat_id, Vec::new());
+    // The runtime is gone, and its jobs with it.
+    inner.set_background_jobs(&chat_id, 0);
     inner.set_retry(&chat_id, None);
 
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:

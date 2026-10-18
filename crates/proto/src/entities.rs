@@ -344,6 +344,12 @@ pub struct Session {
     /// `view::queue_position`. 0 from an engine that predates it.
     #[serde(default)]
     pub queue_position: u32,
+    /// Background jobs (bash jobs: tests, builds, CI watches) the chat's
+    /// runtime is running right now, parked or not. An idle chat holding
+    /// one is waiting on its result, not done; the result wakes it. 0 from
+    /// an engine that predates it.
+    #[serde(default)]
+    pub background_jobs: u32,
     /// The provider failed and the harness (Pi) is retrying on its own. The
     /// status stays `Working` through it; read it through `view::retrying`,
     /// which also gates on freshness. `None` from an engine that predates it.

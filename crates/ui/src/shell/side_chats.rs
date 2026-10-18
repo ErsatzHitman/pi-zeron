@@ -525,6 +525,41 @@ mod tests {
             .unwrap();
     }
 
+    /// The pane's cross ends a btw chat that was sent: it is deleted (its
+    /// Pi process with it), not kept for a draft or the history list.
+    #[gpui::test]
+    fn a_sent_btw_chat_closed_by_its_cross_is_deleted(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = shell_window(dir.path(), cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.active_chat = "main".into();
+                let main: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+                    "id": "main", "deviceId": "local",
+                    "archived": false, "createdAt": Utc::now(),
+                    "config": { "harness": "pi", "model": "m", "sandbox": "workspace-write" },
+                }))
+                .unwrap();
+                shell.state.update(cx, |state, _| {
+                    state.chats = vec![main];
+                    state.selected_chat = Some("main".into());
+                });
+                shell.open_btw_pane(cx);
+                let id = shell.side_chat_seq;
+                let side = shell.side_chats[&id].state.clone();
+                assert_eq!(shell.deletable_btw_chat(id, cx), None, "unsaved: nothing to delete");
+                let chat_id = side.read(cx).selected_chat.clone().unwrap();
+                assert!(chat_id.starts_with(zeron_proto::BTW_CHAT_PREFIX));
+                side.update(cx, |state, cx| state.side_chat_saved(&chat_id, cx));
+                assert_eq!(shell.deletable_btw_chat(id, cx), Some(chat_id));
+
+                assert!(shell.delete_btw_pane(cx));
+                assert_eq!(shell.btw_frame(cx), None);
+                assert!(!shell.side_chats.contains_key(&id));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn new_side_chat_is_unsaved_until_its_first_send(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

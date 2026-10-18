@@ -1521,6 +1521,7 @@ impl RegistryDoc {
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
             ("runningSubagents", json!(session.running_subagents)),
+            ("backgroundJobs", json!(session.background_jobs)),
             (
                 "subagents",
                 json!(serde_json::to_string(&session.subagents)?),
@@ -1714,6 +1715,7 @@ impl RegistryDoc {
                     ("startedAt", opt_ms(session.started_at)),
                     ("updatedAt", json!(session.updated_at.timestamp_millis())),
                     ("runningSubagents", json!(session.running_subagents)),
+                    ("backgroundJobs", json!(session.background_jobs)),
                     (
                         "subagents",
                         json!(serde_json::to_string(&session.subagents)?),

@@ -20,7 +20,7 @@ use crate::theme::Theme;
 const HEADER_HEIGHT: f32 = 32.0;
 const ROW_PAD_X: f32 = 8.0;
 const SIDE_INSET: f32 = 16.0;
-const CHIP_MAX_WIDTH: f32 = 200.0;
+const CHIP_MAX_WIDTH: f32 = 260.0;
 
 /// Per-element presentation, in memory for the app run.
 #[derive(Debug, Default, Clone)]
@@ -392,13 +392,31 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
         if let Some(tps) = footer["tokensPerSecond"].as_f64().filter(|t| *t > 0.0) {
             parts.push(format!("{tps:.0} tok/s"));
         }
-        if let Some(cost) = footer["session"]["costUsd"].as_f64().filter(|c| *c > 0.0) {
+        // The session's prompt-cache hit rate: cached input over all input.
+        // Null until the first response; 0% is worth showing after that.
+        let session = &footer["session"];
+        let cache = session["cacheHitRate"]
+            .as_f64()
+            .filter(|rate| rate.is_finite())
+            .map(|rate| (rate * 100.0).clamp(0.0, 100.0));
+        if let Some(rate) = cache {
+            parts.push(format!("{rate:.0}% cache"));
+        }
+        if let Some(cost) = session["costUsd"].as_f64().filter(|c| *c > 0.0) {
             parts.push(money(cost));
         }
         if !parts.is_empty() {
+            let tokens = |key: &str| session[key].as_u64().unwrap_or(0);
+            let hint = cache.map(|rate| {
+                format!(
+                    "Cache hits {rate:.0}% this session: {} input tokens read from cache, {} new",
+                    crate::settings::usage::format_tokens(tokens("cacheReadTokens")),
+                    crate::settings::usage::format_tokens(tokens("inputTokens")),
+                )
+            });
             chips.push(Chip {
                 key: "channel:footer".into(),
-                hint: None,
+                hint,
                 text: parts.join(" · "),
                 active: false,
                 action: None,
@@ -813,7 +831,9 @@ mod tests {
         };
         state.channels.insert(
             "minimal-status:footer".into(),
-            json!({"tokensPerSecond":41.6,"session":{"costUsd":0.0421}}),
+            json!({"tokensPerSecond":41.6,"session":{
+                "costUsd":0.0421,"cacheHitRate":0.874,"cacheReadTokens":12345,"inputTokens":1800,
+            }}),
         );
         state.channels.insert(
             "pi-goal:status".into(),
@@ -834,8 +854,12 @@ mod tests {
                 "Plan",
                 "Retrying · attempt 1/3",
                 "Background bash · 1 running",
-                "42 tok/s · $0.042"
+                "42 tok/s · 87% cache · $0.042"
             ]
+        );
+        assert_eq!(
+            chips[3].hint.as_deref(),
+            Some("Cache hits 87% this session: 12.3K input tokens read from cache, 1.8K new")
         );
         assert!(chips[0].active);
         assert!(chips[1].active);
@@ -993,7 +1017,7 @@ mod tests {
             icons::REMOTE_SERVER
         );
         assert_eq!(
-            chip_icon(&chip("channel:footer", "121 tok/s · $0.014")),
+            chip_icon(&chip("channel:footer", "121 tok/s · 64% cache · $0.014")),
             icons::FAST_TIER
         );
         assert_eq!(

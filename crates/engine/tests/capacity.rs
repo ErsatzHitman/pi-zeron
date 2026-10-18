@@ -26,6 +26,7 @@ fn set_env(vars: &[(&str, &str)]) {
     for key in [
         "ZERON_MAX_RUNNING_TURNS",
         "ZERON_MEMBER_IDLE_MS",
+        "ZERON_FINISHED_IDLE_MS",
         "ZERON_SESSION_IDLE_MS",
     ] {
         unsafe { std::env::remove_var(key) };
@@ -372,6 +373,8 @@ async fn idle_ttl_stops_tree_members_only_and_the_next_message_resumes() {
     set_env(&[
         ("ZERON_MAX_RUNNING_TURNS", "0"),
         ("ZERON_MEMBER_IDLE_MS", "300"),
+        // The member TTL alone (the finished TTL is its own test).
+        ("ZERON_FINISHED_IDLE_MS", "0"),
         ("ZERON_SESSION_IDLE_MS", "600000"),
     ]);
     let rig = rig(true);
@@ -425,11 +428,60 @@ async fn idle_ttl_stops_tree_members_only_and_the_next_message_resumes() {
 }
 
 #[tokio::test]
+async fn a_finished_pi_runtime_is_stopped_root_or_plain_and_resumes() {
+    let _env = ENV.lock().await;
+    set_env(&[
+        ("ZERON_MAX_RUNNING_TURNS", "0"),
+        ("ZERON_MEMBER_IDLE_MS", "0"),
+        ("ZERON_FINISHED_IDLE_MS", "300"),
+        ("ZERON_SESSION_IDLE_MS", "600000"),
+    ]);
+    let rig = rig(true);
+    rig.create_chat("orchestrator-f", None);
+    rig.create_chat("busy", None);
+    rig.create_chat("plain", None);
+    for chat in ["orchestrator-f", "busy", "plain"] {
+        rig.send(chat, &format!("work {chat}")).await;
+    }
+    wait_for(
+        || {
+            rig.spawns() == 3
+                && ["orchestrator-f", "busy", "plain"]
+                    .iter()
+                    .all(|chat| rig.status(chat) == Some(SessionStatus::Idle))
+        },
+        "every turn to park",
+    )
+    .await;
+    // Tests or a CI watch still running: not finished.
+    rig.ledger.turns.lock().unwrap()["work busy"].set_background(1);
+    wait_for(
+        || !rig.core.sessions.has_run("plain") && !rig.core.sessions.has_run("orchestrator-f"),
+        "the finished runtimes to stop",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(rig.core.sessions.has_run("busy"), "background work spares it");
+    assert_eq!(rig.ledger.kills.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.status("plain"), Some(SessionStatus::Idle), "kept, not deleted");
+
+    rig.send("plain", "work plain again").await;
+    wait_for(|| rig.spawns() == 4, "plain to restart").await;
+    let resumes = rig.ledger.resumes.lock().unwrap().clone();
+    assert_eq!(
+        resumes.last().unwrap(),
+        &("work plain again".to_string(), Some("provider-session".into()))
+    );
+    set_env(&[]);
+}
+
+#[tokio::test]
 async fn idle_ttl_zero_disables_the_member_reaper() {
     let _env = ENV.lock().await;
     set_env(&[
         ("ZERON_MAX_RUNNING_TURNS", "0"),
         ("ZERON_MEMBER_IDLE_MS", "0"),
+        ("ZERON_FINISHED_IDLE_MS", "0"),
         ("ZERON_SESSION_IDLE_MS", "100"),
     ]);
     let rig = rig(true);

@@ -100,6 +100,7 @@ impl Normalizer {
     }
     /// Record `text` as the run's failure and classify it.
     pub fn fail(&mut self, text: String) {
+        tracing::warn!(error = %text, provider = ?self.provider, "pi run failed");
         self.class = Some(classify(&text, self.provider.as_deref()));
         self.error = Some(text);
     }
@@ -323,6 +324,7 @@ impl Normalizer {
                 }
             }
             "extension_error" => {
+                tracing::warn!(error = %string(frame, "error"), "pi extension error");
                 self.class = None;
                 self.error = Some(string(frame, "error").into());
                 events.push(AgentEvent::Error {

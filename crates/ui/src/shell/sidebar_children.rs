@@ -50,8 +50,8 @@ impl ChildIndex {
         )
     }
 
-    /// Archived chats, a chat naming itself, and hidden voice and
-    /// orchestrator chats never nest.
+    /// Archived chats, a chat naming itself, btw asides, and hidden voice
+    /// and orchestrator chats never nest.
     fn from_chats<'a>(chats: impl IntoIterator<Item = (&'a Chat, ChatIndicator)>) -> Self {
         let mut by_parent: HashMap<String, Vec<ChildEntry>> = HashMap::new();
         for (chat, status) in chats {
@@ -60,6 +60,7 @@ impl ChildIndex {
             };
             if chat.archived
                 || parent == chat.id
+                || chat.is_btw()
                 || zeron_proto::voice::is_orchestrator_chat(&chat.id)
                 || zeron_proto::orchestrator::is_root_chat(&chat.id)
             {
@@ -911,6 +912,8 @@ mod tests {
             archived,
             chat("me", Some("me"), 3),
             chat("orphan", Some("missing"), 4),
+            chat("btw-aside", Some("p"), 6),
+            chat("btw-only", Some("q"), 6),
         ];
         let index = ChildIndex::from_chats(chats.iter().map(|chat| (chat, ChatIndicator::Idle)));
         // Creation order, id breaking the tie.
@@ -918,6 +921,7 @@ mod tests {
         assert!(index.of("me").is_empty());
         assert!(index.has("missing"));
         assert!(!index.has("first"));
+        assert!(!index.has("q"), "a btw aside is no sub-agent");
     }
 
     #[test]

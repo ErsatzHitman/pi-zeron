@@ -12531,9 +12531,12 @@ impl Render for Composer {
                 .then(|| self.render_extension_footer(cx))
                 .flatten();
             if session_chrome_opacity > 0.0 {
-                let harness = (!self.side_chat)
-                    .then(|| self.pickers.read(cx).resolved(cx).harness)
-                    .flatten();
+                let (harness, model) = if self.side_chat {
+                    (None, None)
+                } else {
+                    let resolved = self.pickers.read(cx).resolved(cx);
+                    (resolved.harness, resolved.model)
+                };
                 let target = {
                     let state = self.state.read(cx);
                     state
@@ -12542,7 +12545,7 @@ impl Render for Composer {
                         .filter(|device| state.local_device_id.as_ref() != Some(device))
                 };
                 self.account_usage
-                    .update(cx, |usage, cx| usage.track(harness, target, cx));
+                    .update(cx, |usage, cx| usage.track(harness, model, target, cx));
             }
             container.child(
                 div()
@@ -13717,6 +13720,7 @@ mod tests {
                 retry: None,
                 running_subagents: 0,
                 queue_position: 0,
+                background_jobs: 0,
                 subagents: Vec::new(),
             }];
             state.selected_chat = Some("c".into());

@@ -277,6 +277,13 @@ impl PiHarness {
         let stderr = tail.clone();
         let stderr_task = tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
+                // Pi and its extensions report crashes and failures here;
+                // the tail alone only reaches an "exited unexpectedly" note.
+                if looks_like_error(&line) {
+                    tracing::warn!(target: "pi_stderr", %line);
+                } else {
+                    tracing::debug!(target: "pi_stderr", %line);
+                }
                 stderr.push(&line);
             }
             stderr.close();
@@ -873,6 +880,14 @@ fn retry_error(text: &str) -> String {
         Some((at, _)) => format!("{}…", &line[..at]),
         None => line,
     }
+}
+/// A Pi stderr line that reports a failure (an exception, a crash, an
+/// extension's `failed`), as opposed to its progress chatter.
+fn looks_like_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ["error", "exception", "failed", "fatal", "panic", "unhandled"]
+        .iter()
+        .any(|word| lower.contains(word))
 }
 /// `provider/id` of the model in a `get_state` reply.
 fn model_key(state: &Value) -> Option<String> {
@@ -2026,7 +2041,15 @@ fn usage_ledger(agent_dir: Option<PathBuf>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_images, usage_ledger};
+    use super::{load_images, looks_like_error, usage_ledger};
+
+    #[test]
+    fn failures_on_pi_stderr_are_told_from_its_chatter() {
+        assert!(looks_like_error("[jev] consult failed: timeout"));
+        assert!(looks_like_error("TypeError: x is not a function"));
+        assert!(looks_like_error("Unhandled promise rejection"));
+        assert!(!looks_like_error("[capabilities] map built: 41 entries"));
+    }
 
     #[test]
     fn the_usage_ledger_is_found_only_where_it_is_installed() {

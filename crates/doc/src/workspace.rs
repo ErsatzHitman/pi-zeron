@@ -489,6 +489,7 @@ impl WorkspaceDoc {
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         row.insert("runningSubagents", i64::from(session.running_subagents))?;
         row.insert("queuePosition", i64::from(session.queue_position))?;
+        row.insert("backgroundJobs", i64::from(session.background_jobs))?;
         row.insert(
             "subagents",
             serde_json::to_string(&session.subagents)?.as_str(),
@@ -800,6 +801,8 @@ pub(crate) struct RawSession {
     /// Absent from an engine that predates the start queue: not queued.
     #[serde(default)]
     queue_position: u32,
+    #[serde(default)]
+    background_jobs: u32,
     /// `Session::subagents` as JSON text.
     #[serde(default)]
     subagents: Option<String>,
@@ -819,6 +822,7 @@ impl From<RawSession> for Session {
             updated_at: dt(raw.updated_at),
             running_subagents: raw.running_subagents,
             queue_position: raw.queue_position,
+            background_jobs: raw.background_jobs,
             subagents: raw
                 .subagents
                 .and_then(|json| serde_json::from_str(&json).ok())
@@ -934,6 +938,7 @@ mod tests {
             retry: None,
             running_subagents: 0,
             queue_position: 0,
+            background_jobs: 0,
             subagents: Vec::new(),
         }
     }

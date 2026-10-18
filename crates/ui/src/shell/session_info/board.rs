@@ -87,6 +87,32 @@ impl BoardView {
     }
 }
 
+/// The posts whose folder still has a session at work. A folder's board is
+/// over once every session of the tree in it has finished (`at_work` false
+/// for each); posts from before folders existed follow the whole tree.
+pub(super) fn live_posts(
+    entries: &[BoardEntry],
+    members: &[&Chat],
+    at_work: impl Fn(&Chat) -> bool,
+) -> Vec<BoardEntry> {
+    let busy: std::collections::HashSet<String> = members
+        .iter()
+        .filter(|&&chat| at_work(chat))
+        .map(|&chat| zeron_proto::board::folder_of(chat))
+        .collect();
+    entries
+        .iter()
+        .filter(|entry| {
+            if entry.folder.is_empty() {
+                !busy.is_empty()
+            } else {
+                busy.contains(&entry.folder)
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 /// A folder key ([`zeron_proto::board::folder_of`]) as the user knows it:
 /// the project's name, the directory, or the session.
 pub(super) fn folder_label(folder: &str, spaces: &[Space], chats: &[Chat]) -> String {
@@ -150,6 +176,31 @@ mod tests {
             text: format!("post {id}"),
             at: i64::from(id) * 1_000,
         }
+    }
+
+    fn member(id: &str, cwd: &str) -> Chat {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "deviceId": "local", "archived": false,
+            "createdAt": "2026-10-01T00:00:00Z", "cwd": cwd,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_folder_whose_sessions_all_finished_drops_its_board() {
+        let a1 = member("a1", "/a");
+        let a2 = member("a2", "/a");
+        let b1 = member("b1", "/b");
+        let members = [&a1, &a2, &b1];
+        let posts = [post(1, "dir:/a"), post(2, "dir:/b"), post(3, "")];
+        let texts = |live: Vec<BoardEntry>| live.into_iter().map(|e| e.text).collect::<Vec<_>>();
+        // One session of /a still works: /a keeps its board, /b's is over.
+        let live = live_posts(&posts, &members, |chat| chat.id == "a2");
+        assert_eq!(texts(live), ["post 1", "post 3"]);
+        // Everything finished: no posts, so no section at all.
+        let live = live_posts(&posts, &members, |_| false);
+        assert!(live.is_empty());
+        assert!(BoardView::of(&live, str::to_owned).is_none());
     }
 
     #[test]

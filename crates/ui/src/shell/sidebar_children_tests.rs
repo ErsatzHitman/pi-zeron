@@ -55,6 +55,7 @@ fn working(
         retry: None,
         running_subagents: count,
         queue_position: 0,
+        background_jobs: 0,
         subagents,
     }
 }

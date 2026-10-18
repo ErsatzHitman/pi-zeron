@@ -335,11 +335,12 @@ pub fn tree_members<'a>(chats: &'a [Chat], root_id: &str) -> Vec<&'a Chat> {
 }
 
 /// Sessions below `root_id` that still count against [`MAX_LIVE_SESSIONS`]:
-/// [`tree_members`] without the archived ones (the root is never a member).
+/// [`tree_members`] without the archived ones and btw asides (the root is
+/// never a member).
 pub fn live_members<'a>(chats: &'a [Chat], root_id: &str) -> Vec<&'a Chat> {
     tree_members(chats, root_id)
         .into_iter()
-        .filter(|chat| !chat.archived)
+        .filter(|chat| !chat.archived && !chat.is_btw())
         .collect()
 }
 
@@ -528,6 +529,7 @@ mod tests {
             chat_archived("a", Some(&root), false),
             chat_archived("b", Some(&root), true),
             chat_archived("a1", Some("a"), false),
+            chat_archived("btw-x", Some("a"), false),
             chat_archived("plain", None, false),
         ];
         let ids: Vec<&str> = live_members(&chats, &root)

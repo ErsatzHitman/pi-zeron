@@ -905,6 +905,16 @@ fn retry_json(session: Option<&Session>) -> Value {
         })
 }
 
+/// Background jobs an idle chat is waiting on: their results start its next
+/// turn. 0 for a working, stale or unknown session.
+fn waiting_on_jobs(session: Option<&Session>) -> u32 {
+    session
+        .filter(|s| {
+            s.status == SessionStatus::Idle && chrono::Utc::now() - s.updated_at <= SESSION_STALE
+        })
+        .map_or(0, |s| s.background_jobs)
+}
+
 fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value {
     let space = chat
         .space_id
@@ -931,6 +941,8 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
         "status": status,
         "statusAgeSecs": status_age,
         "retry": retry_json(session.as_ref()),
+        "backgroundJobs": session.as_ref().map_or(0, |s| s.background_jobs),
+        "runningSubagents": session.as_ref().map_or(0, |s| s.running_subagents),
         "lastMessageAt": chat.last_message_at,
         "lastMessagePreview": chat.last_message_preview,
         "createdAt": chat.created_at,
@@ -1213,6 +1225,9 @@ impl Tools {
         if !args.include_archived {
             chats.retain(|c| !c.archived);
         }
+        // A btw aside is the user's question beside a chat: no session to
+        // follow, message or count.
+        chats.retain(|c| !c.is_btw());
         if let Some(parent) = args.parent.as_deref() {
             let parent = self.zeron.resolve_chat(parent).await?;
             chats.retain(|c| c.parent_chat_id.as_deref() == Some(parent.id.as_str()));
@@ -1923,8 +1938,14 @@ impl Tools {
             .iter()
             .filter(|chat| chat.id != chat_id)
             .map(|chat| {
-                let (status, _) = status_of(session_for(&sessions, chat).as_ref());
-                json!({ "chatId": chat.id, "title": chat.title, "status": status })
+                let session = session_for(&sessions, chat);
+                let (status, _) = status_of(session.as_ref());
+                json!({
+                    "chatId": chat.id,
+                    "title": chat.title,
+                    "status": status,
+                    "backgroundJobs": waiting_on_jobs(session.as_ref()),
+                })
             })
             .collect();
         Ok(json!({
@@ -2066,7 +2087,14 @@ impl Tools {
         // A quiet tool call can outlive the UI's stale-status window. Route
         // through steering and let the host decide whether a live run exists.
         let live = session.map(|s| s.status).unwrap_or(SessionStatus::Idle);
+        let waiting = waiting_on_jobs(session);
         let chosen = match mode {
+            // Nudging a chat that only waits on its own tests or CI to
+            // "continue" starts a turn that can do nothing but wait again.
+            "auto" if waiting > 0 => anyhow::bail!(
+                "chat {} is idle but waiting on {waiting} background job(s) (tests, builds or a CI watch); their results wake it by themselves, so nothing was sent. Use mode 'queue' to add this to its next turn, or 'run' to start a turn now",
+                short(&chat.id)
+            ),
             "auto" => match live {
                 SessionStatus::Idle | SessionStatus::Errored => "run",
                 SessionStatus::Working => "steer",
@@ -3028,6 +3056,7 @@ mod tests {
             retry: None,
             running_subagents: 0,
             queue_position: 2,
+            background_jobs: 0,
             subagents: Vec::new(),
         };
         assert_eq!(status_of(Some(&session)).0, "queued for capacity (#2)");
@@ -3037,6 +3066,30 @@ mod tests {
         session.queue_position = 2;
         session.updated_at = chrono::Utc::now() - chrono::Duration::minutes(10);
         assert!(status_of(Some(&session)).0.starts_with("working (stale"));
+    }
+
+    #[test]
+    fn only_a_fresh_idle_session_waits_on_its_jobs() {
+        let mut session = Session {
+            chat_id: "c".into(),
+            device_id: "dev-local".into(),
+            status: SessionStatus::Idle,
+            started_at: None,
+            updated_at: chrono::Utc::now(),
+            last_completed_turn: None,
+            retry: None,
+            running_subagents: 0,
+            queue_position: 0,
+            background_jobs: 2,
+            subagents: Vec::new(),
+        };
+        assert_eq!(waiting_on_jobs(Some(&session)), 2);
+        session.status = SessionStatus::Working;
+        assert_eq!(waiting_on_jobs(Some(&session)), 0, "a working chat is steered");
+        session.status = SessionStatus::Idle;
+        session.updated_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        assert_eq!(waiting_on_jobs(Some(&session)), 0, "a stale row proves nothing");
+        assert_eq!(waiting_on_jobs(None), 0);
     }
 
     #[tokio::test]
@@ -3054,6 +3107,7 @@ mod tests {
             retry: None,
             running_subagents: 0,
             queue_position: 0,
+            background_jobs: 0,
             subagents: Vec::new(),
         };
         // No mid-turn capability is required for a live mailbox delivery.
