@@ -86,6 +86,8 @@ pub struct ShortcutsPage {
     thread_naming: Entity<crate::settings::thread_naming::ThreadNamingCard>,
     /// Settings → General's advisor card (its own Pi-only pickers).
     advisor: Entity<crate::settings::advisor::AdvisorCard>,
+    /// Settings → General's default subagent card (a Pi-only picker).
+    default_subagent: Entity<crate::settings::default_subagent::DefaultSubagentCard>,
     /// Settings → General's Pi executable card.
     pi: Entity<crate::settings::pi::PiSettingsCard>,
     _state: Entity<AppState>,
@@ -135,6 +137,12 @@ impl ShortcutsPage {
             advisor: {
                 let state = state.clone();
                 cx.new(|cx| crate::settings::advisor::AdvisorCard::new(state, cx))
+            },
+            default_subagent: {
+                let state = state.clone();
+                cx.new(|cx| {
+                    crate::settings::default_subagent::DefaultSubagentCard::new(state, cx)
+                })
             },
             pi: {
                 let state = state.clone();
@@ -969,6 +977,7 @@ impl Render for ShortcutsPage {
                                     ))
                                     .child(self.thread_naming.clone())
                                     .child(self.pi.clone())
+                                    .child(self.default_subagent.clone())
                                     .child(self.advisor.clone()),
                             ),
                     )

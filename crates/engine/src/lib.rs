@@ -49,6 +49,7 @@ pub mod run_journal;
 pub mod sessions;
 pub mod source_control;
 pub mod spaces;
+pub mod subagent_settings;
 pub mod terminals;
 pub mod titles;
 mod transcript_history;

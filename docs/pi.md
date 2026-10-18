@@ -535,3 +535,19 @@ roster (Claude Opus 5, with its OpenCode fallback) applies again. A
 `loop.json` that is not valid JSON is never overwritten: saving fails until
 it is fixed or removed. A reserved model (see Reserved models) is refused as
 the advisor or a fallback.
+
+## Default subagent
+
+Settings → General → Default subagent picks the agent every child an agent
+starts runs on when the call names none of its own: `subagent_start` tasks,
+dynamic-workflow agents (an `agent()` with neither `model` nor `tier`) and
+delegated sessions. It applies in every session: a plain chat, an
+orchestrator's root, its members and their sub-sessions. The model row uses
+the composer's model picker held to Pi; the thinking row offers Pi's levels or
+the model's own default. The engine writes `defaultModel` and
+`defaultThinkingLevel` in `<pi agent dir>/subagents.json`
+(`GetSubagentSettings` / `SetSubagentSettings`), keeping every other key, and
+the children read the file at each launch, so running chats pick a change up
+at their next child. A model or level the call names still wins, and so does a
+subagent profile's own model. Reset removes the model, and children run on
+their session's model again. A reserved model is refused.

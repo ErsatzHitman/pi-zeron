@@ -55,6 +55,12 @@ pub mod methods {
     /// Save `{model: string|null, fallbacks: string[]}`; replies like
     /// `GetAdvisorSettings`.
     pub const SET_ADVISOR_SETTINGS: &str = "SetAdvisorSettings";
+    /// The default agent (Pi model and thinking level) of every child an
+    /// agent starts, from this device's `subagents.json` (`SubagentSettings`).
+    pub const GET_SUBAGENT_SETTINGS: &str = "GetSubagentSettings";
+    /// Save `{model: string|null, thinking: string|null}`; replies like
+    /// `GetSubagentSettings`.
+    pub const SET_SUBAGENT_SETTINGS: &str = "SetSubagentSettings";
     /// This device's Pi executable setting and its live status.
     pub const GET_PI_SETTINGS: &str = "GetPiSettings";
     /// Save the Pi executable (`{executable: string|null}`); replies like `GetPiSettings`.

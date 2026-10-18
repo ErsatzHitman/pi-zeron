@@ -1936,6 +1936,9 @@ fn forwardable(method: &str) -> bool {
             // Pi's loop.json is on the device that runs it.
             | methods::GET_ADVISOR_SETTINGS
             | methods::SET_ADVISOR_SETTINGS
+            // So is its subagents.json.
+            | methods::GET_SUBAGENT_SETTINGS
+            | methods::SET_SUBAGENT_SETTINGS
             | methods::GET_PI_SETTINGS
             | methods::SET_PI_SETTINGS
             | methods::SET_DELETE_GUARD
@@ -2540,6 +2543,23 @@ impl RpcService for EngineRpc {
                 let settings = tokio::task::spawn_blocking(move || match save {
                     Some(settings) => advisor_settings::write(&dir, settings),
                     None => Ok(advisor_settings::read(&dir)),
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&settings)
+            }
+            methods::GET_SUBAGENT_SETTINGS | methods::SET_SUBAGENT_SETTINGS => {
+                use crate::subagent_settings::{self, SubagentSettings};
+                let save: Option<SubagentSettings> = if method == methods::SET_SUBAGENT_SETTINGS {
+                    Some(parse_params(params)?)
+                } else {
+                    None
+                };
+                let dir = self.agent_accounts.pi_agent_dir();
+                let settings = tokio::task::spawn_blocking(move || match save {
+                    Some(settings) => subagent_settings::write(&dir, settings),
+                    None => Ok(subagent_settings::read(&dir)),
                 })
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?
