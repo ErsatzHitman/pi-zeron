@@ -39,11 +39,15 @@ check('ps: Get-ChildItem', shellWrites('Get-ChildItem -Recurse', 'ps'), false);
 // Tools: Pi's own, extension and MCP tools.
 for (const [name, input] of [['write', {path: 'a', content: 'x'}], ['edit', {path: 'a'}], ['bash', {command: 'touch x'}],
   ['zeron_create_chat', {}], ['zeron_archive_chat', {}], ['zeron_respond_to_input', {}],
-  ['mcp__fs__write_file', {}], ['apply_patch', {}], ['memory_save', {}], ['run_command', {}], ['git_commit', {}]])
+  ['mcp__fs__write_file', {}], ['apply_patch', {}], ['memory_save', {}], ['run_command', {}], ['git_commit', {}],
+  ['subagent_start', {tasks: [{task: 'x', writeAccess: true}]}], ['subagent_start', {tasks: [{task: 'a'}, {task: 'b', writeAccess: true}]}],
+  ['subagent_start', {tasks: [{task: 'x', writeAccess: 'yes'}]}], ['workflow', {}], ['workflow_script', {}]])
   check(`tool: ${name}`, call(name, input), true);
 for (const [name, input] of [['read', {path: 'a'}], ['grep', {}], ['find', {}], ['ls', {}], ['bash', {command: 'git status'}],
   ['zeron_list_chats', {}], ['zeron_read_chat', {}], ['zeron_show_visual', {}], ['web_search', {query: 'rust 2024'}],
-  ['web_fetch', {url: 'https://example.com'}], ['subagent', {}]])
+  ['web_fetch', {url: 'https://example.com'}], ['subagent', {}],
+  ['subagent_start', {tasks: [{task: 'map the auth flow'}]}], ['subagent_start', {tasks: [{task: 'x', writeAccess: false}, {task: 'y'}]}],
+  ['subagent_status', {}], ['subagent_control', {}], ['subagent_agents', {}]])
   check(`tool: ${name}`, call(name, input), false);
 check('tool: marked read-only', call('mcp__x__deploy', {}, {readOnlyHint: true}), false);
 check('tool: marked destructive', call('mcp__x__thing', {}, {destructiveHint: true}), true);
@@ -65,7 +69,15 @@ const blocked = hook({toolName: 'edit', input: {path: 'a'}}, {});
 assert.equal(blocked?.block, true);
 assert.match(blocked.reason, /\[zeron:read-only rule=ro-edit\]/);
 assert.equal(hook({toolName: 'bash', input: {command: 'git status'}}, {}), undefined);
+// Research goes to sub-agents that only read; one that could write is refused.
+const writer = hook({toolName: 'subagent_start', input: {tasks: [{task: 'fix it', writeAccess: true}]}}, {});
+assert.equal(writer?.block, true);
+assert.match(writer.reason, /rule=ro-subagent-writer/);
+assert.equal(hook({toolName: 'subagent_start', input: {tasks: [{task: 'map the auth flow', writeAccess: false}]}}, {}), undefined);
+assert.equal(hook({toolName: 'subagent_start', input: {tasks: [{task: 'map the auth flow'}]}}, {}), undefined);
+assert.match(hook({toolName: 'workflow', input: {goal: 'survey the repo'}}, {})?.reason ?? '', /rule=ro-workflow/);
 delete process.env.ZERON_READ_ONLY;
+assert.equal(hook({toolName: 'subagent_start', input: {tasks: [{task: 'fix it', writeAccess: true}]}}, {}), undefined, 'a writing session starts writers');
 assert.equal(hook({toolName: 'edit', input: {path: 'a'}}, {}), undefined);
 process.env.ZERON_DELETE_GUARD = '1';
 assert.equal(hook({toolName: 'bash', input: {command: 'rm -rf /'}}, {})?.block, true);
