@@ -431,6 +431,7 @@ mod tests {
             "project_forget",
             "project_update",
             "merge_preview",
+            "stop_tree",
         ];
         for prompt in prompts {
             for word in prompt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {

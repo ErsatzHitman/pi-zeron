@@ -176,6 +176,7 @@ name (default: the local engine's device).
 | `send_message`     | `QueueCommand` Run / Steer, or `QueueMessage`             |
 | `wait_for_turn`    | `WatchSessions` until the chat settles                    |
 | `interrupt_chat`   | `QueueCommand` Interrupt                                  |
+| `stop_tree`        | `StopTree {chatId, scope, hold, caller, only?, targetDeviceId?}`: tears down the runtimes of a whole tree (root only) or one branch (a session's own descendants), with their background jobs and sub-agents, clears their queues and holds the tree; one follow-up call per remote device |
 | `respond_to_input` | `QueueCommand` RespondInput                               |
 | `archive_chat`     | `Mutate setChatArchived`                                  |
 | `show_visual`      | `PublishVisual {chatId, title, script, assets}` (origin chat only; assets base64 by name, read by the MCP server from the agent's cwd) |

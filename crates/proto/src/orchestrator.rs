@@ -334,6 +334,32 @@ pub fn tree_members<'a>(chats: &'a [Chat], root_id: &str) -> Vec<&'a Chat> {
     members
 }
 
+/// Every session below `chat_id` (not `chat_id` itself), archived ones and
+/// btw asides included, parents before their children. [`tree_members`]
+/// starts from a root only; this starts from any chat, to name a branch.
+pub fn subtree_members<'a>(chats: &'a [Chat], chat_id: &str) -> Vec<&'a Chat> {
+    let mut members: Vec<&Chat> = Vec::new();
+    let mut level = vec![chat_id];
+    for _ in 0..MAX_DEPTH {
+        let next: Vec<&Chat> = chats
+            .iter()
+            .filter(|chat| {
+                chat.parent_chat_id
+                    .as_deref()
+                    .is_some_and(|parent| level.contains(&parent))
+                    && chat.id != chat_id
+                    && !members.iter().any(|seen| seen.id == chat.id)
+            })
+            .collect();
+        if next.is_empty() {
+            break;
+        }
+        level = next.iter().map(|chat| chat.id.as_str()).collect();
+        members.extend(next);
+    }
+    members
+}
+
 /// Sessions below `root_id` that still count against [`MAX_LIVE_SESSIONS`]:
 /// [`tree_members`] without the archived ones and btw asides (the root is
 /// never a member).
@@ -410,6 +436,35 @@ mod tests {
         assert_eq!(depth(&chats, "side"), None, "a side chat of a plain chat");
         assert_eq!(depth(&chats, "missing"), None);
         assert_eq!(lineage(&chats, "loop-a").len(), 2, "a cycle ends the walk");
+    }
+
+    #[test]
+    fn a_branch_lists_what_hangs_below_it_parents_first() {
+        let root = new_root_chat_id();
+        let mut archived = chat_archived("grandchild-b", Some("child-a"), true);
+        archived.title = Some("old".into());
+        let chats = vec![
+            chat(&root, None),
+            chat("child-a", Some(&root)),
+            chat("child-b", Some(&root)),
+            chat("grandchild-a", Some("child-a")),
+            archived,
+            chat("btw-aside", Some("grandchild-a")),
+        ];
+        let ids = |of: &str| -> Vec<&str> {
+            subtree_members(&chats, of)
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect()
+        };
+        assert_eq!(
+            ids("child-a"),
+            ["grandchild-a", "grandchild-b", "btw-aside"],
+            "archived and aside sessions included, the branch's own chat not"
+        );
+        assert!(ids("child-b").is_empty(), "a leaf has nothing below it");
+        assert!(ids("missing").is_empty());
+        assert_eq!(ids(&root).len(), 5, "from a root it is the whole tree");
     }
 
     #[test]

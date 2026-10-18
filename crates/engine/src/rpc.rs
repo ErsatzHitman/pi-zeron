@@ -613,6 +613,27 @@ struct OrchestratorMemoryParams {
     forget: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StopTreeParams {
+    chat_id: String,
+    #[serde(default)]
+    scope: crate::tree_stop::StopScope,
+    /// Hold the tree so nothing restarts by itself (default).
+    #[serde(default = "default_true")]
+    hold: bool,
+    #[serde(default)]
+    only: Option<Vec<String>>,
+    /// The session asking: never stopped itself, and limited to what is
+    /// below it.
+    #[serde(default)]
+    caller: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum OrchestratorAction {
@@ -1732,6 +1753,9 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // queueing, verification, and the relayed response itself.
         methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // Runtimes come down in parallel, each allowed a few seconds, and the
+        // report waits (bounded) for them to be gone.
+        methods::STOP_TREE => Duration::from_secs(60),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -1821,6 +1845,8 @@ fn forwardable(method: &str) -> bool {
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             | methods::MERGE_PREVIEW
+            // A session is stopped on the device that hosts it.
+            | methods::STOP_TREE
             // Project Actions live in the owning engine's private profile store.
             | methods::LIST_PROJECT_ACTIONS
             | methods::UPSERT_PROJECT_ACTION
@@ -4389,6 +4415,28 @@ impl RpcService for EngineRpc {
                 self.control_orchestrator(&p.root_id, p.action)
                     .and_then(|reply| RpcReply::value(&reply))
             }
+            methods::STOP_TREE => {
+                let p: StopTreeParams = parse_params(params)?;
+                let request = crate::tree_stop::StopTreeRequest {
+                    chat_id: p.chat_id,
+                    scope: p.scope,
+                    hold: p.hold,
+                    only: p.only,
+                    caller: p.caller,
+                };
+                let report = crate::tree_stop::stop_tree(
+                    &self.workspace,
+                    &self.doc_host,
+                    &self.sessions,
+                    &request,
+                )
+                .await
+                .map_err(|e| match e {
+                    crate::tree_stop::StopTreeError::BadParams(text) => RpcError::BadParams(text),
+                    crate::tree_stop::StopTreeError::Failed(text) => RpcError::Failed(text),
+                })?;
+                RpcReply::value(&report)
+            }
             methods::PUBLISH_VISUAL => {
                 let p: PublishVisualParams = parse_params(params)?;
                 let title: String = p
@@ -5054,6 +5102,34 @@ mod tests {
         assert!(!is_stream_method(methods::POST_CHANGE_REQUEST_COMMENT));
         assert!(!is_stream_method(methods::GET_CHANGE_REQUEST));
         assert!(!is_stream_method(methods::GET_CHANGE_REQUEST_DIFF));
+    }
+
+    /// Stopping a tree tears runtimes down on the device that hosts them, and
+    /// takes longer than the default reply budget on a big tree.
+    #[test]
+    fn stop_tree_is_device_addressable_and_given_time() {
+        assert!(forwardable(methods::STOP_TREE));
+        assert!(!is_stream_method(methods::STOP_TREE));
+        assert!(forward_deadline(methods::STOP_TREE) > std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn stop_tree_params_hold_the_whole_tree_unless_told_otherwise() {
+        use crate::tree_stop::StopScope;
+        let plain: StopTreeParams =
+            serde_json::from_value(serde_json::json!({"chatId": "orchestrator-x"})).unwrap();
+        assert_eq!(plain.scope, StopScope::Tree);
+        assert!(plain.hold);
+        assert!(plain.only.is_none() && plain.caller.is_none());
+        let branch: StopTreeParams = serde_json::from_value(serde_json::json!({
+            "chatId": "a", "scope": "subtree", "hold": false,
+            "only": ["b"], "caller": "orchestrator-x",
+        }))
+        .unwrap();
+        assert_eq!(branch.scope, StopScope::Subtree);
+        assert!(!branch.hold);
+        assert_eq!(branch.only.as_deref(), Some(&["b".to_owned()][..]));
+        assert_eq!(branch.caller.as_deref(), Some("orchestrator-x"));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —

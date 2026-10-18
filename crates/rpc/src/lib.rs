@@ -300,6 +300,14 @@ pub mod methods {
     /// or steering any; `resume` lifts it; `archive` / `unarchive` take the
     /// root and every session with it. Local only.
     pub const CONTROL_ORCHESTRATOR: &str = "ControlOrchestrator";
+    /// Stop an orchestrator's whole tree, or one branch, for good
+    /// (`{ chatId, scope?: tree | subtree, hold?: bool, only?: [chat ids],
+    /// caller?: chat id }`): every runtime torn down with its background
+    /// jobs and sub-agents, every queued message cleared, the tree held so
+    /// nothing restarts. -> `{ stopped, alreadyIdle, queuedCleared, held,
+    /// remaining, remote }`. Relay-forwardable: the sessions a device hosts
+    /// are stopped there (`remote` lists the ones to follow up on).
+    pub const STOP_TREE: &str = "StopTree";
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";

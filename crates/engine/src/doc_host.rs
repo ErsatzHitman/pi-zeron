@@ -548,6 +548,14 @@ pub struct TranscriptSnapshot {
     pub replay_baseline: Arc<zeron_doc::TranscriptBaseline>,
 }
 
+/// What [`DocHost::stop_chat_work`] took from one chat.
+pub(crate) struct ChatStop {
+    /// Queued and held messages removed from its queue.
+    pub queued_cleared: usize,
+    /// A live runtime was torn down.
+    pub ended: bool,
+}
+
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
 pub struct ChatDocHandle {
     chat_id: String,
@@ -4291,6 +4299,76 @@ impl DocHost {
                 Err(err)
             }
         }
+    }
+
+    /// Stop everything `chat_id` has going or waiting, for good. The messages
+    /// queued or held for it leave the queue (they land in the transcript
+    /// unrun, as after a Stop), prompts still on their way are cancelled, and
+    /// its runtime is torn down together with every background job and
+    /// sub-agent it holds. A Stop ([`Self::interrupt_and_pause_queue`]) ends a
+    /// turn and leaves a runtime that lives as long as the app (Pi) up with
+    /// its background work; this is the one that ends the runtime. The queue
+    /// stays frozen until the user's next send thaws it.
+    pub(crate) async fn stop_chat_work(
+        &self,
+        sessions: &SessionsEngine,
+        chat_id: &str,
+    ) -> Result<ChatStop, EngineError> {
+        let handle = self.open(chat_id)?;
+        let mut cleared = self.freeze_and_clear_queue(&handle).await?;
+        // A prompt that is still on its way is cancelled by an ordinary Stop,
+        // which first lets the ones ahead of it land. Not holding the drain
+        // lock meanwhile: the Stop takes it.
+        let stop = self.queue_command_with_transfers(
+            chat_id,
+            SessionCommandPayload::Interrupt {},
+            Vec::new(),
+        )?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            let waiting = handle.doc.read_commands().is_ok_and(|commands| {
+                commands
+                    .iter()
+                    .any(|c| c.id == stop && c.status == SessionCommandStatus::Pending)
+            });
+            if !waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let ended = sessions.terminate(chat_id).await?;
+        // Whatever arrived while the runtime went down.
+        cleared += self.freeze_and_clear_queue(&handle).await?;
+        Ok(ChatStop {
+            queued_cleared: cleared,
+            ended,
+        })
+    }
+
+    /// Freeze `handle`'s queue and take every row out of it, the ones held
+    /// for a running turn included. Returns how many there were.
+    async fn freeze_and_clear_queue(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+    ) -> Result<usize, EngineError> {
+        let _drain = handle.drain_lock.lock().await;
+        handle.queue_paused.store(true, Ordering::Release);
+        let rows = handle.doc.read_queue()?;
+        self.cancel_held_sends(handle);
+        let mut changed = false;
+        for row in &rows {
+            let Ok(Some(row)) = handle.doc.take_queued(&row.id) else {
+                continue; // a held send, taken above
+            };
+            changed = true;
+            if let Err(err) = handle.write_user_message(&row.id, &row.text, row.issued_at) {
+                tracing::warn!(chat = %handle.chat_id, error = %err, "cleared queue row write failed");
+            }
+        }
+        if changed {
+            handle.publish_queue();
+        }
+        Ok(rows.len())
     }
 
     /// A Stop cancels the messages sent during the turn it stops: the sends
