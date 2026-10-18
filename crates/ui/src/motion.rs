@@ -1585,7 +1585,7 @@ mod tests {
 
     #[gpui::test]
     fn a_spinner_view_leases_its_own_entity_not_the_callers(cx: &mut gpui::TestAppContext) {
-        use gpui::{Context, Render};
+        use gpui::{AppContext as _, Context, ParentElement as _, Render};
 
         struct Host;
         impl Render for Host {
@@ -1628,7 +1628,7 @@ mod tests {
 
     #[gpui::test]
     fn parked_clock_schedules_no_frames(cx: &mut gpui::TestAppContext) {
-        use gpui::{Context, Render};
+        use gpui::{AppContext as _, Context, Render};
 
         struct Still;
         impl Render for Still {

@@ -17427,6 +17427,7 @@ mod tests {
 
     #[test]
     fn wizard_release_check_reads_the_transcript_in_place() {
+        use zeron_doc::MessageStatus;
         let entry = |n: usize, parts: Vec<MessagePart>| SessionMessageEntry {
             id: format!("e{n}"),
             role: MessageRole::Assistant,
