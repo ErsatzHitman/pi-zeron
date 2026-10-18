@@ -197,6 +197,10 @@ struct DiffSyncInner {
     supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// chat_id → viewer interest; see [`CheckoutDiffSync::retain_chat`].
     interest: Mutex<HashMap<String, Interest>>,
+    /// How many checkouts may capture at once (see [`sync_round_limit`]): a
+    /// tree of agents in a dozen worktrees otherwise starts a dozen rounds of
+    /// git together, each several processes long.
+    sync_rounds: Arc<tokio::sync::Semaphore>,
     /// How long released interest keeps an archived chat tracked.
     interest_linger: Duration,
     /// Wakes the supervisor to reconcile when an archived chat's interest
@@ -352,6 +356,7 @@ impl CheckoutDiffSync {
                 interest: Mutex::new(HashMap::new()),
                 interest_linger,
                 interest_changed: Arc::new(Notify::new()),
+                sync_rounds: Arc::new(tokio::sync::Semaphore::new(sync_round_limit())),
                 discard_lock: tokio::sync::Mutex::new(()),
             }),
         };
@@ -794,6 +799,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         Arc::downgrade(&entry),
         kick_rx,
         inner.cancel.clone(),
+        inner.sync_rounds.clone(),
     ));
     let _ = kick_tx.send(()); // initial snapshot — must not wait for watchers
 
@@ -927,6 +933,13 @@ fn sync_cooldown(last: Duration) -> Duration {
         .min(MAX_SYNC_COOLDOWN)
 }
 
+/// Concurrent capture rounds across checkouts: half the cores, two to four.
+fn sync_round_limit() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, |cores| cores.get() / 2)
+        .clamp(2, 4)
+}
+
 /// What a paced sync round came to.
 enum SyncRound {
     /// A capture ran: the next one waits out its cooldown.
@@ -939,10 +952,13 @@ enum SyncRound {
 
 /// Trailing-debounce fs kicks, then `round` — and between rounds the
 /// cooldown of [`sync_cooldown`]. Rounds run one at a time; kicks during one
-/// accumulate and trigger one more.
+/// accumulate and trigger one more. Each round holds a permit of `limit`,
+/// shared by every checkout; the wait for one is not part of the capture
+/// time the cooldown scales with.
 async fn paced_syncs<F, Fut>(
     mut kick_rx: mpsc::UnboundedReceiver<()>,
     cancel: &CancellationToken,
+    limit: &tokio::sync::Semaphore,
     mut round: F,
 ) where
     F: FnMut() -> Fut,
@@ -962,6 +978,11 @@ async fn paced_syncs<F, Fut>(
             _ = cancel.cancelled() => return,
             _ = tokio::time::sleep_until(ready_at) => {}
         }
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => return,
+            permit = limit.acquire() => permit,
+        };
+        let Ok(_permit) = permit else { return };
         let started = tokio::time::Instant::now();
         match round().await {
             SyncRound::Ran => {
@@ -980,8 +1001,9 @@ async fn entry_task(
     entry: Weak<CheckoutEntry>,
     kick_rx: mpsc::UnboundedReceiver<()>,
     cancel: CancellationToken,
+    limit: Arc<tokio::sync::Semaphore>,
 ) {
-    paced_syncs(kick_rx, &cancel, || {
+    paced_syncs(kick_rx, &cancel, &limit, || {
         let (inner, entry, cancel) = (inner.clone(), entry.clone(), cancel.clone());
         async move {
             let (Some(inner), Some(entry)) = (inner.upgrade(), entry.upgrade()) else {
@@ -1187,6 +1209,29 @@ fn capture_git<'a, S: AsRef<OsStr>>(
     capture_git_in(cwd, args, max_bytes, None)
 }
 
+/// Background git (diff captures, turn snapshots) yields the CPU to the app
+/// and to work the user started: below-normal priority on Windows, `nice` 10
+/// on unix. No console window either.
+pub(super) fn yield_cpu(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        cmd.as_std_mut()
+            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    #[cfg(unix)]
+    // SAFETY: the closure only makes async-signal-safe syscalls.
+    unsafe {
+        cmd.pre_exec(|| {
+            let current = libc::getpriority(libc::PRIO_PROCESS, 0);
+            libc::setpriority(libc::PRIO_PROCESS, 0, current.max(10));
+            Ok(())
+        });
+    };
+}
+
 /// [`capture_git`] that can also see a turn snapshot's objects, which exist
 /// only in that snapshot's store.
 async fn capture_git_in<S: AsRef<OsStr>>(
@@ -1196,11 +1241,7 @@ async fn capture_git_in<S: AsRef<OsStr>>(
     snapshot: Option<&TreeSnapshot>,
 ) -> Result<Capture, EngineError> {
     let mut cmd = tokio::process::Command::new("git");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.as_std_mut().creation_flags(0x08000000);
-    }
+    yield_cpu(&mut cmd);
     cmd.arg("-C").arg(cwd).args(args);
     if let Some(snapshot) = snapshot {
         snapshot.apply_to(&mut cmd);
@@ -2265,7 +2306,8 @@ mod watch_budget_tests {
         let task = tokio::spawn({
             let rounds = rounds.clone();
             async move {
-                paced_syncs(kick_rx, &cancel, || {
+                let limit = tokio::sync::Semaphore::new(1);
+                paced_syncs(kick_rx, &cancel, &limit, || {
                     let rounds = rounds.clone();
                     async move {
                         rounds.fetch_add(1, Ordering::SeqCst);
@@ -2284,6 +2326,93 @@ mod watch_budget_tests {
         assert!(
             (2..=3).contains(&seen),
             "{seen} captures in ten seconds of steady churn"
+        );
+        drop(kick_tx);
+        task.await.unwrap();
+    }
+
+    /// Eight churning checkouts share two permits: never more than two
+    /// capture at once, and every one still gets its round.
+    #[tokio::test(start_paused = true)]
+    async fn checkouts_capture_at_most_limit_at_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = Arc::new(tokio::sync::Semaphore::new(2));
+        let (running, peak, done) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut kicks = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (kick_tx, kick_rx) = tokio::sync::mpsc::unbounded_channel();
+            kick_tx.send(()).unwrap();
+            kicks.push(kick_tx);
+            let (limit, cancel) = (limit.clone(), cancel.clone());
+            let (running, peak, done) = (running.clone(), peak.clone(), done.clone());
+            tasks.push(tokio::spawn(async move {
+                paced_syncs(kick_rx, &cancel, &limit, || {
+                    let (running, peak, done) = (running.clone(), peak.clone(), done.clone());
+                    async move {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        done.fetch_add(1, Ordering::SeqCst);
+                        SyncRound::Ran
+                    }
+                })
+                .await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(done.load(Ordering::SeqCst), 8, "every checkout captured");
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        drop(kicks);
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    /// A round that waited two seconds for a permit but captured in 100ms
+    /// rests the 500ms floor, not four times the wait.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_a_permit_does_not_lengthen_the_cooldown() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = limit.clone().try_acquire_owned().unwrap();
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let (kick_tx, kick_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let (limit, rounds) = (limit.clone(), rounds.clone());
+            async move {
+                paced_syncs(kick_rx, &cancel, &limit, || {
+                    let rounds = rounds.clone();
+                    async move {
+                        rounds.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        SyncRound::Ran
+                    }
+                })
+                .await;
+            }
+        });
+        kick_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(rounds.load(Ordering::SeqCst), 0, "waiting for the permit");
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(rounds.load(Ordering::SeqCst), 1);
+        kick_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            rounds.load(Ordering::SeqCst),
+            2,
+            "the cooldown was the floor"
         );
         drop(kick_tx);
         task.await.unwrap();

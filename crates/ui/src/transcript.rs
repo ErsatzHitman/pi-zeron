@@ -2623,8 +2623,35 @@ fn compact_work_title(
 
 struct HighlightEntry {
     key: DocumentHighlightKey,
+    /// The code `key` stands for.
+    source: Arc<str>,
     document: Option<Weak<zeron_syntax::HighlightedDocument>>,
+    /// While `key`'s tokenize runs: the lines an earlier document of this
+    /// slot had finished, when the code grew from that document's source
+    /// (a streaming fence), so they keep their colours instead of flashing
+    /// plain.
+    stale: Option<Arc<zeron_syntax::HighlightedDocument>>,
+    /// `key`'s tokenize is still running.
+    pending: bool,
     _task: Option<Task<()>>,
+}
+
+/// What `previous` (tokenized from `source`) may still colour of `code`: the
+/// lines `source` had finished, when `code` only grew from it. Never the last,
+/// unfinished line: its spans would fall on a longer, different line.
+fn stale_highlight(
+    previous: &zeron_syntax::HighlightedDocument,
+    source: &str,
+    code: &str,
+) -> Option<zeron_syntax::HighlightedDocument> {
+    if !code.starts_with(source) {
+        return None;
+    }
+    let finished = source.matches('\n').count().min(previous.lines.len());
+    (finished > 0).then(|| zeron_syntax::HighlightedDocument {
+        language: previous.language,
+        lines: previous.lines[..finished].to_vec(),
+    })
 }
 
 /// Cache of tokenized code blocks keyed by `(row id, block ix)`. Tokenization
@@ -2648,12 +2675,20 @@ impl HighlightStore {
     ) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
         let slot_key = (row_id.clone(), block_ix);
         let document_key = DocumentHighlightKey::new(lang, code);
-        if let Some(entry) = self.entries.get(&slot_key)
-            && entry.key == document_key
-        {
-            let document = entry.document.as_ref()?;
-            if let Some(document) = document.upgrade() {
-                return Some(document);
+        let previous = self.entries.get(&slot_key);
+        if let Some(entry) = previous {
+            if entry.key == document_key {
+                if entry.pending {
+                    return entry.stale.clone();
+                }
+                let document = entry.document.as_ref()?;
+                if let Some(document) = document.upgrade() {
+                    return Some(document);
+                }
+            } else if entry.pending && code.starts_with(&*entry.source) {
+                // A streaming fence: one tokenize at a time. When it lands
+                // the repaint asks again with the code as it is by then.
+                return entry.stale.clone();
             }
         }
         if let Some(document) = self.cache.get(&document_key) {
@@ -2661,12 +2696,27 @@ impl HighlightStore {
                 slot_key,
                 HighlightEntry {
                     key: document_key,
+                    source: code.into(),
                     document: Some(Arc::downgrade(&document)),
+                    stale: None,
+                    pending: false,
                     _task: None,
                 },
             );
             return Some(document);
         }
+        let stale = previous.and_then(|entry| {
+            match entry.document.as_ref().and_then(Weak::upgrade) {
+                Some(document) => stale_highlight(&document, &entry.source, code).map(Arc::new),
+                // Still showing an older document's finished lines, which
+                // stay finished as long as the code only grows.
+                None => entry
+                    .stale
+                    .clone()
+                    .filter(|_| code.starts_with(&*entry.source)),
+            }
+        });
+        let source: Arc<str> = code.into();
         let code = code.to_string();
         let source_bytes = code.len();
         let task = cx.spawn(async move |this, cx| {
@@ -2712,6 +2762,13 @@ impl HighlightStore {
                 })
                 .await;
             this.update(cx, |transcript, cx| {
+                if let Some(entry) = transcript.highlights.entries.get_mut(&slot_key)
+                    && entry.key == document_key
+                {
+                    entry.pending = false;
+                    entry.stale = None;
+                    cx.notify();
+                }
                 if let Some(document) = document {
                     let document = Arc::new(document);
                     let retained = transcript
@@ -2735,15 +2792,19 @@ impl HighlightStore {
             })
             .ok();
         });
+        let shown = stale.clone();
         self.entries.insert(
             (row_id, block_ix),
             HighlightEntry {
                 key: document_key,
+                source,
                 document: None,
+                stale,
+                pending: true,
                 _task: Some(task),
             },
         );
-        None
+        shown
     }
 }
 
@@ -11393,6 +11454,29 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_growing_fence_keeps_only_its_finished_lines_coloured() {
+        let source = "fn a() {}\nlet b = 1;\nlet c";
+        let previous = zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+            source,
+            path: None,
+            fence_tag: Some("rust"),
+        })
+        .unwrap();
+        let stale =
+            stale_highlight(&previous, source, "fn a() {}\nlet b = 1;\nlet cd = 2;\n").unwrap();
+        assert_eq!(
+            stale.lines,
+            previous.lines[..2],
+            "the partial line is dropped"
+        );
+        assert_eq!(stale.language, previous.language);
+        // An edit (not an extension) reuses nothing, nor does a first line
+        // that is still being written.
+        assert!(stale_highlight(&previous, source, "fn z() {}\n").is_none());
+        assert!(stale_highlight(&previous, "fn a", "fn a() {}").is_none());
+    }
 
     #[gpui::test]
     fn selected_reply_text_offers_send_to_btw(cx: &mut gpui::TestAppContext) {

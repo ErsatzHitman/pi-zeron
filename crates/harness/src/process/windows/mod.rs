@@ -20,9 +20,9 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
+    BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
 };
 
 #[derive(Debug)]
@@ -140,6 +140,11 @@ fn spawn_prepared(
     startup.StartupInfo.hStdError = handles[2];
     startup.lpAttributeList = attrs.ptr();
     let mut info = PROCESS_INFORMATION::default();
+    let priority = if command.below_normal {
+        BELOW_NORMAL_PRIORITY_CLASS
+    } else {
+        0
+    };
     // SAFETY: buffers/attribute values and all borrowed handles remain alive
     // through creation. The job handle is excluded from inherited handles.
     if unsafe {
@@ -152,7 +157,8 @@ fn spawn_prepared(
             CREATE_NO_WINDOW
                 | CREATE_SUSPENDED
                 | CREATE_UNICODE_ENVIRONMENT
-                | EXTENDED_STARTUPINFO_PRESENT,
+                | EXTENDED_STARTUPINFO_PRESENT
+                | priority,
             prepared.environment.as_ptr().cast(),
             prepared
                 .cwd

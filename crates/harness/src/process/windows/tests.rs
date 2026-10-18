@@ -74,6 +74,21 @@ async fn unrelated_inheritable_handles_are_not_passed_to_agents() {
     );
 }
 
+#[tokio::test]
+async fn a_below_normal_command_starts_below_normal() {
+    use windows_sys::Win32::System::Threading::GetPriorityClass;
+    let mut command = parked_command();
+    command.below_normal_priority();
+    let mut class = 0;
+    let mut child = spawn_prepared(&command, |child| {
+        class = unsafe { GetPriorityClass(child.process.as_raw_handle()) };
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(class, BELOW_NORMAL_PRIORITY_CLASS);
+    assert!(child.wait().await.unwrap().success());
+}
+
 #[test]
 fn creation_is_already_in_job_and_setup_failure_rolls_back() {
     let mut processes = Vec::new();

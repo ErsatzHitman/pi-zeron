@@ -10,6 +10,10 @@
 //!    job object is `KILL_ON_JOB_CLOSE` (`windows_process.rs`).
 //! 3. At engine launch `process::reap_orphans` kills marked processes whose
 //!    engine is gone, including descendants in their own session or group.
+//!
+//! An agent and everything it runs (cargo, node, tsc) also yields the CPU to
+//! the app: below-normal priority on Windows, `nice` 10 on unix, both
+//! inherited by descendants. `ZERON_AGENT_NICE` sets the niceness (0 is off).
 use std::ops::{Deref, DerefMut};
 
 use crate::process::orphans::{ENGINE_PID_ENV, ENGINE_START_ENV, current_marker};
@@ -22,12 +26,23 @@ use crate::process::{Child as ProcessChild, Command};
 pub(crate) fn configure(command: &mut Command) {
     #[cfg(unix)]
     command.process_group(0);
+    #[cfg(windows)]
+    if agent_nice() > 0 {
+        command.below_normal_priority();
+    }
     #[cfg(target_os = "linux")]
     {
         // SAFETY: the closure only calls async-signal-safe libc functions.
         let parent = unsafe { libc::getpid() };
+        let nice = agent_nice();
         unsafe {
             command.pre_exec(move || {
+                // Here, before exec, so every thread the agent starts inherits
+                // it: Linux niceness is per thread.
+                if nice > 0 {
+                    let current = libc::getpriority(libc::PRIO_PROCESS, 0);
+                    libc::setpriority(libc::PRIO_PROCESS, 0, current.max(nice));
+                }
                 if libc::prctl(
                     libc::PR_SET_PDEATHSIG,
                     libc::SIGKILL as libc::c_ulong,
@@ -60,6 +75,18 @@ pub(crate) fn configure(command: &mut Command) {
     }
 }
 
+/// How much an agent's tree yields: `ZERON_AGENT_NICE` (0 to 19, 0 keeps
+/// normal priority), else 10.
+pub(crate) fn agent_nice() -> i32 {
+    nice_from(std::env::var("ZERON_AGENT_NICE").ok().as_deref())
+}
+
+fn nice_from(value: Option<&str>) -> i32 {
+    value
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .map_or(10, |nice| nice.clamp(0, 19))
+}
+
 pub(crate) struct Child {
     inner: ProcessChild,
     #[cfg(unix)]
@@ -68,6 +95,15 @@ pub(crate) struct Child {
 
 impl Child {
     pub(crate) fn new(inner: ProcessChild) -> Self {
+        // macOS niceness is per process, so setting it right after spawn
+        // keeps std's posix_spawn path (a pre_exec would force fork/exec).
+        #[cfg(target_os = "macos")]
+        if let Some(pid) = inner.id()
+            && agent_nice() > 0
+        {
+            // SAFETY: plain syscall on our own child's pid.
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, agent_nice()) };
+        }
         Self {
             #[cfg(unix)]
             group: Some(-(inner.id().expect("newly spawned child") as i32)),
@@ -141,6 +177,21 @@ impl Drop for Child {
         // Tokio's kill_on_drop covers the direct child. Keep the group id
         // even after wait() has reaped it, so descendants cannot escape cleanup.
         self.terminate_group();
+    }
+}
+
+#[cfg(test)]
+mod nice_tests {
+    use super::nice_from;
+
+    #[test]
+    fn agents_yield_by_default_and_the_variable_tunes_or_turns_it_off() {
+        assert_eq!(nice_from(None), 10);
+        assert_eq!(nice_from(Some("0")), 0);
+        assert_eq!(nice_from(Some(" 5 ")), 5);
+        assert_eq!(nice_from(Some("40")), 19);
+        assert_eq!(nice_from(Some("-3")), 0, "never raised above normal");
+        assert_eq!(nice_from(Some("high")), 10);
     }
 }
 

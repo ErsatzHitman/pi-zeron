@@ -367,11 +367,7 @@ async fn snapshot_git(
     stdin: Option<Vec<u8>>,
 ) -> std::io::Result<std::process::Output> {
     let mut cmd = tokio::process::Command::new("git");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.as_std_mut().creation_flags(0x08000000);
-    }
+    super::yield_cpu(&mut cmd);
     cmd.arg("-C").arg(root).args(args);
     cmd.env("GIT_INDEX_FILE", index);
     store.apply_to(&mut cmd);

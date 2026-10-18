@@ -13,6 +13,7 @@ use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWind
 pub struct Command {
     metadata: std::process::Command,
     clear_env: bool,
+    pub(super) below_normal: bool,
     pub(super) stdio: [Stdio; 3],
 }
 impl Command {
@@ -20,6 +21,7 @@ impl Command {
         Self {
             metadata: std::process::Command::new(program),
             clear_env: false,
+            below_normal: false,
             stdio: [Stdio::inherit(); 3],
         }
     }
@@ -62,6 +64,12 @@ impl Command {
     }
     pub fn stderr(&mut self, stdio: Stdio) -> &mut Self {
         self.stdio[2] = stdio;
+        self
+    }
+    /// Start the process at below-normal priority, which every process it
+    /// creates inherits.
+    pub fn below_normal_priority(&mut self) -> &mut Self {
+        self.below_normal = true;
         self
     }
     /// Windows managed children always terminate on owner drop, as in the

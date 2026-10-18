@@ -191,6 +191,10 @@ fn play_in_background(data: &'static [u8]) {
 }
 
 fn play_bytes(data: &[u8]) -> Result<(), String> {
+    #[cfg(windows)]
+    if play_in_memory(data) {
+        return Ok(());
+    }
     // The system players want a file path. Exclusive creation prevents a
     // predictable-name collision (including a pre-planted symlink) from
     // redirecting the embedded bytes to another file.
@@ -236,6 +240,23 @@ fn create_temp_file() -> std::io::Result<(std::fs::File, TempSoundFile)> {
 #[cfg(target_os = "macos")]
 fn run_player(path: &Path) -> Result<(), String> {
     run_checked("afplay", &[], path)
+}
+
+/// The embedded WAV played in process: no temp file and no powershell.exe
+/// per cue. Synchronous on the caller's background thread, like the player
+/// it replaces; false (no audio device, say) falls back to that player.
+#[cfg(windows)]
+fn play_in_memory(data: &[u8]) -> bool {
+    use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_NODEFAULT, SND_SYNC};
+    // SAFETY: with SND_MEMORY the first argument is a whole WAV image in
+    // memory, which outlives this synchronous call.
+    unsafe {
+        PlaySoundW(
+            data.as_ptr().cast(),
+            std::ptr::null_mut(),
+            SND_MEMORY | SND_SYNC | SND_NODEFAULT,
+        ) != 0
+    }
 }
 
 #[cfg(windows)]
