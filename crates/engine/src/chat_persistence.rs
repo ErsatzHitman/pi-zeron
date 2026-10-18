@@ -8,6 +8,18 @@ use zeron_doc::SessionDoc;
 use zeron_sync::DocsStore;
 
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
+/// The longest a streaming chat waits between snapshots, however slow they get.
+const MAX_SAVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long to coalesce changes before the next snapshot, given how long the
+/// last one took. A snapshot exports and rewrites the whole document, so its
+/// cost grows with the chat; spending more than an eighth of the time on it
+/// would keep a core busy for a long streaming chat. Fast saves keep the
+/// one-second cadence.
+fn next_save_delay(last: Duration) -> Duration {
+    last.saturating_mul(8)
+        .clamp(SAVE_INTERVAL, MAX_SAVE_INTERVAL)
+}
 
 pub(crate) struct ChatPersistence {
     doc: Weak<SessionDoc>,
@@ -17,6 +29,8 @@ pub(crate) struct ChatPersistence {
     generation: AtomicU64,
     saved: AtomicU64,
     snapshot_bytes: AtomicUsize,
+    /// How long the last successful export + save took, in microseconds.
+    last_save_micros: AtomicU64,
     urgent: AtomicBool,
     write: Mutex<()>,
     wake: Option<mpsc::Sender<()>>,
@@ -47,6 +61,7 @@ impl ChatPersistence {
             generation: AtomicU64::new(0),
             saved: AtomicU64::new(0),
             snapshot_bytes: AtomicUsize::new(0),
+            last_save_micros: AtomicU64::new(0),
             urgent: AtomicBool::new(false),
             write: Mutex::new(()),
             wake: runtime.as_ref().map(|_| tx),
@@ -100,7 +115,10 @@ impl ChatPersistence {
 
     async fn run(weak: Weak<Self>, mut rx: mpsc::Receiver<()>) {
         while rx.recv().await.is_some() {
-            let deadline = tokio::time::Instant::now() + SAVE_INTERVAL;
+            let Some(this) = weak.upgrade() else { return };
+            let last_save = Duration::from_micros(this.last_save_micros.load(Ordering::Relaxed));
+            drop(this);
+            let deadline = tokio::time::Instant::now() + next_save_delay(last_save);
             loop {
                 let Some(this) = weak.upgrade() else { return };
                 let urgent = this.urgent.swap(false, Ordering::AcqRel);
@@ -156,6 +174,7 @@ impl ChatPersistence {
             if let Some(hook) = self.before_export.lock().unwrap().take() {
                 hook();
             }
+            let started = std::time::Instant::now();
             let result = doc
                 .export_snapshot()
                 .map_err(|e| e.to_string())
@@ -172,6 +191,10 @@ impl ChatPersistence {
                 });
             match result {
                 Ok(()) => {
+                    self.last_save_micros.store(
+                        started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
                     #[cfg(test)]
                     self.writes.fetch_add(1, Ordering::Relaxed);
                     self.saved.store(generation, Ordering::Release);
@@ -276,6 +299,44 @@ mod tests {
         let doc = Arc::new(SessionDoc::init("whale").unwrap());
         let persistence = ChatPersistence::new(&doc, store.clone(), "whale".into(), 0);
         (dir, doc, store, persistence)
+    }
+
+    #[test]
+    fn the_snapshot_window_widens_with_how_long_saves_take() {
+        let ms = Duration::from_millis;
+        assert_eq!(next_save_delay(Duration::ZERO), ms(1_000));
+        assert_eq!(next_save_delay(ms(100)), ms(1_000));
+        assert_eq!(next_save_delay(ms(125)), ms(1_000));
+        assert_eq!(next_save_delay(ms(500)), ms(4_000));
+        assert_eq!(next_save_delay(ms(2_000)), ms(10_000));
+        assert_eq!(next_save_delay(Duration::MAX), ms(10_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_save_holds_the_next_snapshot_back() {
+        let (_dir, doc, store, persistence) = fixture();
+        // The last save took a second: the next waits eight.
+        persistence
+            .last_save_micros
+            .store(1_000_000, Ordering::Relaxed);
+        doc.doc().get_map("test").insert("applied", 1i64).unwrap();
+        doc.doc().commit();
+        persistence.applied(1, false);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(persistence.writes.load(Ordering::Relaxed), 0);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        // The write itself runs on a real blocking thread.
+        for _ in 0..2_000 {
+            if persistence.writes.load(Ordering::Relaxed) != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(persistence.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(store.snapshot_cursor("whale").unwrap(), 1);
     }
 
     #[tokio::test]
