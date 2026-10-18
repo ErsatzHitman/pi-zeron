@@ -20,7 +20,9 @@ use zeron_proto::{
 };
 
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
-use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
+use crate::zeron::{
+    HarnessInfo, RESUBSCRIBE_DELAY, TranscriptWatch, TurnOutcome, Zeron, session_for, short,
+};
 
 /// Default and ceiling for the blocking waits.
 const MAX_BATCH: usize = 32;
@@ -2211,6 +2213,10 @@ impl Tools {
         // Keep the same deadline while waiting for a response to this send.
         let mut rendered = Vec::new();
         let mut replies = Vec::new();
+        // One subscription for the whole wait: the engine sends the reply's
+        // frames as they commit. (Attaching afresh every 100ms was sent the
+        // whole transcript each time, and rendered it again.)
+        let mut watch: Option<TranscriptWatch> = None;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -2219,19 +2225,22 @@ impl Tools {
                 }
                 break;
             }
-            let entries = match tokio::time::timeout(
-                remaining,
-                self.zeron.transcript_on(&chat.id, Some(&chat.device_id)),
-            )
-            .await
-            {
-                Ok(entries) => entries?,
-                Err(_) => {
-                    outcome = TurnOutcome::TimedOut;
-                    break;
-                }
-            };
-            rendered = render_entries(&entries, RenderOptions::default());
+            if watch.is_none() {
+                watch = match tokio::time::timeout(
+                    remaining,
+                    self.zeron.watch_transcript(&chat.id, Some(&chat.device_id)),
+                )
+                .await
+                {
+                    Ok(opened) => Some(opened?),
+                    Err(_) => {
+                        outcome = TurnOutcome::TimedOut;
+                        break;
+                    }
+                };
+            }
+            let Some(open) = watch.as_mut() else { break };
+            rendered = render_entries(open.entries(), RenderOptions::default());
             replies = rendered
                 .iter()
                 .filter(|m| m.role == zeron_doc::MessageRole::Assistant)
@@ -2246,7 +2255,17 @@ impl Tools {
             {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+            match tokio::time::timeout(remaining, open.changed()).await {
+                // A frame is folded in: look again.
+                Ok(Ok(true)) => {}
+                // The stream ended, or its frames no longer fit the entries
+                // held: attach again once the engine has settled.
+                Ok(Ok(false) | Err(_)) => {
+                    watch = None;
+                    tokio::time::sleep(RESUBSCRIBE_DELAY.min(remaining)).await;
+                }
+                Err(_) => {}
+            }
         }
         let (status, _) = status_of(session.as_ref());
         let mut result = json!({
@@ -4309,6 +4328,119 @@ mod tests {
             );
             assert_eq!(result["turn"]["replies"][0]["text"], "new reply");
         }
+    }
+
+    /// A transcript stream that stays open, as the engine's does: the reply
+    /// starts out streaming and, when `complete_after` is set, finishes in a
+    /// delta frame. Counts the attaches made after the send.
+    struct LiveReply {
+        turn: DelayedTurn,
+        complete_after: Option<Duration>,
+        attaches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RpcService for LiveReply {
+        async fn handle(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
+            let sent = self.turn.sent.lock().unwrap().clone();
+            let (Some((timestamp, _, _)), methods::WATCH_DOC_MESSAGES) = (sent, method) else {
+                return self.turn.handle(method, params).await;
+            };
+            self.attaches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let reply = |status: &str, text: &str| {
+                json!({
+                    "id":"new-reply", "role":"assistant", "createdAt":timestamp,
+                    "deviceId":"dev-remote", "status":status,
+                    "parts":[{"kind":"text", "id":"t", "text":text}]
+                })
+            };
+            let opening = json!({ "reset": [reply("streaming", "new")] });
+            let finished = json!({
+                "upsert": [{ "after": null, "entry": reply("complete", "new reply") }],
+                "append": [], "remove": [], "count": 1
+            });
+            let complete_after = self.complete_after;
+            Ok(RpcReply::Stream(
+                futures::stream::once(async move { opening })
+                    .chain(
+                        futures::stream::once(async move {
+                            tokio::time::sleep(complete_after.unwrap()).await;
+                            finished
+                        })
+                        .take(usize::from(complete_after.is_some())),
+                    )
+                    // The engine's stream stays open until the watcher leaves.
+                    .chain(futures::stream::pending())
+                    .boxed(),
+            ))
+        }
+    }
+
+    fn live_reply(complete_after: Option<Duration>) -> Arc<LiveReply> {
+        Arc::new(LiveReply {
+            turn: DelayedTurn {
+                world: World {
+                    beta_remote: true,
+                    ..Default::default()
+                },
+                sent: Mutex::new(None),
+                reply_delay: Duration::ZERO,
+                never_reply: true,
+                host_skew_millis: 0,
+            },
+            complete_after,
+            attaches: Default::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn await_turn_subscribes_to_the_transcript_once() {
+        let service = live_reply(Some(Duration::from_millis(700)));
+        let tools = Tools::new(Arc::new(Zeron::with_client(
+            memory_client(service.clone()),
+            Origin::default(),
+        )));
+        let result = tools
+            .call(
+                "send_message",
+                json!({"chat":"Beta", "text":"go", "wait":true, "timeout_secs":5}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["turn"]["outcome"], "completed", "{result}");
+        assert_eq!(
+            result["turn"]["replies"][0]["text"], "new reply",
+            "{result}"
+        );
+        // The reply streamed for 700ms and was followed on the one attach,
+        // not re-fetched by a fresh attach every 100ms.
+        assert_eq!(
+            service.attaches.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn await_turn_times_out_on_a_reply_that_stays_streaming_without_polling() {
+        let service = live_reply(None);
+        let tools = Tools::new(Arc::new(Zeron::with_client(
+            memory_client(service.clone()),
+            Origin::default(),
+        )));
+        let result = tools
+            .call(
+                "send_message",
+                json!({"chat":"Beta", "text":"go", "wait":true, "timeout_secs":1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["turn"]["outcome"], "timedOut", "{result}");
+        assert_eq!(
+            service.attaches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second of waiting is one attach, not ten"
+        );
     }
 
     #[tokio::test]
