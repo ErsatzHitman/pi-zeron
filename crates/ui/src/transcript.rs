@@ -8570,8 +8570,10 @@ impl Transcript {
         )
     }
 
-    /// The "※ Recap" block: no card, a dim header and up to three dim plain
-    /// lines, with a close button that appears on hover or keyboard focus.
+    /// The recap block: no card, one paragraph that starts with a bold dim
+    /// "※ recap:" label and runs on in italics in a muted colour (the way
+    /// Claude Code shows it), so it never reads as part of the reply. A close
+    /// button appears on hover or keyboard focus.
     fn render_recap(
         &self,
         row_id: &SharedString,
@@ -8582,10 +8584,12 @@ impl Transcript {
     ) -> AnyElement {
         let chat_id = self.chat_id.clone().unwrap_or_default();
         let accent = theme.accent;
-        let header: SharedString = if generating {
-            "※ Recapping…".into()
-        } else {
-            "※ Recap".into()
+        let paragraph = recap_paragraph(lines, generating);
+        let label = gpui::HighlightStyle {
+            font_style: Some(gpui::FontStyle::Normal),
+            font_weight: Some(gpui::FontWeight::SEMIBOLD),
+            color: Some(theme.text_faint),
+            ..Default::default()
         };
         let dismiss = (!generating).then(|| {
             div()
@@ -8628,22 +8632,13 @@ impl Transcript {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
+                    .text_size(crate::typography::ui_rems(12.5))
+                    .italic()
+                    .text_color(theme.text_muted.opacity(0.85))
                     .child(
-                        div()
-                            .text_size(crate::typography::ui_rems(12.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_faint)
-                            .child(header),
-                    )
-                    .children(lines.iter().map(|line| {
-                        div()
-                            .text_size(crate::typography::ui_rems(12.5))
-                            .text_color(theme.text_muted.opacity(0.85))
-                            .child(line.clone())
-                    })),
+                        gpui::StyledText::new(paragraph.text)
+                            .with_highlights([(paragraph.label, label)]),
+                    ),
             )
             .children(dismiss)
             .into_any_element()
@@ -10091,6 +10086,36 @@ fn error_chip(message: SharedString, hint: Option<SharedString>, theme: &Theme) 
                 }),
         )
         .into_any_element()
+}
+
+/// A recap as one paragraph: the "※ recap:" label (its byte range) and the
+/// lines run together after it; "※ recapping…" alone while it is written.
+struct RecapParagraph {
+    text: SharedString,
+    label: std::ops::Range<usize>,
+}
+
+fn recap_paragraph(lines: &[SharedString], generating: bool) -> RecapParagraph {
+    let label = if generating {
+        "※ recapping…"
+    } else {
+        "※ recap:"
+    };
+    let body = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = if generating || body.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label} {body}")
+    };
+    RecapParagraph {
+        text: text.into(),
+        label: 0..label.len(),
+    }
 }
 
 /// The recap row for `chat_id`. Its id is stable, so a new recap replaces the
@@ -13926,6 +13951,24 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_recap_reads_as_one_labelled_paragraph() {
+        let lines: Vec<SharedString> = vec![
+            "Shipping 0.2.147. ".into(),
+            "".into(),
+            "Next: verify.".into(),
+        ];
+        let ready = recap_paragraph(&lines, false);
+        assert_eq!(
+            ready.text.as_ref(),
+            "※ recap: Shipping 0.2.147. Next: verify."
+        );
+        assert_eq!(&ready.text[ready.label.clone()], "※ recap:");
+        let writing = recap_paragraph(&[], true);
+        assert_eq!(writing.text.as_ref(), "※ recapping…");
+        assert_eq!(writing.label, 0..writing.text.len());
     }
 
     #[test]
