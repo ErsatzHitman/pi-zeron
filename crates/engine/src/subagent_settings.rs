@@ -5,9 +5,12 @@
 //! members and their sub-sessions). They live in Pi's
 //! `<agent dir>/subagents.json` as `defaultModel` and `defaultThinkingLevel`,
 //! which those extensions re-read at each launch, so a change reaches running
-//! chats at their next child. Every other key in the file is kept. A child
+//! chats at their next child. Up to two fallbacks (`fallbackModels`, each a
+//! model and an optional level) are tried in order when the default cannot
+//! run a child: a model on an almost used-up account, or a child that fails
+//! before it does any work. Every other key in the file is kept. A child
 //! cannot run a reserved model (Claude Fable, GPT Astra), so neither can the
-//! default.
+//! default or a fallback.
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -20,6 +23,8 @@ use crate::advisor_settings::spec;
 pub const FILE: &str = "subagents.json";
 /// Pi's thinking levels, least first.
 pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/// How many fallbacks the default may have.
+pub const MAX_FALLBACKS: usize = 2;
 
 /// Serialises the engine's writers.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -32,10 +37,23 @@ pub struct SubagentSettings {
     pub model: Option<String>,
     /// One of [`THINKING_LEVELS`]; None is Pi's default for the model.
     pub thinking: Option<String>,
+    /// Tried in order when `model` cannot run a child; at most
+    /// [`MAX_FALLBACKS`], none repeating the default or each other.
+    pub fallbacks: Vec<SubagentFallback>,
+}
+
+/// One fallback: a `provider/id` and the level it runs at, None for the
+/// default's own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SubagentFallback {
+    pub model: String,
+    pub thinking: Option<String>,
 }
 
 impl SubagentSettings {
-    /// Checked and tidied: a well-formed model and a known level.
+    /// Checked and tidied: a well-formed model and a known level, and
+    /// fallbacks that are well formed, each once, and no more than allowed.
     fn normalized(self) -> Result<Self, String> {
         let model = match self
             .model
@@ -43,26 +61,62 @@ impl SubagentSettings {
             .map(str::trim)
             .filter(|m| !m.is_empty())
         {
-            Some(model) => Some(
-                spec(model).ok_or_else(|| format!("{model} is not a Pi model (provider/id)"))?,
-            ),
+            Some(model) => Some(checked_model(model)?),
             None => None,
         };
-        let thinking = match self
-            .thinking
+        let thinking = checked_level(self.thinking.as_deref())?;
+        let mut fallbacks: Vec<SubagentFallback> = Vec::new();
+        for fallback in self.fallbacks {
+            let named = fallback.model.trim();
+            if named.is_empty() {
+                continue;
+            }
+            let fallback = SubagentFallback {
+                model: checked_model(named)?,
+                thinking: checked_level(fallback.thinking.as_deref())?,
+            };
+            // Falling back to the default, or to an earlier fallback, would
+            // only run the model that just failed again.
+            let repeats = model.as_deref() == Some(fallback.model.as_str())
+                || fallbacks.iter().any(|f| f.model == fallback.model);
+            if !repeats {
+                fallbacks.push(fallback);
+            }
+        }
+        if fallbacks.len() > MAX_FALLBACKS {
+            return Err(format!(
+                "A default subagent has at most {MAX_FALLBACKS} fallbacks"
+            ));
+        }
+        Ok(Self {
+            model,
+            thinking,
+            fallbacks,
+        })
+    }
+
+    /// The default, then each fallback.
+    fn models(&self) -> impl Iterator<Item = &str> {
+        self.model
             .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            Some(level) => Some(level_of(level).ok_or_else(|| {
-                format!(
-                    "{level} is not a thinking level ({})",
-                    THINKING_LEVELS.join(", ")
-                )
-            })?),
-            None => None,
-        };
-        Ok(Self { model, thinking })
+            .into_iter()
+            .chain(self.fallbacks.iter().map(|f| f.model.as_str()))
+    }
+}
+
+fn checked_model(model: &str) -> Result<String, String> {
+    spec(model).ok_or_else(|| format!("{model} is not a Pi model (provider/id)"))
+}
+
+fn checked_level(level: Option<&str>) -> Result<Option<String>, String> {
+    match level.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(level) => level_of(level).map(Some).ok_or_else(|| {
+            format!(
+                "{level} is not a thinking level ({})",
+                THINKING_LEVELS.join(", ")
+            )
+        }),
+        None => Ok(None),
     }
 }
 
@@ -98,17 +152,52 @@ fn load(path: &Path) -> Result<Option<Map<String, Value>>, String> {
     }
 }
 
-/// What the file sets, as Pi reads it: an ill-formed value is no value.
+/// What the file sets, as Pi reads it: an ill-formed value is no value, and
+/// so is a fallback that repeats the default or an earlier one, or comes
+/// after the first [`MAX_FALLBACKS`].
 fn from_root(root: &Map<String, Value>) -> SubagentSettings {
+    let model = root
+        .get("defaultModel")
+        .and_then(Value::as_str)
+        .and_then(spec);
+    let mut fallbacks: Vec<SubagentFallback> = Vec::new();
+    for entry in root
+        .get("fallbackModels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (named, level) = match entry {
+            Value::String(named) => (Some(named.as_str()), None),
+            Value::Object(fields) => (
+                fields.get("model").and_then(Value::as_str),
+                fields.get("thinkingLevel").and_then(Value::as_str),
+            ),
+            _ => (None, None),
+        };
+        let Some(fallback_model) = named.and_then(spec) else {
+            continue;
+        };
+        if model.as_deref() == Some(fallback_model.as_str())
+            || fallbacks.iter().any(|f| f.model == fallback_model)
+        {
+            continue;
+        }
+        fallbacks.push(SubagentFallback {
+            model: fallback_model,
+            thinking: level.and_then(|level| level_of(level.trim())),
+        });
+        if fallbacks.len() == MAX_FALLBACKS {
+            break;
+        }
+    }
     SubagentSettings {
-        model: root
-            .get("defaultModel")
-            .and_then(Value::as_str)
-            .and_then(spec),
+        model,
         thinking: root
             .get("defaultThinkingLevel")
             .and_then(Value::as_str)
             .and_then(|level| level_of(level.trim())),
+        fallbacks,
     }
 }
 
@@ -125,13 +214,12 @@ pub fn read(agent_dir: &Path) -> SubagentSettings {
 
 /// Save `settings`, creating the file when needed, and return what it now
 /// sets. A file that is not a JSON object is refused, never overwritten, and
-/// so is a reserved model.
+/// so is a reserved model, as the default or as a fallback.
 pub fn write(agent_dir: &Path, settings: SubagentSettings) -> Result<SubagentSettings, String> {
     let settings = settings.normalized()?;
     if let Some(model) = settings
-        .model
-        .as_deref()
-        .filter(|model| reserved_models::reserved_family(model).is_some())
+        .models()
+        .find(|model| reserved_models::reserved_family(model).is_some())
     {
         return Err(reserved_models::refusal(model, "A subagent"));
     }
@@ -147,6 +235,23 @@ pub fn write(agent_dir: &Path, settings: SubagentSettings) -> Result<SubagentSet
             Some(value) => root.insert(key.into(), value.clone().into()),
             None => root.remove(key),
         };
+    }
+    if settings.fallbacks.is_empty() {
+        root.remove("fallbackModels");
+    } else {
+        let fallbacks = settings
+            .fallbacks
+            .iter()
+            .map(|fallback| {
+                let mut entry = Map::new();
+                entry.insert("model".into(), fallback.model.clone().into());
+                if let Some(level) = &fallback.thinking {
+                    entry.insert("thinkingLevel".into(), level.clone().into());
+                }
+                Value::Object(entry)
+            })
+            .collect();
+        root.insert("fallbackModels".into(), Value::Array(fallbacks));
     }
     if root != before {
         save(&path, &root)?;
@@ -181,6 +286,14 @@ mod tests {
     fn settings(model: Option<&str>, thinking: Option<&str>) -> SubagentSettings {
         SubagentSettings {
             model: model.map(str::to_owned),
+            thinking: thinking.map(str::to_owned),
+            fallbacks: Vec::new(),
+        }
+    }
+
+    fn fallback(model: &str, thinking: Option<&str>) -> SubagentFallback {
+        SubagentFallback {
+            model: model.to_owned(),
             thinking: thinking.map(str::to_owned),
         }
     }
@@ -239,13 +352,93 @@ mod tests {
     }
 
     #[test]
+    fn two_fallbacks_are_saved_in_order_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wanted = settings(Some("opencode-go/deepseek-flash"), Some("max"));
+        wanted.fallbacks = vec![
+            fallback(" openai/gpt-5.5 ", Some("high")),
+            fallback("", None),
+            fallback("zai/glm-5", None),
+        ];
+        let saved = write(dir.path(), wanted).unwrap();
+        assert_eq!(
+            saved.fallbacks,
+            [
+                fallback("openai/gpt-5.5", Some("high")),
+                fallback("zai/glm-5", None)
+            ],
+            "an empty slot is dropped"
+        );
+        assert_eq!(
+            file_json(dir.path())["fallbackModels"],
+            serde_json::json!([
+                { "model": "openai/gpt-5.5", "thinkingLevel": "high" },
+                { "model": "zai/glm-5" }
+            ])
+        );
+        assert_eq!(read(dir.path()), saved);
+        // Clearing them removes the key, nothing else.
+        let mut cleared = saved.clone();
+        cleared.fallbacks.clear();
+        write(dir.path(), cleared).unwrap();
+        assert!(file_json(dir.path()).get("fallbackModels").is_none());
+        assert_eq!(
+            file_json(dir.path())["defaultModel"],
+            "opencode-go/deepseek-flash"
+        );
+    }
+
+    #[test]
+    fn a_fallback_that_repeats_a_model_is_dropped_and_a_third_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repeats = settings(Some("openai/gpt-5.5"), None);
+        repeats.fallbacks = vec![
+            fallback("openai/gpt-5.5", None),
+            fallback("zai/glm-5", None),
+            fallback("zai/glm-5", Some("low")),
+        ];
+        assert_eq!(
+            write(dir.path(), repeats).unwrap().fallbacks,
+            [fallback("zai/glm-5", None)]
+        );
+        let mut three = settings(None, None);
+        three.fallbacks = vec![
+            fallback("a/one", None),
+            fallback("b/two", None),
+            fallback("c/three", None),
+        ];
+        let error = write(dir.path(), three).unwrap_err();
+        assert!(error.contains("at most 2"), "{error}");
+        // Pi's own reading: a string is a model, the first two count.
+        std::fs::write(
+            path(dir.path()),
+            r#"{ "fallbackModels": ["a/one", { "model": "bad" }, { "model": "b/two", "thinkingLevel": "low" }, "c/three"] }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read(dir.path()).fallbacks,
+            [fallback("a/one", None), fallback("b/two", Some("low"))]
+        );
+    }
+
+    #[test]
     fn a_bad_model_level_or_reserved_model_is_refused_and_nothing_is_written() {
         let dir = tempfile::tempdir().unwrap();
+        let reserved_fallback = SubagentSettings {
+            fallbacks: vec![fallback("openai/gpt-6-astra", None)],
+            ..settings(Some("openai/gpt-5.5"), None)
+        };
+        let bad_fallback_level = SubagentSettings {
+            fallbacks: vec![fallback("zai/glm-5", Some("ludicrous"))],
+            ..settings(None, None)
+        };
         for bad in [
             settings(Some("gpt-5.5"), None),
             settings(Some("openai/gpt-5.5"), Some("ludicrous")),
             settings(Some("anthropic/claude-fable-5"), Some("high")),
             settings(Some("openai/gpt-6-astra-mini"), None),
+            reserved_fallback,
+            bad_fallback_level,
         ] {
             assert!(write(dir.path(), bad.clone()).is_err(), "{bad:?}");
             assert!(!path(dir.path()).exists());

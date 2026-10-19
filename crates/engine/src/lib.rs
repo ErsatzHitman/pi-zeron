@@ -24,6 +24,7 @@ mod change_request_store;
 pub mod change_requests;
 pub mod chat2_host;
 mod chat_persistence;
+pub mod decision_settings;
 pub mod diff_sync;
 pub mod doc_host;
 mod extension_ui;

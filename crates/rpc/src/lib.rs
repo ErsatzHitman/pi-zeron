@@ -58,9 +58,16 @@ pub mod methods {
     /// The default agent (Pi model and thinking level) of every child an
     /// agent starts, from this device's `subagents.json` (`SubagentSettings`).
     pub const GET_SUBAGENT_SETTINGS: &str = "GetSubagentSettings";
-    /// Save `{model: string|null, thinking: string|null}`; replies like
+    /// Save `{model: string|null, thinking: string|null, fallbacks: [{model,
+    /// thinking: string|null}]}` (at most two fallbacks); replies like
     /// `GetSubagentSettings`.
     pub const SET_SUBAGENT_SETTINGS: &str = "SetSubagentSettings";
+    /// The decision model Pi's decisions gate asks, from this device's
+    /// `decisions-model.json` (`DecisionSettings`: `{model: "jev"|"snap",
+    /// hasKey}`).
+    pub const GET_DECISION_SETTINGS: &str = "GetDecisionSettings";
+    /// Save `{model: "jev"|"snap"}`; replies like `GetDecisionSettings`.
+    pub const SET_DECISION_SETTINGS: &str = "SetDecisionSettings";
     /// This device's Pi executable setting and its live status.
     pub const GET_PI_SETTINGS: &str = "GetPiSettings";
     /// Save the Pi executable (`{executable: string|null}`); replies like `GetPiSettings`.

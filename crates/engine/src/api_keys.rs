@@ -61,6 +61,7 @@ pub const KNOWN: &[Known] = &[
     Known::pi("mistral", "Mistral", "Pi models, voice mode"),
     Known::pi("xai", "xAI", "Pi models"),
     Known::pi("deepseek", "DeepSeek", "Pi models, web search & fetch"),
+    Known::other("subq", "SubQ", "Decisions gate (SubQ Snap)"),
     Known::other("nvidia", "NVIDIA", "Memory embeddings"),
     Known::other("deepgram", "Deepgram", "Voice mode"),
     Known::other("dashscope", "DashScope", "Voice mode (real-time)"),
