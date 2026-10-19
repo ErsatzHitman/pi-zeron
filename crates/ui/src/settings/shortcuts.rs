@@ -88,6 +88,8 @@ pub struct ShortcutsPage {
     advisor: Entity<crate::settings::advisor::AdvisorCard>,
     /// Settings → General's default subagent card (a Pi-only picker).
     default_subagent: Entity<crate::settings::default_subagent::DefaultSubagentCard>,
+    /// Settings → General's decision gate card (Jev or SubQ Snap).
+    decision_gate: Entity<crate::settings::decision_gate::DecisionGateCard>,
     /// Settings → General's Pi executable card.
     pi: Entity<crate::settings::pi::PiSettingsCard>,
     _state: Entity<AppState>,
@@ -143,6 +145,10 @@ impl ShortcutsPage {
                 cx.new(|cx| {
                     crate::settings::default_subagent::DefaultSubagentCard::new(state, cx)
                 })
+            },
+            decision_gate: {
+                let state = state.clone();
+                cx.new(|cx| crate::settings::decision_gate::DecisionGateCard::new(state, cx))
             },
             pi: {
                 let state = state.clone();
@@ -978,6 +984,7 @@ impl Render for ShortcutsPage {
                                     .child(self.thread_naming.clone())
                                     .child(self.pi.clone())
                                     .child(self.default_subagent.clone())
+                                    .child(self.decision_gate.clone())
                                     .child(self.advisor.clone()),
                             ),
                     )

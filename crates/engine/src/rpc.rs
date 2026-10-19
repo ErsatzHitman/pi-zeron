@@ -1939,6 +1939,9 @@ fn forwardable(method: &str) -> bool {
             // So is its subagents.json.
             | methods::GET_SUBAGENT_SETTINGS
             | methods::SET_SUBAGENT_SETTINGS
+            // And the decisions gate's decisions-model.json.
+            | methods::GET_DECISION_SETTINGS
+            | methods::SET_DECISION_SETTINGS
             | methods::GET_PI_SETTINGS
             | methods::SET_PI_SETTINGS
             | methods::SET_DELETE_GUARD
@@ -2560,6 +2563,23 @@ impl RpcService for EngineRpc {
                 let settings = tokio::task::spawn_blocking(move || match save {
                     Some(settings) => subagent_settings::write(&dir, settings),
                     None => Ok(subagent_settings::read(&dir)),
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&settings)
+            }
+            methods::GET_DECISION_SETTINGS | methods::SET_DECISION_SETTINGS => {
+                use crate::decision_settings::{self, DecisionSettings};
+                let save: Option<DecisionSettings> = if method == methods::SET_DECISION_SETTINGS {
+                    Some(parse_params(params)?)
+                } else {
+                    None
+                };
+                let dir = self.agent_accounts.pi_agent_dir();
+                let settings = tokio::task::spawn_blocking(move || match save {
+                    Some(settings) => decision_settings::write(&dir, settings),
+                    None => Ok(decision_settings::read(&dir)),
                 })
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?

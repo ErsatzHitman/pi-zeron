@@ -1616,21 +1616,22 @@ impl Tools {
             },
         };
         // A Pi session that names no model is a child like any other: it runs
-        // on the device's default subagent (Settings → General), when one is
-        // set and offered there.
-        if args.model.is_none()
-            && harness == HarnessId::Pi
-            && let Some((model, thinking)) = self.default_subagent(&device_id).await
-            && self
-                .zeron
-                .models_on(harness, Some(&device_id))
-                .await?
-                .iter()
-                .any(|m| m.id == model)
-        {
-            args.model = Some(model);
-            if args.reasoning.is_none() {
-                args.reasoning = thinking;
+        // on the device's default subagent (Settings → General), or on the
+        // first of its fallbacks the device offers when it does not offer the
+        // default itself.
+        if args.model.is_none() && harness == HarnessId::Pi {
+            let agents = self.default_subagent(&device_id).await;
+            if !agents.is_empty() {
+                let offered = self.zeron.models_on(harness, Some(&device_id)).await?;
+                if let Some((model, thinking)) = agents
+                    .into_iter()
+                    .find(|(model, _)| offered.iter().any(|m| &m.id == model))
+                {
+                    args.model = Some(model);
+                    if args.reasoning.is_none() {
+                        args.reasoning = thinking;
+                    }
+                }
             }
         }
         if let Some(model) = args.model.as_deref() {
@@ -2435,11 +2436,12 @@ impl Tools {
 
     /// `create_chat` named a folder that is not a project yet: register it,
     /// when the engine finds exactly one folder for the path or short name.
-    /// The device's default subagent (`GetSubagentSettings`): its model and
-    /// thinking level. None when unset or unreadable; a device that cannot
-    /// say leaves the harness default in place.
-    async fn default_subagent(&self, device_id: &str) -> Option<(String, Option<String>)> {
-        let reply = self
+    /// The device's default subagent (`GetSubagentSettings`), then each of
+    /// its fallbacks, as models and thinking levels; a fallback with no level
+    /// of its own runs at the default's. Empty when unset or unreadable; a
+    /// device that cannot say leaves the harness default in place.
+    async fn default_subagent(&self, device_id: &str) -> Vec<(String, Option<String>)> {
+        let Ok(reply) = self
             .zeron
             .call(
                 zeron_rpc::methods::GET_SUBAGENT_SETTINGS,
@@ -2447,10 +2449,21 @@ impl Tools {
             )
             .await
             .inspect_err(|error| tracing::debug!(%error, "default subagent unavailable"))
-            .ok()?;
-        let model = reply["model"].as_str()?.to_owned();
+        else {
+            return Vec::new();
+        };
+        let Some(model) = reply["model"].as_str() else {
+            return Vec::new();
+        };
         let thinking = reply["thinking"].as_str().map(str::to_owned);
-        Some((model, thinking))
+        let fallbacks = reply["fallbacks"].as_array().into_iter().flatten();
+        std::iter::once((model.to_owned(), thinking.clone()))
+            .chain(fallbacks.filter_map(|fallback| {
+                let model = fallback["model"].as_str()?.to_owned();
+                let level = fallback["thinking"].as_str().map(str::to_owned);
+                Some((model, level.or_else(|| thinking.clone())))
+            }))
+            .collect()
     }
 
     async fn register_for_create(
@@ -4942,8 +4955,32 @@ mod tests {
         let created = create(&world, json!({})).await;
         assert_eq!(created["harness"], "claude-code");
         assert!(created["model"].is_null(), "{created}");
-        // A default the device does not offer, or none at all, is no default.
-        for default in [json!({ "model": "x/gone" }), json!({ "model": null })] {
+        // A default the device does not offer runs on its first offered
+        // fallback, at the fallback's level or else the default's.
+        for (fallbacks, model, reasoning) in [
+            (
+                json!([{ "model": "x/gone" }, { "model": "opus", "thinking": "low" }]),
+                "opus",
+                "low",
+            ),
+            (json!([{ "model": "opus" }]), "opus", "high"),
+        ] {
+            let world = Arc::new(World {
+                subagent_default: Some(
+                    json!({ "model": "x/gone", "thinking": "high", "fallbacks": fallbacks }),
+                ),
+                ..World::default()
+            });
+            let created = create(&world, json!({ "harness": "pi" })).await;
+            assert_eq!(created["model"], model);
+            assert_eq!(created["reasoning"], reasoning);
+        }
+        // A default the device does not offer, with no offered fallback, or
+        // none at all, is no default.
+        for default in [
+            json!({ "model": "x/gone", "fallbacks": [{ "model": "y/gone" }] }),
+            json!({ "model": null }),
+        ] {
             let world = Arc::new(World {
                 subagent_default: Some(default),
                 ..World::default()

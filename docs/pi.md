@@ -553,3 +553,32 @@ the children read the file at each launch, so running chats pick a change up
 at their next child. A model or level the call names still wins, and so does a
 subagent profile's own model. Reset removes the model, and children run on
 their session's model again. A reserved model is refused.
+
+Once the model is set, two fallback rows appear (`fallbackModels` in the same
+file, each a model and an optional level; without one it runs at the default's
+level). A child on the default starts on the first of the default and its
+fallbacks that can run: a reserved model, or one on a subscription Settings →
+Usage marks almost used up, is skipped. A `subagent_start` child that fails
+before it runs a single tool (an unknown model, a provider error, no key) is
+started again on the next fallback, and its result says so (`- Fallback:`). A
+workflow agent on the default whose retries all fail runs on each fallback in
+turn before any tier escalation. A delegated session starts on the first one
+that can run, and `zeron_create_chat` on the first one the device offers. A
+fallback that repeats the default or an earlier one is dropped; Reset on a
+fallback moves the next one up, and Reset on the model clears both.
+
+## Decision gate
+
+Settings → General → Decision gate picks the decision model Pi's decisions
+gate asks before a plan with a writer launches. Jev (`typesafe/jev-1.13`) runs
+on OpenRouter's decisions endpoint with the OpenRouter key; SubQ Snap
+(`subq-snap-preview`) runs on SubQ's Decisions API
+(`https://api.subq.ai/v1/systemone`) with the active SubQ key from Settings →
+API keys, or `SUBQ_API_KEY`. Both take the same System One request and return
+the same answers, so the gate decides the same way with either. The engine
+writes `{ "model": "jev" | "snap" }` to `<pi agent dir>/decisions-model.json`
+(`GetDecisionSettings` / `SetDecisionSettings`); the gate reads it at every
+consult, so a change applies to the next one. The card warns when Snap is
+chosen and the store holds no SubQ key: the gate then lets launches through
+without a consult. `/decisions model [jev|snap]` sets the same file, and
+`DECISIONS_MODEL` overrides it.
