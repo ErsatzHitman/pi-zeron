@@ -4244,10 +4244,13 @@ mod tests {
         let input = cx.debug_bounds("pr-repository-load").unwrap();
         scroll.set_offset(gpui::point(px(0.0), -scroll.max_offset().y));
         cx.update(|window, cx| window.draw(cx).clear());
-        assert_eq!(
-            cx.debug_bounds("pr-repository-load").unwrap(),
-            input,
-            "the input stays above the scroll region"
+        // Within a pixel: a redraw can land the input half a pixel apart.
+        let after = cx.debug_bounds("pr-repository-load").unwrap();
+        assert_eq!(after.size, input.size);
+        assert!(
+            (f32::from(after.origin.x) - f32::from(input.origin.x)).abs() <= 1.0
+                && (f32::from(after.origin.y) - f32::from(input.origin.y)).abs() <= 1.0,
+            "the input stays above the scroll region: {after:?} vs {input:?}"
         );
         page.update(cx, |page, cx| {
             page.state.update(cx, |state, cx| {

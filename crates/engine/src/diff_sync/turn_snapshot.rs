@@ -772,10 +772,20 @@ mod tests {
             .expect("git cat-file spawns");
         assert!(!plain.status.success());
 
-        // The store lives exactly as long as the snapshot.
+        // The store lives exactly as long as the snapshot. The diff's own
+        // snapshot store is removed on a blocking thread when it drops, so
+        // wait for it to go before counting.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store_dirs(&data_dir).len() > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the diff's snapshot store was not deleted: {:?}",
+                store_dirs(&data_dir)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(store_dirs(&data_dir).len(), 1);
         drop(turn);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !store_dirs(&data_dir).is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
