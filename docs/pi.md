@@ -298,7 +298,11 @@ Zeron's existing delegation uses a temporary MCP bridge loaded with
 `crates/harness/src/pi/visuals.md`, which describes the charts, diagrams and
 tables Zeron draws ([chat visuals](reference/chat-visuals.md)) and the
 interactive Luau visuals Pi shows with `zeron_show_visual` (see
-[MCP](mcp.md)).
+[MCP](mcp.md)). Every Pi run except a btw side chat also gets
+`crates/harness/src/pi/host.md`: before heavy work (full test suites,
+release builds, workflows, many sub-agents) the agent checks the machine's
+memory, load, cgroup memory cap and GPU with shell commands, and on a busy
+machine prefers CI, a narrower run or a short wait, and says what it deferred.
 
 What a session is and what it can do is the harness's to say, not Zeron's:
 Zeron publishes where a run sits as env (`ZERON_PI_MCP` with the chat id,
