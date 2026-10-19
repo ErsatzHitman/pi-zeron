@@ -6374,10 +6374,10 @@ pub struct Composer {
     route_snap_until: Option<Instant>,
     _observe: Subscription,
     _pickers_observe: Subscription,
-    /// The footer's rings: plan usage of the session harness's live
-    /// account, and context occupancy — each opening a popover.
+    /// The footer's plan-usage ring for the session harness's live account,
+    /// opening a popover.
     account_usage: Entity<crate::account_usage::AccountUsage>,
-    /// A side chat's composer: its footer keeps only the context ring.
+    /// A side chat's composer: no checkout/ref footer and no plan usage.
     pub(crate) side_chat: bool,
     /// No model picker: the chat runs the model it inherited (a btw pane's
     /// side chat runs its parent's).
@@ -6857,8 +6857,8 @@ impl Composer {
         self.show_error(message, cx);
     }
 
-    /// Mark this as a side chat's composer: below the input it shows only
-    /// the context ring (no checkout/ref footer, no plan usage).
+    /// Mark this as a side chat's composer: no checkout/ref footer and no
+    /// plan usage below the input.
     pub(crate) fn set_side_chat(&mut self, cx: &mut Context<Self>) {
         self.side_chat = true;
         cx.notify();

@@ -46,7 +46,7 @@ The sidebar nests the same side chats under their parent session ([sidebar side 
 
 ## Context
 
-Under Changes, for any chat whose agent reports a context window. Folded (the default) it is one line: **Context**, its percent and a ring, like the composer footer's. Click it to open the breakdown, Claude Code's `/context`:
+Under Changes, for any chat whose agent reports a context window. Folded (the default) it is one line: **Context**, its percent and a ring (the composer footer has no context ring). Click it to open the breakdown, Claude Code's `/context`:
 
 - **Used of the window:** "7% used" and "71.3k / 1M", then a bar split by what fills it, in each part's colour, with the autocompact buffer at its end.
 - **One row per part,** with its tokens and share of the window: System tools, MCP tools, System prompt, Messages, Skills, MCP server instructions, Since last update (tokens the provider has not counted yet, estimated), Autocompact buffer (kept free because Pi compacts before the window fills) and Free space. Hover a row for what it counts.
@@ -58,20 +58,20 @@ The total and the window are the chat's own (the footer ring's numbers), so the 
 
 ## Workflow
 
-Pi chats only, from the `workflows` extension's `workflow:state` channel. Shown while a workflow run is in flight or pausing, while a run that stopped early (paused, interrupted when Pi quit or crashed, stopped, or failed) can be resumed, and briefly after a run ends: 20 seconds, or 2 minutes for a failure. The header counts `done/total`, and its pill reads Running (with a spinner), Retrying, Paused, Done, Failed, Interrupted or Stopped.
+Pi chats only, from the `workflows` extension's `workflow:state` channel. Shown while a workflow run is in flight or pausing, while a run that stopped early (paused, interrupted when Pi quit or crashed, stopped, or failed) can be resumed, and briefly after a run ends: a run that finished (done, stopped, or interrupted with nothing to resume) clears within 5 seconds; a failure stays 2 minutes so its reason can be read. The header counts `done/total`; a running run shows only a spinner, and any other state a pill: Retrying, Paused, Done, Failed, Interrupted or Stopped.
 
-- **The run:** its name and goal, a bar toward done with its percent, the current phase ("Verify · 2/3") with a live timer, and **Pause** (let running tasks finish, then pause) and **Stop**. Stop asks on the first click and acts on the second.
+- **The run:** its name and goal, a bar toward done with its percent, the current phase ("Verify · 2/3") with a live timer, and Pause (let running tasks finish, then pause) and Stop as glyph buttons, named in their tooltips. Stop asks on the first click ("Stop?") and acts on the second.
 - **Tasks:** running, retrying and failed tasks lead, each with its state glyph. A running task shows a live timer; a retrying one, its attempt and when the next one starts; a failed one, its error. Hover a task for its full error and what it depends on.
 - **Queued (N)** and **Finished (N)** fold, closed until opened, and list up to 12 tasks each, then "+N more". Finished includes results reused from an earlier run (cached), skipped and aborted tasks.
-- **Durability:** the last checkpoint ("Checkpoint 2m ago · 7 done", "Resumed 10s ago"), how many results a resume reused or found no longer matching, and how many tasks the payload left out.
+- **Notes:** how many results a resume reused or found no longer matching, and how many tasks the payload left out.
 - **Recovery:** for a run that stopped early, why it stopped and **Resume** (picks up where it left off; finished work is reused) and **Discard** (stops offering it; asks first). With no run tracked, the newest interrupted run is offered the same way.
 
 A run from a workflows extension that groups by phase (`workflow:state` v2) is drawn the way Claude Code draws a workflow instead of the bar and the Queued and Finished folds:
 
-- **Totals:** "Workflow" with how long it has run (frozen once it ends), the number of agents and their tokens ("4 agents · 170.8k tokens", retries included), and **Pause** and **Stop**.
+- **Totals:** how long it has run (frozen once it ends) with the Pause and Stop glyphs, and the number of agents and their tokens ("4 agents · 170.8k tokens", retries included).
 - **Phases:** every phase in the order the script started them, any number and any names; a repeated title (a second Verify round) is its own phase, and phases declared but not reached yet follow, dimmed. Each shows its title, `done/total` and a strip of dots: done, running, retrying, failed, and still to come (past 24 agents a dot stands for several).
 - **Agents:** a phase opens to a table of its agents: Agent, Model, Tokens and Time (a live timer while running; "reused" for a result reused from an earlier run). Agents the phase is waiting to start show as dim rows with no model yet. The phase in progress is open; click any phase to open or close it, and that choice lasts for the run.
-- A grouped run that ended stays up for 10 minutes so its table can be read.
+- A grouped run that failed stays up for 10 minutes so its table can be read; one that finished clears within 5 seconds like any other.
 
 ## btw
 

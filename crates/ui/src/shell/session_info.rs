@@ -963,6 +963,16 @@ impl Shell {
                 .and_then(|ui| WorkflowView::of(ui, now))
         };
         if let Some(view) = workflow {
+            // An idle chat repaints once a minute: wake for the moment a
+            // finished run clears, so it goes within five seconds.
+            if let Some(expires) = view.expires {
+                self.clock.arm(
+                    expires + chrono::TimeDelta::milliseconds(50),
+                    now,
+                    |shell: &mut Self| &mut shell.clock,
+                    cx,
+                );
+            }
             active.push((
                 SectionKey::Workflow,
                 view.since(),
@@ -2139,7 +2149,7 @@ impl Shell {
 
     /// A Pi workflow run: its name and goal, a bar toward done, the phase it
     /// is in, the tasks running, retrying or failed (queued and finished ones
-    /// fold), its last checkpoint, and Resume or Discard when it stopped
+    /// fold), and Resume or Discard when it stopped
     /// early. Active while the run is (see [`WorkflowView::of`]).
     fn render_workflow(
         &mut self,
@@ -2164,22 +2174,25 @@ impl Shell {
             )
             .into_any_element()
         });
+        // Running says itself with the spinner; every other state names
+        // itself in a pill.
+        let label = (view.phase != RunPhase::Running).then(|| {
+            div()
+                .flex_none()
+                .px(px(6.0))
+                .rounded_full()
+                .bg(tone.opacity(0.14))
+                .text_size(crate::typography::ui_rems(10.5))
+                .text_color(tone)
+                .child(view.phase.label())
+        });
         let pill = div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
             .children(spinner)
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(6.0))
-                    .rounded_full()
-                    .bg(tone.opacity(0.14))
-                    .text_size(crate::typography::ui_rems(10.5))
-                    .text_color(tone)
-                    .child(view.phase.label()),
-            );
+            .children(label);
         let count = (view.total > 0).then(|| format!("· {}/{}", view.done, view.total).into());
         let mut rows = vec![
             popover::picker_divider().into_any_element(),
@@ -2377,9 +2390,8 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) {
-        // ── Its durability: the last checkpoint, results reused on resume.
+        // ── Results reused on resume, and rows the payload left out.
         let mut notes: Vec<String> = Vec::new();
-        notes.extend(view.checkpoint.clone());
         notes.extend(view.reuse.clone());
         if view.truncated > 0 {
             notes.push(format!(
@@ -2792,7 +2804,6 @@ impl Shell {
                         .gap(px(6.0))
                         .text_size(crate::typography::ui_rems(11.5))
                         .text_color(muted)
-                        .child("Workflow")
                         .child(clock)
                         .child(div().flex_1())
                         .children(controls),
@@ -3240,12 +3251,19 @@ impl Shell {
         let label = SharedString::from(if armed { format!("{base}?") } else { base });
         let tip = match action.id.as_str() {
             "stop" if armed => "Click again to stop the workflow",
-            "stop" => "Stop the workflow; a stopped run is final",
-            "pause" => "Let running tasks finish, then pause",
+            "stop" => "Stop: a stopped run is final",
+            "pause" => "Pause: let running tasks finish, then pause",
             "resume" => "Pick up where it left off; finished work is reused",
             "discard" if armed => "Click again to discard this run",
             "discard" => "Stop offering to resume this run",
             _ => "",
+        };
+        // Pause and Stop sit beside the clock as glyphs, like a sub-agent's
+        // Stop; an armed Stop spells out its question.
+        let glyph = match action.id.as_str() {
+            "pause" => Some(icons::PAUSE),
+            "stop" => Some(icons::STOP),
+            _ => None,
         };
         let action = action.clone();
         let element_id = SharedString::from(format!("session-info-workflow-{}", action.id));
@@ -3256,7 +3274,14 @@ impl Shell {
             .aria_label(label.clone())
             .flex_none()
             .h(px(20.0))
-            .px(px(7.0))
+            .when(glyph.is_none(), |button| button.px(px(7.0)))
+            .when(glyph.is_some(), |button| {
+                button
+                    .min_w(px(20.0))
+                    .px(px(if armed { 5.0 } else { 0.0 }))
+                    .justify_center()
+                    .gap(px(3.0))
+            })
             .flex()
             .items_center()
             .rounded(px(5.0))
@@ -3281,7 +3306,12 @@ impl Shell {
                 }
                 cx.notify();
             }))
-            .child(label)
+            .map(|button| match glyph {
+                Some(glyph) => button
+                    .child(icon(glyph).size(px(10.0)).text_color(tone))
+                    .when(armed, |button| button.child(label)),
+                None => button.child(label),
+            })
             .into_any_element()
     }
 

@@ -420,6 +420,59 @@ fn catalog() -> Vec<ToolDef> {
             }
         }),
     });
+    tools.push(ToolDef {
+        name: LIST_SUBSESSIONS,
+        description: "Everything delegated under a chat (default: your own), with its state and errors: Pi sub-agents (subagent_start jobs, nested ones included) and their recent activity, the workflow run in flight plus recent runs from their journals (each with its failed agents and their error codes), background shells, the goal loop, the chat's newest errors and its child sessions. Call it first when delegated work looks stuck, slow or failed; then inspect_subsession with an id from it. Read-only and bounded.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "chat": {
+                    "type": "string",
+                    "description": "Chat id, unique id prefix or exact title. Default: your own chat."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 20,
+                    "description": "Most child sessions listed."
+                }
+            }
+        }),
+    });
+    tools.push(ToolDef {
+        name: INSPECT_SUBSESSION,
+        description: "Full diagnostics for ONE delegated unit from list_subsessions, to find why it failed before you retry or replace it. subagent: its state, task, model, health, tokens, activity and the result it delivered (error text, stderr, stop reason, worktree), recovered from the run journal even after it finished. workflow: the run's state and phases, every agent's status, error code, error and attempts, the run log's tail, and with `agent` that agent's prompt, result and transcript tail (where the real cause of an empty-output failure is), plus the journal, log and history paths to read with your own tools. background: a shell's state and last output. chat: a child session's status, location, failure and its newest messages and errors. events: the chat's own newest errors. Omit kind to detect it from id. Output is capped; raise tail (max 400) for more.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "chat": {
+                    "type": "string",
+                    "description": "The chat that owns the unit (id, unique prefix or exact title). Default: your own chat."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["subagent", "workflow", "background", "chat", "events"]
+                },
+                "id": {
+                    "type": "string",
+                    "description": "A sub-agent job id, workflow run id, background job id or child chat id from list_subsessions."
+                },
+                "agent": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Workflow runs: the agent ordinal whose prompt, result and transcript tail to include."
+                },
+                "tail": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 400,
+                    "default": 40,
+                    "description": "Log lines, transcript entries or events to include."
+                }
+            }
+        }),
+    });
     for tool in &mut tools {
         forbid_extra(&mut tool.input_schema);
     }
@@ -474,6 +527,12 @@ const PROJECT_UPDATE: &str = "project_update";
 const MERGE_PREVIEW: &str = "merge_preview";
 /// Stops a subtree for good: runtimes, background work, queues.
 const STOP_TREE: &str = "stop_tree";
+/// Read-only diagnostics of what a chat delegated: sub-agents, workflow
+/// runs, background shells and child sessions.
+const LIST_SUBSESSIONS: &str = "list_subsessions";
+const INSPECT_SUBSESSION: &str = "inspect_subsession";
+/// Child-session messages `inspect_subsession` shows at most.
+const INSPECT_MESSAGES: usize = 10;
 
 /// The message board of the CALLING chat's orchestrator tree, offered only
 /// to an agent Zeron launched (`ZERON_CHAT_ID` set).
@@ -726,6 +785,23 @@ struct StopTreeArgs {
 struct MergePreviewArgs {
     chat: String,
     base: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSubsessionsArgs {
+    chat: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectSubsessionArgs {
+    chat: Option<String>,
+    kind: Option<String>,
+    id: Option<String>,
+    agent: Option<u64>,
+    tail: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1173,6 +1249,8 @@ impl Tools {
             PROJECT_UPDATE => self.project_update(parse(args)?).boxed().await,
             MERGE_PREVIEW => self.merge_preview(parse(args)?).boxed().await,
             STOP_TREE => self.stop_tree(parse(args)?).boxed().await,
+            LIST_SUBSESSIONS => self.list_subsessions(parse(args)?).boxed().await,
+            INSPECT_SUBSESSION => self.inspect_subsession(parse(args)?).boxed().await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| format!("{e:#}"))
@@ -2104,6 +2182,146 @@ impl Tools {
                 }),
             )
             .await
+    }
+
+    /// The chat `key` names, else the calling chat.
+    async fn owner_chat(&self, key: Option<&str>, tool: &str) -> anyhow::Result<Chat> {
+        let key = key
+            .map(str::to_owned)
+            .or_else(|| self.zeron.origin().chat_id.clone())
+            .with_context(|| format!("{tool}: pass `chat` (there is no calling chat)"))?;
+        self.zeron.resolve_chat(&key).await
+    }
+
+    /// Ask the chat's host what it knows about the chat's delegated work.
+    async fn inspect_on_host(
+        &self,
+        chat: &Chat,
+        cwd: &Value,
+        detail: Value,
+    ) -> anyhow::Result<Value> {
+        let mut params = json!({
+            "chatId": chat.id,
+            "cwd": cwd,
+            "targetDeviceId": chat.device_id,
+        });
+        if let (Some(params), Value::Object(detail)) = (params.as_object_mut(), detail) {
+            params.extend(detail);
+        }
+        self.zeron
+            .call(zeron_rpc::methods::INSPECT_SUBSESSIONS, params)
+            .await
+    }
+
+    async fn list_subsessions(&self, args: ListSubsessionsArgs) -> anyhow::Result<Value> {
+        let chat = self
+            .owner_chat(args.chat.as_deref(), LIST_SUBSESSIONS)
+            .await?;
+        let (chats, spaces, sessions) = tokio::try_join!(
+            self.zeron.chats(),
+            self.zeron.spaces(),
+            self.zeron.sessions()
+        )?;
+        let summary = summarize_chat(&chat, &spaces, &sessions);
+        let mut report = self
+            .inspect_on_host(&chat, &summary["cwd"], json!({}))
+            .await?;
+        let limit = args.limit.unwrap_or(20).clamp(1, 50);
+        let children: Vec<&Chat> = chats
+            .iter()
+            .filter(|c| {
+                c.parent_chat_id.as_deref() == Some(chat.id.as_str()) && !c.is_btw() && !c.archived
+            })
+            .collect();
+        report["childrenTotal"] = json!(children.len());
+        report["children"] = json!(
+            children
+                .iter()
+                .take(limit)
+                .map(|c| summarize_chat(c, &spaces, &sessions))
+                .collect::<Vec<_>>()
+        );
+        report["chat"] = summary;
+        Ok(report)
+    }
+
+    async fn inspect_subsession(&self, args: InspectSubsessionArgs) -> anyhow::Result<Value> {
+        let tail = args.tail.unwrap_or(40).clamp(1, 400);
+        if args.kind.as_deref() == Some("chat") {
+            let key = args
+                .id
+                .as_deref()
+                .or(args.chat.as_deref())
+                .context("kind chat needs the child chat's id")?;
+            return self.inspect_chat(key, tail).await;
+        }
+        let owner = self
+            .owner_chat(args.chat.as_deref(), INSPECT_SUBSESSION)
+            .await?;
+        let (spaces, sessions) = tokio::try_join!(self.zeron.spaces(), self.zeron.sessions())?;
+        let summary = summarize_chat(&owner, &spaces, &sessions);
+        let report = self
+            .inspect_on_host(
+                &owner,
+                &summary["cwd"],
+                json!({
+                    "kind": args.kind,
+                    "id": args.id,
+                    "agent": args.agent,
+                    "tail": tail,
+                }),
+            )
+            .await?;
+        if report["found"] == false {
+            // An id that is no unit of the chat may be one of its sessions.
+            if args.kind.is_none()
+                && let Some(id) = args.id.as_deref()
+                && self.zeron.resolve_chat(id).await.is_ok()
+            {
+                return self.inspect_chat(id, tail).await;
+            }
+            anyhow::bail!(
+                "{INSPECT_SUBSESSION}: no sub-agent, workflow run or background job {:?} under {}; known: {}",
+                args.id.unwrap_or_default(),
+                owner.id,
+                report["candidates"]
+            );
+        }
+        Ok(report)
+    }
+
+    /// A child session: its summary, classified failure, newest messages
+    /// and its own newest errors.
+    async fn inspect_chat(&self, key: &str, tail: usize) -> anyhow::Result<Value> {
+        let chat = self.zeron.resolve_chat(key).await?;
+        let (spaces, sessions, entries) = tokio::try_join!(
+            self.zeron.spaces(),
+            self.zeron.sessions(),
+            self.zeron.transcript_on(&chat.id, Some(&chat.device_id))
+        )?;
+        let rendered = render_entries(&entries, RenderOptions::default());
+        let summary = summarize_chat(&chat, &spaces, &sessions);
+        // Best effort: an older host has no InspectSubsessions.
+        let events = self
+            .inspect_on_host(
+                &chat,
+                &summary["cwd"],
+                json!({ "kind": "events", "tail": tail }),
+            )
+            .await
+            .map(|mut events| events["events"].take())
+            .unwrap_or(Value::Null);
+        let window = tail.min(INSPECT_MESSAGES);
+        Ok(json!({
+            "kind": "chat",
+            "found": true,
+            "chat": summary,
+            "failure": failure_of(&rendered),
+            "pendingInput": last_pending_input(&rendered),
+            "messageCount": rendered.len(),
+            "messages": &rendered[rendered.len().saturating_sub(window)..],
+            "events": events,
+        }))
     }
 
     /// Stop the calling orchestrator's whole tree, or the branch of one of
@@ -3244,6 +3462,19 @@ mod tests {
                     RpcReply::Value(json!({
                         "chatId": params["member"], "branch": "zeron/x", "base": "main",
                         "ahead": 1, "behind": 0, "conflictCheck": "clean", "conflicts": [],
+                    }))
+                }
+                methods::INSPECT_SUBSESSIONS => {
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    let known = params["id"].is_null() || params["id"] == "j1";
+                    RpcReply::Value(json!({
+                        "found": known,
+                        "kind": if params["id"].is_null() { json!("overview") } else { json!("subagent") },
+                        "subagents": [{ "key": "j1", "state": "failed" }],
+                        "candidates": { "subagents": ["j1"], "workflows": [], "background": [] },
                     }))
                 }
                 methods::STOP_TREE => {
@@ -4555,6 +4786,49 @@ mod tests {
         );
         assert_eq!(calls[2]["member"], "member-b");
         assert_eq!(calls[2]["base"], "dev");
+        assert!(world.writes.lock().unwrap().is_empty(), "read-only");
+    }
+
+    #[tokio::test]
+    async fn delegated_work_is_listed_and_inspected_read_only() {
+        let world = orchestrator_world(false, Vec::new());
+        let calls = |world: &Arc<World>| {
+            world
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == methods::INSPECT_SUBSESSIONS)
+                .map(|(_, params)| params.clone())
+                .collect::<Vec<_>>()
+        };
+        let root = from(&world, "orchestrator-root");
+        let listed = root.call("list_subsessions", json!({})).await.unwrap();
+        assert_eq!(listed["chat"]["id"], "orchestrator-root");
+        assert_eq!(listed["childrenTotal"], 2);
+        assert_eq!(listed["subagents"][0]["key"], "j1");
+        assert_eq!(calls(&world)[0]["chatId"], "orchestrator-root");
+        assert_eq!(calls(&world)[0]["targetDeviceId"], "dev-local");
+
+        let job = root
+            .call("inspect_subsession", json!({ "id": "j1", "tail": 9999 }))
+            .await
+            .unwrap();
+        assert_eq!(job["kind"], "subagent");
+        assert_eq!(calls(&world)[1]["id"], "j1");
+        assert_eq!(calls(&world)[1]["tail"], 400, "the tail is capped");
+
+        let miss = root
+            .call("inspect_subsession", json!({ "id": "nope" }))
+            .await
+            .unwrap_err();
+        assert!(miss.contains("j1"), "a miss names what exists: {miss}");
+
+        let outside = tools(world.clone(), Origin::default())
+            .call("list_subsessions", json!({}))
+            .await
+            .unwrap_err();
+        assert!(outside.contains("pass `chat`"), "{outside}");
         assert!(world.writes.lock().unwrap().is_empty(), "read-only");
     }
 

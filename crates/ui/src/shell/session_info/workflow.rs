@@ -4,7 +4,8 @@
 //!
 //! The section is up while there is something to act on or watch: a run in
 //! flight, a paused or interrupted run that can be resumed, or a run that
-//! just ended (briefly, so its last tick is seen). Tasks group the way the
+//! just ended. A run that finished (done, stopped, or interrupted for good)
+//! clears within five seconds; a failed one stays so its reason is read. Tasks group the way the
 //! Sub-agents section does: running, retrying and failed work leads, and
 //! queued and finished work folds.
 //!
@@ -13,22 +14,32 @@
 //! does: any number of phases in the order the script announced them (a
 //! repeated title such as a second Verify is its own phase), each with its
 //! progress dots and a table of its agents: model, tokens and time. A
-//! finished grouped run stays up longer, so its table can be read.
+//! failed grouped run stays up longer, so its table can be read.
 
 use chrono::{DateTime, Utc};
 use zeron_proto::extension_ui::{
     ExtensionUiState, WorkflowAction, WorkflowState, WorkflowTask, WorkflowTaskState,
 };
 
-/// How long a finished run stays up: long enough to see it end.
-const LINGER_SECS: i64 = 20;
-/// A finished run grouped by phase stays up long enough to read its table.
+/// How long a finished run stays up: long enough to see it end, and short
+/// enough that it has folded away (`motion::MENU_OUT`) five seconds after.
+const FINISHED_LINGER_MS: i64 = 4_800;
+/// A failed run grouped by phase stays up long enough to read its table.
 const GROUPED_LINGER_SECS: i64 = 600;
 /// Dots a phase draws before they stand for more than one agent each.
 pub(super) const PHASE_DOTS: usize = 24;
 /// A run that failed and cannot be resumed stays longer, so its reason is
 /// read.
 const FAILED_LINGER_SECS: i64 = 120;
+
+/// How long a run that ended in `phase` stays up after it ended.
+fn linger(phase: RunPhase, grouped: bool) -> chrono::TimeDelta {
+    match phase {
+        RunPhase::Failed if grouped => chrono::TimeDelta::seconds(GROUPED_LINGER_SECS),
+        RunPhase::Failed => chrono::TimeDelta::seconds(FAILED_LINGER_SECS),
+        _ => chrono::TimeDelta::milliseconds(FINISHED_LINGER_MS),
+    }
+}
 /// Rows shown per folded group before a "+N more" line.
 pub(super) const GROUP_ROWS: usize = 12;
 
@@ -302,8 +313,6 @@ pub(super) struct WorkflowView {
     pub finished: Vec<TaskRow>,
     /// Rows the extension left out of the payload.
     pub truncated: u32,
-    /// "Checkpoint 2 minutes ago · 5 done".
-    pub checkpoint: Option<String>,
     /// "3 results reused from the last run".
     pub reuse: Option<String>,
     pub pause: Option<WorkflowAction>,
@@ -317,6 +326,9 @@ pub(super) struct WorkflowView {
     pub agents: u32,
     pub tokens: u64,
     pub ended: Option<DateTime<Utc>>,
+    /// When a run that ended for good stops being shown; the panel arms a
+    /// redraw for it, since an idle chat repaints only once a minute.
+    pub expires: Option<DateTime<Utc>>,
 }
 
 impl WorkflowView {
@@ -345,8 +357,6 @@ impl WorkflowView {
                 queued_more: 0,
                 finished: Vec::new(),
                 truncated: 0,
-                checkpoint: at(latest.ended_at)
-                    .map(|t| format!("Stopped {}", crate::pull_requests::relative_time(t, now))),
                 reuse: None,
                 pause: None,
                 stop: None,
@@ -360,24 +370,17 @@ impl WorkflowView {
                 agents: 0,
                 tokens: 0,
                 ended: None,
+                expires: None,
             });
         };
 
         let phase = RunPhase::of(&run.status, state.progress.retrying > 0);
         let ended = run.ended_at.and_then(at);
-        if let Some(ended) = ended
-            && !state.recovery.resumable
-        {
-            let linger = if state.grouped() {
-                GROUPED_LINGER_SECS
-            } else if phase == RunPhase::Failed {
-                FAILED_LINGER_SECS
-            } else {
-                LINGER_SECS
-            };
-            if (now - ended).num_seconds() > linger {
-                return None;
-            }
+        let expires = ended
+            .filter(|_| !state.recovery.resumable)
+            .map(|ended| ended + linger(phase, state.grouped()));
+        if expires.is_some_and(|expires| now > expires) {
+            return None;
         }
 
         let mut lead = Vec::new();
@@ -422,13 +425,6 @@ impl WorkflowView {
         } else {
             Vec::new()
         };
-        let checkpoint = state.checkpoints.last().and_then(|c| {
-            let when = crate::pull_requests::relative_time(at(c.at)?, now);
-            Some(match c.kind.as_str() {
-                "resume" => format!("Resumed {when}"),
-                _ => format!("Checkpoint {when} · {} done", c.done_count),
-            })
-        });
         let reuse = match (state.recovery.reused, state.recovery.invalidated) {
             (0, 0) => None,
             (n, 0) => Some(format!(
@@ -462,7 +458,6 @@ impl WorkflowView {
             queued_more,
             finished,
             truncated: state.tasks_truncated,
-            checkpoint,
             reuse,
             pause: if live { action("pause") } else { None },
             stop: if live { action("stop") } else { None },
@@ -481,6 +476,7 @@ impl WorkflowView {
                 state.tasks.iter().filter_map(|t| t.tokens).sum()
             },
             ended,
+            expires,
         })
     }
 
@@ -833,10 +829,6 @@ mod tests {
             view.reuse.as_deref(),
             Some("1 result reused from the earlier run")
         );
-        assert_eq!(
-            view.checkpoint.as_deref(),
-            Some("Checkpoint just now · 2 done")
-        );
         assert!(view.pause.is_some() && view.stop.is_some());
         assert!(view.recovery.is_none());
         assert!((view.fraction() - 2.0 / 6.0).abs() < 1e-6);
@@ -926,16 +918,43 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_run_lingers_then_goes() {
+    fn a_finished_run_clears_within_five_seconds() {
         let mut payload = running();
         payload["run"]["status"] = json!("completed");
         payload["run"]["endedAt"] = json!(T0 + 50_000);
         payload["recovery"]["actions"] = json!([]);
-        let view = WorkflowView::of(&ui(payload.clone()), now()).expect("lingers");
+        let ended = DateTime::from_timestamp_millis(T0 + 50_000).unwrap();
+        let at = |ms: i64| ended + chrono::TimeDelta::milliseconds(ms);
+        let view = WorkflowView::of(&ui(payload.clone()), at(1_000)).expect("lingers");
         assert_eq!(view.phase, RunPhase::Completed);
         assert!(view.stop.is_none() && view.pause.is_none());
-        let later = now() + chrono::TimeDelta::seconds(30);
-        assert_eq!(WorkflowView::of(&ui(payload), later), None);
+        assert_eq!(view.expires, Some(at(FINISHED_LINGER_MS)));
+        assert!(WorkflowView::of(&ui(payload.clone()), at(FINISHED_LINGER_MS)).is_some());
+        assert_eq!(WorkflowView::of(&ui(payload.clone()), at(5_000)), None);
+
+        // Stopped by hand is finished too.
+        payload["run"]["status"] = json!("aborted");
+        assert_eq!(WorkflowView::of(&ui(payload), at(5_000)), None);
+    }
+
+    #[test]
+    fn a_failed_run_stays_so_its_reason_is_read() {
+        let mut payload = running();
+        payload["run"]["status"] = json!("error");
+        payload["run"]["endedAt"] = json!(T0 + 50_000);
+        payload["recovery"]["actions"] = json!([]);
+        let ended = DateTime::from_timestamp_millis(T0 + 50_000).unwrap();
+        let at = |secs: i64| ended + chrono::TimeDelta::seconds(secs);
+        let view = WorkflowView::of(&ui(payload.clone()), at(60)).expect("still shown");
+        assert_eq!(view.phase, RunPhase::Failed);
+        assert_eq!(view.expires, Some(at(FAILED_LINGER_SECS)));
+        assert_eq!(WorkflowView::of(&ui(payload), at(FAILED_LINGER_SECS + 1)), None);
+    }
+
+    #[test]
+    fn a_live_run_never_expires() {
+        let view = WorkflowView::of(&ui(running()), now()).expect("shown");
+        assert_eq!(view.expires, None);
     }
 
     #[test]
@@ -1101,13 +1120,13 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_grouped_run_freezes_its_time_and_stays_to_be_read() {
+    fn a_finished_grouped_run_freezes_its_time_then_clears() {
         let mut payload = grouped();
         payload["run"]["status"] = json!("completed");
         payload["run"]["endedAt"] = json!(T0 + 33_000);
         payload["phases"][3]["state"] = json!("done");
         let at = |secs: i64| DateTime::from_timestamp_millis(T0 + 33_000 + secs * 1_000).unwrap();
-        let view = WorkflowView::of(&ui(payload.clone()), at(5)).expect("shown");
+        let view = WorkflowView::of(&ui(payload.clone()), at(4)).expect("shown");
         assert_eq!(view.took().as_deref(), Some("33s"));
         assert!(view.stop.is_none());
         assert!(
@@ -1118,6 +1137,10 @@ mod tests {
             view.phases[3].rows.iter().all(|r| !r.placeholder),
             "an ended run expects no more agents"
         );
+        assert!(WorkflowView::of(&ui(payload.clone()), at(5)).is_none());
+
+        // A failed grouped run keeps its table up to be read.
+        payload["run"]["status"] = json!("error");
         assert!(WorkflowView::of(&ui(payload.clone()), at(300)).is_some());
         assert!(WorkflowView::of(&ui(payload), at(601)).is_none());
     }

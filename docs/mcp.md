@@ -189,6 +189,8 @@ name (default: the local engine's device).
 | `project_remember` / `project_forget` | `OrchestratorMemory {chatId, text}` / `{chatId, forget}` (root only) |
 | `project_update`   | `UpdateOrchestratorProject {chatId, update: {goal?, instructions?}}` (root only) |
 | `merge_preview`    | `MergePreview {chatId, member, base?, targetDeviceId}`: read-only merge preview of a session's worktree branch (root only) |
+| `list_subsessions` | `WatchChats` + `WatchSessions` snapshots + `InspectSubsessions {chatId, cwd, targetDeviceId}`: what a chat (default: the caller) delegated, with state and errors: Pi sub-agents and their activity, the live workflow run and recent runs from their journals (failed agents with error codes), background shells, the goal, the chat's newest errors and its child sessions. Read-only; never watches the chat's UI |
+| `inspect_subsession` | `InspectSubsessions {chatId, cwd, kind?, id, agent?, tail?, targetDeviceId}`: one unit in full: a sub-agent's live state and the result it delivered (from the run journal, after it finished too), a workflow run's every agent with error code, error and attempts, the run log tail and with `agent` that agent's prompt, result and transcript tail plus the journal paths, a background shell, or (`kind: chat`, `WatchDocMessages`) a child session's status, failure, newest messages and errors. Strings are clipped and redacted and the reply capped at 48 KB |
 
 **Pushed child outcomes.** `wait_for_turns` is the pull path and is unchanged.
 Besides it, the engine pushes: when a tree member settles (done, failed,

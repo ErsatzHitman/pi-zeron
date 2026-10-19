@@ -130,7 +130,8 @@ impl ExtensionUiHub {
         Some(receiver)
     }
 
-    #[cfg(test)]
+    /// A copy of the chat's current state. It neither watches nor follows
+    /// the chat, so the harness keeps its plain fallbacks.
     pub fn state(&self, chat_id: &str) -> ExtensionUiState {
         self.chat(chat_id).state.borrow().clone()
     }

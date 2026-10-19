@@ -2008,6 +2008,9 @@ fn forwardable(method: &str) -> bool {
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             | methods::MERGE_PREVIEW
+            // A chat's live extension channels, run journal and workflow
+            // journals live on the device that hosts it.
+            | methods::INSPECT_SUBSESSIONS
             // A session is stopped on the device that hosts it.
             | methods::STOP_TREE
             // Project Actions live in the owning engine's private profile store.
@@ -4603,6 +4606,20 @@ impl RpcService for EngineRpc {
                 let entry = self.workspace.post_board_entry(entry).map_err(failed)?;
                 RpcReply::value(&serde_json::json!({ "entry": entry }))
             }
+            methods::INSPECT_SUBSESSIONS => {
+                let p: crate::subsession_inspect::InspectParams = parse_params(params)?;
+                // A one-shot copy: watching would flip Pi into its GUI mode
+                // in the very chat being inspected.
+                let ui = self.sessions.extension_ui_state(&p.chat_id);
+                let journal = self.sessions.run_journal();
+                let home = crate::repos::home_dir();
+                let report = tokio::task::spawn_blocking(move || {
+                    crate::subsession_inspect::inspect(&home, &ui, &journal, &p)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&report)
+            }
             methods::LIST_BOARD => {
                 let p: ListBoardParams = parse_params(params)?;
                 let chats = self
@@ -5578,6 +5595,13 @@ mod tests {
         assert!(forwardable(methods::STOP_TREE));
         assert!(!is_stream_method(methods::STOP_TREE));
         assert!(forward_deadline(methods::STOP_TREE) > std::time::Duration::from_secs(30));
+    }
+
+    /// A chat's delegated work is read where the chat runs.
+    #[test]
+    fn inspecting_subsessions_is_device_addressable() {
+        assert!(forwardable(methods::INSPECT_SUBSESSIONS));
+        assert!(!is_stream_method(methods::INSPECT_SUBSESSIONS));
     }
 
     #[test]

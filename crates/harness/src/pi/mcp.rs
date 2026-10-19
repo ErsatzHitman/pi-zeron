@@ -9,6 +9,9 @@ use crate::{HarnessError, process::Command, scratch::ScratchDir};
 
 /// Appended to every Pi chat's system prompt.
 pub(crate) const VISUALS_PROMPT: &str = include_str!("visuals.md");
+/// Appended to every Pi run that can run commands (all but btw chats): check
+/// the machine's load before heavy work, and prefer CI or a narrower run.
+pub(crate) const HOST_PROMPT: &str = include_str!("host.md");
 
 /// A btw side chat's tools (Pi `--tools`): it answers questions about the
 /// session it forked from, so it reads files and the web and changes
@@ -109,6 +112,9 @@ fn role_args(
         args.extend(["--tools".into(), BTW_TOOLS.into(), "--no-mcp".into()]);
         return Ok(args);
     }
+    let host = scratch.join("zeron-host.md");
+    std::fs::write(&host, HOST_PROMPT)?;
+    args.extend(["--append-system-prompt".into(), host.into()]);
     match place.role {
         Role::Chat => {}
         Role::Root => {
@@ -201,11 +207,13 @@ mod tests {
     #[test]
     fn a_plain_chat_keeps_pi_s_prompt_and_every_tool() {
         let (_scratch, args) = args(Role::Chat);
-        assert_eq!(args.len(), 4, "{args:?}");
+        assert_eq!(args.len(), 6, "{args:?}");
         assert!(flag(&args, "--extension").is_some_and(|f| f.ends_with("zeron-mcp.mjs")));
         assert!(
             flag(&args, "--append-system-prompt").is_some_and(|f| f.ends_with("zeron-visuals.md"))
         );
+        let host = args.iter().find(|arg| arg.ends_with("zeron-host.md")).unwrap();
+        assert_eq!(std::fs::read_to_string(host).unwrap(), HOST_PROMPT);
         for absent in ["--system-prompt", "--tools", "--no-mcp"] {
             assert!(!args.iter().any(|arg| arg == absent), "{absent}");
         }
@@ -224,6 +232,7 @@ mod tests {
             );
             assert!(args.iter().any(|arg| arg == "--no-mcp"));
             assert!(args.iter().any(|arg| arg.ends_with("zeron-btw.md")));
+            assert!(!args.iter().any(|arg| arg.ends_with("zeron-host.md")), "a btw chat runs nothing");
             assert!(!args.iter().any(|arg| arg.ends_with("zeron-member.md")));
             assert!(!args.iter().any(|arg| arg == "--system-prompt"));
         }
@@ -320,7 +329,7 @@ mod tests {
         // A plain chat is in no project.
         let scratch = ScratchDir::new("pi-mcp-test").unwrap();
         let args = role_args(&at(Role::Chat, None), Some(project), scratch.path()).unwrap();
-        assert_eq!(args.len(), 4);
+        assert_eq!(args.len(), 6);
     }
 
     #[cfg(not(windows))]
@@ -417,7 +426,7 @@ mod tests {
     #[test]
     fn a_side_chat_s_place_rides_the_env_not_a_prompt_file() {
         let (_scratch, args) = args_at(&at(Role::Chat, Some("parent-1")));
-        assert_eq!(args.len(), 4, "{args:?}");
+        assert_eq!(args.len(), 6, "{args:?}");
         let place = Place::from_env(
             &at(Role::Chat, Some("parent-1"))
                 .env()
@@ -436,6 +445,7 @@ mod tests {
             orchestrator::ROOT_SYSTEM_PROMPT.to_owned(),
             orchestrator::member_prompt(&at(Role::Member { depth: 1 }, Some("orchestrator-r"))),
             VISUALS_PROMPT.to_owned(),
+            HOST_PROMPT.to_owned(),
         ];
         let known = [
             "whoami",
@@ -468,6 +478,13 @@ mod tests {
                     assert!(known.contains(&tool), "unknown tool zeron_{tool}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_host_prompt_says_how_to_check_load_and_what_to_do_instead() {
+        for needle in ["free -m", "Get-CimInstance", "nvidia-smi", "/proc/pressure/memory", "CI", "narrower"] {
+            assert!(super::HOST_PROMPT.contains(needle), "{needle}");
         }
     }
 

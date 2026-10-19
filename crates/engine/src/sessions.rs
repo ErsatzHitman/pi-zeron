@@ -482,6 +482,19 @@ impl SessionsEngine {
         self.inner.extension_ui.watch(chat_id)
     }
 
+    /// A one-shot copy of a chat's live extension UI, channels included;
+    /// unlike [`Self::watch_extension_ui`] it does not mark the chat watched.
+    pub(crate) fn extension_ui_state(
+        &self,
+        chat_id: &str,
+    ) -> zeron_proto::extension_ui::ExtensionUiState {
+        self.inner.extension_ui.state(chat_id)
+    }
+
+    pub(crate) fn run_journal(&self) -> Arc<RunJournal> {
+        self.inner.journal.clone()
+    }
+
     /// Send an extension UI action to the chat's live harness process.
     pub(crate) fn extension_ui_action(
         &self,

@@ -208,7 +208,10 @@ icon_assets![
     (HARD_DRIVE, "hard-drive"),
     (HOME, "home"),
     (STOP, "stop"),
+    (PAUSE, "pause"),
     (CHECK, "check"),
+    // Two ticks: a user message the agent has read (the single tick is CHECK).
+    (CHECK_DOUBLE, "check-double"),
     (COPY, "copy"),
     // Project Action icon family (Solar Linear-compatible strokes).
     (ACTION_PLAY, "action-play"),

@@ -1,6 +1,5 @@
-//! The composer footer's ring cluster. The plan-usage ring shows how much of
-//! the active account's rate limit the session's harness has used, beside
-//! the context ring. Clicking it opens the harness's accounts — each with its
+//! The composer footer's plan-usage ring: how much of the active account's
+//! rate limit the session's harness has used. Clicking it opens the harness's accounts — each with its
 //! usage meters — and clicking one switches to it, the same `ActivateAgentAccount` Settings →
 //! Accounts runs. Both views share [`AccountsSnapshotCache`], so a switch in
 //! either shows up in the other.
@@ -534,24 +533,21 @@ impl AccountUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FooterCard {
     Accounts,
-    Context,
 }
 
 impl FooterCard {
     fn id(self) -> &'static str {
         match self {
             FooterCard::Accounts => "account-usage-menu",
-            FooterCard::Context => "context-usage-menu",
         }
     }
 }
 
-/// The footer's ring cluster: account usage (accent arc, so the two read
-/// apart), then context occupancy. Each opens its popover on click.
+/// The footer's plan-usage ring; it opens the accounts popover on click.
+/// Context occupancy lives in Session Details, not here.
 impl Render for AccountUsage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let context = self.state.read(cx).context_usage;
         let counters = self.counters(cx);
         let account = self.fraction(cx).zip(counters).map(|(fraction, counters)| {
             let level = usage_level(fraction);
@@ -574,25 +570,11 @@ impl Render for AccountUsage {
                 cx,
             )
         });
-        let context = crate::context_usage::has_window(context).then(|| {
-            let chip = crate::context_usage::chip(
-                context,
-                self.popup.get() == Some(&FooterCard::Context),
-                &theme,
-            );
-            self.trigger(
-                chip,
-                FooterCard::Context,
-                move |_, cx| crate::context_usage::card(context, &Theme::of(cx).for_popup()),
-                cx,
-            )
-        });
         div()
             .flex()
             .items_center()
             .gap(px(4.0))
             .children(account)
-            .children(context)
     }
 }
 
