@@ -1,8 +1,8 @@
 # Context usage
 
-Every selected conversation has a context ring beneath its composer, including
-project-less and remote conversations. Hovering shows measured tokens and
-remaining capacity. The ring turns amber at 75% and red at 90%; its drawing clamps
+Every conversation whose agent reports a context window shows its occupancy in
+Session Details under **Context** (a percent and a ring; click for the
+breakdown). The composer footer no longer carries a context ring. The ring turns amber at 75% and red at 90%; its drawing clamps
 at a full circle while the label preserves over-capacity measurements. A dash
 means the harness has not reported enough data to calculate a percentage. Measured
 zero is displayed as 0%.

@@ -1296,6 +1296,41 @@ pub struct Row {
     pub compact_fold: Option<SharedString>,
 }
 
+/// Read receipt under a user message. Derived from row order rather than
+/// stored on the row (rows are cached per entry, blind to their
+/// neighbours), so history reloaded from the doc shows `Read` with nothing
+/// persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    /// The host accepted the prompt: its entry is in the doc.
+    Sent,
+    /// The agent produced output after it, so it consumed the prompt.
+    Read,
+}
+
+/// `None` for rows that carry no receipt: not a user row, or an optimistic
+/// echo the host has not confirmed yet. Another prompt, an error, a fork
+/// seam or the recap is not an answer.
+fn user_delivery(rows: &[Row], ix: usize) -> Option<Delivery> {
+    let RowKind::User { pending: false, .. } = &rows.get(ix)?.kind else {
+        return None;
+    };
+    let answered = rows[ix + 1..].iter().any(|row| {
+        !matches!(
+            row.kind,
+            RowKind::User { .. }
+                | RowKind::ErrorChip { .. }
+                | RowKind::ForkMarker { .. }
+                | RowKind::Recap { .. }
+        )
+    });
+    Some(if answered {
+        Delivery::Read
+    } else {
+        Delivery::Sent
+    })
+}
+
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
 /// `formatTimestamp` shape (utils.ts: short month, numeric day, hour,
 /// 2-digit minutes, no leading zero on the hour). Pure over an explicit
@@ -8291,6 +8326,11 @@ impl Transcript {
         let copied_message = self.copied_message.as_ref() == Some(&row.entry_id);
         let copy_text = row.copy_text.clone();
         let copy_entry_id = row.entry_id.clone();
+        // Only a hovered user row draws its receipt, so the forward scan
+        // stays off every other row's frame.
+        let delivery = (hovered && is_user_row)
+            .then(|| user_delivery(&self.rows, ix))
+            .flatten();
         let rewind = (hovered
             && matches!(row.kind, RowKind::User { pending: false, .. })
             && row.timestamp.is_some()
@@ -8334,12 +8374,35 @@ impl Transcript {
                         .text_color(theme.text_muted),
                     )
             });
+            // Read receipt beside the time: one muted tick once the host has
+            // the prompt, two accent ticks once the agent has answered it.
+            // Fixed width, so Sent -> Read never shifts the strip.
+            let receipt = delivery.map(|state| {
+                let (path, color, label, kind) = match state {
+                    Delivery::Sent => (crate::icons::CHECK, theme.text_muted, "Sent", "sent"),
+                    Delivery::Read => (crate::icons::CHECK_DOUBLE, theme.accent, "Read", "read"),
+                };
+                let selector = format!("delivery-{kind}-{copy_entry_id}");
+                div()
+                    .id(SharedString::from(format!("delivery-{copy_entry_id}")))
+                    .debug_selector(move || selector)
+                    .size(px(Theme::SPACE_MD * 2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(crate::settings::widgets::text_tooltip(label))
+                    .child(crate::icons::icon(path).size(px(14.0)).text_color(color))
+            });
             let metadata = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM));
-            let metadata = metadata.child(timestamp).children(copy).children(rewind);
+            let metadata = metadata
+                .child(timestamp)
+                .children(receipt)
+                .children(copy)
+                .children(rewind);
             div()
                 .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
                 .pt(px(Theme::SPACE_SM))
@@ -17593,6 +17656,48 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_prompt_reads_sent_until_the_agent_answers_it() {
+        let user = |id: &str, pending: bool| {
+            let entry = SessionMessageEntry {
+                id: id.into(),
+                role: MessageRole::User,
+                parts: vec![text_part("p1", "hi")],
+                created_at: 1,
+                device_id: "dev".into(),
+                status: None,
+                continuation_of: None,
+                duration_ms: None,
+            };
+            rows_for_entry(&entry, pending, false, &mut parse)
+        };
+        let reply = |id: &str| {
+            rows_for_entry(
+                &assistant(id, MessageStatus::Complete, vec![text_part("t", "ok")]),
+                false,
+                false,
+                &mut parse,
+            )
+        };
+
+        let mut rows = user("u1", false);
+        assert_eq!(user_delivery(&rows, 0), Some(Delivery::Sent));
+        rows.extend(user("u2", true));
+        assert_eq!(user_delivery(&rows, 0), Some(Delivery::Sent), "an echo is no answer");
+        assert_eq!(user_delivery(&rows, 1), None, "an unconfirmed echo has no receipt");
+
+        // A steer: the first prompt is answered, the second still waits.
+        let mut rows = user("u1", false);
+        rows.extend(reply("a1"));
+        let steer = rows.len();
+        rows.extend(user("u2", false));
+        assert_eq!(user_delivery(&rows, 0), Some(Delivery::Read));
+        assert_eq!(user_delivery(&rows, 1), None, "assistant rows have no receipt");
+        assert_eq!(user_delivery(&rows, steer), Some(Delivery::Sent));
+        rows.extend(reply("a2"));
+        assert_eq!(user_delivery(&rows, steer), Some(Delivery::Read));
     }
 
     #[test]

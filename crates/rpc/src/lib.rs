@@ -321,6 +321,12 @@ pub mod methods {
     /// lead branch (`{ chatId: root, member: chat id, base? }`) -> `MergePreview`.
     /// Never modifies a tree or ref.
     pub const MERGE_PREVIEW: &str = "MergePreview";
+    /// What the host knows about the work delegated under a chat
+    /// (`{ chatId, cwd?, kind?, id?, agent?, tail? }`): without `id` an
+    /// overview of its Pi sub-agents, workflow runs (live and from their
+    /// journals), background shells, goal and recent errors; with one, the
+    /// detail of that unit. Read-only; never watches the chat's UI.
+    pub const INSPECT_SUBSESSIONS: &str = "InspectSubsessions";
     /// Change an orchestrator project's goal, instructions or pause
     /// (`{ chatId: root, update }`) -> `{ project }`. Local only.
     pub const UPDATE_ORCHESTRATOR_PROJECT: &str = "UpdateOrchestratorProject";

@@ -281,17 +281,17 @@ fn freeflow_status(text: &str) -> Option<String> {
     })
 }
 
-/// What the session footer shows of [`footer_chips`]: speed and spend
-/// (tokens per second, API cost so far), plus the chips that are controls
-/// (plan mode) or Zeron's own live notices (Pi retrying a request). Account
-/// usage and context sit beside them as rings. Extension metadata (key
-/// rotation, uniichat's counts, background work) stays in the session panel.
+/// What the session footer shows of [`footer_chips`]: speed (tokens per
+/// second), plus plan mode's toggle and Zeron's own live notices (Pi retrying
+/// a request). Plan limits sit beside them as a ring. Workflows, context and
+/// other extension metadata (key rotation, uniichat's counts, background
+/// work, an extension's own action chips) stay in Session Details.
 pub(crate) fn footer_metrics(chips: Vec<Chip>) -> Vec<Chip> {
     chips
         .into_iter()
         .filter(|chip| {
             chip.key == "channel:footer"
-                || chip.action.is_some()
+                || chip.key == MODE_ELEMENT_KEY
                 || chip.key.starts_with("status:zeron:")
         })
         .collect()
@@ -787,14 +787,15 @@ mod tests {
             chip("status:opencode-keys", false),
             chip("status:uniichat", false),
             chip("work:subagents:fleet", false),
-            chip("mode", true),
+            chip("status:workflows", true),
+            chip(MODE_ELEMENT_KEY, true),
             chip("status:zeron:retry", false),
             chip("channel:footer", false),
         ])
         .into_iter()
         .map(|chip| chip.key)
         .collect();
-        assert_eq!(kept, ["mode", "status:zeron:retry", "channel:footer"]);
+        assert_eq!(kept, [MODE_ELEMENT_KEY, "status:zeron:retry", "channel:footer"]);
     }
 
     #[test]

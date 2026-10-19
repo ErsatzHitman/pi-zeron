@@ -963,6 +963,16 @@ impl Shell {
                 .and_then(|ui| WorkflowView::of(ui, now))
         };
         if let Some(view) = workflow {
+            // An idle chat repaints once a minute: wake for the moment a
+            // finished run clears, so it goes within five seconds.
+            if let Some(expires) = view.expires {
+                self.clock.arm(
+                    expires + chrono::TimeDelta::milliseconds(50),
+                    now,
+                    |shell: &mut Self| &mut shell.clock,
+                    cx,
+                );
+            }
             active.push((
                 SectionKey::Workflow,
                 view.since(),
