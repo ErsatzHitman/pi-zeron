@@ -313,8 +313,6 @@ pub(super) struct WorkflowView {
     pub finished: Vec<TaskRow>,
     /// Rows the extension left out of the payload.
     pub truncated: u32,
-    /// "Checkpoint 2 minutes ago · 5 done".
-    pub checkpoint: Option<String>,
     /// "3 results reused from the last run".
     pub reuse: Option<String>,
     pub pause: Option<WorkflowAction>,
@@ -359,8 +357,6 @@ impl WorkflowView {
                 queued_more: 0,
                 finished: Vec::new(),
                 truncated: 0,
-                checkpoint: at(latest.ended_at)
-                    .map(|t| format!("Stopped {}", crate::pull_requests::relative_time(t, now))),
                 reuse: None,
                 pause: None,
                 stop: None,
@@ -429,13 +425,6 @@ impl WorkflowView {
         } else {
             Vec::new()
         };
-        let checkpoint = state.checkpoints.last().and_then(|c| {
-            let when = crate::pull_requests::relative_time(at(c.at)?, now);
-            Some(match c.kind.as_str() {
-                "resume" => format!("Resumed {when}"),
-                _ => format!("Checkpoint {when} · {} done", c.done_count),
-            })
-        });
         let reuse = match (state.recovery.reused, state.recovery.invalidated) {
             (0, 0) => None,
             (n, 0) => Some(format!(
@@ -469,7 +458,6 @@ impl WorkflowView {
             queued_more,
             finished,
             truncated: state.tasks_truncated,
-            checkpoint,
             reuse,
             pause: if live { action("pause") } else { None },
             stop: if live { action("stop") } else { None },
@@ -840,10 +828,6 @@ mod tests {
         assert_eq!(
             view.reuse.as_deref(),
             Some("1 result reused from the earlier run")
-        );
-        assert_eq!(
-            view.checkpoint.as_deref(),
-            Some("Checkpoint just now · 2 done")
         );
         assert!(view.pause.is_some() && view.stop.is_some());
         assert!(view.recovery.is_none());
