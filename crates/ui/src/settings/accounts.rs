@@ -161,18 +161,35 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 }
 
 /// "Session: resets 3:45 PM · Week: resets Thu" — the usage meters' tooltip.
+/// A window past its reset says so until the next probe replaces it.
 pub(crate) fn usage_resets(
     windows: &[zeron_proto::AgentUsageWindow],
     now: DateTime<Utc>,
 ) -> String {
     windows
         .iter()
-        .map(|window| match format_reset(window.resets_at, now) {
-            Some(reset) => format!("{}: {reset}", window.label),
-            None => window.label.clone(),
+        .map(|window| match window.resets_at {
+            Some(at) if at <= now => format!("{}: reset, refreshing", window.label),
+            at => match format_reset(at, now) {
+                Some(reset) => format!("{}: {reset}", window.label),
+                None => window.label.clone(),
+            },
         })
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// A usage window as of `now`: one whose reset time has passed starts over
+/// at 0% (its figure is the last period's) until the next probe.
+pub(crate) fn current_window(
+    window: &zeron_proto::AgentUsageWindow,
+    now: DateTime<Utc>,
+) -> zeron_proto::AgentUsageWindow {
+    let mut window = window.clone();
+    if window.resets_at.is_some_and(|at| at <= now) {
+        window.used_fraction = 0.0;
+    }
+    window
 }
 
 /// The providers zeron can sign into, in display order: (harness, name, CLI
@@ -1229,8 +1246,7 @@ impl AccountsPage {
                     account
                         .usage_windows
                         .iter()
-                        .take(2)
-                        .map(|window| render_usage_meter(window, theme)),
+                        .map(|window| render_usage_meter(&current_window(window, now), theme)),
                 )
                 .into_any_element()
         };
