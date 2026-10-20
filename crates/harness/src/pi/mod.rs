@@ -200,7 +200,7 @@ impl PiHarness {
         rx.await
             .map_err(|_| HarnessError::Protocol("Pi discovery task failed".into()))?
     }
-    /// Beside the session map: Zeron's own files in Pi's agent directory.
+    /// Beside the session map, in Zeron's own files (see `Store::new`).
     fn commands_file(&self) -> PathBuf {
         sessions::Store::new(self.session_store.clone(), self.agent_dir.clone())
             .root()
@@ -272,7 +272,7 @@ impl PiHarness {
         if let Some(setting) = self.delete_guard.as_ref().filter(|_| guarded) {
             guard::configure(&mut cmd, &setting())?;
         }
-        let mut child = Child::new(cmd.spawn()?);
+        let mut child = Child::new(crate::process::owned::spawn(cmd)?);
         // Read now, while /proc/<pid> exists: it tells an out-of-memory kill
         // from any other SIGKILL once this Pi dies.
         let oom = child.id().and_then(crate::process::exit::OomWatch::start);
@@ -841,9 +841,13 @@ impl Harness for PiHarness {
                 };
                 runner.norm.fail(message.clone());
                 if let Some(signal) = death.and_then(|death| death.fatal_signal()) {
+                    // Suspect memory only when the kernel's counter moved or
+                    // could not be read (see `Termination::explain`).
+                    let kills = runner.process.oom.as_ref().and_then(|watch| watch.kills());
                     runner.norm.class = Some(zeron_proto::ErrorClass::ProcessKilled {
                         signal,
-                        oom_suspected: signal == 9,
+                        oom_suspected: signal == 9
+                            && kills.is_none_or(|(before, after)| after > before),
                     });
                 } else if death.is_some()
                     && runner.norm.class == Some(zeron_proto::ErrorClass::SessionGone)

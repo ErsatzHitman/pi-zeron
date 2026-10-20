@@ -358,7 +358,7 @@ async fn capture(mut pipe: impl AsyncRead + Unpin, tail: StderrTail) {
 }
 
 async fn run(
-    mut command: Command,
+    command: Command,
     cancel: CancellationToken,
     deadline: Duration,
 ) -> Result<(), HarnessError> {
@@ -366,9 +366,7 @@ async fn run(
         return Err(HarnessError::Install("installation cancelled".into()));
     }
     let mut child = crate::acp::child::Child::new(
-        command
-            .spawn()
-            .map_err(|e| HarnessError::Install(e.to_string()))?,
+        crate::acp::child::spawn(command).map_err(|e| HarnessError::Install(e.to_string()))?,
     );
     let tail = StderrTail::default();
     let stdout = capture(child.stdout.take().expect("piped stdout"), tail.clone());
