@@ -104,7 +104,7 @@ async fn terminal_contract_handles_normal_errors_retries_compaction_and_consumed
 
 #[cfg(unix)]
 #[tokio::test]
-async fn a_sigkilled_pi_reports_the_signal_and_an_out_of_memory_hint() {
+async fn a_sigkilled_pi_reports_the_signal_and_whether_memory_is_to_blame() {
     use zeron_proto::ErrorClass;
     let events = collect("sigkill").await;
     let dones: Vec<_> = events
@@ -123,17 +123,22 @@ async fn a_sigkilled_pi_reports_the_signal_and_an_out_of_memory_hint() {
     let (status, error, class) = &dones[0];
     assert_eq!(*status, DoneStatus::Errored);
     let error = error.as_deref().unwrap();
-    assert!(
-        error.contains("SIGKILL") && error.contains("signal 9") && error.contains("out of memory"),
-        "{error}"
-    );
-    assert_eq!(
-        *class,
-        Some(ErrorClass::ProcessKilled {
-            signal: 9,
-            oom_suspected: true
-        })
-    );
+    assert!(error.contains("SIGKILL") && error.contains("signal 9"), "{error}");
+    // The mock kills itself, so the kernel's OOM counter never moves: where
+    // the cgroup's counter is readable the error says memory was not the
+    // cause; where it is not, an OOM kill stays the suspicion.
+    let Some(ErrorClass::ProcessKilled {
+        signal: 9,
+        oom_suspected,
+    }) = class
+    else {
+        panic!("{class:?}");
+    };
+    if *oom_suspected {
+        assert!(error.contains("out of memory"), "{error}");
+    } else {
+        assert!(error.contains("OOM killer did not fire"), "{error}");
+    }
 }
 
 /// A Pi that dies between turns has no Done to carry the failure: the stream
