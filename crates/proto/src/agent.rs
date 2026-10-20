@@ -713,9 +713,9 @@ pub enum ErrorClass {
     },
     ProviderOverloaded,
     SessionGone,
-    /// The agent process was ended by a signal it did not choose. SIGKILL
-    /// (`signal` 9) is `oom_suspected`: the out-of-memory killer, or a memory
-    /// limit, is how a process most often dies that way.
+    /// The agent process was ended by a signal it did not choose. A SIGKILL
+    /// (`signal` 9) is `oom_suspected` unless the kernel's OOM-kill counter
+    /// proves the OOM killer did not fire.
     #[serde(rename_all = "camelCase")]
     ProcessKilled {
         signal: i32,
@@ -783,8 +783,14 @@ impl ErrorClass {
             ErrorClass::ProcessKilled {
                 oom_suspected: true,
                 ..
-            } => "Pi was killed by the system (SIGKILL), most likely out of memory.                   Free memory or raise the limit, then ask it to continue."
+            } => "Pi was killed by the system (SIGKILL), most likely out of memory. \
+                  Free memory or raise the limit, then ask it to continue."
                 .to_string(),
+            ErrorClass::ProcessKilled { signal: 9, .. } => {
+                "Pi was killed (SIGKILL) by another process, not the kernel's OOM killer; \
+                 ask it to continue"
+                    .to_string()
+            }
             ErrorClass::ProcessKilled { signal, .. } => {
                 format!("Pi was ended by signal {signal}; ask it to continue")
             }
@@ -1068,6 +1074,17 @@ mod tests {
             hint.contains("signal 11") && !hint.contains("memory"),
             "{hint}"
         );
+        let outside = ErrorClass::ProcessKilled {
+            signal: 9,
+            oom_suspected: false,
+        }
+        .hint()
+        .unwrap();
+        assert!(
+            outside.contains("another process") && !outside.contains("most likely out of memory"),
+            "{outside}"
+        );
+        assert!(!killed.hint().unwrap().contains("  "), "no stray indentation");
     }
 
     #[test]

@@ -90,7 +90,14 @@ impl Termination {
             Some((before, after)) if after > before => format!(
                 "{how}killed by {name}: out of memory, the kernel's OOM killer fired (oom_kill {before} -> {after})"
             ),
-            _ => format!(
+            // The kernel counts every OOM kill in the victim's cgroup, global
+            // or not; a counter that stayed put means another process sent
+            // the signal (a userspace OOM daemon like systemd-oomd or
+            // earlyoom, or a plain `kill -9`), so memory is not the story.
+            Some((_, after)) => format!(
+                "{how}killed by {name} from another process; the kernel's OOM killer did not fire (oom_kill stayed at {after})"
+            ),
+            None => format!(
                 "{how}killed by {name}, likely out of memory, from the system's OOM killer or a memory limit"
             ),
         }
@@ -218,11 +225,13 @@ mod tests {
         assert!(unproven.contains("likely out of memory"), "{unproven}");
         assert!(!unproven.contains("->"), "{unproven}");
 
-        // A counter that did not move is no evidence either way.
+        // A counter that did not move rules the kernel's OOM killer out.
+        let outside = killed_by(9).explain(Some((4, 4)));
         assert!(
-            killed_by(9)
-                .explain(Some((4, 4)))
-                .contains("likely out of memory")
+            outside.contains("from another process")
+                && outside.contains("did not fire")
+                && !outside.contains("likely out of memory"),
+            "{outside}"
         );
 
         let crash = killed_by(11).explain(Some((0, 5)));

@@ -38,6 +38,7 @@ mod isolated;
 pub mod lag_monitor;
 pub mod local_import;
 mod model_catalogs;
+mod model_notices;
 pub mod model_policy;
 pub mod profile;
 pub mod project_actions;

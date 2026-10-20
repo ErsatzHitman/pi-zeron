@@ -19,10 +19,10 @@ use std::ops::{Deref, DerefMut};
 use crate::process::orphans::{ENGINE_PID_ENV, ENGINE_START_ENV, current_marker};
 use crate::process::{Child as ProcessChild, Command};
 
-/// PDEATHSIG is tied to the spawning THREAD, not the process: spawn from a
-/// long-lived runtime worker (never `spawn_blocking`, never a short-lived
-/// runtime), or the child is SIGKILLed when that thread exits. Using
-/// `pre_exec` also makes std fall back from posix_spawn to fork/exec.
+/// PDEATHSIG is tied to the spawning THREAD, not the process: start the
+/// command with [`spawn`], or the child is SIGKILLed when the thread that
+/// spawned it exits. Using `pre_exec` also makes std fall back from
+/// posix_spawn to fork/exec.
 pub(crate) fn configure(command: &mut Command) {
     #[cfg(unix)]
     command.process_group(0);
@@ -72,6 +72,57 @@ pub(crate) fn configure(command: &mut Command) {
         "CLAUDE_AGENT_SDK_VERSION",
     ] {
         command.env_remove(key);
+    }
+}
+
+/// Start a [`configure`]d command from the engine's spawner thread.
+///
+/// The kernel delivers PDEATHSIG when the spawning THREAD exits, and no tokio
+/// worker is long-lived: a worker that blocks (`block_in_place`, which the
+/// chat store's synchronous flush does) hands its role to a fresh thread and
+/// retires, and a retired thread exits after its idle keep-alive. Each
+/// retirement SIGKILLed the agents that thread had spawned, with nothing in
+/// any log (Pi killed 35 minutes into a workflow, 2026-10-20). One thread
+/// that lives as long as the engine makes the signal mean what it says: the
+/// engine died.
+pub(crate) fn spawn(command: Command) -> std::io::Result<ProcessChild> {
+    #[cfg(target_os = "linux")]
+    {
+        type Job = Box<dyn FnOnce() + Send>;
+        static SPAWNER: std::sync::OnceLock<std::sync::mpsc::Sender<Job>> =
+            std::sync::OnceLock::new();
+        let spawner = SPAWNER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name("zeron-agent-spawner".into())
+                .spawn(move || {
+                    for job in rx {
+                        job();
+                    }
+                })
+                .expect("agent spawner thread");
+            tx
+        });
+        // The child registers with the caller's runtime (reaping, pipes).
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut command = command;
+        let job: Job = Box::new(move || {
+            let _entered = runtime.as_ref().map(|runtime| runtime.enter());
+            let _ = tx.send(command.spawn());
+        });
+        // fork/exec takes milliseconds; blocking the caller for it is what
+        // `Command::spawn` does anyway.
+        spawner
+            .send(job)
+            .map_err(|_| std::io::Error::other("the agent spawner thread is gone"))?;
+        rx.recv()
+            .map_err(|_| std::io::Error::other("the agent spawner thread is gone"))?
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut command = command;
+        command.spawn()
     }
 }
 
@@ -198,6 +249,29 @@ mod nice_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn an_agent_outlives_the_thread_that_asked_for_it() {
+        // Spawned from a thread that then exits: with PDEATHSIG bound to the
+        // caller, the kernel would SIGKILL the child the moment it returns.
+        let runtime = tokio::runtime::Handle::current();
+        let mut child = std::thread::spawn(move || {
+            let _entered = runtime.enter();
+            let mut command = Command::new("sleep");
+            command.arg("2");
+            configure(&mut command);
+            spawn(command).unwrap()
+        })
+        .join()
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the agent died with the thread that spawned it"
+        );
+        child.kill().await.unwrap();
+    }
 
     #[test]
     fn acp_environment_removes_nested_claude_markers() {
