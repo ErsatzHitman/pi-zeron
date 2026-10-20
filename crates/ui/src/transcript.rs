@@ -49,7 +49,7 @@ use crate::markdown::parser::{
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _};
-use crate::notice::{NoticeChipIcon::Tile, notice_chip};
+use crate::notice::{NoticeChipIcon::Tile, NoticeCopy, notice_chip};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
@@ -8301,7 +8301,21 @@ impl Transcript {
                 self.render_visual(&row.id, owner, path, title, cx)
             }
             RowKind::ErrorChip { message, hint } => {
-                error_chip(message.clone(), hint.clone(), &theme)
+                // Keyed apart from entry ids so a message's hover copy and
+                // this chip never show each other's check.
+                let key = SharedString::from(format!("notice:{}", row.id));
+                let entity = cx.weak_entity();
+                let copy = NoticeCopy {
+                    id: gpui::ElementId::Name(format!("notice-copy-{}", row.id).into()),
+                    copied: self.copied_message.as_ref() == Some(&key),
+                    on_copy: Rc::new(move |_, cx| {
+                        let key = key.clone();
+                        entity
+                            .update(cx, |this, cx| this.mark_message_copied(key, cx))
+                            .ok();
+                    }),
+                };
+                error_chip(message.clone(), hint.clone(), copy, &theme)
             }
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
             RowKind::Recap { lines, generating } => {
@@ -8821,7 +8835,13 @@ impl Transcript {
     fn copy_message(&mut self, entry_id: SharedString, text: SharedString, cx: &mut Context<Self>) {
         cx.stop_propagation();
         cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-        self.copied_message = Some(entry_id);
+        self.mark_message_copied(entry_id, cx);
+    }
+
+    /// Show the copied check on `key` (an entry id, or an error chip's
+    /// `notice:` key) for ~1.2s.
+    fn mark_message_copied(&mut self, key: SharedString, cx: &mut Context<Self>) {
+        self.copied_message = Some(key);
         self.copied_message_clear = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(1200))
@@ -10131,12 +10151,17 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
 /// WRAPS instead of truncating: startup-crash errors carry the agent's exit
 /// status and stderr, and a one-line ellipsis was exactly what made
 /// zeronsh/comet#95 undiagnosable from the screenshot.
-fn error_chip(message: SharedString, hint: Option<SharedString>, theme: &Theme) -> AnyElement {
+fn error_chip(
+    message: SharedString,
+    hint: Option<SharedString>,
+    copy: NoticeCopy,
+    theme: &Theme,
+) -> AnyElement {
     div()
         .py(px(4.0))
         .w_full()
         .child(
-            notice_chip(theme, false, "Error", message, Tile)
+            notice_chip(theme, false, "Error", message, Tile, copy)
                 .overflow_hidden()
                 .w_full()
                 .when_some(hint, |chip, hint| {

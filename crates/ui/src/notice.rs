@@ -2,7 +2,11 @@
 //! transcript converged on (zeron composer.tsx `Notice` / chat-view.tsx
 //! `ErrorChip`).
 
-use gpui::{AnyElement, Div, FontWeight, SharedString, div, prelude::*, px};
+use std::rc::Rc;
+
+use gpui::{
+    AnyElement, App, Div, ElementId, FontWeight, SharedString, Window, div, prelude::*, px,
+};
 
 use crate::theme::Theme;
 
@@ -16,6 +20,16 @@ pub enum NoticeChipIcon {
     /// 20px accent-washed tile holding a 12px triangle; 10px inset/radius,
     /// fixed 12px text (the transcript's ErrorChip).
     Tile,
+}
+
+/// The chip's copy button, owned by the caller: a free function keeps no
+/// state, so the caller remembers the click (`on_copy`) and passes back
+/// `copied` to show the check for a moment, like the transcript's other copy
+/// buttons. `id` must be unique per chip on screen.
+pub struct NoticeCopy {
+    pub id: ElementId,
+    pub copied: bool,
+    pub on_copy: Rc<dyn Fn(&mut Window, &mut App)>,
 }
 
 /// The failure notice both surfaces render (zeron composer.tsx `Notice`,
@@ -35,6 +49,7 @@ pub fn notice_chip(
     label: &'static str,
     message: impl Into<SharedString>,
     icon: NoticeChipIcon,
+    copy: NoticeCopy,
 ) -> Div {
     let (accent, muted) = if warning {
         (theme.warning, theme.warning_muted)
@@ -102,7 +117,7 @@ pub fn notice_chip(
             .child(div().flex_1())
             .child(
                 div()
-                    .id("notice-copy")
+                    .id(copy.id)
                     .flex_none()
                     .size(px(20.0))
                     .rounded(px(6.0))
@@ -113,15 +128,24 @@ pub fn notice_chip(
                     .hover(move |s| s.bg(accent.opacity(0.12)))
                     // The composer chip dismisses on click; copying must
                     // not take the notice with it.
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                             copy_message.to_string(),
                         ));
+                        (copy.on_copy)(window, cx);
                     })
-                    .tooltip(crate::settings::widgets::text_tooltip("Copy message"))
+                    .tooltip(crate::settings::widgets::text_tooltip(if copy.copied {
+                        "Copied"
+                    } else {
+                        "Copy message"
+                    }))
                     .child(
-                        crate::icons::icon(crate::icons::COPY)
+                        crate::icons::icon(if copy.copied {
+                            crate::icons::CHECK
+                        } else {
+                            crate::icons::COPY
+                        })
                             .size(px(12.0))
                             .text_color(muted.opacity(0.8)),
                     ),

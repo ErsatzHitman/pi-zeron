@@ -35,7 +35,7 @@ use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::composer_markdown::{self, in_code};
 use crate::motion;
-use crate::notice::{NoticeChipIcon, notice_chip};
+use crate::notice::{NoticeChipIcon, NoticeCopy, notice_chip};
 use crate::pickers::Pickers;
 use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
@@ -6277,6 +6277,9 @@ pub struct Composer {
     /// under their own chat — a blanket clear-on-switch erased the one
     /// visible trace of a failed send (2026-08-19).
     failure_key: Option<String>,
+    /// The failure chip's copy button shows its check (cleared after ~1.2s).
+    failure_copied: bool,
+    failure_copied_clear: Option<Task<()>>,
     pub(crate) wizard: Option<Wizard>,
     pub(crate) wizard_focus: FocusHandle,
     /// Live extension UI: sheets, trays, chips (see `crate::extension_ui`).
@@ -6610,6 +6613,8 @@ impl Composer {
             extension: crate::extension_ui::ComposerExtension::new(cx),
             answered_requests: HashSet::new(),
             failure_key: None,
+            failure_copied: false,
+            failure_copied_clear: None,
             action_task: None,
             advance_task: None,
             send_task: None,
@@ -11791,6 +11796,31 @@ impl Render for Composer {
                 // connected), red with "Error" for send/run failures. Click
                 // dismisses.
                 let offline = message.as_ref() == "Engine not connected";
+                let entity = cx.weak_entity();
+                let copy = NoticeCopy {
+                    id: "composer-failure-copy".into(),
+                    copied: self.failure_copied,
+                    on_copy: Rc::new(move |_, cx| {
+                        entity
+                            .update(cx, |this, cx| {
+                                this.failure_copied = true;
+                                this.failure_copied_clear =
+                                    Some(cx.spawn(async move |this, cx| {
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(1200))
+                                            .await;
+                                        this.update(cx, |this, cx| {
+                                            this.failure_copied = false;
+                                            this.failure_copied_clear = None;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    }));
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+                };
                 el.child(
                     notice_chip(
                         &theme,
@@ -11798,6 +11828,7 @@ impl Render for Composer {
                         if offline { "Warning" } else { "Error" },
                         message,
                         NoticeChipIcon::Plain,
+                        copy,
                     )
                     .id("composer-failure")
                     .mx(px(4.0))
