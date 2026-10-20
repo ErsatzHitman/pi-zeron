@@ -2,9 +2,10 @@
 use super::*;
 
 /// A staged attachment an attachment chip can refer to; an image chip opens
-/// its picture on click.
+/// its picture on click, and a document chip (`document`) its viewer.
 pub(super) struct ChipAttachment {
     pub(super) image: Option<std::sync::Arc<gpui::Image>>,
+    pub(super) document: bool,
 }
 
 /// Spaces reserve room at the start of every chip for its icon well, which is

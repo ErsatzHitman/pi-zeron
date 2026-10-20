@@ -1576,6 +1576,7 @@ pub fn rows_for_entry(
         attachments.retain(|att| {
             att.appshot.is_some()
                 || crate::attachments::is_image_path(&att.path)
+                || zeron_docview::DocKind::of(&att.path).is_some()
                 || !chips
                     .iter()
                     .any(|chip| crate::attachments::chip_names_attachment(chip, &att.path))
@@ -3709,6 +3710,8 @@ pub struct Transcript {
     /// In-flight ReadAttachmentChunk loads, keyed by device, path and validation
     /// policy; results land in the global attachment cache.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
+    /// Document attachments being read and parsed, by `(device, path)`.
+    doc_loads: HashMap<(String, String), Task<()>>,
     /// Inline `show_visual` visuals, keyed by row id.
     visuals: HashMap<SharedString, Entity<crate::visuals::VisualFrame>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
@@ -4212,6 +4215,7 @@ impl Transcript {
             image_menu_focus: cx.focus_handle(),
             image_copy: None,
             attachment_loads: HashMap::new(),
+            doc_loads: HashMap::new(),
             visuals: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
@@ -6342,6 +6346,103 @@ impl Transcript {
         }
     }
 
+    /// [`Self::attachment_state`] for a document attachment: the first
+    /// device that has it parsed wins; loads are claimed on each candidate.
+    fn doc_state(
+        &mut self,
+        device_ids: &[String],
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> crate::doc_preview::DocSnapshot {
+        use crate::doc_preview::{DocSnapshot, begin_load, snapshot};
+        for dev in device_ids {
+            if let DocSnapshot::Ready(doc) = snapshot(dev, path) {
+                return DocSnapshot::Ready(doc);
+            }
+        }
+        let mut loading = false;
+        let mut unreadable = false;
+        let mut retry: Option<Duration> = None;
+        for dev in device_ids {
+            if begin_load(dev, path) {
+                self.spawn_doc_load(dev.clone(), path.to_string(), cx);
+            }
+            match snapshot(dev, path) {
+                DocSnapshot::Ready(doc) => return DocSnapshot::Ready(doc),
+                DocSnapshot::Loading => loading = true,
+                DocSnapshot::Failed { retry_in: None } => unreadable = true,
+                DocSnapshot::Failed {
+                    retry_in: Some(delay),
+                } => retry = Some(retry.map_or(delay, |r| r.min(delay))),
+            }
+        }
+        if loading {
+            return DocSnapshot::Loading;
+        }
+        if !unreadable
+            && let (Some(delay), Some(dev)) = (retry, device_ids.first())
+        {
+            self.schedule_attachment_retry((dev.clone(), path.to_string()), delay, cx);
+            return DocSnapshot::Failed {
+                retry_in: Some(delay),
+            };
+        }
+        DocSnapshot::Failed { retry_in: None }
+    }
+
+    /// Read a document attachment back from `device_id` and parse it.
+    fn spawn_doc_load(&mut self, device_id: String, path: String, cx: &mut Context<Self>) {
+        let Some(kind) = zeron_docview::DocKind::of(&path) else {
+            crate::doc_preview::store_failed(&device_id, &path, true);
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            crate::doc_preview::store_failed(&device_id, &path, false);
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
+        let key = (device_id.clone(), path.clone());
+        let guard = crate::doc_preview::LoadGuard {
+            device: device_id,
+            path,
+        };
+        let task_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let read = crate::attachments::read_attachment_bytes(
+                &engine,
+                cx.background_executor(),
+                target.as_deref(),
+                &guard.path,
+                None,
+            )
+            .await;
+            match read {
+                Some((name, _, bytes)) => {
+                    let name = if name.is_empty() {
+                        guard.path.clone()
+                    } else {
+                        name
+                    };
+                    match crate::doc_preview::build(cx.background_executor(), name, kind, Arc::new(bytes))
+                        .await {
+                        Ok(doc) => {
+                            crate::doc_preview::store_ready(&guard.device, &guard.path, Arc::new(doc))
+                        }
+                        Err(_) => crate::doc_preview::store_failed(&guard.device, &guard.path, true),
+                    }
+                }
+                None => crate::doc_preview::store_failed(&guard.device, &guard.path, false),
+            }
+            this.update(cx, |transcript, cx| {
+                transcript.doc_loads.remove(&task_key);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.doc_loads.insert(key, task);
+    }
+
     fn spawn_attachment_load(
         &mut self,
         device_id: String,
@@ -7508,6 +7609,93 @@ impl Transcript {
         div().w_full().child(frame).into_any_element()
     }
 
+    /// A sent document's thumbnail: its first page or lines in the image
+    /// thumbnails' frame; a click opens the in-chat viewer.
+    fn render_doc_thumb(
+        &mut self,
+        row_id: &SharedString,
+        aix: usize,
+        att: &crate::attachments::UserImageAttachment,
+        kind: zeron_docview::DocKind,
+        device_ids: &[String],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::doc_preview::DocSnapshot;
+        let state = self.doc_state(device_ids, &att.path, cx);
+        let (sending, uploading) = self.upload_status(&att.path, cx);
+        let pulse = motion::pulse_wave(motion::pulse_delta(
+            &motion::ZERON_PULSE,
+            cx.entity_id(),
+            cx,
+        ));
+        let theme = Theme::of(cx).clone();
+        let body = crate::doc_preview::thumb_body(
+            &att.name,
+            kind,
+            &state,
+            ATT_THUMB_W - 2.0,
+            ATT_THUMB_H - 2.0,
+            7.0,
+            true,
+            pulse,
+            &theme,
+        );
+        let mut frame = div()
+            .id(SharedString::from(format!("{row_id}#doc{aix}")))
+            .debug_selector(|| "transcript-doc-thumb".into())
+            .flex_none()
+            .w(px(ATT_THUMB_W))
+            .h(px(ATT_THUMB_H))
+            .rounded(px(8.0))
+            .relative()
+            .border_1()
+            .border_color(crate::theme::hairline(0.11))
+            .child(body);
+        if let DocSnapshot::Ready(doc) = state {
+            let accent = theme.accent;
+            frame = frame
+                .role(gpui::Role::Button)
+                .aria_label(format!("Preview {}", doc.name))
+                .tab_index(0)
+                .cursor_pointer()
+                .focus_visible(move |style| style.border_2().border_color(accent))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.attachment_preview_return_focus = window.focused(cx);
+                    let doc = doc.clone();
+                    let viewer = cx.new(|cx| crate::doc_viewer::DocViewer::new(doc, cx));
+                    this.attachment_preview =
+                        Some(crate::attachments::PreviewImage::document(viewer, cx));
+                    window.focus(&this.attachment_preview_focus, cx);
+                    cx.notify();
+                }));
+        }
+        if sending {
+            let indicator: AnyElement = match uploading {
+                Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
+                None => crate::loaders::mini_glyph_spinner(
+                    format!("doc-sending-{row_id}-{aix}"),
+                    3.0,
+                    theme.glyph,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element(),
+            };
+            frame = frame.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(7.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
+                    .child(indicator),
+            );
+        }
+        frame.into_any_element()
+    }
+
     /// The right-aligned thumbnail strip above a user bubble.
     fn render_user_attachments(
         &mut self,
@@ -7533,6 +7721,11 @@ impl Transcript {
             .pt(px(4.0))
             .pb(px(6.0));
         for (aix, att) in atts.iter().enumerate() {
+            if let Some(kind) = zeron_docview::DocKind::of(&att.path) {
+                let thumb = self.render_doc_thumb(row_id, aix, att, kind, &device_ids, cx);
+                strip = strip.child(thumb);
+                continue;
+            }
             if !crate::attachments::is_image_path(&att.path) {
                 strip = strip.child(user_file_pill(&att.name, Theme::of(cx)));
                 continue;
@@ -13479,6 +13672,58 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_sent_document_shows_a_thumbnail_that_opens_the_viewer(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("doc-device".into());
+            state
+        });
+        let transcript = cx.new(|cx| Transcript::new(state, cx));
+        let path = "/up/ab12cd34-budget.csv";
+        crate::doc_preview::store_ready(
+            "doc-device",
+            path,
+            crate::doc_preview::test_doc(
+                "ab12cd34-budget.csv",
+                zeron_docview::DocKind::Csv,
+                b"item,cost\nrent,1200\n",
+            ),
+        );
+        let parsed = crate::attachments::parse_user_message_images(
+            &crate::attachments::with_attachments("", &[path.to_string(), "/up/x.zip".to_string()]),
+        );
+        struct RowFixture(Entity<Transcript>, Vec<crate::attachments::UserImageAttachment>);
+        impl Render for RowFixture {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let atts = self.1.clone();
+                self.0.update(cx, |this, cx| {
+                    this.render_user_attachments(&"row".into(), &atts, window, cx)
+                })
+            }
+        }
+        let (_fixture, cx) =
+            cx.add_window_view(|_, _| RowFixture(transcript.clone(), parsed.attachments.clone()));
+        cx.run_until_parked();
+        let thumb = cx
+            .debug_bounds("transcript-doc-thumb")
+            .expect("the document gets a thumbnail; the zip keeps its pill");
+        assert_eq!(thumb.size.width, px(ATT_THUMB_W));
+        assert_eq!(thumb.size.height, px(ATT_THUMB_H));
+        cx.simulate_click(thumb.center(), gpui::Modifiers::default());
+        transcript.read_with(cx, |this, cx| {
+            let preview = this.attachment_preview.as_ref().expect("the viewer opens");
+            let viewer = preview.document.as_ref().expect("as a document");
+            assert_eq!(viewer.read(cx).name().as_ref(), "budget.csv");
+        });
+    }
+
+    #[gpui::test]
     fn generated_image_fixture_uses_cache_and_retries(cx: &mut gpui::TestAppContext) {
         use crate::attachments::*;
         let dir = tempfile::tempdir().unwrap();
@@ -16955,13 +17200,18 @@ mod tests {
         else {
             panic!("expected a user row");
         };
-        // The image keeps its thumbnail; the files are their chips.
+        // The image and the previewable documents keep their thumbnails
+        // beside their chips.
         assert_eq!(
             attachments
                 .iter()
                 .map(|a| a.path.as_str())
                 .collect::<Vec<_>>(),
-            ["pending://att-1/Image 1.png"]
+            [
+                "pending://att-1/Image 1.png",
+                "pending://att-2/notes.md",
+                "/uploads/ef56ab78-done.md"
+            ]
         );
         let mentions = mentions.clone();
         transcript.update(cx, |transcript, cx| {
@@ -16990,8 +17240,8 @@ mod tests {
     }
 
     /// A sent message with image, file-attachment and workspace-file chips
-    /// reads as chips in the bubble; only attachments without a chip stay in
-    /// the strip above.
+    /// reads as chips in the bubble; images, previewable documents and
+    /// attachments without a chip stay in the strip above.
     #[test]
     fn user_bubbles_project_attachment_chips_in_place_of_the_strip() {
         use crate::composer::ChipKind;
@@ -17038,8 +17288,8 @@ mod tests {
             })
             .collect();
         assert_eq!(labels, ["Image 1", "notes.md", "composer.rs"]);
-        // A file's chip stands in for it; every image stays in the strip,
-        // and each attachment chip carries its upload.
+        // Every image and previewable document stays in the strip, and each
+        // attachment chip carries its upload.
         assert_eq!(
             attachments
                 .iter()
@@ -17047,6 +17297,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "/uploads/ab12cd34-Image_1.png",
+                "/uploads/ef56ab78-notes.md",
                 "/uploads/0a1b2c3d-Image_3.png"
             ]
         );

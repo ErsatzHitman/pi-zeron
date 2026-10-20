@@ -1,0 +1,18 @@
+[package]
+name = "zeron-docview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Document previews for chat attachments: PDF pages rasterized with hayro,
+# spreadsheets, Word and PowerPoint files read from their OOXML parts, and
+# text/CSV. Pure Rust with no UI dependency, so it ships on every desktop
+# platform without native libraries and is unit-testable on its own.
+
+[dependencies]
+hayro = "=0.8.0"
+roxmltree = "0.21.1"
+zip.workspace = true
+
+[dev-dependencies]

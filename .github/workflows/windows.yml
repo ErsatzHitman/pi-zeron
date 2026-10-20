@@ -61,7 +61,9 @@ jobs:
           $nativeResult = $LASTEXITCODE
           cargo test --release --locked -p zeron-ui --lib -- --test-threads=1 --skip native_diff_font_geometry --nocapture
           $headlessResult = $LASTEXITCODE
-          if ($nativeResult -ne 0 -or $headlessResult -ne 0) { exit 1 }
+          cargo test --release --locked -p zeron-docview --lib
+          $docviewResult = $LASTEXITCODE
+          if ($nativeResult -ne 0 -or $headlessResult -ne 0 -or $docviewResult -ne 0) { exit 1 }
 
   # The crate suites compile different package sets, so the two jobs below each
   # build what they need in parallel instead of one job building them in turn.

@@ -30,6 +30,8 @@ mod composer_dock;
 mod composer_markdown;
 mod context_usage;
 mod dictation;
+pub mod doc_preview;
+pub(crate) mod doc_viewer;
 pub mod edge_fade;
 pub(crate) mod extension_ui;
 pub mod rounded_clip;
