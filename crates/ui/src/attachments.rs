@@ -936,6 +936,15 @@ fn protected() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
     PROTECTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Whether `(device, path)` is on screen in the open transcript (see
+/// [`protected`]); the document cache shields the same keys.
+pub(crate) fn is_protected(device: &str, path: &str) -> bool {
+    protected()
+        .lock()
+        .unwrap()
+        .contains(&(device.to_string(), path.to_string()))
+}
+
 /// Replace the eviction shield with the given keys (see [`protected`]).
 pub fn protect_attachments(keys: std::collections::HashSet<(String, String)>) {
     *protected().lock().unwrap() = keys;
@@ -997,7 +1006,7 @@ pub(crate) fn attachment_snapshot_for(source: &AttachmentKey) -> AttachmentSnaps
 /// The uploadId fragment a committed upload's basename starts with
 /// (`{id8}-{name}` per the engine's `Uploads::pending_target`). `None` when
 /// the path can't be a committed upload.
-fn upload_alias_id8(path: &str) -> Option<String> {
+pub(crate) fn upload_alias_id8(path: &str) -> Option<String> {
     let base = std::path::Path::new(path).file_name()?.to_str()?;
     let (id8, _) = base.split_at_checked(8)?;
     (base.as_bytes().get(8) == Some(&b'-') && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
@@ -1113,18 +1122,20 @@ pub fn seed_attachment(device_id: &str, path: &str, name: &str, image: Arc<Image
     store_loaded(device_id, path, name.to_string().into(), image);
 }
 
-/// [`seed_attachment`] for a staged attachment; a file that is not an image
-/// has no thumbnail to seed.
+/// [`seed_attachment`] for a staged attachment; a document seeds its parsed
+/// preview instead, once the composer has read it.
 pub fn seed_staged(device_id: &str, path: &str, att: &StagedAttachment) {
-    if let Some(image) = att.image() {
-        seed_attachment(device_id, path, &att.name, image.clone());
+    match att.image() {
+        Some(image) => seed_attachment(device_id, path, &att.name, image.clone()),
+        None => crate::doc_preview::seed_staged(device_id, path, &att.id),
     }
 }
 
 /// [`seed_attachment_alias`] for a staged attachment.
 pub fn seed_staged_alias(device_id: &str, upload_id: &str, att: &StagedAttachment) {
-    if let Some(image) = att.image() {
-        seed_attachment_alias(device_id, upload_id, &att.name, image.clone());
+    match att.image() {
+        Some(image) => seed_attachment_alias(device_id, upload_id, &att.name, image.clone()),
+        None => crate::doc_preview::seed_staged_alias(device_id, upload_id, &att.id),
     }
 }
 
@@ -1140,6 +1151,9 @@ pub struct PreviewImage {
     pub(crate) viewer: crate::image_viewer::ImageView,
     /// Fill behind an image drawn on a transparent canvas (diagrams).
     pub(crate) plate: Option<gpui::Hsla>,
+    /// Set for a document attachment: the lightbox shows this viewer
+    /// instead of `image`.
+    pub(crate) document: Option<gpui::Entity<crate::doc_viewer::DocViewer>>,
 }
 
 impl PreviewImage {
@@ -1149,7 +1163,18 @@ impl PreviewImage {
             image,
             viewer: Default::default(),
             plate: None,
+            document: None,
         }
+    }
+
+    /// A document attachment's preview: the lightbox shows `viewer`.
+    pub(crate) fn document(viewer: gpui::Entity<crate::doc_viewer::DocViewer>, cx: &gpui::App) -> Self {
+        let mut preview = Self::new(
+            viewer.read(cx).name().clone(),
+            Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
+        );
+        preview.document = Some(viewer);
+        preview
     }
 
     pub(crate) fn with_plate(mut self, plate: gpui::Hsla) -> Self {
@@ -1179,6 +1204,9 @@ pub(crate) fn lightbox_with_size(
     on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
     cx: &mut gpui::App,
 ) -> AnyElement {
+    if let Some(viewer) = preview.document.clone() {
+        return document_lightbox(window, viewer, focus, on_close, cx);
+    }
     let viewport = window.viewport_size();
     let max_h = px(f32::from(viewport.height) * 0.85);
     let max_w = px(f32::from(viewport.width) * 0.9);
@@ -1256,6 +1284,63 @@ pub(crate) fn lightbox_with_size(
                             .text_color(ink(0.45))
                             .child(preview.name.clone()),
                     ),
+            ),
+    )
+    .priority(3)
+    .into_any_element()
+}
+
+/// The lightbox for a document: its viewer in a panel over the scrim.
+/// Escape or a click on the scrim closes it; arrows and Page Up/Down step
+/// through a PDF's pages (or a workbook's sheets).
+fn document_lightbox(
+    window: &mut gpui::Window,
+    viewer: gpui::Entity<crate::doc_viewer::DocViewer>,
+    focus: &gpui::FocusHandle,
+    on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    cx: &mut gpui::App,
+) -> AnyElement {
+    let viewport = window.viewport_size();
+    let width = px((f32::from(viewport.width) * 0.9).min(1_120.0));
+    let height = px(f32::from(viewport.height) * 0.88);
+    let on_close: crate::doc_viewer::CloseFn = std::rc::Rc::new(on_close);
+    viewer.update(cx, |viewer, _| viewer.on_close = Some(on_close.clone()));
+    let close_on_key = on_close.clone();
+    let keys = viewer.clone();
+    gpui::deferred(
+        gpui::anchored()
+            .position(gpui::point(px(0.0), px(0.0)))
+            .child(
+                div()
+                    .id("attachment-lightbox")
+                    .occlude()
+                    .track_focus(focus)
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .bg(crate::popover::scrim_alpha(0.7))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                        let delta = match event.keystroke.key.as_str() {
+                            "escape" => {
+                                cx.stop_propagation();
+                                close_on_key(window, cx);
+                                return;
+                            }
+                            "left" | "pageup" => -1,
+                            "right" | "pagedown" => 1,
+                            _ => return,
+                        };
+                        cx.stop_propagation();
+                        keys.update(cx, |viewer, cx| viewer.step(delta, cx));
+                    })
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        on_close(window, cx);
+                    })
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .child(div().w(width).h(height).child(viewer)),
             ),
     )
     .priority(3)

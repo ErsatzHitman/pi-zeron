@@ -2493,16 +2493,17 @@ impl ComposerInput {
     pub(crate) fn set_attachment_chips(
         &mut self,
         scope: &str,
-        attachments: HashMap<u32, Option<std::sync::Arc<gpui::Image>>>,
+        attachments: HashMap<u32, (Option<std::sync::Arc<gpui::Image>>, bool)>,
         cx: &mut Context<Self>,
     ) {
         let unchanged = self.attachment_scope == scope
             && self.attachment_chips.as_ref().is_some_and(|current| {
                 current.len() == attachments.len()
-                    && attachments.iter().all(|(index, image)| {
+                    && attachments.iter().all(|(index, (image, document))| {
                         current.get(index).is_some_and(|known| {
                             known.image.as_ref().map(std::sync::Arc::as_ptr)
                                 == image.as_ref().map(std::sync::Arc::as_ptr)
+                                && known.document == *document
                         })
                     })
             });
@@ -2513,7 +2514,7 @@ impl ComposerInput {
         self.attachment_chips = Some(
             attachments
                 .into_iter()
-                .map(|(index, image)| (index, ChipAttachment { image }))
+                .map(|(index, (image, document))| (index, ChipAttachment { image, document }))
                 .collect(),
         );
         self.invalidate_mention_tooltip();
@@ -2737,12 +2738,20 @@ impl ComposerInput {
             .is_some_and(|chip| chip.image.is_some())
     }
 
-    /// The number of the image chip under `position`, if any.
-    fn image_chip_at(&self, position: Point<Pixels>) -> Option<u32> {
+    /// Whether a click on the chip opens it: an image or a document.
+    fn is_openable_chip(&self, target: &MentionTooltipTarget) -> bool {
+        target
+            .attachment
+            .and_then(|index| self.attachment_chips.as_ref()?.get(&index))
+            .is_some_and(|chip| chip.image.is_some() || chip.document)
+    }
+
+    /// The number of the openable chip under `position`, if any.
+    fn openable_chip_at(&self, position: Point<Pixels>) -> Option<u32> {
         self.mention_hits
             .iter()
             .find(|hit| hit.bounds.contains(&position))
-            .filter(|hit| self.is_image_chip(&hit.target))
+            .filter(|hit| self.is_openable_chip(&hit.target))
             .and_then(|hit| hit.target.attachment)
     }
 
@@ -4051,7 +4060,7 @@ impl ComposerInput {
         window.focus(&self.focus_handle, cx);
         let intent = press_intent(event.click_count, event.modifiers.shift);
         self.chip_press = (intent == PressIntent::PlaceCaret)
-            .then(|| self.image_chip_at(event.position))
+            .then(|| self.openable_chip_at(event.position))
             .flatten()
             .map(|index| (index, event.position));
         self.is_selecting = true;
@@ -4134,10 +4143,10 @@ impl ComposerInput {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        // A click that starts and ends on an image chip opens the picture, as
-        // the thumbnails did; a drag across it only selects.
+        // A click that starts and ends on an image or document chip opens
+        // it, as the thumbnails did; a drag across it only selects.
         if let Some((index, down)) = self.chip_press.take()
-            && self.image_chip_at(event.position) == Some(index)
+            && self.openable_chip_at(event.position) == Some(index)
             && (event.position - down).magnitude() <= 4.0
         {
             cx.emit(ComposerInputEvent::OpenAttachment(index));
@@ -5185,7 +5194,7 @@ impl gpui::Element for ComposerTextElement {
             });
         let image_chip_hitboxes = mention_hits
             .iter()
-            .filter(|hit| input.is_image_chip(&hit.target))
+            .filter(|hit| input.is_openable_chip(&hit.target))
             .map(|hit| window.insert_hitbox(hit.bounds, gpui::HitboxBehavior::Normal))
             .collect();
         ComposerTextPrepaint {
@@ -6761,16 +6770,22 @@ impl Composer {
         }
     }
 
-    /// Open a staged image full size, from its chip (the tiles' click).
+    /// Open a staged image full size, or a document in the viewer, from its
+    /// chip (the tiles' click).
     fn open_attachment(&mut self, index: u32, cx: &mut Context<Self>) {
-        let Some((name, image)) = self
+        let Some(att) = self
             .staged()
             .iter()
-            .filter(|att| att.mention == Some(index))
-            .find_map(|att| Some((att.name.clone(), att.image()?.clone())))
+            .find(|att| att.mention == Some(index))
+            .cloned()
         else {
             return;
         };
+        let Some(image) = att.image().cloned() else {
+            self.ensure_doc_preview(&att, Some(()), cx);
+            return;
+        };
+        let name = att.name.clone();
         let preview = attachments::PreviewImage::new(name, image);
         preview.viewer.reset();
         self.preview = Some(preview);
@@ -7112,17 +7127,91 @@ impl Composer {
                 att.mention = Some(index);
             }
         }
+        for att in &staged {
+            self.ensure_doc_preview(att, None, cx);
+        }
         self.attachments.entry(key).or_default().extend(staged);
         self.sync_attachment_chips(cx);
         cx.notify();
     }
 
+    /// Start reading a staged document for its preview, unless that is done
+    /// or under way. With `open`, show it in the viewer once it is ready.
+    fn ensure_doc_preview(&mut self, att: &StagedAttachment, open: Option<()>, cx: &mut Context<Self>) {
+        if att.image().is_some() || zeron_docview::DocKind::of(&att.name).is_none() {
+            return;
+        }
+        let (device, path) = crate::doc_preview::staged_key(&att.id);
+        if let crate::doc_preview::DocSnapshot::Ready(doc) = crate::doc_preview::snapshot(device, &path) {
+            if open.is_some() {
+                self.open_doc(doc, cx);
+            }
+            return;
+        }
+        Self::spawn_doc_preview(att, open, cx);
+    }
+
+    /// Read and parse a staged document off-thread (unless a load is under
+    /// way and nothing waits to open it), then open it when `open` is set.
+    fn spawn_doc_preview(att: &StagedAttachment, open: Option<()>, cx: &mut Context<Self>) {
+        let (Some(kind), attachments::AttachmentContent::File(bytes)) =
+            (zeron_docview::DocKind::of(&att.name), &att.content)
+        else {
+            return;
+        };
+        let (device, path) = crate::doc_preview::staged_key(&att.id);
+        if !crate::doc_preview::begin_load(device, &path) && open.is_none() {
+            return;
+        }
+        let (name, bytes) = (att.name.clone(), bytes.clone());
+        cx.spawn(async move |this, cx| {
+            let guard = crate::doc_preview::LoadGuard {
+                device: device.to_string(),
+                path,
+            };
+            let built = match crate::doc_preview::snapshot(&guard.device, &guard.path) {
+                crate::doc_preview::DocSnapshot::Ready(doc) => Some(doc),
+                _ => match crate::doc_preview::build(cx.background_executor(), name, kind, bytes).await {
+                    Ok(doc) => {
+                        let doc = std::sync::Arc::new(doc);
+                        crate::doc_preview::store_ready(&guard.device, &guard.path, doc.clone());
+                        Some(doc)
+                    }
+                    Err(_) => {
+                        crate::doc_preview::store_failed(&guard.device, &guard.path, true);
+                        None
+                    }
+                },
+            };
+            this.update(cx, |this, cx| {
+                if let (Some(doc), Some(())) = (built, open) {
+                    this.open_doc(doc, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Show a staged document in the viewer.
+    fn open_doc(&mut self, doc: std::sync::Arc<crate::doc_preview::LoadedDoc>, cx: &mut Context<Self>) {
+        let viewer = cx.new(|cx| crate::doc_viewer::DocViewer::new(doc, cx));
+        self.preview = Some(attachments::PreviewImage::document(viewer, cx));
+        self.preview_focus_pending = true;
+        cx.notify();
+    }
+
     /// Hand the editor the attachments its chips may reference.
     fn sync_attachment_chips(&mut self, cx: &mut Context<Self>) {
-        let attachments: HashMap<u32, Option<std::sync::Arc<gpui::Image>>> = self
+        let attachments: HashMap<u32, (Option<std::sync::Arc<gpui::Image>>, bool)> = self
             .staged()
             .iter()
-            .filter_map(|att| att.mention.map(|index| (index, att.image().cloned())))
+            .filter_map(|att| {
+                let document = att.image().is_none() && zeron_docview::DocKind::of(&att.name).is_some();
+                att.mention
+                    .map(|index| (index, (att.image().cloned(), document)))
+            })
             .collect();
         let scope = self.current_key.clone();
         self.input.update(cx, |input, cx| {
@@ -7377,6 +7466,9 @@ impl Composer {
             .border_1()
             .border_color(crate::theme::hairline(0.10));
         let Some(image) = att.image() else {
+            if let Some(kind) = zeron_docview::DocKind::of(&att.name) {
+                return self.doc_tile(frame, att, kind, cx);
+            }
             let theme = Theme::of(cx);
             return frame
                 .flex()
@@ -7428,6 +7520,43 @@ impl Composer {
                     .object_fit(ObjectFit::Cover),
             )
             .into_any_element()
+    }
+
+    /// A staged document's tile: its first page or lines; a click opens the
+    /// viewer once it has been read.
+    fn doc_tile(
+        &self,
+        frame: gpui::Stateful<gpui::Div>,
+        att: &StagedAttachment,
+        kind: zeron_docview::DocKind,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (device, path) = crate::doc_preview::staged_key(&att.id);
+        let state = crate::doc_preview::snapshot(device, &path);
+        if matches!(state, crate::doc_preview::DocSnapshot::Loading) {
+            // Restored drafts and queued messages arrive without passing
+            // `adopt_staged_attachments`; read them on first paint.
+            Self::spawn_doc_preview(att, None, cx);
+        }
+        let body = crate::doc_preview::thumb_body(
+            &att.name,
+            kind,
+            &state,
+            STRIP_THUMB - 2.0,
+            STRIP_THUMB - 2.0,
+            7.0,
+            false,
+            0.6,
+            Theme::of(cx),
+        );
+        let frame = frame.relative().child(body);
+        match state {
+            crate::doc_preview::DocSnapshot::Ready(doc) => frame
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.open_doc(doc.clone(), cx)))
+                .into_any_element(),
+            _ => frame.into_any_element(),
+        }
     }
 
     fn render_appshot_strip(

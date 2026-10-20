@@ -70,6 +70,8 @@ jobs:
         run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib --test voice_orb_geometry
       - name: Dictation capture, cleanup and trigger phrase
         run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-voice --lib
+      - name: Document attachment previews
+        run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-docview --lib
 
   linux-browser:
     runs-on: ubuntu-24.04

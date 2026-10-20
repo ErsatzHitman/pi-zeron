@@ -790,3 +790,20 @@ fn clicking_an_image_chip_opens_the_picture_full_size(cx: &mut gpui::TestAppCont
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn clicking_a_document_chip_opens_its_viewer(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
+    let path = dir.path().join("budget.csv");
+    std::fs::write(&path, b"item,cost\nrent,1200\n").unwrap();
+    add_file(&handle, cx, path);
+    assert_eq!(staged_names(&handle, cx), ["budget.csv"]);
+    click_first_chip(&handle, cx, point(px(0.0), px(0.0)));
+    handle
+        .read_with(cx, |composer, cx| {
+            let preview = composer.preview.as_ref().expect("the chip opens its document");
+            let viewer = preview.document.as_ref().expect("in the document viewer");
+            assert_eq!(viewer.read(cx).name().as_ref(), "budget.csv");
+        })
+        .unwrap();
+}
