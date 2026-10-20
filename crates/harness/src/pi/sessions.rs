@@ -36,10 +36,17 @@ fn project_trusted(trust: &Value, cwd: &Path) -> bool {
     false
 }
 
+fn key_in(root: &Path, id: &str) -> PathBuf {
+    root.join(format!("{:x}.json", Sha256::digest(id.as_bytes())))
+}
+
 #[derive(Clone)]
 pub(super) struct Store {
     root: PathBuf,
     agent: PathBuf,
+    /// Where the map lived before it moved out of Pi's settings directory
+    /// (`<agent>/zeron-sessions`); still read so existing chats resume.
+    previous: PathBuf,
     legacy: PathBuf,
 }
 /// Pi's settings directory: an explicit override, else `PI_CODING_AGENT_DIR`,
@@ -55,10 +62,23 @@ pub(super) fn agent_dir(explicit: Option<PathBuf>) -> PathBuf {
 impl Store {
     pub fn new(root: Option<PathBuf>, agent: Option<PathBuf>) -> Self {
         let home = crate::executable::home_or_current_dir();
+        // Zeron's own files belong in Zeron's home, not in Pi's settings
+        // directory (which users keep in git). A redirected Pi (an explicit
+        // or `PI_CODING_AGENT_DIR` agent dir: tests, containers) keeps them
+        // beside it so nothing escapes to the real home.
+        let redirected = agent.is_some() || std::env::var_os("PI_CODING_AGENT_DIR").is_some();
         let agent = agent_dir(agent);
+        let previous = agent.join("zeron-sessions");
         Self {
-            root: root.unwrap_or_else(|| agent.join("zeron-sessions")),
+            root: root.unwrap_or_else(|| {
+                if redirected {
+                    previous.clone()
+                } else {
+                    home.join(".zeron").join("pi-sessions")
+                }
+            }),
             agent,
+            previous,
             legacy: home.join(".pi/pi-acp/session-map.json"),
         }
     }
@@ -94,8 +114,7 @@ impl Store {
         files
     }
     fn key(&self, id: &str) -> PathBuf {
-        self.root
-            .join(format!("{:x}.json", Sha256::digest(id.as_bytes())))
+        key_in(&self.root, id)
     }
     pub fn remember(&self, id: &str, file: &Path) -> Result<(), HarnessError> {
         if !file.is_absolute() {
@@ -182,6 +201,11 @@ impl Store {
     pub fn resolve(&self, id: &str, cwd: &Path) -> Result<PathBuf, HarnessError> {
         let mut candidates = vec![];
         if let Some(file) = json_file(&self.key(id))["sessionFile"].as_str() {
+            candidates.push(PathBuf::from(file));
+        }
+        if self.previous != self.root
+            && let Some(file) = json_file(&key_in(&self.previous, id))["sessionFile"].as_str()
+        {
             candidates.push(PathBuf::from(file));
         }
         if let Some(file) = json_file(&self.legacy)["sessions"][id]["sessionFile"].as_str() {
@@ -522,5 +546,24 @@ mod tests {
         assert_eq!(store.resolve("old-id", dir.path()).unwrap(), expected);
         store.remember("wrong-id", &path).unwrap();
         assert!(store.resolve("wrong-id", dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_map_entry_left_in_the_agent_dir_still_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "{\"type\":\"session\",\"id\":\"moved-id\"}
+").unwrap();
+        let mut old = Store::new(Some(dir.path().join("agent/zeron-sessions")), None);
+        old.agent = dir.path().join("agent");
+        old.remember("moved-id", &path).unwrap();
+        let mut store = Store::new(Some(dir.path().join("zeron/pi-sessions")), None);
+        store.agent = dir.path().join("agent");
+        store.previous = dir.path().join("agent/zeron-sessions");
+        store.legacy = dir.path().join("legacy.json");
+        assert_eq!(
+            store.resolve("moved-id", dir.path()).unwrap(),
+            path.canonicalize().unwrap()
+        );
     }
 }
