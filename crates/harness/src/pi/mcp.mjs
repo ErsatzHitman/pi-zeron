@@ -13,8 +13,33 @@ export function callTimeoutMs(method, params) {
   return Math.max(660_000, (secs.length ? Math.max(...secs) : 0) * 1000 + 30_000);
 }
 
+// Zeron tools a plain chat rarely needs, with what each is for. They are
+// deferred: not declared on every request until tool_search loads them,
+// and named in a short prompt section so the model knows they exist. An
+// orchestrator's root and members keep every tool declared.
+const ON_DEMAND = {
+  whoami: "this chat, device and place in a tree",
+  list_devices: "devices Zeron can run chats on",
+  list_projects: "projects on a device",
+  register_project: "add a folder as a project",
+  github_preflight: "check GitHub access before GitHub work",
+  list_harnesses: "agent harnesses on a device",
+  list_models: "models a harness can run",
+  archive_chat: "hide or restore a chat",
+  list_subsessions: "what a chat delegated",
+  inspect_subsession: "one delegated run in detail",
+};
+
+export function onDemandSection(name, deferred) {
+  if (!deferred.length) return "";
+  return `More Zeron tools load when needed: call tool_search (for example "zeron ${deferred[0]}") to load one, then call it.\n`
+    + deferred.map(tool => `- ${name}_${tool}: ${ON_DEMAND[tool]}`).join("\n");
+}
+
 export default function (pi) {
   const config = JSON.parse(process.env.ZERON_PI_MCP);
+  const plainChat = !process.env.ZERON_ROLE;
+  let deferred = [];
   let child, lines, nextId = 0;
   const pending = new Map();
   function fail(error) {
@@ -79,10 +104,14 @@ export default function (pi) {
       await rpc("initialize", {protocolVersion: "2024-11-05", capabilities: {}, clientInfo: {name: "zeron-pi", version: "1"}});
       child.stdin.write(JSON.stringify({jsonrpc: "2.0", method: "notifications/initialized"}) + "\n");
       const {tools} = await rpc("tools/list", {});
+      deferred = [];
       for (const tool of tools) {
+        const onDemand = plainChat && Object.hasOwn(ON_DEMAND, tool.name);
+        if (onDemand) deferred.push(tool.name);
         pi.registerTool({
           name: `${config.name}_${tool.name}`, label: `Zeron: ${tool.name}`,
           description: tool.description, parameters: tool.inputSchema,
+          ...(onDemand ? {exposure: "deferred"} : {}),
           async execute(_id, args, signal) {
             const result = await rpc("tools/call", {name: tool.name, arguments: args}, signal);
             if (result.isError) throw new Error(result.content?.filter(c => c.type === "text").map(c => c.text).join("\n") || "Zeron tool failed");
@@ -90,10 +119,26 @@ export default function (pi) {
           },
         });
       }
+      const active = pi.getActiveTools();
+      if (deferred.length && !active.includes("tool_search")
+        && pi.getAllTools().some(tool => tool.name === "tool_search")) {
+        pi.setActiveTools([...active, "tool_search"]);
+      }
     } catch (error) {
       close();
       throw error;
     }
+  });
+  pi.on("before_agent_start", event => {
+    const text = onDemandSection(config.name, deferred);
+    if (!text) return;
+    const options = event.systemPromptOptions;
+    if (options && options.forceSystemPrompt === undefined) {
+      options.sections ??= {};
+      options.sections.zeron_tools = text;
+      return;
+    }
+    return {systemPrompt: `${event.systemPrompt ?? ""}\n\n<zeron_tools>\n${text}\n</zeron_tools>`};
   });
   pi.on("session_shutdown", close);
   process.once("exit", close);
