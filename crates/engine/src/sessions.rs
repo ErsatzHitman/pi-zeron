@@ -1570,6 +1570,19 @@ impl SessionsEngine {
                     ),
                 );
             }
+            if !will_resume
+                && prompt.is_some()
+                && let Some(dir) = self.inner.registry.data_dir()
+            {
+                crate::model_notices::record(
+                    &dir,
+                    &chat_id,
+                    now_ms(),
+                    &format!(
+                        "The engine stopped unexpectedly (a crash, an out-of-memory kill or a reboot) during your turn, and the turn was not resumed because {not_resumed}."
+                    ),
+                );
+            }
             tracing::info!(chat = %chat_id, stamped, will_resume, attempts, "recovered stale session journal");
             recovered += 1;
 
@@ -3101,6 +3114,36 @@ fn recovery_prompt(request: &str) -> String {
     )
 }
 
+/// Tool calls of the current segment that never got a result, one short
+/// line each, for a crash notice.
+fn unfinished_tools(parts: &[MessagePart]) -> Vec<String> {
+    const MAX_CHARS: usize = 200;
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Tool {
+                call,
+                resolved: false,
+                ..
+            } => Some(match call {
+                zeron_proto::ToolCall::Exec { command } => {
+                    let command: String = command.chars().take(MAX_CHARS).collect();
+                    format!("`{command}`")
+                }
+                other => {
+                    let value = serde_json::to_value(other).unwrap_or_default();
+                    let kind = value["kind"].as_str().unwrap_or("tool");
+                    match value["path"].as_str() {
+                        Some(path) => format!("{kind} {path}"),
+                        None => kind.to_owned(),
+                    }
+                }
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// "2 background jobs and 1 sub-agent" for the work a dead runtime held;
 /// `None` for none.
 fn describe_lost_work(jobs: u32, agents: u32) -> Option<String> {
@@ -3389,6 +3432,21 @@ async fn drive_run(
         if let Some(file) = inner.tree_policy_file(&chat_id, &dir) {
             mcp.env
                 .insert(zeron_proto::orchestrator::ENV_TREE_POLICY.to_owned(), file);
+        }
+    }
+    // Notices the model is owed (its last runtime died, a turn was not
+    // resumed) lead this prompt. Before the retry copy, so a startup-crash
+    // retry carries them too; cleared once the agent answers. A command must
+    // stay first in its prompt, so it leaves them for the next message.
+    let mut notice_ids: Vec<String> = Vec::new();
+    if !resume_state.idle
+        && !native_command(&request.prompt, harness_id)
+        && let Some(dir) = inner.registry.data_dir()
+    {
+        let notices = crate::model_notices::pending(&dir, &chat_id);
+        if !notices.is_empty() {
+            request.prompt = crate::model_notices::wrap(&notices, &request.prompt);
+            notice_ids = notices.into_iter().map(|notice| notice.id).collect();
         }
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch
@@ -3846,7 +3904,27 @@ async fn drive_run(
                 }
                 Some(event) = engine_rx.recv() => event,
                 next = stream.next() => match next {
-                    Some(Ok(event)) => event,
+                    Some(Ok(event)) => {
+                        // The agent answered the prompt that carried the
+                        // notices: they reached it. A startup failure (an
+                        // errored Done first) leaves them for the retry or
+                        // the next message.
+                        if !notice_ids.is_empty()
+                            && !matches!(
+                                event,
+                                AgentEvent::Done {
+                                    status: DoneStatus::Errored,
+                                    ..
+                                }
+                            )
+                        {
+                            if let Some(dir) = inner.registry.data_dir() {
+                                crate::model_notices::mark_delivered(&dir, &chat_id, &notice_ids);
+                            }
+                            notice_ids.clear();
+                        }
+                        event
+                    }
                     // A stream error while PARKED is a post-turn child death —
                     // the turn was already finalized, so the run ends clean
                     // instead of stamping a completed session Errored.
@@ -3866,6 +3944,9 @@ async fn drive_run(
                             "{cause}. It was still running {held}; their results were not saved. Check git status and the worktree before continuing."
                         );
                         tracing::warn!(chat = %chat_id, error = %message, "parked session child died holding work");
+                        if let Some(dir) = inner.registry.data_dir() {
+                            crate::model_notices::record(&dir, &chat_id, now_ms(), &message);
+                        }
                         let parts = [MessagePart::Error {
                             id: "e0".into(),
                             message: message.clone(),
@@ -4561,6 +4642,30 @@ async fn drive_run(
             // journal. To reintroduce: `zeron_doc::sidecar_payload(&event)`
             // → `apply_sidecar_refs` → `doc_host.upload_tool_sidecar`, all
             // still in place and tested.
+        }
+
+        // The agent died mid-turn: it cannot tell itself, so the next prompt
+        // carries the cause and what was still running.
+        if let AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error,
+            class,
+            ..
+        } = &event
+            && (stream_failed || matches!(class, Some(zeron_proto::ErrorClass::ProcessKilled { .. })))
+            && let Some(dir) = inner.registry.data_dir()
+        {
+            let cause = error.as_deref().unwrap_or("the agent process ended without a reply");
+            let unfinished = unfinished_tools(&folded);
+            let text = if unfinished.is_empty() {
+                format!("Your turn ended abruptly: {cause}.")
+            } else {
+                format!(
+                    "Your turn ended abruptly: {cause}. Tool calls still running then: {}.",
+                    unfinished.join("; ")
+                )
+            };
+            crate::model_notices::record(&dir, &chat_id, now_ms(), &text);
         }
 
         if let AgentEvent::Done { status, .. } = &event {
