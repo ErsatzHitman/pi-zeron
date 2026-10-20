@@ -693,6 +693,8 @@ struct ProbeEndpoints {
     nous_portal: String,
     /// OpenCode Go's usage view for an API key (`/zen/go/v1/usage`).
     opencode_go_usage: String,
+    /// Cline's API root (`/api/v1/users/me`, `/api/v1/auth/refresh`, …).
+    cline_api: String,
     allow_slot_refresh: bool,
     /// Test seam: admit `http://127.0.0.1` for credential-DEFINED endpoints
     /// (Grok issuer, Devin server, …) so mock servers can stand in. Always
@@ -715,6 +717,7 @@ impl Default for ProbeEndpoints {
             openai_port: oauth::OPENAI_LOOPBACK_PORT,
             nous_portal: usage::NOUS_PORTAL.into(),
             opencode_go_usage: usage::OPENCODE_GO_USAGE_URL.into(),
+            cline_api: usage::CLINE_API.into(),
             allow_slot_refresh: true,
             allow_loopback_http: false,
         }

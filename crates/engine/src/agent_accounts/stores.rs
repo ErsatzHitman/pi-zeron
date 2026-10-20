@@ -152,6 +152,7 @@ pub(super) fn upstream_vendor(store_key: &str) -> &'static str {
         "nous" => "Nous",
         "xai-oauth" | "xai" => "xAI",
         "opencode-go" => "OpenCode",
+        "clinepass" => "Cline",
         _ => "the provider",
     }
 }
@@ -326,6 +327,8 @@ pub(super) enum Upstream {
     Anthropic,
     /// GitHub Copilot (a GitHub OAuth token).
     Copilot,
+    /// ClinePass (Cline's WorkOS login, `workos:`-prefixed access token).
+    Cline,
 }
 
 /// The store keys zeron manages per agent.
@@ -339,6 +342,7 @@ pub(super) fn keyed_accounts(harness: HarnessId) -> &'static [(&'static str, Ups
             ("openai-codex", Upstream::OpenAi),
             ("anthropic", Upstream::Anthropic),
             ("github-copilot", Upstream::Copilot),
+            ("clinepass", Upstream::Cline),
         ],
         _ => &[],
     }
@@ -349,6 +353,15 @@ pub(super) fn upstream_of(harness: HarnessId, store_key: &str) -> Option<Upstrea
         .iter()
         .find(|(key, _)| *key == store_key)
         .map(|(_, upstream)| *upstream)
+}
+
+/// Whether an OAuth entry's access token has expired (or does within a
+/// minute) by its own `expires` (ms since the epoch); `false` without one.
+pub(super) fn token_lapsed(entry: &serde_json::Value) -> bool {
+    entry
+        .get("expires")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|expires| expires <= now_ms() + 60_000)
 }
 
 /// An OAuth entry zeron can use: `type: "oauth"` with an access token.
@@ -444,6 +457,7 @@ fn unresolved(store_key: &str, upstream: Upstream) -> Detected {
         Upstream::Anthropic => ("Claude account", "Claude"),
         Upstream::Copilot => ("GitHub account", "GitHub Copilot"),
         Upstream::OpenAi => ("ChatGPT account", "ChatGPT"),
+        Upstream::Cline => ("ClinePass account", "ClinePass"),
     };
     Detected {
         account_key: format!("{store_key}:unidentified"),
@@ -465,7 +479,7 @@ fn unresolved(store_key: &str, upstream: Upstream) -> Detected {
 /// `auth.json` key; an unknown key (a gateway's) is shown as it is.
 pub(super) fn pi_login_name(store_key: &str) -> &str {
     match store_key {
-        "openai" => "ChatGPT",
+        "openai" => "OpenAI (ChatGPT subscription)",
         "kimi-coding" => "Kimi Code",
         "openrouter" => "OpenRouter",
         "xai" => "xAI",
@@ -475,15 +489,40 @@ pub(super) fn pi_login_name(store_key: &str) -> &str {
 }
 
 /// A live Pi login zeron can't identify or switch: one per provider key.
-fn other_login(store_key: &str) -> Detected {
+/// Pi's `openai` login is "Sign in with ChatGPT" for the OpenAI API — a
+/// separate login from `openai-codex`, with no usage view and no identity
+/// in its token — so it is named for what it is. A token past its expiry
+/// says so: Pi refreshes it only when that provider runs.
+fn other_login(store_key: &str, entry: &serde_json::Value) -> Detected {
     let name = pi_login_name(store_key);
+    let email = match store_key {
+        "openai" => "OpenAI API login".to_string(),
+        _ => format!("{name} account"),
+    };
+    let lapsed = entry
+        .get("expires")
+        .and_then(|v| v.as_i64())
+        .map(|expires| now_ms() - expires)
+        .filter(|ago| *ago > 0);
+    let plan = match lapsed {
+        Some(ago) => {
+            let hours = ago / 3_600_000;
+            let when = match hours {
+                0 => format!("{}m", ago / 60_000 + 1),
+                1..48 => format!("{hours}h"),
+                _ => format!("{}d", hours / 24),
+            };
+            format!("{name} · idle, token expired {when} ago")
+        }
+        None => name.to_string(),
+    };
     Detected {
         account_key: format!("{store_key}:unidentified"),
         profile: SlotProfile {
-            email: format!("{name} account"),
+            email,
             display_name: None,
             organization: None,
-            plan: Some(name.to_string()),
+            plan: Some(plan),
             auth_kind: AgentAuthKind::Oauth,
         },
         credentials: None,
@@ -932,7 +971,7 @@ impl AgentAccounts {
         {
             for (store_key, entry) in entries {
                 if upstream_of(harness, store_key).is_none() && oauth_entry(entry) {
-                    unidentified.push(other_login(store_key));
+                    unidentified.push(other_login(store_key, entry));
                 }
             }
         }
@@ -963,7 +1002,7 @@ impl AgentAccounts {
     ) -> Option<Detected> {
         match upstream {
             Upstream::OpenAi => openai_detected(store_key, entry, None),
-            Upstream::Anthropic | Upstream::Copilot => {
+            Upstream::Anthropic | Upstream::Copilot | Upstream::Cline => {
                 self.identify_opaque(harness, store_key, upstream, entry)
                     .await
             }
@@ -1004,16 +1043,34 @@ impl AgentAccounts {
         }
         let fingerprint = format!("{store_key}:{}", hashed_key(&secret));
         let cached = lock(&self.inner.identities).get(&fingerprint).cloned();
+        let mut entry = entry.clone();
         let (account_key, profile) = match cached {
             Some(IdentityLookup::Known(key, profile)) => (key, profile),
             Some(IdentityLookup::Failed(at)) if at.elapsed() < IDENTITY_RETRY => return None,
             _ => {
+                // An idle Pi login's access token lapses (Claude's in hours,
+                // ClinePass's in under one): refresh it as Pi would, else
+                // the profile call fails and the row stays anonymous.
+                if matches!(upstream, Upstream::Anthropic | Upstream::Cline)
+                    && harness == HarnessId::Pi
+                    && token_lapsed(&entry)
+                    && let Some(access) = str_field(&entry, "access")
+                    && let Ok(Some(fresh)) = self
+                        .refresh_keyed_login(harness, store_key, upstream, None, &access)
+                        .await
+                {
+                    entry = fresh;
+                }
                 let known = match upstream {
-                    Upstream::Anthropic => match str_field(entry, "access") {
+                    Upstream::Anthropic => match str_field(&entry, "access") {
                         Some(access) => self.anthropic_identity(store_key, &access).await,
                         None => None,
                     },
-                    Upstream::Copilot => self.github_identity(store_key, &secret, entry).await,
+                    Upstream::Cline => match str_field(&entry, "access") {
+                        Some(access) => self.cline_identity(store_key, &access).await,
+                        None => None,
+                    },
+                    Upstream::Copilot => self.github_identity(store_key, &secret, &entry).await,
                     Upstream::OpenAi => None,
                 };
                 let lookup = match &known {
@@ -1024,7 +1081,43 @@ impl AgentAccounts {
                 known?
             }
         };
-        Some(Detected::known(account_key, profile, entry.clone()).keyed(store_key))
+        Some(Detected::known(account_key, profile, entry).keyed(store_key))
+    }
+
+    /// ClinePass's user behind a live access token (`/api/v1/users/me`).
+    async fn cline_identity(
+        &self,
+        store_key: &str,
+        access_token: &str,
+    ) -> Option<(String, SlotProfile)> {
+        let body: serde_json::Value = self
+            .inner
+            .http
+            .get(format!(
+                "{}/api/v1/users/me",
+                self.inner.endpoints.cline_api.trim_end_matches('/')
+            ))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .ok()
+            .filter(|res| res.status().is_success())?
+            .json()
+            .await
+            .ok()?;
+        let user = body.get("data").filter(|d| d.is_object()).unwrap_or(&body);
+        let email = str_field(user, "email");
+        let id = str_field(user, "id").or_else(|| email.clone())?;
+        Some((
+            format!("{store_key}:{id}"),
+            SlotProfile {
+                email: email.unwrap_or_else(|| "ClinePass account".to_string()),
+                display_name: str_field(user, "displayName"),
+                organization: None,
+                plan: Some("ClinePass".to_string()),
+                auth_kind: AgentAuthKind::Oauth,
+            },
+        ))
     }
 
     /// Claude's profile for a live access token (`user:profile` scope).

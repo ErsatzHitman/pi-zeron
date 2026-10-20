@@ -26,7 +26,37 @@ use crate::theme::Theme;
 /// ring re-probes on every hover, so don't even ask more often than this.
 const FORCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// Background re-probe while a composer is alive: usage moves as turns run.
-const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const POLL_INTERVAL: Duration = Duration::from_secs(2 * 60);
+/// Re-probe cadence while the accounts card is open.
+const OPEN_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// After the session's chat moves (a turn landed), wait this long — the
+/// provider books usage a beat after the reply — then re-probe.
+const AFTER_TURN_DELAY: Duration = Duration::from_secs(6);
+/// How often the poll loop checks whether a re-probe is due (no network
+/// unless one is).
+const TICK: Duration = Duration::from_secs(5);
+
+/// Whether a forced re-probe is due. `since_forced` is the time since the
+/// last one (`None`: never); `turn_landed` the time since the session's chat
+/// last moved without a re-probe after it; `reset_passed` whether a shown
+/// window's reset time has come since that probe. Pure.
+pub(crate) fn refresh_due(
+    since_forced: Option<Duration>,
+    open: bool,
+    turn_landed: Option<Duration>,
+    reset_passed: bool,
+) -> bool {
+    let Some(since) = since_forced else {
+        return true;
+    };
+    if since < FORCE_MIN_INTERVAL {
+        return false;
+    }
+    since >= POLL_INTERVAL
+        || (open && since >= OPEN_POLL_INTERVAL)
+        || turn_landed.is_some_and(|ago| ago >= AFTER_TURN_DELAY)
+        || reset_passed
+}
 
 /// The binding limit: the most-used window of the account still current
 /// at `now`. Pure.
@@ -159,9 +189,15 @@ pub struct AccountUsage {
     harness: Option<HarnessId>,
     /// The session's model (`provider/id`), which picks Pi's login.
     model: Option<String>,
+    /// The session chat's last message time: a change means a turn landed.
+    activity: Option<DateTime<Utc>>,
+    /// When `activity` last moved, until the re-probe after it runs.
+    turn_landed: Option<Instant>,
     /// Once any list has been asked for the current target.
     loaded: bool,
     last_forced: Option<Instant>,
+    /// Wall time of the last forced probe, for reset times passing after it.
+    last_forced_at: Option<DateTime<Utc>>,
     error: Option<SharedString>,
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
@@ -173,12 +209,15 @@ pub struct AccountUsage {
 
 impl AccountUsage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        // Live, not periodic: re-probe after each turn of the session, when a
+        // shown window resets, every minute while the card is open, and
+        // every two minutes otherwise.
         let poll = cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(POLL_INTERVAL).await;
+                cx.background_executor().timer(TICK).await;
                 if this
                     .update(cx, |usage, cx| {
-                        if usage.harness.is_some() {
+                        if usage.harness.is_some() && usage.refresh_is_due(cx) {
                             usage.load(true, cx);
                         }
                     })
@@ -194,8 +233,11 @@ impl AccountUsage {
             target: None,
             harness: None,
             model: None,
+            activity: None,
+            turn_landed: None,
             loaded: false,
             last_forced: None,
+            last_forced_at: None,
             error: None,
             load_task: None,
             action_task: None,
@@ -213,6 +255,7 @@ impl AccountUsage {
         harness: Option<HarnessId>,
         model: Option<String>,
         target: Option<String>,
+        activity: Option<DateTime<Utc>>,
         cx: &mut Context<Self>,
     ) {
         let harness = harness.filter(|h| signs_in(*h) && reports_usage(*h));
@@ -222,12 +265,42 @@ impl AccountUsage {
             self.target = target;
             self.loaded = false;
             self.last_forced = None;
+            self.last_forced_at = None;
             self.error = None;
+            self.activity = activity;
+        }
+        if self.activity != activity {
+            // First sight of a chat is not a turn: only a later move is.
+            if self.activity.is_some() && activity.is_some() {
+                self.turn_landed = Some(Instant::now());
+            }
+            self.activity = activity;
         }
         if harness.is_some() && !self.loaded {
             self.loaded = true;
             self.load(true, cx);
         }
+    }
+
+    fn refresh_is_due(&self, cx: &gpui::App) -> bool {
+        let reset_passed = self.last_forced_at.is_some_and(|probed| {
+            let now = Utc::now();
+            self.snapshot(cx).is_some_and(|snapshot| {
+                snapshot
+                    .accounts
+                    .iter()
+                    .filter(|account| Some(account.harness) == self.harness)
+                    .flat_map(|account| &account.usage_windows)
+                    .filter_map(|window| window.resets_at)
+                    .any(|at| at > probed && at <= now)
+            })
+        });
+        refresh_due(
+            self.last_forced.map(|at| at.elapsed()),
+            self.popup.get() == Some(&FooterCard::Accounts),
+            self.turn_landed.map(|at| at.elapsed()),
+            reset_passed,
+        )
     }
 
     fn snapshot<'a>(&self, cx: &'a gpui::App) -> Option<&'a AgentAccountsSnapshot> {
@@ -254,6 +327,8 @@ impl AccountUsage {
                 return;
             }
             self.last_forced = Some(Instant::now());
+            self.last_forced_at = Some(Utc::now());
+            self.turn_landed = None;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -509,13 +584,9 @@ impl AccountUsage {
                                     now,
                                 )))
                             })
-                            .children(
-                                account
-                                    .usage_windows
-                                    .iter()
-                                    .take(2)
-                                    .map(|window| render_usage_meter(window, theme)),
-                            ),
+                            .children(account.usage_windows.iter().map(|window| {
+                                render_usage_meter(&accounts::current_window(window, now), theme)
+                            })),
                     )
             }))
             .children(self.error.clone().map(|error| {
@@ -642,6 +713,25 @@ mod tests {
         go.usage_windows.clear();
         snapshot.accounts = vec![go];
         assert_eq!(usage_counters(&snapshot, pi, now), None);
+    }
+
+    #[test]
+    fn usage_refreshes_live_not_only_on_a_timer() {
+        let s = Duration::from_secs;
+        // Never probed: now.
+        assert!(refresh_due(None, false, None, false));
+        // Never sooner than the throttle, whatever happened.
+        assert!(!refresh_due(Some(s(10)), true, Some(s(60)), true));
+        // A quiet composer: every two minutes.
+        assert!(!refresh_due(Some(s(90)), false, None, false));
+        assert!(refresh_due(Some(s(120)), false, None, false));
+        // The card open: every minute.
+        assert!(refresh_due(Some(s(60)), true, None, false));
+        // A turn landed: a beat after it.
+        assert!(!refresh_due(Some(s(40)), false, Some(s(2)), false));
+        assert!(refresh_due(Some(s(40)), false, Some(s(6)), false));
+        // A shown window reset since the last probe.
+        assert!(refresh_due(Some(s(40)), false, None, true));
     }
 
     fn account(harness: HarnessId, active: bool, used: &[f32]) -> AgentAccount {

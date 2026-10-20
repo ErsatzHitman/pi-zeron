@@ -13,6 +13,9 @@
 //! - **ChatGPT logins** (OpenCode `openai`, Pi `openai-codex`, Hermes
 //!   `openai-codex`): the Codex usage endpoint — the same token kind.
 //! - **Claude logins** (Pi `anthropic`): Claude's `/api/oauth/usage`.
+//! - **ClinePass** (Pi `clinepass`): Cline's
+//!   `/api/v1/users/me/plan/usage-limits` — 5-hour, weekly and monthly
+//!   percentages — with the plan's name from `/api/v1/users/me/plan`.
 //! - **Copilot** (OpenCode / Pi `github-copilot`):
 //!   `api.github.com/copilot_internal/user` — premium-request quota.
 //! - **Nous** (Hermes `nous`): the portal's `/api/oauth/account` credits.
@@ -24,6 +27,9 @@
 //! like Claude's): a saved slot in its own file, the live login in the
 //! agent's store under the agent's own lock, which Pi re-reads before it
 //! refreshes. Otherwise the session stayed "expired" until the agent ran.
+//! Pi's Claude and ClinePass logins are refreshed the same way, the way Pi
+//! itself does it ([`AgentAccounts::refresh_keyed_login`]): an idle one
+//! lapses within hours and showed no usage until Pi next used it.
 //! Other per-provider tokens are left to the agent (or Hermes' pool) — a
 //! rejected one reads "switch to it to refresh" / "refreshes next time".
 
@@ -40,6 +46,11 @@ pub(super) const NOUS_PORTAL: &str = "https://portal.nousresearch.com";
 pub(super) const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 /// Pi's provider id for OpenCode Go, and its key store's.
 pub(super) const OPENCODE_GO: &str = "opencode-go";
+/// Cline's API root, which ClinePass logs in, refreshes and reports on.
+pub(super) const CLINE_API: &str = "https://api.cline.bot";
+/// pi-clinepass's token lifetime less its refresh margin (55 − 5 minutes):
+/// a refreshed entry carries the same `expires` Pi would write.
+const CLINE_TOKEN_TTL_MS: i64 = 50 * 60 * 1000;
 const DEVIN_STATUS_RPC: &str = "exa.seat_management_pb.SeatManagementService/GetUserStatus";
 const DEVIN_DEFAULT_API_SERVER: &str = "https://server.codeium.com";
 /// The CLI version the status call identifies as (the server wants one).
@@ -299,9 +310,43 @@ impl AgentAccounts {
                     result => result,
                 }
             }
-            Some(Upstream::Anthropic) => {
-                let access = str_field(creds, "access").ok_or(missing)?;
-                self.claude_usage_request(&access).await
+            Some(upstream @ (Upstream::Anthropic | Upstream::Cline)) => {
+                let live = match is_active {
+                    true => self.live_keyed_entry(harness, key),
+                    false => None,
+                };
+                let entry = live.as_ref().unwrap_or(creds);
+                let mut access = str_field(entry, "access").ok_or(missing)?;
+                let refreshable = harness == HarnessId::Pi && self.inner.endpoints.allow_slot_refresh;
+                // A lapsed token is refreshed before the call, not after its 401:
+                // Anthropic's usage endpoint rate-limits eagerly.
+                if refreshable
+                    && stores::token_lapsed(entry)
+                    && let Ok(Some(fresh)) = self
+                        .refresh_keyed_login(harness, key, upstream, Some((slot, is_active)), &access)
+                        .await
+                {
+                    access = str_field(&fresh, "access").unwrap_or(access);
+                }
+                let probe = |access: String| async move {
+                    match upstream {
+                        Upstream::Cline => self.cline_usage(&access).await,
+                        _ => self.claude_usage_request(&access).await,
+                    }
+                };
+                match probe(access.clone()).await {
+                    Err(ProbeError::Unauthorized { status }) if refreshable => {
+                        match self
+                            .refresh_keyed_login(harness, key, upstream, Some((slot, is_active)), &access)
+                            .await?
+                            .and_then(|fresh| str_field(&fresh, "access"))
+                        {
+                            Some(fresh) if fresh != access => probe(fresh).await,
+                            _ => Err(ProbeError::Unauthorized { status }),
+                        }
+                    }
+                    result => result,
+                }
             }
             Some(Upstream::Copilot) => {
                 let token = str_field(creds, "refresh").ok_or(missing)?;
@@ -410,6 +455,174 @@ impl AgentAccounts {
             tracing::warn!(slot = %slot.id, error = %err, "refreshed chatgpt login write failed");
         }
         Ok(Some((access, account(&fresh))))
+    }
+
+    /// A lapsed or rejected Pi Claude / ClinePass login, refreshed once
+    /// (single-flight) exactly as Pi refreshes it, and written back where it
+    /// lives: Pi's `auth.json` under Pi's lock for the live login (`slot` is
+    /// `None`, or is the active one), else the saved slot. The fresh entry,
+    /// or `None` while another refresh of it is in flight. The live entry is
+    /// re-read first: when Pi already rotated it, that entry is used as is.
+    /// A refused refresh (400/401) means the login is dead.
+    pub(super) async fn refresh_keyed_login(
+        &self,
+        harness: HarnessId,
+        store_key: &str,
+        upstream: Upstream,
+        slot: Option<(&Slot, bool)>,
+        rejected: &str,
+    ) -> Result<Option<serde_json::Value>, ProbeError> {
+        let saved = slot.filter(|(_, is_active)| !is_active).map(|(slot, _)| slot);
+        let flight = format!(
+            "{}:{store_key}:{}",
+            harness_slug(harness),
+            saved.map_or("live", |slot| slot.id.as_str())
+        );
+        if !lock(&self.inner.inflight_refreshes).insert(flight.clone()) {
+            return Ok(None);
+        }
+        let _release = InflightGuard {
+            set: &self.inner.inflight_refreshes,
+            keys: vec![flight],
+        };
+        let missing = ProbeError::NoCredentials {
+            why: NoCredentials::Missing,
+        };
+        let entry = match saved {
+            Some(slot) => slot.credentials.clone(),
+            None => self
+                .live_keyed_entry(harness, store_key)
+                .ok_or(missing.clone())?,
+        };
+        if let Some(current) = str_field(&entry, "access")
+            && current != rejected
+            && !stores::token_lapsed(&entry)
+        {
+            return Ok(Some(entry));
+        }
+        let refresh_token = str_field(&entry, "refresh").ok_or(missing)?;
+        let provider = stores::cli_name(harness);
+        let dead = |error| match error {
+            ProbeError::Http { status: 400, .. } | ProbeError::Unauthorized { .. } => {
+                ProbeError::Unauthorized { status: 400 }
+            }
+            other => other,
+        };
+        let (access, refresh, expires) = match upstream {
+            Upstream::Anthropic => {
+                let body = probe_json(
+                    provider,
+                    "refresh",
+                    self.inner
+                        .http
+                        .post(&self.inner.endpoints.claude_loopback_token)
+                        .header("Accept", "application/json")
+                        .json(&serde_json::json!({
+                            "grant_type": "refresh_token",
+                            "client_id": CLAUDE_CLIENT_ID,
+                            "refresh_token": refresh_token,
+                        })),
+                )
+                .await
+                .map_err(dead)?;
+                let access = str_field(&body, "access_token")
+                    .ok_or_else(|| schema_error(provider, &body))?;
+                let expires_in = body
+                    .get("expires_in")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(3600);
+                (
+                    access,
+                    str_field(&body, "refresh_token").unwrap_or(refresh_token),
+                    // Pi's own margin: five minutes early.
+                    now_ms() + expires_in * 1000 - 5 * 60 * 1000,
+                )
+            }
+            Upstream::Cline => {
+                let body = probe_json(
+                    provider,
+                    "refresh",
+                    self.inner
+                        .http
+                        .post(format!(
+                            "{}/api/v1/auth/refresh",
+                            self.inner.endpoints.cline_api.trim_end_matches('/')
+                        ))
+                        .json(&serde_json::json!({
+                            "granttype": "refresh_token",
+                            "refreshToken": refresh_token,
+                        })),
+                )
+                .await
+                .map_err(dead)?;
+                let tokens = body.get("data").filter(|d| d.is_object()).unwrap_or(&body);
+                let access = str_field(tokens, "accessToken")
+                    .ok_or_else(|| schema_error(provider, &body))?;
+                // The chat API wants the `workos:` prefix a bare JWT lacks.
+                let access = match access.starts_with("workos:") {
+                    true => access,
+                    false => format!("workos:{access}"),
+                };
+                (
+                    access,
+                    str_field(tokens, "refreshToken").unwrap_or(refresh_token),
+                    now_ms() + CLINE_TOKEN_TTL_MS,
+                )
+            }
+            Upstream::OpenAi | Upstream::Copilot => {
+                return Err(ProbeError::NoCredentials {
+                    why: NoCredentials::Unsupported,
+                });
+            }
+        };
+        let mut fresh = entry.clone();
+        if let Some(map) = fresh.as_object_mut() {
+            map.insert("access".into(), serde_json::json!(access));
+            map.insert("refresh".into(), serde_json::json!(refresh));
+            map.insert("expires".into(), serde_json::json!(expires));
+        }
+        let written = match saved {
+            Some(slot) => {
+                let mut refreshed = slot.clone();
+                refreshed.credentials = fresh.clone();
+                refreshed.saved_at = now_ms();
+                self.write_slot(&refreshed)
+            }
+            None => self.write_keyed_entry(harness, store_key, Some(&fresh)),
+        };
+        if let Err(err) = written {
+            tracing::warn!(store_key, error = %err, "refreshed login write failed");
+        }
+        Ok(Some(fresh))
+    }
+
+    /// ClinePass's plan limits: 5-hour, weekly and monthly percentages with
+    /// their reset times, named by the plan (`Cline Pass (Monthly)`).
+    async fn cline_usage(&self, access_token: &str) -> Result<UsageSnapshot, ProbeError> {
+        let base = self.inner.endpoints.cline_api.trim_end_matches('/').to_string();
+        let get = |path: &str| {
+            self.inner
+                .http
+                .get(format!("{base}{path}"))
+                .bearer_auth(access_token)
+                .header("Accept", "application/json")
+        };
+        let body = probe_json(
+            "clinepass",
+            "usage",
+            get("/api/v1/users/me/plan/usage-limits"),
+        )
+        .await?;
+        let mut snapshot =
+            cline_usage_snapshot(&body).ok_or_else(|| schema_error("clinepass", &body))?;
+        // The plan's name is a nicety: its failure never fails the meters.
+        if let Ok(plan) = probe_json("clinepass", "plan", get("/api/v1/users/me/plan")).await {
+            let plan = plan.get("data").filter(|d| d.is_object()).unwrap_or(&plan);
+            if let Some(name) = plan.get("plan").and_then(|p| str_field(p, "displayName")) {
+                snapshot.plan_label = Some(name);
+            }
+        }
+        Ok(snapshot)
     }
 
     async fn openai_usage(
@@ -808,6 +1021,34 @@ pub(super) fn opencode_go_usage_snapshot(
     (!windows.is_empty()).then(|| UsageSnapshot {
         windows,
         plan_label: Some("OpenCode Go".into()),
+    })
+}
+
+/// ClinePass's `usage-limits`: `{data: {limits: [{type, percentUsed,
+/// resetsAt}]}}`, `type` one of `five_hour`, `weekly`, `monthly`.
+pub(super) fn cline_usage_snapshot(body: &serde_json::Value) -> Option<UsageSnapshot> {
+    let limits = body
+        .get("data")
+        .unwrap_or(body)
+        .get("limits")?
+        .as_array()?;
+    let windows: Vec<AgentUsageWindow> = [("5h", "five_hour"), ("Week", "weekly"), ("Month", "monthly")]
+        .into_iter()
+        .filter_map(|(label, kind)| {
+            let limit = limits
+                .iter()
+                .find(|l| str_field(l, "type").as_deref() == Some(kind))?;
+            let percent = limit.get("percentUsed").and_then(json_f64)?;
+            Some(AgentUsageWindow {
+                label: label.to_string(),
+                used_fraction: (percent / 100.0).clamp(0.0, 1.0) as f32,
+                resets_at: parse_when(limit.get("resetsAt")),
+            })
+        })
+        .collect();
+    (!windows.is_empty()).then(|| UsageSnapshot {
+        windows,
+        plan_label: Some("ClinePass".into()),
     })
 }
 

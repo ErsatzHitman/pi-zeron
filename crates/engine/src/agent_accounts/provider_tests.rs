@@ -139,6 +139,7 @@ fn mocked(base: &str) -> ProbeEndpoints {
         openai_port: 0,
         nous_portal: base.to_string(),
         opencode_go_usage: format!("{base}/zen/go/v1/usage"),
+        cline_api: base.to_string(),
         allow_slot_refresh: true,
         allow_loopback_http: true,
     }
@@ -796,11 +797,14 @@ async fn pi_swaps_under_its_lockfile_and_groups_rows_per_provider() {
 async fn every_provider_pi_s_login_signed_in_to_is_listed() {
     let tmp = tempfile::tempdir().unwrap();
     let (accounts, config) = accounts_with(tmp.path(), ProbeEndpoints::default());
-    let oauth = |token: &str| serde_json::json!({ "type": "oauth", "access": token, "refresh": "r", "expires": 1 });
+    let oauth = |token: &str| serde_json::json!({ "type": "oauth", "access": token, "refresh": "r", "expires": 4_102_444_800_000_i64 });
     write(
         &config.pi_agent_dir.join("auth.json"),
         &serde_json::json!({
             "openai-codex": openai_entry("a@example.com", "acct-a"),
+            // Pi's "OpenAI (ChatGPT subscription)" API login, idle for days.
+            "openai": { "type": "oauth", "access": "o", "refresh": "r",
+                        "expires": now_ms() - 3 * 86_400_000 },
             "kimi-coding": oauth("kimi"),
             "openrouter": oauth("or"),
             "my-gateway": oauth("gw"),
@@ -821,7 +825,18 @@ async fn every_provider_pi_s_login_signed_in_to_is_listed() {
             )
         })
         .collect();
-    assert_eq!(listed.len(), 4, "{listed:?}");
+    assert_eq!(listed.len(), 5, "{listed:?}");
+    // Pi's `openai` login is named for what it is, not as a second ChatGPT
+    // account, and says its token lapsed.
+    let api = rows
+        .iter()
+        .find(|row| row.provider.as_deref() == Some("openai"))
+        .unwrap();
+    assert_eq!(api.email.as_deref(), Some("OpenAI API login"));
+    assert_eq!(
+        api.plan_label.as_deref(),
+        Some("OpenAI (ChatGPT subscription) · idle, token expired 3d ago")
+    );
     assert!(
         rows.iter()
             .any(|row| row.provider.as_deref() == Some("openai-codex") && row.switchable),
@@ -1211,6 +1226,134 @@ fn copilot_usage_reads_metered_quotas_and_the_plan() {
     assert!((snapshot.windows[0].used_fraction - 0.2).abs() < 1e-6);
     assert!((snapshot.windows[1].used_fraction - 0.75).abs() < 1e-6);
     assert!(copilot_usage_snapshot(&serde_json::json!({})).is_none());
+}
+
+#[test]
+fn clinepass_usage_reads_its_three_limits() {
+    let body = serde_json::json!({ "success": true, "data": { "limits": [
+        { "type": "monthly", "percentUsed": 28, "resetsAt": "2030-01-26T10:45:27.240828297Z" },
+        { "type": "five_hour", "percentUsed": 1, "resetsAt": "2030-01-20T21:07:49.23823579Z" },
+        { "type": "weekly", "percentUsed": 0, "resetsAt": "2030-01-27T16:07:49Z" },
+    ]}});
+    let usage = cline_usage_snapshot(&body).unwrap();
+    let read: Vec<(&str, f32)> = usage
+        .windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.used_fraction))
+        .collect();
+    assert_eq!(read, [("5h", 0.01), ("Week", 0.0), ("Month", 0.28)]);
+    assert!(usage.windows.iter().all(|w| w.resets_at.is_some()));
+    assert!(cline_usage_snapshot(&serde_json::json!({ "data": { "limits": [] } })).is_none());
+}
+
+#[tokio::test]
+async fn an_idle_pi_clinepass_login_refreshes_like_pi_then_shows_its_usage() {
+    let server = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/api/v1/auth/refresh") => {
+            assert!(body.contains("\"granttype\":\"refresh_token\""), "{body}");
+            assert!(body.contains("\"refreshToken\":\"r1\""), "{body}");
+            (
+                200,
+                r#"{"success":true,"data":{"accessToken":"jwt-new","refreshToken":"r2"}}"#.into(),
+            )
+        }
+        ("GET", "/api/v1/users/me") => (
+            200,
+            r#"{"success":true,"data":{"id":"usr-1","email":"cline@example.com","displayName":"C"}}"#.into(),
+        ),
+        ("GET", "/api/v1/users/me/plan/usage-limits") => (
+            200,
+            r#"{"success":true,"data":{"limits":[{"type":"five_hour","percentUsed":10,"resetsAt":"2030-01-01T05:00:00Z"},{"type":"weekly","percentUsed":20,"resetsAt":"2030-01-06T00:00:00Z"},{"type":"monthly","percentUsed":30,"resetsAt":"2030-01-20T00:00:00Z"}]}}"#.into(),
+        ),
+        ("GET", "/api/v1/users/me/plan") => (
+            200,
+            r#"{"success":true,"data":{"plan":{"displayName":"Cline Pass (Monthly)"}}}"#.into(),
+        ),
+        _ => (404, String::new()),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    let file = config.pi_agent_dir.join("auth.json");
+    write(
+        &file,
+        &serde_json::json!({
+            "clinepass": { "type": "oauth", "access": "workos:jwt-old", "refresh": "r1", "expires": 1 },
+            "deepseek": { "type": "api_key", "key": "sk-keep" },
+        })
+        .to_string(),
+    );
+    let snapshot = accounts.list(true).await.unwrap();
+    let pi = rows(&snapshot, HarnessId::Pi);
+    let row = pi
+        .iter()
+        .find(|row| row.provider.as_deref() == Some("clinepass"))
+        .unwrap();
+    assert_eq!(row.email.as_deref(), Some("cline@example.com"));
+    assert!(row.active);
+    let read: Vec<(&str, f32)> = row
+        .usage_windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.used_fraction))
+        .collect();
+    assert_eq!(read, [("5h", 0.1), ("Week", 0.2), ("Month", 0.3)]);
+    assert_eq!(row.plan_label.as_deref(), Some("Cline Pass (Monthly)"));
+    // Refreshed once, into Pi's store, prefixed as Pi's chat API wants it;
+    // the other providers are untouched.
+    assert_eq!(server.hits("POST /api/v1/auth/refresh"), 1);
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(written["clinepass"]["access"], "workos:jwt-new");
+    assert_eq!(written["clinepass"]["refresh"], "r2");
+    assert!(written["clinepass"]["expires"].as_i64().unwrap() > now_ms());
+    assert_eq!(written["deepseek"]["key"], "sk-keep");
+}
+
+#[tokio::test]
+async fn an_idle_pi_claude_login_refreshes_like_pi_then_is_identified() {
+    let server = MockServer::start(|method, path, body| match (method, path) {
+        ("POST", "/v1/oauth/token") => {
+            assert!(body.contains("\"grant_type\":\"refresh_token\""), "{body}");
+            assert!(body.contains("\"refresh_token\":\"r1\""), "{body}");
+            (
+                200,
+                r#"{"access_token":"fresh","refresh_token":"r2","expires_in":3600}"#.into(),
+            )
+        }
+        ("GET", "/api/oauth/profile") => (
+            200,
+            serde_json::json!({
+                "account": { "uuid": "acct-uuid", "email_address": "claude@example.com" },
+                "organization": { "organization_type": "claude_max" },
+            })
+            .to_string(),
+        ),
+        ("GET", "/api/oauth/usage") => (
+            200,
+            r#"{"five_hour":{"utilization":6.0,"resets_at":"2030-01-01T05:00:00Z"},"seven_day":{"utilization":40.0,"resets_at":"2030-01-06T00:00:00Z"}}"#.into(),
+        ),
+        _ => (404, String::new()),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    let file = config.pi_agent_dir.join("auth.json");
+    write(
+        &file,
+        &serde_json::json!({ "anthropic": {
+            "type": "oauth", "access": "stale", "refresh": "r1", "expires": 1,
+        }})
+        .to_string(),
+    );
+    let pi = rows(&accounts.list(true).await.unwrap(), HarnessId::Pi);
+    assert_eq!(pi.len(), 1);
+    assert_eq!(pi[0].email.as_deref(), Some("claude@example.com"));
+    assert_eq!(pi[0].usage_windows.len(), 2, "{:?}", pi[0]);
+    assert_eq!(server.hits("POST /v1/oauth/token"), 1);
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(written["anthropic"]["access"], "fresh");
+    assert_eq!(written["anthropic"]["refresh"], "r2");
 }
 
 #[test]

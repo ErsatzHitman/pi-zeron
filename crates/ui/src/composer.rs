@@ -12717,15 +12717,18 @@ impl Render for Composer {
                     let resolved = self.pickers.read(cx).resolved(cx);
                     (resolved.harness, resolved.model)
                 };
-                let target = {
+                let (target, activity) = {
                     let state = self.state.read(cx);
-                    state
-                        .selected_chat_row()
-                        .map(|chat| chat.device_id.clone())
-                        .filter(|device| state.local_device_id.as_ref() != Some(device))
+                    let chat = state.selected_chat_row();
+                    (
+                        chat.map(|chat| chat.device_id.clone())
+                            .filter(|device| state.local_device_id.as_ref() != Some(device)),
+                        chat.and_then(|chat| chat.last_message_at),
+                    )
                 };
-                self.account_usage
-                    .update(cx, |usage, cx| usage.track(harness, model, target, cx));
+                self.account_usage.update(cx, |usage, cx| {
+                    usage.track(harness, model, target, activity, cx)
+                });
             }
             container.child(
                 div()
