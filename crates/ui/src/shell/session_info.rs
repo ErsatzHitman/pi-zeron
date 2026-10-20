@@ -397,6 +397,44 @@ fn workflow_more_row(key: impl Into<String>, hidden: usize, theme: &Theme) -> Op
     })
 }
 
+/// Agent rows a phase's table shows before it scrolls.
+const PHASE_TABLE_ROWS: usize = 10;
+/// One agent row of a workflow phase's table.
+const WORKFLOW_AGENT_ROW_HEIGHT: f32 = 24.0;
+
+/// A grouped workflow's time and tokens for its header: `8s · 2.7k tokens`.
+/// The time ticks while the run is live and freezes once it ends.
+fn workflow_totals(view: &WorkflowView, color: gpui::Hsla) -> AnyElement {
+    let clock: Option<AnyElement> = match (view.took(), view.started) {
+        (Some(took), _) => Some(trailing_text(took, color).into_any_element()),
+        (None, Some(started)) if view.phase.live() => Some(elapsed_label(
+            "session-info-workflow-elapsed".into(),
+            started,
+            color,
+        )),
+        _ => None,
+    };
+    let tokens = (view.tokens > 0).then(|| {
+        trailing_text(
+            format!("{} tokens", workflow::compact_tokens(view.tokens)),
+            color,
+        )
+    });
+    let dot = (clock.is_some() && tokens.is_some()).then(|| trailing_text("·", color));
+    div()
+        .id("session-info-workflow-totals")
+        .debug_selector(|| "session-info-workflow-totals".into())
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .children(clock)
+        .children(dot)
+        .children(tokens)
+        .into_any_element()
+}
+
 fn trailing_text(text: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div {
     div()
         .flex_none()
@@ -1508,6 +1546,22 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.render_section_header_with(section, label, count, None, action, theme, cx)
+    }
+
+    /// [`Self::render_section_header`] with `beside` drawn right after the
+    /// count, before the spacer: a workflow's time and tokens.
+    #[allow(clippy::too_many_arguments)]
+    fn render_section_header_with(
+        &self,
+        section: &'static str,
+        label: &str,
+        count: Option<SharedString>,
+        beside: Option<AnyElement>,
+        action: Option<AnyElement>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let open = self.session_panel.is_open(section);
         div()
             .id(SharedString::from(format!("session-info-{section}-header")))
@@ -1537,6 +1591,7 @@ impl Shell {
                     .child(SharedString::from(popover::tracked_upper(label))),
             )
             .children(count.map(|count| trailing_text(count, theme.text_muted.opacity(0.7))))
+            .children(beside)
             .child(div().flex_1())
             .children(action)
             .child(
@@ -2194,12 +2249,18 @@ impl Shell {
             .children(spinner)
             .children(label);
         let count = (view.total > 0).then(|| format!("· {}/{}", view.done, view.total).into());
+        // A grouped run keeps its time and tokens up here, beside `done/total`,
+        // instead of on lines of their own under the goal.
+        let beside = view
+            .grouped
+            .then(|| workflow_totals(view, theme.text_muted.opacity(0.7)));
         let mut rows = vec![
             popover::picker_divider().into_any_element(),
-            self.render_section_header(
+            self.render_section_header_with(
                 WORKFLOW,
                 "Workflow",
                 count,
+                beside,
                 Some(pill.into_any_element()),
                 theme,
                 cx,
@@ -2766,56 +2827,29 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) {
-        let muted = theme.text_muted;
-        let clock: AnyElement = match (view.took(), view.started) {
-            (Some(took), _) => trailing_text(took, muted).into_any_element(),
-            (None, Some(started)) if view.phase.live() => {
-                elapsed_label("session-info-workflow-elapsed".into(), started, muted)
-            }
-            _ => div().into_any_element(),
-        };
-        let mut totals = vec![format!(
-            "{} agent{}",
-            view.agents,
-            if view.agents == 1 { "" } else { "s" }
-        )];
-        if view.tokens > 0 {
-            totals.push(format!("{} tokens", workflow::compact_tokens(view.tokens)));
-        }
+        // Time and tokens sit in the header (`workflow_totals`); only Pause
+        // and Stop are left for this line, and a finished run has neither.
         let controls: Vec<AnyElement> = [view.pause.as_ref(), view.stop.as_ref()]
             .into_iter()
             .flatten()
             .map(|action| self.render_workflow_button(action, false, theme, cx))
             .collect();
-        rows.push(
-            div()
-                .id("session-info-workflow-totals")
-                .debug_selector(|| "session-info-workflow-totals".into())
-                .px(px(9.0))
-                .flex()
-                .flex_col()
-                .gap(px(1.0))
-                .child(
-                    div()
-                        .min_h(px(20.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .text_size(crate::typography::ui_rems(11.5))
-                        .text_color(muted)
-                        .child(clock)
-                        .child(div().flex_1())
-                        .children(controls),
-                )
-                .child(
-                    div()
-                        .text_size(crate::typography::ui_rems(11.5))
-                        .text_color(muted)
-                        .child(totals.join(" · ")),
-                )
-                .into_any_element(),
-        );
+        if !controls.is_empty() {
+            rows.push(
+                div()
+                    .id("session-info-workflow-controls")
+                    .debug_selector(|| "session-info-workflow-controls".into())
+                    .px(px(9.0))
+                    .min_h(px(20.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(6.0))
+                    .children(controls)
+                    .into_any_element(),
+            );
+        }
         if view.phases.is_empty() {
             return;
         }
@@ -2843,12 +2877,30 @@ impl Shell {
                 continue;
             }
             rows.push(workflow_table_header(phase.index, theme));
-            for row in phase.rows.iter().take(workflow::GROUP_ROWS) {
-                let element = self.render_workflow_agent(row, theme, cx);
-                rows.push(self.arriving(WORKFLOW, &row.id, element));
-            }
-            let hidden =
-                phase.rows.len().saturating_sub(workflow::GROUP_ROWS) + phase.hidden as usize;
+            // Every agent of the phase, in a box that scrolls past
+            // `PHASE_TABLE_ROWS` rows instead of hiding the rest.
+            let agents: Vec<AnyElement> = phase
+                .rows
+                .iter()
+                .map(|row| {
+                    let element = self.render_workflow_agent(row, theme, cx);
+                    self.arriving(WORKFLOW, &row.id, element)
+                })
+                .collect();
+            let scroll_id = format!("session-info-workflow-phase-{}-rows", phase.index);
+            rows.push(
+                div()
+                    .id(SharedString::from(scroll_id.clone()))
+                    .debug_selector(move || scroll_id.clone())
+                    .max_h(px(WORKFLOW_AGENT_ROW_HEIGHT * PHASE_TABLE_ROWS as f32))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(agents)
+                    .into_any_element(),
+            );
+            // Rows the payload itself left out; Pi sends every row it can.
+            let hidden = phase.hidden as usize;
             if hidden > 0 {
                 rows.extend(workflow_more_row(
                     format!("phase-{}", phase.index),
@@ -3054,7 +3106,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .h(px(24.0))
+            .h(px(WORKFLOW_AGENT_ROW_HEIGHT))
             .px(px(9.0))
             .rounded(px(popover::MENU_ITEM_RADIUS))
             .text_size(crate::typography::ui_rems(12.0))

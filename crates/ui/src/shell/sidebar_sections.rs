@@ -1052,6 +1052,16 @@ mod tests {
             let bounds = cx.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
             assert!(card.contains(&bounds.center()), "{id}");
         }
+        // Time and tokens sit in the header beside `done/total`, not on lines
+        // of their own; an open phase's agents are in a scroll box.
+        let header = cx.debug_bounds("session-info-workflow-header").unwrap();
+        let totals = cx.debug_bounds("session-info-workflow-totals").unwrap();
+        assert!(header.contains(&totals.center()), "time and tokens left the header");
+        assert!(
+            cx.debug_bounds("session-info-workflow-phase-2-rows")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("session-info-workflow-controls").is_some());
         // The v1 layout is not drawn for a grouped run.
         assert!(cx.debug_bounds("session-info-workflow-progress").is_none());
         assert!(cx.debug_bounds("session-info-workflow-finished").is_none());
@@ -1086,6 +1096,10 @@ mod tests {
         set_workflow_state(&window, &mut cx, dynamic_frame(24));
         assert!(cx.debug_bounds("session-info-workflow-stop").is_none());
         assert!(cx.debug_bounds("session-info-workflow-totals").is_some());
+        assert!(
+            cx.debug_bounds("session-info-workflow-controls").is_none(),
+            "a finished run has no Pause or Stop to give a line to"
+        );
         assert!(cx.debug_bounds("session-info-workflow-phase-4").is_some());
     }
 
