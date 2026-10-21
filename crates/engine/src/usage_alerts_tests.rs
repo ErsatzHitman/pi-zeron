@@ -165,30 +165,80 @@ fn scope_follows_the_models_provider() {
     assert!(affects(
         alert,
         HarnessId::Pi,
-        Some("anthropic/claude-opus-5-5")
+        Some("anthropic/claude-opus-5-5"),
+        None
     ));
     assert!(affects(
         alert,
         HarnessId::Pi,
-        Some("Anthropic/claude-opus-5-5")
+        Some("Anthropic/claude-opus-5-5"),
+        None
     ));
-    assert!(!affects(alert, HarnessId::Pi, Some("openai-codex/gpt-5.5")));
     assert!(!affects(
         alert,
         HarnessId::Pi,
-        Some("opencode-go/deepseek-v4.1-flash")
+        Some("openai-codex/gpt-5.5"),
+        None
     ));
-    assert!(!affects(alert, HarnessId::Pi, Some("default")));
-    assert!(!affects(alert, HarnessId::Pi, None));
+    assert!(!affects(
+        alert,
+        HarnessId::Pi,
+        Some("opencode-go/deepseek-v4.1-flash"),
+        None
+    ));
+    assert!(!affects(alert, HarnessId::Pi, Some("default"), None));
+    assert!(!affects(alert, HarnessId::Pi, None, None));
     assert!(!affects(
         alert,
         HarnessId::Opencode,
-        Some("anthropic/claude-opus-5-5")
+        Some("anthropic/claude-opus-5-5"),
+        None
+    ));
+    // Pi's own default model runs on the provider Pi's settings name.
+    assert!(affects(
+        alert,
+        HarnessId::Pi,
+        Some("default"),
+        Some("anthropic")
+    ));
+    assert!(affects(alert, HarnessId::Pi, None, Some("Anthropic")));
+    assert!(!affects(
+        alert,
+        HarnessId::Pi,
+        Some("default"),
+        Some("google")
+    ));
+    // A model that names its provider is never read as the default one.
+    assert!(!affects(
+        alert,
+        HarnessId::Pi,
+        Some("google/gemini-4-pro"),
+        Some("anthropic")
     ));
     assert_eq!(
         model_provider(Some("clinepass/cline-pass/deepseek-v4.1-flash")).as_deref(),
         Some("clinepass")
     );
+}
+
+#[test]
+fn pi_default_provider_comes_from_pi_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("settings.json");
+    assert_eq!(pi_default_provider(&file), None, "no settings, no default");
+    let write = |text: &str| std::fs::write(&file, text).unwrap();
+    write(r#"{"defaultProvider":"Anthropic","defaultModel":"claude-opus-5-5"}"#);
+    assert_eq!(pi_default_provider(&file).as_deref(), Some("anthropic"));
+    write(r#"{"defaultModel":"openai-codex/gpt-5.5"}"#);
+    assert_eq!(pi_default_provider(&file).as_deref(), Some("openai-codex"));
+    write(r#"{"defaultModel":"gpt-5.5"}"#);
+    assert_eq!(
+        pi_default_provider(&file),
+        None,
+        "a bare id names no provider"
+    );
+    write("not json");
+    assert_eq!(pi_default_provider(&file), None);
 }
 
 // ── dedup
@@ -317,6 +367,7 @@ fn delivery_matrix_for_every_zeron_surface() {
         &anthropic_low(),
         &Delivered::default(),
         "dev",
+        None,
         &|_| false,
     );
     assert_eq!(
@@ -338,6 +389,46 @@ fn delivery_matrix_for_every_zeron_surface() {
 }
 
 #[test]
+fn chat_on_pis_default_model_is_told_through_pi_settings() {
+    use SessionStatus::*;
+    let mut on_default = view("on-default", None, Some(Working), "default");
+    let mut unset = on_default.clone();
+    unset.chat.id = "unset".into();
+    unset.model = None;
+    let views = vec![on_default.clone(), unset];
+    let alerts = anthropic_low();
+    assert!(
+        plan(&views, &alerts, &Delivered::default(), "dev", None, &|_| {
+            false
+        })
+        .is_empty(),
+        "an unknown default provider cannot be attributed"
+    );
+    assert_eq!(
+        kinds(&plan(
+            &views.clone()[..1],
+            &alerts,
+            &Delivered::default(),
+            "dev",
+            Some("anthropic"),
+            &|_| false
+        )),
+        vec![("on-default".into(), DeliveryKind::Steer, false)]
+    );
+    assert_eq!(
+        kinds(&plan(
+            &views[1..],
+            &alerts,
+            &Delivered::default(),
+            "dev",
+            Some("anthropic"),
+            &|_| false
+        )),
+        vec![("unset".into(), DeliveryKind::Steer, false)]
+    );
+}
+
+#[test]
 fn paused_root_and_dedup_suppress_delivery() {
     use SessionStatus::*;
     let root = "orchestrator-r1";
@@ -346,7 +437,9 @@ fn paused_root_and_dedup_suppress_delivery() {
         view("m", Some(root), Some(Working), OPUS),
     ];
     let alerts = anthropic_low();
-    let paused = plan(&views, &alerts, &Delivered::default(), "dev", &|_| true);
+    let paused = plan(&views, &alerts, &Delivered::default(), "dev", None, &|_| {
+        true
+    });
     assert_eq!(
         kinds(&paused),
         vec![("m".into(), DeliveryKind::Steer, false)],
@@ -359,7 +452,7 @@ fn paused_root_and_dedup_suppress_delivery() {
     tree.key = tree_key(&tree.key);
     d.record(root, &tree, now());
     assert!(
-        plan(&views, &alerts, &d, "dev", &|_| false).is_empty(),
+        plan(&views, &alerts, &d, "dev", None, &|_| false).is_empty(),
         "told once per key"
     );
 
@@ -368,7 +461,9 @@ fn paused_root_and_dedup_suppress_delivery() {
         view(root, None, Some(Working), OPUS),
         view("m", Some(root), Some(Working), OPUS),
     ];
-    let both = plan(&views, &alerts, &Delivered::default(), "dev", &|_| false);
+    let both = plan(&views, &alerts, &Delivered::default(), "dev", None, &|_| {
+        false
+    });
     assert_eq!(
         kinds(&both),
         vec![
@@ -383,17 +478,16 @@ fn paused_root_and_dedup_suppress_delivery() {
 fn no_alerts_no_deliveries_and_idle_is_told_when_it_works() {
     use SessionStatus::*;
     let idle = vec![view("a", None, Some(Idle), OPUS)];
-    assert!(plan(&idle, &[], &Delivered::default(), "dev", &|_| false).is_empty());
-    assert!(
-        plan(
-            &idle,
-            &anthropic_low(),
-            &Delivered::default(),
-            "dev",
-            &|_| false
-        )
-        .is_empty()
-    );
+    assert!(plan(&idle, &[], &Delivered::default(), "dev", None, &|_| false).is_empty());
+    assert!(plan(
+        &idle,
+        &anthropic_low(),
+        &Delivered::default(),
+        "dev",
+        None,
+        &|_| false
+    )
+    .is_empty());
     let working = vec![view("a", None, Some(Working), OPUS)];
     assert_eq!(
         plan(
@@ -401,6 +495,7 @@ fn no_alerts_no_deliveries_and_idle_is_told_when_it_works() {
             &anthropic_low(),
             &Delivered::default(),
             "dev",
+            None,
             &|_| false
         )
         .len(),
