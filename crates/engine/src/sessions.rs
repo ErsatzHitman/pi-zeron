@@ -200,6 +200,40 @@ struct RoutedSteer {
     request: Option<Box<RunRequest>>,
 }
 
+/// The chats DELETED from this workspace while the process ran (chat ids are
+/// never reused). A run can settle a little after [`SessionsEngine::forget_chat`]
+/// — `terminate` waits a bounded 5s — and its status write must not resurrect
+/// the row the delete just dropped, so deletes are recorded and honoured.
+///
+/// Only a settlement within seconds of the delete needs defeating, so the
+/// oldest marks are dropped once the ledger is full instead of it growing for
+/// the life of the process (voice calls delete a chat per rotation).
+#[derive(Default)]
+struct DeletedChats {
+    ids: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl DeletedChats {
+    /// How many recent deletions the ledger remembers.
+    const MEMORY: usize = 4096;
+
+    fn mark(&mut self, chat_id: &str) {
+        if self.ids.insert(chat_id.to_string()) {
+            self.order.push_back(chat_id.to_string());
+            while self.order.len() > Self::MEMORY {
+                if let Some(old) = self.order.pop_front() {
+                    self.ids.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, chat_id: &str) -> bool {
+        self.ids.contains(chat_id)
+    }
+}
+
 struct Inner {
     voice: crate::voice::VoiceManager,
     device_id: String,
@@ -208,6 +242,11 @@ struct Inner {
     /// Per chat: messages a Stop cancelled while they were still on their
     /// way (see [`SessionsEngine::cancel_sent_messages`]).
     cancelled_sends: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Chats that were DELETED (their ids are never reused). A run that settles
+    /// after [`SessionsEngine::forget_chat`] — `terminate` only waits so long —
+    /// must not resurrect the session row it just lost, so the delete is
+    /// recorded here and every status/dispatch write honours it.
+    deleted_chats: Mutex<DeletedChats>,
     /// Loopback IPC port this engine serves, once known (0 = not serving):
     /// what the injected `zeron mcp` server dials back into.
     ipc_port: std::sync::atomic::AtomicU16,
@@ -340,6 +379,7 @@ impl SessionsEngine {
                 device_id,
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 cancelled_sends: Mutex::new(HashMap::new()),
+                deleted_chats: Mutex::new(DeletedChats::default()),
                 ipc_port: std::sync::atomic::AtomicU16::new(0),
                 journal,
                 registry,
@@ -816,6 +856,12 @@ impl SessionsEngine {
         startup_retry: bool,
         idle: bool,
     ) -> Result<String, EngineError> {
+        // Never start a turn for a chat that was deleted (a drain or a peer
+        // send can still land after the delete): it would recreate the row and
+        // the doc `forget_chat`/`purge_chat` just dropped (audit #115).
+        if self.inner.is_deleted(chat_id) {
+            return Err(EngineError::Other("chat was deleted".into()));
+        }
         let harness_id = self.inner.registry.runnable(harness_id);
         if request.harness.is_some() {
             request.harness = Some(harness_id);
@@ -1425,8 +1471,10 @@ impl SessionsEngine {
     /// hub, its resume cache, its last request, its cancelled-send ledger and
     /// its live extension UI. Nothing else ever prunes those maps, so a chat
     /// kept them for the life of the process (audit #115). Call after
-    /// [`Self::terminate`], whose settlement can still write a row.
+    /// [`Self::terminate`], whose settlement can still write a row — the
+    /// delete is marked FIRST so that settlement cannot resurrect it.
     pub fn forget_chat(&self, chat_id: &str) {
+        lock(&self.inner.deleted_chats).mark(chat_id);
         let dropped = {
             // `statuses` before `admission` (lock order); publish inside like
             // every other status change.
@@ -1446,6 +1494,22 @@ impl SessionsEngine {
         self.inner.forget_admission(chat_id);
         if dropped {
             tracing::info!(chat = %chat_id, "session state dropped with the chat");
+        }
+    }
+
+    /// The one teardown every chat-DELETION path runs, so no delete route can
+    /// forget half of it (audit #115): end the chat's runtime (interrupt, then
+    /// the bounded wait for it to settle), drop its per-chat engine state and
+    /// its doc. The workspace row belongs to the caller (each site deletes it
+    /// under its own policy and error handling), as do the recap cache and the
+    /// voice lease, which those sites own.
+    pub async fn discard_chat(&self, chat_id: &str) {
+        if let Err(err) = self.terminate(chat_id).await {
+            tracing::debug!(chat = %chat_id, error = %err, "deleted chat teardown skipped");
+        }
+        self.forget_chat(chat_id);
+        if let Some(host) = self.inner.doc_host() {
+            host.purge_chat(chat_id);
         }
     }
 
@@ -2012,6 +2076,12 @@ impl Inner {
         describe_lost_work(jobs, agents)
     }
 
+    /// Whether `chat_id` was deleted from the workspace in this process; its
+    /// late-settling run must write no status row and start no new turn.
+    fn is_deleted(&self, chat_id: &str) -> bool {
+        lock(&self.deleted_chats).contains(chat_id)
+    }
+
     fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
         lock(&self.runs)
             .get(chat_id)
@@ -2028,6 +2098,12 @@ impl Inner {
         fresh_start: bool,
         completed_turn: Option<String>,
     ) {
+        // A chat deleted while its run was still settling: `forget_chat`
+        // dropped the row and the doc, so this late write must not put any of
+        // it back (audit #115).
+        if self.is_deleted(chat_id) {
+            return;
+        }
         let now = Utc::now();
         let settled_turn = completed_turn.clone();
         let prev;
@@ -2098,6 +2174,19 @@ impl Inner {
             ws.record_session(&session);
         }
         self.parent_notifier_note(chat_id, prev, status, settled_turn.as_deref());
+        // A turn ENDING is not a doc change the chat's queue can see, so tell
+        // the doc host to re-drain its held messages. Notified HERE, on the
+        // producer, rather than watched off the published list: that list
+        // arrives over a coalescing watch, and a turn that started and ended
+        // while another chat's drain was in flight would never be observed
+        // (audit #116).
+        if !matches!(
+            status,
+            SessionStatus::Working | SessionStatus::AwaitingInput
+        ) && let Some(host) = self.doc_host()
+        {
+            host.notify_turn_end(chat_id);
+        }
         // A freed slot moved the queue: the waiters' rows show it.
         if queue_changed {
             self.publish_queue_positions();

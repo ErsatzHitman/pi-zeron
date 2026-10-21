@@ -446,7 +446,12 @@ impl EngineCore {
         sessions.set_turn_listener(Arc::new(move |chat_id, cwd| {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
-        let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let spaces_sync = SpacesSync::start(
+            repos.clone(),
+            workspace.clone(),
+            sessions.clone(),
+            &device_id,
+        );
         Ok(Self {
             sessions,
             doc_host,
