@@ -19,7 +19,7 @@ use zeron_doc::recap::{RecapKey, recap_key};
 use zeron_doc::{
     MessagePart, MessageRole, MessageStatus, SessionMessageEntry, join_continuation_entries,
 };
-use zeron_proto::HarnessId;
+use zeron_proto::{Chat, HarnessId};
 
 use crate::EngineError;
 use crate::doc_host::DocHost;
@@ -531,6 +531,29 @@ fn analyse(joined: &[SessionMessageEntry]) -> Option<Analysis> {
     })
 }
 
+/// `chat` and its ancestors, nearest first: enough for the tree checks
+/// without reading every chat (a tree is at most
+/// [`zeron_proto::orchestrator::MAX_DEPTH`] deep).
+fn lineage(workspace: &WorkspaceHost, chat: &Chat) -> Vec<Chat> {
+    let mut lineage = vec![chat.clone()];
+    while lineage.len() <= zeron_proto::orchestrator::MAX_DEPTH + 1 {
+        let Some(parent) = lineage
+            .last()
+            .and_then(|chat| chat.parent_chat_id.clone())
+        else {
+            break;
+        };
+        if lineage.iter().any(|seen| seen.id == parent) {
+            break;
+        }
+        let Ok(Some(parent)) = workspace.chat(&parent) else {
+            break;
+        };
+        lineage.push(parent);
+    }
+    lineage
+}
+
 type Flight = Shared<BoxFuture<'static, Result<RecapOutcome, String>>>;
 
 struct Inner {
@@ -601,8 +624,10 @@ impl RecapGenerator {
             .workspace
             .chat(chat_id)?
             .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
-        // Side chats and subagents have no returning reader.
-        if chat.is_btw() || chat.parent_chat_id.is_some() {
+        // Side chats, subagents and btw asides have no returning reader; a
+        // session in an orchestrator's tree does (the Orchestrator tab opens
+        // it full screen).
+        if !chat.has_returning_reader(&lineage(&self.inner.workspace, &chat)) {
             return Ok(RecapOutcome::without(RecapStatus::NothingToRecap));
         }
         let raw = self.inner.doc_host.open(chat_id)?.doc().read_entries()?;

@@ -505,8 +505,7 @@ impl AppState {
         let plan = plan_auto(&AutoInputs {
             enabled,
             host_supports: self.chat_host_supports(&chat_id, zeron_proto::capabilities::RECAP_V1)
-                && !chat.is_btw()
-                && chat.parent_chat_id.is_none(),
+                && chat.has_returning_reader(&self.chats),
             now,
             away_threshold: away_threshold(),
             departure: &departure,
@@ -532,7 +531,7 @@ impl AppState {
         let Some(chat) = self.chats.iter().find(|chat| chat.id == chat_id) else {
             return;
         };
-        if chat.is_btw() || chat.parent_chat_id.is_some() {
+        if !chat.has_returning_reader(&self.chats) {
             if manual {
                 crate::toast::info(cx, "Recaps are for main conversations.");
             }
