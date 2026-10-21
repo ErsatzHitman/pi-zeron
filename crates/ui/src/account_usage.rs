@@ -15,8 +15,8 @@ use zeron_rpc::methods;
 
 use crate::popover;
 use crate::settings::accounts::{
-    self, AccountsSnapshotCache, UsageLevel, render_usage_meter, reports_usage, signs_in,
-    usage_color, usage_level,
+    self, AccountsCacheKey, AccountsSnapshotCache, UsageLevel, render_usage_meter, reports_usage,
+    signs_in, usage_color, usage_level,
 };
 use crate::settings::widgets;
 use crate::state::AppState;
@@ -195,6 +195,10 @@ pub struct AccountUsage {
     turn_landed: Option<Instant>,
     /// Once any list has been asked for the current target.
     loaded: bool,
+    /// `EngineInfo::device_id` of the engine the last list was asked of:
+    /// another engine serves another machine's accounts, so a switch here
+    /// reloads at once instead of reading the old one's cache.
+    engine: Option<String>,
     last_forced: Option<Instant>,
     /// Wall time of the last forced probe, for reset times passing after it.
     last_forced_at: Option<DateTime<Utc>>,
@@ -236,6 +240,7 @@ impl AccountUsage {
             activity: None,
             turn_landed: None,
             loaded: false,
+            engine: None,
             last_forced: None,
             last_forced_at: None,
             error: None,
@@ -261,7 +266,14 @@ impl AccountUsage {
         let harness = harness.filter(|h| signs_in(*h) && reports_usage(*h));
         self.harness = harness;
         self.model = model;
-        if self.target != target {
+        let engine = self
+            .state
+            .read(cx)
+            .engine()
+            .map(|engine| engine.engine_info().device_id.clone());
+        let switched_engine = self.engine != engine;
+        self.engine = engine;
+        if self.target != target || switched_engine {
             self.target = target;
             self.loaded = false;
             self.last_forced = None;
@@ -304,9 +316,8 @@ impl AccountUsage {
     }
 
     fn snapshot<'a>(&self, cx: &'a gpui::App) -> Option<&'a AgentAccountsSnapshot> {
-        cx.try_global::<AccountsSnapshotCache>()?
-            .0
-            .get(&self.target)
+        let key = AccountsCacheKey::new(self.state.read(cx), self.target.clone());
+        cx.try_global::<AccountsSnapshotCache>()?.0.get(&key)
     }
 
     fn params(&self, mut value: serde_json::Value) -> serde_json::Value {
@@ -333,7 +344,7 @@ impl AccountUsage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let key = self.target.clone();
+        let key = AccountsCacheKey::new(self.state.read(cx), self.target.clone());
         let paint_first = force_usage && self.snapshot(cx).is_none();
         let plain = self.params(serde_json::json!({ "forceUsage": false }));
         let params = self.params(serde_json::json!({ "forceUsage": force_usage }));
@@ -375,7 +386,7 @@ impl AccountUsage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let key = self.target.clone();
+        let key = AccountsCacheKey::new(self.state.read(cx), self.target.clone());
         let cache = &mut cx.default_global::<AccountsSnapshotCache>().0;
         let previous = cache.get(&key).cloned();
         if let Some(snapshot) = cache.get_mut(&key) {
@@ -782,5 +793,70 @@ mod tests {
             Some("Codex-true")
         );
         assert!(active_account(&snapshot, HarnessId::Cursor).is_none());
+    }
+
+    /// Pump both the tokio runtime (the client's reader) and the foreground
+    /// executor until a `ListAgentAccounts` shows up on `requests`.
+    fn asked_for_accounts(
+        cx: &mut gpui::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        requests: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> bool {
+        for _ in 0..20 {
+            cx.run_until_parked();
+            runtime.block_on(tokio::time::sleep(Duration::from_millis(2)));
+            while let Ok(request) = requests.try_recv() {
+                let Ok(frame) = serde_json::from_str::<zeron_rpc::ClientFrame>(&request) else {
+                    continue;
+                };
+                if frame.method.as_deref() == Some(methods::LIST_AGENT_ACCOUNTS) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// A machine switch attaches another engine: the card must ask the new
+    /// one rather than keep reading the previous one's cache.
+    #[gpui::test]
+    fn another_engine_asks_for_its_own_accounts(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), dir.path(), cx));
+        let (out, mut first) = tokio::sync::mpsc::channel(8);
+        let (_replies, inbound) = tokio::sync::mpsc::channel(8);
+        let (out_new, mut second) = tokio::sync::mpsc::channel(8);
+        let (_replies_new, inbound_new) = tokio::sync::mpsc::channel(8);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client_on(
+                zeron_rpc::RpcClient::new(out, inbound),
+                "local",
+            ));
+        });
+        let usage = cx.new(|cx| AccountUsage::new(state.clone(), cx));
+        usage.update(cx, |usage, cx| {
+            usage.track(Some(HarnessId::Codex), None, None, None, cx)
+        });
+        assert!(asked_for_accounts(cx, &runtime, &mut first));
+
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client_on(
+                zeron_rpc::RpcClient::new(out_new, inbound_new),
+                "other",
+            ));
+        });
+        usage.update(cx, |usage, cx| {
+            usage.track(Some(HarnessId::Codex), None, None, None, cx)
+        });
+        assert!(
+            asked_for_accounts(cx, &runtime, &mut second),
+            "the new engine's accounts must be asked for, not the old engine's"
+        );
     }
 }

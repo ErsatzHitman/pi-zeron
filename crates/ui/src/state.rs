@@ -565,6 +565,15 @@ impl EngineHandle {
         }
     }
 
+    /// Tests: a handle that reports `device_id`, as a view of another
+    /// machine's engine would.
+    #[cfg(test)]
+    pub(crate) fn from_test_client_on(client: RpcClient, device_id: &str) -> Self {
+        let mut handle = Self::from_test_client(client);
+        handle.engine_info.device_id = device_id.to_string();
+        handle
+    }
+
     pub fn client(&self) -> &RpcClient {
         self.inner.client()
     }

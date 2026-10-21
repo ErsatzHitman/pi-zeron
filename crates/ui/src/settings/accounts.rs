@@ -507,12 +507,35 @@ impl LoginFlow {
     }
 }
 
-/// The last accounts list per target device (`None` = this device), shared
-/// by every accounts view so a re-opened Settings paints instantly and
-/// revalidates in place instead of flashing a skeleton.
+/// Which engine answered, and which device's logins were asked for (`None`
+/// = that engine's own device). A machine switch or a re-attach puts another
+/// engine behind the same target, and its accounts are a different world:
+/// keyed by target alone, the new engine's first paint would show the old
+/// one's rows until a load landed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct AccountsCacheKey {
+    /// `EngineInfo::device_id` of the attached engine; `None` before one.
+    engine: Option<String>,
+    target_device: Option<String>,
+}
+
+impl AccountsCacheKey {
+    pub(crate) fn new(state: &AppState, target_device: Option<String>) -> Self {
+        Self {
+            engine: state
+                .engine()
+                .map(|engine| engine.engine_info().device_id.clone()),
+            target_device,
+        }
+    }
+}
+
+/// The last accounts list per [`AccountsCacheKey`], shared by every accounts
+/// view so a re-opened Settings paints instantly and revalidates in place
+/// instead of flashing a skeleton.
 #[derive(Default)]
 pub(crate) struct AccountsSnapshotCache(
-    pub(crate) std::collections::HashMap<Option<String>, AgentAccountsSnapshot>,
+    pub(crate) std::collections::HashMap<AccountsCacheKey, AgentAccountsSnapshot>,
 );
 
 impl gpui::Global for AccountsSnapshotCache {}
@@ -620,13 +643,19 @@ impl AccountsPage {
         self.load(force_usage_for(LoadTrigger::Mount), cx);
     }
 
+    /// Point the page at one provider's rows. One page serves every provider
+    /// of the page it is embedded in, so every (re-)open re-probes: a login
+    /// can land elsewhere (the composer's accounts card, a CLI, another
+    /// device) while it is collapsed, and the rows shown must be this
+    /// visit's. The painted list stays up while the probe runs.
     pub(crate) fn set_embedded_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         if self.embedded_harness != Some(harness) {
             self.embedded_harness = Some(harness);
             self.login = None;
+            self.busy_account = None;
             self.error = None;
-            cx.notify();
         }
+        self.load(force_usage_for(LoadTrigger::Refresh), cx);
     }
 
     #[cfg(test)]
@@ -738,7 +767,7 @@ impl AccountsPage {
             self.snapshot = Loadable::Error("Engine not connected".into());
             return;
         };
-        let key = self.target_device.clone();
+        let key = AccountsCacheKey::new(self.state.read(cx), self.target_device.clone());
         if !matches!(self.snapshot, Loadable::Ready(_)) {
             self.snapshot = match cx
                 .try_global::<AccountsSnapshotCache>()
@@ -829,7 +858,7 @@ impl AccountsPage {
             "accountId": account.id,
             "harness": account.harness,
         }));
-        let key = self.target_device.clone();
+        let key = AccountsCacheKey::new(self.state.read(cx), self.target_device.clone());
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(method, params).await;
             this.update(cx, |page, cx| {
@@ -2685,5 +2714,169 @@ mod tests {
         );
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
+    }
+
+    /// Answer every `ListAgentAccounts` in flight, returning the
+    /// `forceUsage` flags asked for, in order.
+    fn drain_lists(
+        cx: &mut gpui::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        engine: &mut FakeEngine,
+    ) -> Vec<bool> {
+        let mut forced = Vec::new();
+        let mut idle = 0;
+        loop {
+            // A reply lands on the tokio runtime (the client's reader), the
+            // page's load task runs on the foreground executor: pump both.
+            cx.run_until_parked();
+            runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(2)));
+            let Ok(request) = engine.requests.try_recv() else {
+                idle += 1;
+                if idle >= 3 {
+                    return forced;
+                }
+                continue;
+            };
+            idle = 0;
+            let frame: zeron_rpc::ClientFrame = serde_json::from_str(&request).unwrap();
+            if frame.method.as_deref() == Some(zeron_rpc::methods::LIST_AGENT_ACCOUNTS) {
+                forced.push(frame.params["forceUsage"].as_bool().unwrap_or(false));
+            }
+            let reply = serde_json::json!({
+                "id": frame.id,
+                "ok": { "accounts": [], "warnings": [] },
+            });
+            runtime
+                .block_on(engine.replies.send(reply.to_string()))
+                .unwrap();
+        }
+    }
+
+    /// A fake engine behind an accounts view: the RPC frames it receives and
+    /// the channel its replies are written to.
+    struct FakeEngine {
+        requests: tokio::sync::mpsc::Receiver<String>,
+        replies: tokio::sync::mpsc::Sender<String>,
+        inbound: Option<tokio::sync::mpsc::Receiver<String>>,
+        out: tokio::sync::mpsc::Sender<String>,
+    }
+
+    impl FakeEngine {
+        fn new() -> Self {
+            let (out, requests) = tokio::sync::mpsc::channel(16);
+            let (replies, inbound) = tokio::sync::mpsc::channel(16);
+            Self {
+                requests,
+                replies,
+                inbound: Some(inbound),
+                out,
+            }
+        }
+
+        /// A handle to this engine reporting `device_id` (its `EngineInfo`).
+        fn handle(&mut self, device_id: &str) -> crate::state::EngineHandle {
+            let client = zeron_rpc::RpcClient::new(
+                self.out.clone(),
+                self.inbound
+                    .take()
+                    .expect("one engine handle per fake engine"),
+            );
+            crate::state::EngineHandle::from_test_client_on(client, device_id)
+        }
+    }
+
+    /// The page reloads every time a provider's details are opened — the
+    /// same provider again, or another one through the page they share —
+    /// because a login can land elsewhere (the composer's accounts card, a
+    /// CLI, another device) while it is collapsed.
+    #[gpui::test]
+    fn opening_a_provider_again_reprobes_its_accounts(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let mut engine = FakeEngine::new();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            crate::settings::init(Default::default(), dir.path(), cx);
+            gpui_base::init(cx);
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let state = cx.new(|_| crate::state::AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(engine.handle("local"));
+        });
+        let window = cx.add_window(|_, cx| {
+            AccountsPage::new_embedded(state.clone(), None, HarnessId::ClaudeCode, cx)
+        });
+        // Nothing painted yet: the plain list first, then the probe.
+        assert_eq!(drain_lists(cx, &runtime, &mut engine), [false, true]);
+        // Collapse and re-open the same provider: the page outlives the
+        // visit, so this is the only chance to refresh its rows.
+        window
+            .update(cx, |page, _, cx| {
+                page.set_embedded_harness(HarnessId::ClaudeCode, cx)
+            })
+            .unwrap();
+        assert_eq!(drain_lists(cx, &runtime, &mut engine), [true]);
+        // Opening another provider (same page, retargeted) probes again.
+        window
+            .update(cx, |page, _, cx| {
+                page.set_embedded_harness(HarnessId::Codex, cx)
+            })
+            .unwrap();
+        assert_eq!(drain_lists(cx, &runtime, &mut engine), [true]);
+    }
+
+    /// The accounts list is cached per engine as well as per device: after a
+    /// machine switch (a different engine behind the same target), the new
+    /// engine's page must not paint the previous one's rows.
+    #[gpui::test]
+    fn the_cache_never_paints_another_engines_rows(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let mut first = FakeEngine::new();
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            crate::settings::init(Default::default(), dir.path(), cx);
+            gpui_base::init(cx);
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let state = cx.new(|_| crate::state::AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(first.handle("local"));
+        });
+        let window = cx.add_window(|_, cx| {
+            AccountsPage::new_embedded(state.clone(), None, HarnessId::Codex, cx)
+        });
+        assert_eq!(drain_lists(cx, &runtime, &mut first), [false, true]);
+        window
+            .update(cx, |page, _, _| {
+                assert!(matches!(page.snapshot, Loadable::Ready(_)));
+            })
+            .unwrap();
+
+        // A machine switch attaches another engine for the same target.
+        let mut second = FakeEngine::new();
+        state.update(cx, |state, _| {
+            state.set_test_engine(second.handle("other"));
+        });
+        let reopened = cx.add_window(|_, cx| {
+            AccountsPage::new_embedded(state.clone(), None, HarnessId::Codex, cx)
+        });
+        // The new engine's list is in flight, not the old engine's rows.
+        reopened
+            .update(cx, |page, _, _| {
+                assert!(
+                    matches!(page.snapshot, Loadable::Loading),
+                    "the previous engine's rows must not paint for this one"
+                );
+            })
+            .unwrap();
+        assert_eq!(drain_lists(cx, &runtime, &mut second), [false, true]);
     }
 }
