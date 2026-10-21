@@ -47,7 +47,7 @@ pub struct CompactStatus {
 
 impl CompactStatus {
     pub fn of(ui: &ExtensionUiState) -> Option<Self> {
-        serde_json::from_value(ui.channels.get(COMPACT_CHANNEL)?.clone()).ok()
+        Self::deserialize(ui.channels.get(COMPACT_CHANNEL)?).ok()
     }
 }
 
@@ -452,25 +452,34 @@ impl ExtensionUiState {
     }
 
     /// Typed views of the elements; ones that fail to parse are skipped.
+    ///
+    /// Read straight from the raw element: a render path and the fleet
+    /// follower both call this on every frame, and copying each element only
+    /// to parse the copy was a deep clone per element per frame.
     pub fn typed_elements(&self) -> Vec<PiUiElement> {
         self.elements
             .iter()
-            .filter_map(|value| serde_json::from_value(value.clone()).ok())
+            .filter_map(|value| PiUiElement::deserialize(value).ok())
             .collect()
     }
 
     /// The Pi sub-agents at work (running or waiting), from the fleet
     /// roster: its typed rows while a UI watches the chat, timed from the
     /// [`FLEET_CHANNEL`]; otherwise the plain-text lines Pi mirrors the
-    /// roster to, which carry no start.
+    /// roster to, which carry no start. Only the roster is parsed: the
+    /// engine follows this on every frame.
     pub fn running_fleet(&self) -> Vec<FleetJob> {
         let live = |state: Option<PiUiRowState>| {
             matches!(state, Some(PiUiRowState::Running | PiUiRowState::Waiting))
         };
         if let Some(roster) = self
-            .typed_elements()
-            .into_iter()
-            .find(|element| element.ns == FLEET_NS && element.kind == PiUiKind::Roster)
+            .elements
+            .iter()
+            .filter(|element| {
+                element.get("ns").and_then(Value::as_str) == Some(FLEET_NS)
+                    && element.get("kind").and_then(Value::as_str) == Some("roster")
+            })
+            .find_map(|element| PiUiElement::deserialize(element).ok())
         {
             let entries = self
                 .channels
