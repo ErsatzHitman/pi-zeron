@@ -560,6 +560,89 @@ mod tests {
             .unwrap();
     }
 
+    /// The cross deletes only the aside the pane's own `+` started: one picked
+    /// from the history list is settled, so closing the pane leaves it (and
+    /// its Pi process) alone.
+    #[gpui::test]
+    fn the_cross_keeps_an_aside_picked_from_the_history_list(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel(64);
+        let _replies = replies;
+        let engine = crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(
+            out, inbound,
+        ));
+        // Every deleteChat the engine was asked for, in order.
+        fn deletes(
+            cx: &mut TestAppContext,
+            runtime: &tokio::runtime::Runtime,
+            requests: &mut tokio::sync::mpsc::Receiver<String>,
+        ) -> Vec<String> {
+            let mut deletes = Vec::new();
+            loop {
+                cx.run_until_parked();
+                runtime.block_on(async { tokio::task::yield_now().await });
+                let Ok(frame) = requests.try_recv() else {
+                    return deletes;
+                };
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                // Opening a chat sends other mutations (markChatSeen): only
+                // the deletes matter here.
+                if frame.method.as_deref() == Some(methods::MUTATE)
+                    && frame.params["op"] == "deleteChat"
+                {
+                    deletes.push(frame.params["chatId"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let window = shell_window(dir.path(), cx);
+        let fresh = window
+            .update(cx, |shell, _, cx| {
+                shell.active_chat = "main".into();
+                let main: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+                    "id": "main", "deviceId": "local",
+                    "archived": false, "createdAt": Utc::now(),
+                    "config": { "harness": "pi", "model": "m", "sandbox": "workspace-write" },
+                }))
+                .unwrap();
+                let older: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+                    "id": "btw-older", "parentChatId": "main", "deviceId": "local",
+                    "title": "An older aside", "archived": false,
+                    "createdAt": "2026-10-14T00:00:00Z",
+                    "lastMessageAt": "2026-10-14T00:05:00Z",
+                }))
+                .unwrap();
+                shell.state.update(cx, |state, _| {
+                    state.chats = vec![main, older.clone()];
+                    state.selected_chat = Some("main".into());
+                    state.set_test_engine(engine);
+                });
+                // The pane's own aside, sent, then closed by its cross.
+                shell.open_btw_pane(cx);
+                let id = shell.side_chat_seq;
+                let side = shell.side_chats[&id].state.clone();
+                let chat_id = side.read(cx).selected_chat.clone().unwrap();
+                side.update(cx, |state, cx| state.side_chat_saved(&chat_id, cx));
+                assert!(shell.delete_btw_pane(cx));
+                assert_eq!(shell.btw_frame(cx), None);
+                // An older one, read again from the history list, then its
+                // cross: the pane closes, the chat stays in the list.
+                shell.open_btw_pane(cx);
+                shell.btw_show_chat(older, cx);
+                assert!(shell.delete_btw_pane(cx));
+                assert_eq!(shell.btw_frame(cx), None);
+                chat_id
+            })
+            .unwrap();
+        let deleted = deletes(cx, &runtime, &mut requests);
+        assert_eq!(deleted, [fresh], "only the pane's own aside goes");
+    }
+
     #[gpui::test]
     fn new_side_chat_is_unsaved_until_its_first_send(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
