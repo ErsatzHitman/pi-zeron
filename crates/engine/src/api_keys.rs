@@ -592,6 +592,8 @@ impl ApiKeys {
 
     /// Apply `change` to `provider`, save, and project. `gone` are secrets
     /// the change retires: Pi's entry is removed only if it still holds one.
+    /// The key that was current before the change is retired too, so
+    /// disabling the last enabled key takes it out of Pi as well.
     fn write(
         &self,
         provider: &str,
@@ -602,13 +604,21 @@ impl ApiKeys {
             let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let path = self.store_path();
             let mut store = Store::load(&path)?;
+            let before = store.key(provider).map(str::to_owned);
             let keys = store.providers.entry(provider.to_owned()).or_default();
             change(keys)?;
             if keys.keys.is_empty() {
                 store.providers.remove(provider);
             }
             store.save(&path)?;
-            self.project(provider, store.key(provider), gone)?;
+            let after = store.key(provider);
+            let mut retired = gone.to_vec();
+            if let Some(old) = before.as_deref()
+                && Some(old) != after
+            {
+                retired.push(old.to_owned());
+            }
+            self.project(provider, after, &retired)?;
         }
         Ok(self.list())
     }
@@ -886,6 +896,55 @@ mod tests {
         })
         .unwrap();
         assert_eq!(auth(dir.path())["opencode-go"]["key"], "key-aaaaaaaa1");
+    }
+
+    #[test]
+    fn disabling_the_last_enabled_key_takes_it_out_of_pi() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = keys(dir.path());
+        let view = add(&k, "openai", "", "sk-proj-only-1111");
+        let one = provider(&view, "openai").keys[0].id.clone();
+        let view = k
+            .update(UpdateParams {
+                provider: "openai".into(),
+                id: one.clone(),
+                disabled: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(provider(&view, "openai").keys[0].disabled);
+        assert!(
+            auth(dir.path()).get("openai").is_none(),
+            "a disabled key must not stay live in Pi"
+        );
+        // Turning it back on puts it back.
+        k.update(UpdateParams {
+            provider: "openai".into(),
+            id: one.clone(),
+            disabled: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(auth(dir.path())["openai"]["key"], "sk-proj-only-1111");
+        // Disabling every key of a provider leaves Pi without one.
+        let view = add(&k, "openai", "", "sk-proj-two-2222");
+        let two = provider(&view, "openai").keys[1].id.clone();
+        k.update(UpdateParams {
+            provider: "openai".into(),
+            id: one,
+            disabled: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(auth(dir.path())["openai"]["key"], "sk-proj-two-2222");
+        k.update(UpdateParams {
+            provider: "openai".into(),
+            id: two,
+            disabled: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(auth(dir.path()).get("openai").is_none());
     }
 
     #[test]
