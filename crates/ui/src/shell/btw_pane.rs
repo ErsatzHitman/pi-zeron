@@ -60,6 +60,9 @@ pub(super) struct BtwPane {
     grab: Option<(f32, f32)>,
     /// Closed by its cross: the side chat goes with it, Pi process and all.
     delete_on_close: bool,
+    /// Picked from the history list rather than started by the row's `+`:
+    /// it is settled, so its cross only closes the pane.
+    from_history: bool,
 }
 
 /// A fresh side chat off `parent`. Nothing is written until its first send
@@ -150,7 +153,7 @@ impl Shell {
         let mut chat = forked_child(&parent);
         chat.id = format!("{}{}", zeron_proto::BTW_CHAT_PREFIX, chat.id);
         let id = self.build_side_chat_tab(chat, true, cx);
-        self.show_btw(key, id, cx);
+        self.show_btw(key, id, false, cx);
     }
 
     /// The selection bar's "Send to /btw": the pane opens (or comes forward)
@@ -173,8 +176,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// Show side chat `id` in the pane of conversation `key`.
-    fn show_btw(&mut self, key: String, id: u64, cx: &mut Context<Self>) {
+    /// Show side chat `id` in the pane of conversation `key`. One picked
+    /// from the history list (`from_history`) was already settled.
+    fn show_btw(&mut self, key: String, id: u64, from_history: bool, cx: &mut Context<Self>) {
         if let Some(old) = self.btw.take()
             && old.side_chat != id
         {
@@ -188,6 +192,7 @@ impl Shell {
             bar_height: Rc::new(Cell::new(0.0)),
             grab: None,
             delete_on_close: false,
+            from_history,
         });
         self.focus_btw(id, cx);
     }
@@ -212,12 +217,14 @@ impl Shell {
         true
     }
 
-    /// Close the pane for good (its cross): once the exit has played, its
-    /// side chat is deleted, which also ends its Pi process and takes it off
-    /// the session lists. One kept as a right-pane tab stays.
+    /// Close the pane for good (its cross): once the exit has played, the
+    /// side chat it started is deleted, which also ends its Pi process and
+    /// takes it off the session lists. One picked from the history list is
+    /// only closed: it stays there, ready to open again. One kept as a
+    /// right-pane tab stays.
     pub(super) fn delete_btw_pane(&mut self, cx: &mut Context<Self>) -> bool {
         if let Some(pane) = self.btw.as_mut().filter(|pane| pane.open) {
-            pane.delete_on_close = true;
+            pane.delete_on_close = !pane.from_history;
         }
         self.close_btw_pane(cx)
     }
@@ -282,7 +289,7 @@ impl Shell {
 
     /// Show one of the conversation's side chats in the pane. One already
     /// open as a right-pane tab is brought forward there instead.
-    fn btw_show_chat(&mut self, chat: zeron_proto::Chat, cx: &mut Context<Self>) {
+    pub(super) fn btw_show_chat(&mut self, chat: zeron_proto::Chat, cx: &mut Context<Self>) {
         let Some(key) = self.btw.as_ref().map(|pane| pane.key.clone()) else {
             return;
         };
@@ -301,7 +308,7 @@ impl Shell {
             Some(id) => id,
             None => self.build_side_chat_tab(chat, false, cx),
         };
-        self.show_btw(key, id, cx);
+        self.show_btw(key, id, true, cx);
     }
 
     /// Until its first send, the pane's side chat `id` runs its parent's
