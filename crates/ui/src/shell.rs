@@ -70,6 +70,8 @@ mod chat_dropzone;
 #[cfg(test)]
 mod chat_dropzone_tests;
 #[cfg(test)]
+mod chat_menu_tests;
+#[cfg(test)]
 mod chat_rename_tests;
 mod command_palette;
 mod file_mutations;
@@ -6052,10 +6054,11 @@ impl Shell {
         else {
             return;
         };
-        // The sidebar lists only top-level chats; side chats live in the
-        // session panel's Sub-agents section. Either way the row must be on
-        // screen first: a field on a hidden row would take keystrokes unseen.
-        let surface = surface.unwrap_or(if parent.is_some() {
+        // The sidebar nests a side chat under its parent; a session in an
+        // orchestrator's tree keeps a row of its own. Either way the row must
+        // be on screen first: a field on a hidden row would take keystrokes
+        // unseen.
+        let surface = surface.unwrap_or(if self.is_side_chat(&chat_id, cx) {
             ChatRenameSurface::Session
         } else {
             ChatRenameSurface::Sidebar
@@ -10990,12 +10993,7 @@ impl Shell {
             let position = menu_state.position;
             let chat_menu_closing = self.chat_menu.closing_since();
             let is_side_chat = matches!(menu_state.tab, Some((_, RightSurface::SideChat(_))))
-                || self
-                    .state
-                    .read(cx)
-                    .chats
-                    .iter()
-                    .any(|chat| chat.id == chat_id && chat.parent_chat_id.is_some());
+                || self.is_side_chat(&chat_id, cx);
             let is_pinned = self.active_sidebar_pins(cx).contains(&chat_id);
             let rename_id = chat_id.clone();
             let pin_id = chat_id.clone();
@@ -11027,6 +11025,7 @@ impl Shell {
                     let open =
                         popover::menu_row(&theme, false, format!("chat-menu-open-{chat_id}"))
                             .id("chat-menu-open")
+                            .debug_selector(|| "chat-menu-open".into())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_chat_menu(cx);
                                 this.open_chat(open_id.clone(), cx);
@@ -11083,6 +11082,7 @@ impl Shell {
                 } else {
                     let pin = popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
                         .id("chat-menu-pin")
+                        .debug_selector(|| "chat-menu-pin".into())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
                         }))
@@ -11091,6 +11091,7 @@ impl Shell {
                     let archive =
                         popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
+                            .debug_selector(|| "chat-menu-archive".into())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.archive_chat(archive_id.clone(), cx)
                             }))

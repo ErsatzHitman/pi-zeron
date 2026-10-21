@@ -4920,6 +4920,10 @@ impl Shell {
     /// clear), or a synced section could not be expanded. Either way the
     /// sidebar notice says why.
     pub(super) fn reveal_sidebar_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) -> bool {
+        // A session in an orchestrator's tree lists in the Orchestrator tab.
+        if self.reveal_orchestrator_chat(chat_id, cx) {
+            return true;
+        }
         // A side chat draws under its listed parent: reveal that, unfolded
         // far enough to include it.
         if let Some(parent) = self.sidebar_child_parent(chat_id, cx) {
@@ -5018,7 +5022,7 @@ impl Shell {
     /// Mark a disclosure opened for a reveal: its motion starts on the next
     /// render, where the body height is known. Like a header click, it
     /// replaces the resort glide for this movement.
-    fn queue_sidebar_reveal(&mut self, key: &str) {
+    pub(super) fn queue_sidebar_reveal(&mut self, key: &str) {
         self.sidebar_reveal_motions.insert(key.to_owned());
         self.sidebar_prev_order.clear();
         self.sidebar_resort.clear();
