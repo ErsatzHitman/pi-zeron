@@ -496,6 +496,29 @@ impl SessionDoc {
             .collect())
     }
 
+    /// The id of the last entry, read from the tail container only.
+    ///
+    /// Callers that merely need to name the row a command is `basedOn` (every
+    /// send/steer/interrupt, on the async runtime) must not go through
+    /// [`Self::read_entries`], which materializes the whole transcript — every
+    /// part of every turn — to then discard all but `.last()`. Walk the list
+    /// backwards instead and take the first readable `id`; a container
+    /// imported before its fields land has no id to offer (and a salvaged
+    /// stand-in id would name a turn no session ever ran), so it is skipped.
+    pub fn last_entry_id(&self) -> Option<String> {
+        use loro::{Container, ValueOrContainer};
+        let messages = self.doc.get_list("messages");
+        for index in (0..messages.len()).rev() {
+            let Some(ValueOrContainer::Container(Container::Map(map))) = messages.get(index) else {
+                continue;
+            };
+            if let Some(ValueOrContainer::Value(LoroValue::String(id))) = map.get("id") {
+                return Some(id.to_string());
+            }
+        }
+        None
+    }
+
     /// Read a bounded suffix directly from the containers, without expanding
     /// the full messages tree. For first paint only: the full watch must follow.
     /// Limits count parts rather than joined messages (one turn can have tens
@@ -1579,6 +1602,36 @@ mod tests {
         assert_eq!(entries[0].parts, vec![seam]);
     }
     use zeron_proto::{AgentEvent, ToolCall};
+
+    #[test]
+    fn last_entry_id_reads_only_the_tail() {
+        let doc = SessionDoc::init("tail").unwrap();
+        assert_eq!(doc.last_entry_id(), None);
+        for id in ["a", "b", "c"] {
+            doc.push_message(&SessionMessageEntry {
+                id: id.into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: "body".into(),
+                }],
+                created_at: 1,
+                device_id: "device".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(doc.last_entry_id().as_deref(), Some("c"));
+        // A container imported before its fields landed carries no id, so it
+        // never speaks for the tail.
+        doc.doc()
+            .get_list("messages")
+            .push_container(LoroMap::new())
+            .unwrap();
+        assert_eq!(doc.last_entry_id().as_deref(), Some("c"));
+    }
 
     #[test]
     fn opening_tail_bounds_parts_and_preserves_continuation_ids() {
