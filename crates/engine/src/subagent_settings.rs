@@ -5,16 +5,15 @@
 //! members and their sub-sessions). They live in Pi's
 //! `<agent dir>/subagents.json` as `defaultModel` and `defaultThinkingLevel`,
 //! which those extensions re-read at each launch, so a change reaches running
-//! chats at their next child. A cleared value is written as an explicit
-//! `null`, never removed: Pi reads a missing `defaultModel` as its own
-//! built-in opencode-go/deepseek-flash at max and only `null` as the
-//! session's own model (the missing level's default), which is what the card
-//! shows. Up to two fallbacks (`fallbackModels`, each a
-//! model and an optional level) are tried in order when the default cannot
-//! run a child: a model on an almost used-up account, or a child that fails
-//! before it does any work. Every other key in the file is kept. A child
-//! cannot run a reserved model (Claude Fable, GPT Astra), so neither can the
-//! default or a fallback.
+//! chats at their next child. A value the user clears is written as an explicit
+//! `null`, never left out: `subagent_start` reads a missing key as Pi's own
+//! built-in default (deepseek-flash at max thinking), while `null` is what makes
+//! children run on their session's own model and thinking level. Up to two
+//! fallbacks (`fallbackModels`, each a model and an optional level) are tried in
+//! order when the default cannot run a child: a model on an almost used-up
+//! account, or a child that fails before it does any work. Every other key in
+//! the file is kept. A child cannot run a reserved model (Claude Fable, GPT
+//! Astra), so neither can the default or a fallback.
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -39,7 +38,7 @@ pub struct SubagentSettings {
     /// A `provider/id` spec; None is each child's own default (its parent
     /// session's model).
     pub model: Option<String>,
-    /// One of [`THINKING_LEVELS`]; None is Pi's default for the model.
+    /// One of [`THINKING_LEVELS`]; None is the delegating session's own level.
     pub thinking: Option<String>,
     /// Tried in order when `model` cannot run a child; at most
     /// [`MAX_FALLBACKS`], none repeating the default or each other.
@@ -231,9 +230,9 @@ pub fn write(agent_dir: &Path, settings: SubagentSettings) -> Result<SubagentSet
     let path = path(agent_dir);
     let mut root = load(&path)?.unwrap_or_default();
     let before = root.clone();
-    // `null` says "no default"; removing the key would only hand the child
-    // back to Pi's built-in default while the card still says the session's
-    // own model.
+    // A cleared value is written as `null`, not removed: Pi's built-in default
+    // applies to a MISSING key, so removing it would put a reset child back on
+    // deepseek-flash at max thinking instead of its session's own model.
     for (key, value) in [
         ("defaultModel", &settings.model),
         ("defaultThinkingLevel", &settings.thinking),
@@ -313,6 +312,8 @@ mod tests {
     fn a_missing_file_is_no_default_and_a_save_records_that_explicitly() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read(dir.path()), SubagentSettings::default());
+        // Nothing chosen is still written, as `null`: that is the difference
+        // between "the user cleared it" and "no file, use Pi's own default".
         write(dir.path(), SubagentSettings::default()).unwrap();
         assert_eq!(
             file_json(dir.path()),
@@ -328,6 +329,30 @@ mod tests {
                 .unwrap()
                 .ends_with("}\n")
         );
+    }
+
+    /// The audit finding: clearing the default removed the keys, which Pi's
+    /// `subagent_start` reads as its own built-in default, so a reset in Zeron
+    /// left children on deepseek-flash at max thinking.
+    #[test]
+    fn a_cleared_default_is_written_as_null_and_reads_back_as_no_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut set = settings(Some("opencode-go/deepseek-v4.1-flash"), Some("max"));
+        set.fallbacks = vec![fallback("zai/glm-5", None)];
+        write(dir.path(), set).unwrap();
+        assert_eq!(
+            write(dir.path(), SubagentSettings::default()).unwrap(),
+            SubagentSettings::default()
+        );
+        let saved = file_json(dir.path());
+        assert_eq!(saved["defaultModel"], Value::Null, "cleared, not removed");
+        assert_eq!(
+            saved["defaultThinkingLevel"],
+            Value::Null,
+            "cleared, not removed"
+        );
+        assert!(saved.get("fallbackModels").is_none(), "no fallback is left");
+        assert_eq!(read(dir.path()), SubagentSettings::default());
     }
 
     #[test]
