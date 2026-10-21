@@ -333,7 +333,7 @@ fn claude_keychain_service(config_dir: Option<&Path>) -> String {
 
 // ── slot storage ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SlotProfile {
     email: String,
@@ -914,7 +914,8 @@ impl AgentAccounts {
         let mut active_keys: HashMap<HarnessId, std::collections::HashSet<String>> = HashMap::new();
         // Live logins listed without a slot: credentials unreadable (Keychain
         // denied) or identity unresolvable (an opaque token whose profile
-        // call failed). Active, never switchable.
+        // call failed), or a slot whose write just failed. Active, never
+        // switchable.
         let mut unreadable: Vec<(HarnessId, Detected)> = Vec::new();
         let mut live = |harness: HarnessId, detected: &Detected| {
             active_keys
@@ -933,7 +934,9 @@ impl AgentAccounts {
         if let Some(detected) = claude {
             live(HarnessId::ClaudeCode, &detected);
             if detected.credentials.is_some() {
-                self.snapshot_detected(HarnessId::ClaudeCode, &detected)?;
+                if !self.snapshot_live(&mut warnings, HarnessId::ClaudeCode, &detected) {
+                    unreadable.push((HarnessId::ClaudeCode, detected));
+                }
             } else {
                 unreadable.push((HarnessId::ClaudeCode, detected));
             }
@@ -941,11 +944,15 @@ impl AgentAccounts {
         self.migrate_codex_slot_keys()?;
         if let Some(detected) = self.detect_codex() {
             live(HarnessId::Codex, &detected);
-            self.snapshot_detected(HarnessId::Codex, &detected)?;
+            if !self.snapshot_live(&mut warnings, HarnessId::Codex, &detected) {
+                unreadable.push((HarnessId::Codex, detected));
+            }
         }
         if let Some(detected) = self.detect_cursor() {
             live(HarnessId::Cursor, &detected);
-            self.snapshot_detected(HarnessId::Cursor, &detected)?;
+            if !self.snapshot_live(&mut warnings, HarnessId::Cursor, &detected) {
+                unreadable.push((HarnessId::Cursor, detected));
+            }
             // The SDK's minted keys expire (90-day default) — an expired live
             // key fails every run with an auth error, so say so up front.
             if !self.cursor_live_usable() {
@@ -967,9 +974,11 @@ impl AgentAccounts {
                 unreadable.push((harness, detected));
             }
         }
-        for (harness, detected) in &detected_more {
-            live(*harness, detected);
-            self.snapshot_detected(*harness, detected)?;
+        for (harness, detected) in detected_more {
+            live(harness, &detected);
+            if !self.snapshot_live(&mut warnings, harness, &detected) {
+                unreadable.push((harness, detected));
+            }
         }
         if let Some(message) = stores::opencode_env_warning() {
             warnings.push(AgentAccountWarning {
@@ -2455,20 +2464,38 @@ impl AgentAccounts {
     }
 
     /// Persist a detected login into its slot (refreshing stored tokens).
+    ///
+    /// A plain no-op when the slot already holds exactly this login: `list`
+    /// runs on every page paint and re-detects the same live login, so
+    /// rewriting (and fsyncing) every slot on every list was pure churn
+    /// (audit #140). `created_at` is the one field a legacy slot still needs
+    /// backfilled (`write_slot` stamps it from `saved_at`), so a slot without
+    /// it is written once more.
     fn snapshot_detected(&self, harness: HarnessId, d: &Detected) -> Result<(), EngineError> {
         let Some(credentials) = &d.credentials else {
             return Ok(());
         };
         let id = slot_id_for(harness, &d.account_key);
+        let existing = self.read_slot(harness, &id);
         // A store without identity (Devin's bare key) must not overwrite the
         // identity a usage probe already wrote into the slot.
         let profile = match d.identity_known {
             true => d.profile.clone(),
-            false => self
-                .read_slot(harness, &id)
-                .map(|existing| existing.profile)
+            false => existing
+                .as_ref()
+                .map(|existing| existing.profile.clone())
                 .unwrap_or_else(|| d.profile.clone()),
         };
+        if let Some(existing) = &existing
+            && existing.created_at.is_some()
+            && existing.account_key == d.account_key
+            && existing.profile == profile
+            && existing.credentials == *credentials
+            && existing.claude_config == d.claude_config
+            && existing.store_key == d.store_key
+        {
+            return Ok(());
+        }
         self.write_slot(&Slot {
             id,
             harness,
@@ -2480,6 +2507,34 @@ impl AgentAccounts {
             created_at: None,
             store_key: d.store_key.clone(),
         })
+    }
+
+    /// [`Self::snapshot_detected`] for [`Self::list`]: a slot that cannot be
+    /// written (a full disk, a directory we no longer own) must not fail the
+    /// whole page. The live login still lists as active — it just has no
+    /// saved slot — so the failure becomes a warning, and `false` tells the
+    /// caller to list the login from the detection itself (audit #140).
+    fn snapshot_live(
+        &self,
+        warnings: &mut Vec<AgentAccountWarning>,
+        harness: HarnessId,
+        detected: &Detected,
+    ) -> bool {
+        match self.snapshot_detected(harness, detected) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    harness = harness_slug(harness),
+                    error = %err,
+                    "agent account slot snapshot failed"
+                );
+                warnings.push(AgentAccountWarning {
+                    harness,
+                    message: format!("Could not save this login's snapshot: {err}"),
+                });
+                false
+            }
+        }
     }
 
     /// One saved slot by id (`None` when missing or unparseable).
@@ -5070,6 +5125,62 @@ mod login_tests {
             ..Default::default()
         };
         AgentAccounts::with_endpoints(config(root), endpoints, Default::default())
+    }
+
+    /// Audit #140: `list` runs on every page paint and re-detects the same
+    /// live login, so an unchanged slot must not be rewritten (or fsynced).
+    #[tokio::test]
+    async fn a_second_list_leaves_an_unchanged_slot_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = AgentAccounts::new(config(tmp.path()));
+        write_live_claude(tmp.path(), "acct-keep", "keep@example.com", "token");
+        assert!(accounts.list(false).await.unwrap().warnings.is_empty());
+
+        let file = accounts
+            .slots_dir(HarnessId::ClaudeCode)
+            .unwrap()
+            .join(format!("{}.json", slot_id_for(HarnessId::ClaudeCode, "acct-keep")));
+        let before = std::fs::read(&file).unwrap();
+        // `saved_at` is stamped from the millisecond clock: a rewrite would
+        // have to change the bytes.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(accounts.list(false).await.unwrap().warnings.is_empty());
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "an unchanged live login must not rewrite its slot"
+        );
+    }
+
+    /// Audit #140: one slot that cannot be written must not fail the whole
+    /// page — the login still lists (active, without a slot).
+    #[tokio::test]
+    async fn a_slot_that_cannot_be_written_warns_instead_of_failing_the_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounts = AgentAccounts::new(config(tmp.path()));
+        write_live_claude(tmp.path(), "acct-new", "new@example.com", "token");
+        // A plain file where the slot directory belongs: every snapshot write
+        // for Claude Code now fails.
+        let dir = accounts.slots_dir(HarnessId::ClaudeCode).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+
+        let snapshot = accounts.list(false).await.unwrap();
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .any(|a| a.harness == HarnessId::ClaudeCode
+                    && a.email.as_deref() == Some("new@example.com")
+                    && a.active
+                    && !a.switchable)
+        );
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|w| w.harness == HarnessId::ClaudeCode && w.message.contains("snapshot"))
+        );
     }
 
     #[tokio::test]
