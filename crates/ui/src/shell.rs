@@ -3049,7 +3049,7 @@ impl Shell {
                         let send_pending = state.send_pending(&s.chat_id, now);
                         let chat = state.chats.iter().find(|c| c.id == s.chat_id);
                         let title = chat.and_then(|c| c.title.clone());
-                        let notify = chat.is_some_and(|c| c.is_top_level());
+                        let notify = crate::sound::notifies(&state.chats, &s.chat_id);
                         (s.chat_id.clone(), status, send_pending, title, notify)
                     })
                     .collect();
@@ -3067,7 +3067,9 @@ impl Shell {
             for (chat_id, status, send_pending, title, notify) in sessions {
                 let prev = self.sound_prev.insert(chat_id.clone(), status.clone());
                 // Keep side-chat baselines current, but never emit their
-                // completion, input-request, or failure sounds/banners.
+                // completion, input-request, or failure sounds/banners. An
+                // orchestrator's sessions do ring: they are the user's work
+                // (see `sound::notifies`).
                 if notify
                     && let Some(prev) = prev
                     && let Some(sound) = status.sound_since(&prev, send_pending)
