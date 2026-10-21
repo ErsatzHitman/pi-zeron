@@ -140,7 +140,7 @@ impl Shell {
         self.overlay_owns_keyboard(cx)
             || self.sync_flow.has_visible_overlay()
             || self.delete_confirm.is_some()
-            || self.delete_space_confirm.is_some()
+            || self.delete_project_confirm.is_some()
             || self.chat_rename.is_some()
             || self.rename_space_dialog.is_some()
             || self.discard_working_tree.is_some()

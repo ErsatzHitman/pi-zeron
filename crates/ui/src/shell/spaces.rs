@@ -2644,12 +2644,72 @@ fn path_under(path: &str, base: &str) -> bool {
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
 }
 
-/// The space-row Rename dialog (same shape as [`RenameChatDialog`]).
+/// The project-filter row's Rename dialog (same shape as [`RenameChatDialog`]):
+/// one name, written to every checkout of the project.
 pub(super) struct RenameSpaceDialog {
-    pub space_id: String,
+    /// Every checkout of the row's project: one name for all of them.
+    pub space_ids: Vec<String>,
     pub input: Entity<ComposerInput>,
     pub focus_pending: bool,
     pub _events: Subscription,
+}
+
+/// The project a project-filter row stands for. The row draws one repository
+/// — every checkout of it across devices ([`AppState::project_members`]) — so
+/// Rename and Remove must act on the project, never on the one checkout whose
+/// id happens to sit on the row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FilterProjectTarget {
+    /// Every checkout's space id, this device's first.
+    pub checkouts: Vec<String>,
+    /// The row's name: the representative checkout's
+    /// ([`AppState::representative_space`]).
+    pub name: String,
+    /// Devices holding a checkout, in checkout order, one entry each.
+    pub devices: Vec<String>,
+    /// Sessions across every checkout.
+    pub sessions: usize,
+}
+
+/// "1 session" / "N sessions" — the Remove-project confirm's count.
+fn sessions_phrase(count: usize) -> String {
+    if count == 1 {
+        "1 session".into()
+    } else {
+        format!("{count} sessions")
+    }
+}
+
+/// "Studio", "Studio and Server", "Studio, Server and Halo"; "its device"
+/// when the host is unknown (a row naming a space not synced here).
+fn device_list(devices: &[String]) -> String {
+    match devices {
+        [] => "its device".into(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The Remove-project confirm's sentence. A single checkout on one device
+/// keeps the old wording; a project spanning checkouts or devices says so,
+/// because removing it takes every one of their sessions.
+fn delete_project_copy(target: &FilterProjectTarget) -> String {
+    let name = if target.name.is_empty() {
+        "this project"
+    } else {
+        target.name.as_str()
+    };
+    let sessions = sessions_phrase(target.sessions);
+    let devices = device_list(&target.devices);
+    let place = if target.checkouts.len() > 1 {
+        format!(
+            "across its {} checkouts on {devices}",
+            target.checkouts.len()
+        )
+    } else {
+        format!("on {devices}")
+    };
+    format!("Removing “{name}” permanently deletes its {sessions} {place}. This can’t be undone.")
 }
 
 /// Dot color for a chat's display status (tab dots + Sessions rows).
@@ -3700,6 +3760,45 @@ impl Shell {
             .read(cx)
             .space_row(id)
             .map_or_else(|| id.to_owned(), zeron_proto::view::project_key)
+    }
+
+    /// The project a filter row's space belongs to: the whole repository, as
+    /// the row draws it — its checkouts, the name standing for them, the
+    /// devices holding one, and every checkout's sessions. A space not synced
+    /// here stands for itself ([`Self::space_row_key`]'s fallback).
+    fn filter_project_target(&self, space_id: &str, cx: &App) -> FilterProjectTarget {
+        let state = self.state.read(cx);
+        let Some(space) = state.space_row(space_id) else {
+            return FilterProjectTarget {
+                checkouts: vec![space_id.to_owned()],
+                name: String::new(),
+                devices: Vec::new(),
+                sessions: 0,
+            };
+        };
+        let members = state.project_members(space);
+        let mut devices: Vec<String> = Vec::new();
+        for member in &members {
+            let device = state
+                .device_name(&member.device_id)
+                .unwrap_or("Unknown device")
+                .to_string();
+            if !devices.contains(&device) {
+                devices.push(device);
+            }
+        }
+        FilterProjectTarget {
+            checkouts: members.iter().map(|member| member.id.clone()).collect(),
+            name: state
+                .representative_space(space)
+                .display_name()
+                .to_string(),
+            devices,
+            sessions: members
+                .iter()
+                .map(|member| state.chats_in_space(&member.id).len())
+                .sum(),
+        }
     }
 
     fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7477,13 +7576,11 @@ impl Shell {
 
     pub(super) fn open_rename_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.close_space_menu(cx);
-        let current = self
-            .state
-            .read(cx)
-            .space_row(&space_id)
-            .map(|s| s.display_name().to_string())
-            .unwrap_or_default();
+        // The row is a project: one name for every checkout of it, prefilled
+        // with the name the row (and every device's row) shows.
+        let target = self.filter_project_target(&space_id, cx);
         let input = cx.new(|cx| ComposerInput::new("Project name", cx));
+        let current = target.name.clone();
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -7491,7 +7588,7 @@ impl Shell {
             }
         });
         self.rename_space_dialog = Some(RenameSpaceDialog {
-            space_id,
+            space_ids: target.checkouts,
             input,
             focus_pending: true,
             _events: events,
@@ -7505,20 +7602,28 @@ impl Shell {
         };
         let name = dialog.input.read(cx).text().trim().to_string();
         if !name.is_empty() {
-            self.mutate(
-                serde_json::json!({ "op": "renameSpace", "spaceId": dialog.space_id, "name": name }),
-                cx,
-            );
+            // Every checkout, so the project reads alike on every device.
+            let ops = dialog
+                .space_ids
+                .iter()
+                .map(|space_id| {
+                    serde_json::json!({ "op": "renameSpace", "spaceId": space_id, "name": name })
+                })
+                .collect();
+            self.mutate_many(ops, cx);
         }
         cx.notify();
     }
 
-    pub(super) fn delete_space(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.delete_space_confirm = None;
-        self.mutate(
-            serde_json::json!({ "op": "deleteSpace", "spaceId": space_id }),
-            cx,
-        );
+    /// Remove the whole project the confirm names: `deleteSpace` cascades to
+    /// a checkout's chats, so every checkout is deleted in turn.
+    pub(super) fn delete_project(&mut self, checkouts: Vec<String>, cx: &mut Context<Self>) {
+        self.delete_project_confirm = None;
+        let ops = checkouts
+            .iter()
+            .map(|space_id| serde_json::json!({ "op": "deleteSpace", "spaceId": space_id }))
+            .collect();
+        self.mutate_many(ops, cx);
         cx.notify();
     }
 
@@ -7560,7 +7665,8 @@ impl Shell {
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_space_menu(cx);
-                            this.delete_space_confirm = Some(delete_id.clone());
+                            this.delete_project_confirm =
+                                Some(this.filter_project_target(&delete_id, cx));
                             cx.notify();
                         }))
                         .child(
@@ -7625,30 +7731,9 @@ impl Shell {
             overlays.push(popover::modal("rename-space-dialog", viewport, card));
         }
 
-        if let Some(space_id) = self.delete_space_confirm.clone() {
-            let (name, device, count) = {
-                let state = self.state.read(cx);
-                let space = state.space_row(&space_id);
-                (
-                    space
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "this project".into()),
-                    space
-                        .and_then(|s| state.device_name(&s.device_id))
-                        .unwrap_or("its device")
-                        .to_string(),
-                    state.chats_in_space(&space_id).len(),
-                )
-            };
-            let copy = if count == 1 {
-                format!(
-                    "Removing “{name}” permanently deletes its 1 session on {device}. This can’t be undone."
-                )
-            } else {
-                format!(
-                    "Removing “{name}” permanently deletes its {count} sessions on {device}. This can’t be undone."
-                )
-            };
+        if let Some(target) = self.delete_project_confirm.clone() {
+            let copy = delete_project_copy(&target);
+            let checkouts = target.checkouts;
             let card = popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
@@ -7663,7 +7748,7 @@ impl Shell {
                             popover::btn_ghost(&theme, "Cancel", "delete-space-cancel")
                                 .id("delete-space-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_space_confirm = None;
+                                    this.delete_project_confirm = None;
                                     cx.notify();
                                 })),
                         )
@@ -7671,7 +7756,7 @@ impl Shell {
                             popover::btn_danger(&theme, "Remove")
                                 .id("delete-space-confirm")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_space(space_id.clone(), cx)
+                                    this.delete_project(checkouts.clone(), cx)
                                 })),
                         ),
                 )
@@ -8543,5 +8628,166 @@ mod home_folder_search_tests {
                 .take(methods::RELEASE_HOME_FOLDER_SEARCH, cx)
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod project_menu_tests {
+    //! The project-filter row's context menu acts on the project the row
+    //! draws — every checkout of the repository — never on one checkout.
+    use super::*;
+
+    fn target(
+        name: &str,
+        checkouts: &[&str],
+        devices: &[&str],
+        sessions: usize,
+    ) -> FilterProjectTarget {
+        FilterProjectTarget {
+            checkouts: checkouts.iter().map(|id| (*id).to_owned()).collect(),
+            name: name.into(),
+            devices: devices.iter().map(|d| (*d).to_owned()).collect(),
+            sessions,
+        }
+    }
+
+    #[test]
+    fn the_remove_copy_names_every_checkout_a_project_spanning_devices_takes() {
+        // One checkout keeps the old sentence.
+        assert_eq!(
+            delete_project_copy(&target("zeron", &["sp-1"], &["Studio"], 1)),
+            "Removing “zeron” permanently deletes its 1 session on Studio. This can’t be undone."
+        );
+        assert_eq!(
+            delete_project_copy(&target("zeron", &["sp-1"], &["Studio"], 4)),
+            "Removing “zeron” permanently deletes its 4 sessions on Studio. This can’t be undone."
+        );
+        // Two checkouts on two devices: both are named, both are counted.
+        assert_eq!(
+            delete_project_copy(&target(
+                "zeron",
+                &["sp-1", "sp-2"],
+                &["Studio", "Server"],
+                6
+            )),
+            "Removing “zeron” permanently deletes its 6 sessions across its 2 checkouts on Studio and Server. This can’t be undone."
+        );
+        // A row naming a space this device never synced stays generic.
+        assert_eq!(
+            delete_project_copy(&target("", &["sp-9"], &[], 0)),
+            "Removing “this project” permanently deletes its 0 sessions on its device. This can’t be undone."
+        );
+    }
+
+    #[test]
+    fn device_lists_read_as_prose() {
+        assert_eq!(device_list(&[]), "its device");
+        assert_eq!(device_list(&["Studio".into()]), "Studio");
+        assert_eq!(
+            device_list(&["Studio".into(), "Server".into()]),
+            "Studio and Server"
+        );
+        assert_eq!(
+            device_list(&["Studio".into(), "Server".into(), "Halo".into()]),
+            "Studio, Server and Halo"
+        );
+        assert_eq!(sessions_phrase(1), "1 session");
+        assert_eq!(sessions_phrase(0), "0 sessions");
+    }
+
+    #[gpui::test]
+    fn every_checkout_row_resolves_to_the_whole_project(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let shell = cx.new(|cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.local_device_id = Some("local".into());
+                state.devices = serde_json::from_value(serde_json::json!([
+                    {"id":"local","name":"Studio","platform":"macos","lastSeenAt":null},
+                    {"id":"remote","name":"Server","platform":"linux","lastSeenAt":null}
+                ]))
+                .unwrap();
+                // One repository: the local checkout, a worktree clone on the
+                // same device, and a checkout on the other device. Plus one
+                // unrelated project that must never leak into the target.
+                state.spaces = serde_json::from_value(serde_json::json!([
+                    {
+                        "id": "sp-local", "deviceId": "local", "path": "/work/zeron",
+                        "name": "zeron", "repositoryId": "repo:r1",
+                        "createdAt": "2025-01-01T00:00:00Z"
+                    },
+                    {
+                        "id": "sp-worktree", "deviceId": "local", "path": "/work/zeron-wt",
+                        "repositoryId": "repo:r1",
+                        "createdAt": "2025-01-02T00:00:00Z"
+                    },
+                    {
+                        "id": "sp-remote", "deviceId": "remote", "path": "/srv/zeron",
+                        "name": "zeron-renamed", "repositoryId": "repo:r1",
+                        "createdAt": "2024-12-31T00:00:00Z"
+                    },
+                    {
+                        "id": "sp-other", "deviceId": "local", "path": "/work/pi",
+                        "repositoryId": "repo:r2",
+                        "createdAt": "2025-01-03T00:00:00Z"
+                    }
+                ]))
+                .unwrap();
+                state.chats = ["c1", "c2", "c3", "c4"]
+                    .into_iter()
+                    .zip(["sp-local", "sp-local", "sp-remote", "sp-other"])
+                    .enumerate()
+                    .map(|(ix, (id, space_id))| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "title": id, "deviceId": "local", "archived": false,
+                            "spaceId": space_id,
+                            "createdAt": Utc::now() - chrono::Duration::minutes(10 - ix as i64),
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+                state
+            });
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: String::new(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        shell.update(cx, |shell, cx| {
+            // The oldest checkout speaks for the project — that name is the
+            // row's, not whichever checkout the row happens to carry.
+            let expected = target(
+                "zeron-renamed",
+                &["sp-local", "sp-worktree", "sp-remote"],
+                &["Studio", "Server"],
+                3,
+            );
+            for row_id in ["sp-local", "sp-worktree", "sp-remote"] {
+                assert_eq!(shell.filter_project_target(row_id, cx), expected);
+            }
+            assert_eq!(
+                shell.filter_project_target("sp-other", cx),
+                target("pi", &["sp-other"], &["Studio"], 1)
+            );
+            // A row whose space never synced here stands for itself.
+            assert_eq!(
+                shell.filter_project_target("sp-gone", cx),
+                target("", &["sp-gone"], &[], 0)
+            );
+        });
     }
 }

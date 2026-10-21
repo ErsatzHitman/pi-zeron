@@ -2166,8 +2166,9 @@ pub struct Shell {
     section_header_hover: Option<String>,
     section_menu_focus: FocusHandle,
     section_menu_active: Option<usize>,
-    /// Space id awaiting delete confirmation (hard delete + session cascade).
-    delete_space_confirm: Option<String>,
+    /// The project awaiting a Remove confirmation (its checkouts, name,
+    /// devices and session count — see [`spaces::FilterProjectTarget`]).
+    delete_project_confirm: Option<spaces::FilterProjectTarget>,
     /// The add-space palette (device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
@@ -2720,7 +2721,7 @@ impl Shell {
             section_header_hover: None,
             section_menu_focus: cx.focus_handle(),
             section_menu_active: None,
-            delete_space_confirm: None,
+            delete_project_confirm: None,
             add_space: None,
             project_crumb_menu: popover::Popup::default(),
             command_palette: None,
@@ -6011,18 +6012,32 @@ impl Shell {
 
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
+        self.mutate_many(vec![params], cx);
+    }
+
+    /// Fire Mutate ops in order on ONE task: a project's rename or removal
+    /// spans its checkouts, and a second `mutate` call would replace (and so
+    /// cancel) the first request. The first failure surfaces in the sidebar
+    /// notice strip, as for a single op.
+    fn mutate_many(&mut self, ops: Vec<serde_json::Value>, cx: &mut Context<Self>) {
+        if ops.is_empty() {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.show_notice(crate::toast::ToastKind::Error, "Engine not connected", cx);
             cx.notify();
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
-            if let Err(err) = engine.client().call(methods::MUTATE, params).await {
-                this.update(cx, |shell, cx| {
-                    shell.show_notice(crate::toast::ToastKind::Error, format!("{err}"), cx);
-                    cx.notify();
-                })
-                .ok();
+            for params in ops {
+                if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                    this.update(cx, |shell, cx| {
+                        shell.show_notice(crate::toast::ToastKind::Error, format!("{err}"), cx);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
             }
         }));
     }
@@ -10830,7 +10845,7 @@ impl Shell {
         // path close here; the others remain explicit blockers.
         if self.sync_flow.has_visible_overlay()
             || self.delete_confirm.is_some()
-            || self.delete_space_confirm.is_some()
+            || self.delete_project_confirm.is_some()
             || self.chat_menu.get().is_some()
             || self.space_menu.get().is_some()
             || self.user_menu.get().is_some()
