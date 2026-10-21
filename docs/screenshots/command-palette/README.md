@@ -22,8 +22,8 @@ With an empty query, All shows:
    newest first, with the parent folder in muted text.
 2. **Quick Actions** — New chat, New project, Open settings, the theme switch
    and, with a focused unarchived chat, Archive thread, each with its shortcut.
-3. **Recent Threads** — up to five other unarchived top-level threads by
-   latest activity.
+3. **Recent Threads** — up to five other unarchived history threads (top-level
+   chats and orchestrator sessions) by latest activity.
 
 With a query, All shows **Threads** (five), **Commands**, **Files** (five) and
 **In Files** (five); empty sections are omitted. The Threads tab lists up to 50
@@ -34,7 +34,8 @@ file).
   query word must match the title (weight 100), project (40), branch (30),
   device or pull request (20); a match starting a word earns half its weight
   again; archived threads score half; ties go to recent activity. Side chats
-  and subagent workers never appear.
+  and subagent workers outside an orchestrator's tree never appear; a tree's
+  root and sessions list and rank with the rest.
 - Files and In Files query the focused chat's host (`SearchWorkspaceFiles` at
   once, `SearchWorkspaceContent` after an 80 ms pause) once the query has two
   characters. Their headers read "Searching…" while a request runs and

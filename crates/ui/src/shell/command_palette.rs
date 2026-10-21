@@ -738,13 +738,23 @@ impl Shell {
             .collect()
     }
 
-    /// Unarchived top-level chats by latest activity, the focused one aside.
+    /// Whether the palette's thread lists show `chat`: a top-level session,
+    /// or any session of an orchestrator's tree (the Orchestrator tab lists
+    /// those, so the palette finds them from anywhere). Side chats and MCP
+    /// workers outside a tree stay out.
+    fn lists_in_history(chats: &[zeron_proto::Chat], chat: &zeron_proto::Chat) -> bool {
+        chat.is_top_level()
+            || (!chat.is_btw() && zeron_proto::orchestrator::depth(chats, &chat.id).is_some())
+    }
+
+    /// Unarchived history chats by latest activity, the focused one aside.
     fn recent_threads(&self, limit: usize, cx: &App) -> Vec<String> {
         let state = self.state.read(cx);
         let mut chats: Vec<_> = state
             .chats
             .iter()
-            .filter(|chat| chat.is_top_level() && !chat.archived && chat.id != self.active_chat)
+            .filter(|chat| Self::lists_in_history(&state.chats, chat))
+            .filter(|chat| !chat.archived && chat.id != self.active_chat)
             .collect();
         chats
             .sort_by_key(|chat| std::cmp::Reverse(chat.last_message_at.unwrap_or(chat.created_at)));
@@ -755,18 +765,19 @@ impl Shell {
             .collect()
     }
 
-    /// Top-level chats matching every word of `query`, best match first
+    /// History chats matching every word of `query`, best match first
     /// (see `thread_search`).
     fn thread_matches(&self, query: &str, limit: usize, cx: &App) -> Vec<String> {
         let state = self.state.read(cx);
         let terms = thread_search::search_terms(query);
         // Global history deliberately ignores the sidebar's project filter and
         // collapsed groups. Archived conversations remain searchable too.
-        // Like the sidebar, only list top-level sessions, not side chats or MCP workers.
+        // Like the sidebar, leave side chats and MCP workers outside an
+        // orchestrator's tree out; the sessions of a tree list.
         let scored = state
             .chats
             .iter()
-            .filter(|chat| chat.is_top_level())
+            .filter(|chat| Self::lists_in_history(&state.chats, chat))
             .filter_map(|chat| {
                 let pull_request = state
                     .change_request_for_chat(chat)
@@ -1557,6 +1568,47 @@ mod tests {
                     search_chats(shell, "archived-session", cx),
                     ["archived-session"]
                 );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn orchestrator_sessions_list_and_search_beside_top_level_ones(cx: &mut TestAppContext) {
+        let (window, _dir) = palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_chats(vec![
+                        chat("orchestrator-root", None, false, 9),
+                        chat("member", Some("orchestrator-root"), false, 7),
+                        chat("member-child", Some("member"), false, 5),
+                        chat("btw-question", Some("member"), false, 4),
+                        chat("plain", None, false, 2),
+                        chat("plain-worker", Some("plain"), false, 1),
+                    ]);
+                });
+                shell.toggle_command_palette(window, cx);
+                assert_eq!(
+                    search_chats(shell, "", cx),
+                    ["plain", "member-child", "member", "orchestrator-root"],
+                    "the orchestrator and its sessions sit with the top-level chats"
+                );
+                assert_eq!(
+                    search_chats(shell, "member", cx),
+                    ["member-child", "member"],
+                    "a tree session is found by name"
+                );
+                assert_eq!(
+                    search_chats(shell, "orchestrator", cx),
+                    ["orchestrator-root"],
+                    "the root too"
+                );
+                for query in ["worker", "btw-question"] {
+                    assert!(
+                        search_chats(shell, query, cx).is_empty(),
+                        "{query} stays out of global history"
+                    );
+                }
             })
             .unwrap();
     }
