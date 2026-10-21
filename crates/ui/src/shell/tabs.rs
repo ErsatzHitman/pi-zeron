@@ -886,10 +886,7 @@ mod cycle_tests {
             Some("side".into()),
             "a parent outside the list leaves the selection to enter from the end"
         );
-        assert_eq!(
-            cycle_start(&list, Some("side"), None),
-            Some("side".into())
-        );
+        assert_eq!(cycle_start(&list, Some("side"), None), Some("side".into()));
         assert_eq!(
             cycle_start(&list, None, Some("b")),
             None,
