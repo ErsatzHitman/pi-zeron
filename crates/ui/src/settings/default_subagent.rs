@@ -18,7 +18,7 @@ use zeron_rpc::methods;
 use crate::pickers::{Pickers, TitleModelPicked};
 use crate::popover::Loadable;
 use crate::settings::widgets;
-use crate::state::AppState;
+use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 /// One picker per row: the model, then each fallback.
@@ -72,24 +72,22 @@ impl DefaultSubagentCard {
             picked.push(cx.subscribe(
                 &picker,
                 move |this: &mut Self, _, event: &TitleModelPicked, cx| {
-                    // Pi's catalog ids are already `provider/id` specs; a pick
-                    // that is not one (Pi's own default row) clears the row.
+                    // Pi's own default row clears the saved model.
                     let model = crate::settings::picked_pi_model(event.0.model.as_deref());
-                    this.change(|settings| set_row(settings, row, model), cx);
+                    this.change(move |settings| set_row(settings, row, model), cx);
                 },
             ));
             pickers.push(picker);
         }
-        // Settings can open before the engine connects: load once it does. A
-        // device switch is another `subagents.json`: reload through it.
+        // Load on connection and whenever the selected device changes.
         let state_sub = cx.observe(&state, |this: &mut Self, state, cx| {
             let device = crate::settings::target_device(&state.read(cx));
             if device != this.device {
                 this.device = device;
                 this.settings = Loadable::Idle;
-                this.call(None, cx);
+                this.load(cx);
             } else if matches!(this.settings, Loadable::Idle) {
-                this.call(None, cx);
+                this.load(cx);
             }
         });
         let mut card = Self {
@@ -104,15 +102,82 @@ impl DefaultSubagentCard {
             _picked: picked,
             _state: state_sub,
         };
-        card.call(None, cx);
+        card.load(cx);
         card
     }
 
-    fn change(&mut self, change: impl FnOnce(&mut SubagentSettings), cx: &mut Context<Self>) {
-        if let Some(mut settings) = self.settings.ready().cloned() {
-            change(&mut settings);
-            self.call(Some(settings), cx);
+    /// Re-read what the device sets: the settings page outlives visits to it,
+    /// so what this card loaded when it opened can be well out of date.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.settings, Loadable::Idle | Loadable::Loading) {
+            self.load(cx);
         }
+    }
+
+    /// Apply `change` to what the device sets *now* and save that: this card's
+    /// copy can be stale (the page outlives visits, another window or device
+    /// may have saved since), and writing it back whole would undo whatever
+    /// else changed. Each change waits for the one before it, so two quick
+    /// picks both land instead of the second cancelling the first.
+    fn change(
+        &mut self,
+        change: impl FnOnce(&mut SubagentSettings) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let device = self.device.clone();
+        let previous = self.task.take();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let outcome = match get(&engine, device.as_deref()).await {
+                Ok(current) => {
+                    let mut wanted = current.clone();
+                    change(&mut wanted);
+                    match set(&engine, wanted, device.as_deref()).await {
+                        Ok(settings) => Outcome::Set(settings),
+                        Err(error) => Outcome::Refused { error, current },
+                    }
+                }
+                Err(error) => Outcome::Failed(error),
+            };
+            this.update(cx, |card, cx| {
+                if card.device == device {
+                    card.settled(outcome, cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// A finished load or save, applied to the card and its pickers.
+    fn settled(&mut self, outcome: Outcome, cx: &mut Context<Self>) {
+        match outcome {
+            Outcome::Set(settings) => {
+                self.show_in_pickers(&settings, cx);
+                self.settings = Loadable::Ready(settings);
+                self.error = None;
+            }
+            // The engine's refusal (a reserved model, say) goes to the toast,
+            // and the card shows what the device still sets.
+            Outcome::Refused { error, current } => {
+                self.show_in_pickers(&current, cx);
+                self.settings = Loadable::Ready(current);
+                self.error = Some(error);
+            }
+            Outcome::Failed(error) if matches!(self.settings, Loadable::Ready(_)) => {
+                if let Some(settings) = self.settings.ready().cloned() {
+                    self.show_in_pickers(&settings, cx);
+                }
+                self.error = Some(error);
+            }
+            Outcome::Failed(error) => self.settings = Loadable::Error(error),
+        }
+        cx.notify();
     }
 
     /// Each picker shows its row of `settings`.
@@ -131,56 +196,77 @@ impl DefaultSubagentCard {
         }
     }
 
-    /// `GetSubagentSettings`, or `SetSubagentSettings` when saving, at the
-    /// device whose `subagents.json` this card shows; either reply is what
-    /// that file now sets.
-    fn call(&mut self, save: Option<SubagentSettings>, cx: &mut Context<Self>) {
+    /// `GetSubagentSettings`: the selected device's current settings.
+    fn load(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let (method, params) = match save {
-            Some(settings) => (
-                methods::SET_SUBAGENT_SETTINGS,
-                serde_json::to_value(settings).unwrap_or_default(),
-            ),
-            None => (methods::GET_SUBAGENT_SETTINGS, serde_json::json!({})),
-        };
-        let params = crate::settings::with_target_device(params, self.device.as_deref());
         if matches!(self.settings, Loadable::Idle) {
             self.settings = Loadable::Loading;
         }
+        let device = self.device.clone();
+        let previous = self.task.take();
         self.task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(method, params)
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|v| {
-                    serde_json::from_value::<SubagentSettings>(v).map_err(|e| e.to_string())
-                });
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let outcome = match get(&engine, device.as_deref()).await {
+                Ok(settings) => Outcome::Set(settings),
+                Err(error) => Outcome::Failed(error),
+            };
             this.update(cx, |card, cx| {
-                match result {
-                    Ok(settings) => {
-                        card.show_in_pickers(&settings, cx);
-                        card.settings = Loadable::Ready(settings);
-                        card.error = None;
-                    }
-                    // The engine's refusal (a reserved model, say) goes to
-                    // the toast, and the pickers go back to what is saved.
-                    Err(error) if matches!(card.settings, Loadable::Ready(_)) => {
-                        if let Some(settings) = card.settings.ready().cloned() {
-                            card.show_in_pickers(&settings, cx);
-                        }
-                        card.error = Some(error);
-                    }
-                    Err(error) => card.settings = Loadable::Error(error),
+                if card.device == device {
+                    card.settled(outcome, cx);
                 }
-                cx.notify();
             })
             .ok();
         }));
         cx.notify();
     }
+}
+
+/// How a call to the engine ended.
+enum Outcome {
+    /// A load's reply, or a save the engine accepted: what the device sets.
+    Set(SubagentSettings),
+    /// A save the engine refused, with what the device set before it.
+    Refused {
+        error: String,
+        current: SubagentSettings,
+    },
+    /// The call itself failed (no engine, a reply that does not parse).
+    Failed(String),
+}
+
+/// The device's `subagents.json`, as the engine has it.
+async fn get(engine: &EngineHandle, device: Option<&str>) -> Result<SubagentSettings, String> {
+    engine
+        .client()
+        .call(
+            methods::GET_SUBAGENT_SETTINGS,
+            crate::settings::with_target_device(serde_json::json!({}), device),
+        )
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+}
+
+/// Save `settings`; the reply is what the device now sets.
+async fn set(
+    engine: &EngineHandle,
+    settings: SubagentSettings,
+    device: Option<&str>,
+) -> Result<SubagentSettings, String> {
+    let params = crate::settings::with_target_device(
+        serde_json::to_value(settings).unwrap_or_default(),
+        device,
+    );
+    engine
+        .client()
+        .call(methods::SET_SUBAGENT_SETTINGS, params)
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
 }
 
 /// The model a row shows: row 0 the default's, then each fallback's.
@@ -301,7 +387,7 @@ impl Render for DefaultSubagentCard {
                 })
                 .focus_visible(|s| s.border_2().border_color(theme.accent))
                 .on_click(cx.listener(move |card, _, _, cx| {
-                    card.change(|settings| set_row(settings, row, None), cx)
+                    card.change(move |settings| set_row(settings, row, None), cx)
                 }))
         };
         let controls = || {
@@ -337,7 +423,7 @@ impl Render for DefaultSubagentCard {
         )
         .width(150.0)
         .on_select(|card, ix, _, cx| {
-            card.change(|settings| settings.thinking = thinking_at(ix), cx)
+            card.change(move |settings| settings.thinking = thinking_at(ix), cx)
         })
         .render(&self.thinking_select, cx);
         let thinking_row = widgets::card_row(&theme, false)
@@ -363,7 +449,7 @@ impl Render for DefaultSubagentCard {
                     .width(140.0)
                     .on_select(move |card, ix, _, cx| {
                         card.change(
-                            |settings| {
+                            move |settings| {
                                 if let Some(slot) = settings.fallbacks.get_mut(row - 1) {
                                     slot.thinking = thinking_at(ix);
                                 }

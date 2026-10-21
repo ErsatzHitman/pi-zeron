@@ -53,6 +53,14 @@ impl ThreadNamingCard {
         card
     }
 
+    /// Re-read what the device sets: the settings page outlives visits to it,
+    /// so what this card loaded when it opened can be well out of date.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.settings, Loadable::Idle | Loadable::Loading) {
+            self.call(None, cx);
+        }
+    }
+
     /// `GetTitleSettings`, or `SetTitleSettings` when saving; either reply is
     /// the device's authoritative settings.
     fn call(&mut self, save: Option<TitleSettings>, cx: &mut Context<Self>) {
