@@ -126,9 +126,13 @@ all state; an envelope whose `agentSeq` is not newer than the last is dropped.
 
 Gating: the driver says `hello` only while its chat is watched (at least one
 `WatchExtensionUi` stream on the host; the engine's `ExtensionUiHub` releases a
-chat 3 s after its last watcher) and `bye` when it stops being watched. Before `hello` and after `bye`, extensions use plain
+chat 3 s after its last watcher) and `bye` when it stops being watched.
+Before `hello` and after `bye`, extensions use plain
 dialogs/`setWidget`/`setStatus`, so an unwatched chat never waits on PIUI. On
-`bye` all live elements are dropped and host dialog sheets are cancelled.
+`bye` Pi's live elements are dropped, but an open dialog sheet stays: the
+agent is waiting on that question, so leaving the chat must not answer it.
+The next watcher finds the sheet in the state, and only the dialog's own
+timeout or the turn's abort closes it.
 
 Ops: `set` (whole element, keyed `ns:id`), `patch` (merge into an element),
 `remove`, `reset` (everything), `channel` (keyed payload, e.g.
@@ -140,7 +144,7 @@ Plain RPC UI requests are folded into the same live state: `notify` (a notice;
 also transcript text during a turn when no UI watches), `setStatus`,
 `setWidget`, `setTitle`, `set_editor_text`. A blocking dialog with no turn to
 answer it in becomes a `pi:dialog-N` sheet element for a watching UI (its
-timeout honoured, cancelled on `bye`); with no watcher it is cancelled.
+timeout honoured); with no watcher it is cancelled.
 
 Custom messages: `message_end` with `message.role == "custom"` and
 `display: true` maps to a `pi`/`<customType>` tool call with `details` as input

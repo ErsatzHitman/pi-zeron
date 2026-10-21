@@ -1036,14 +1036,14 @@ impl Runner {
     /// out when the last one leaves, so Pi falls back to dialogs a plain
     /// client (or an older Zeron) can answer. Sent as a raw command: it must
     /// not open a turn, and its `handled` ACK matches no pending entry.
+    ///
+    /// A sheet left open stays open: it is the agent's own question, so a
+    /// user who switched chats (or closed the window for a while) must not
+    /// have it answered with a cancel on their behalf. The sheets are
+    /// published with every state, so a watcher that comes back finds them,
+    /// and a dialog's own timeout or the turn's abort still closes them.
     fn sync_piui(&mut self) -> Result<(), HarnessError> {
         let watched = self.watched();
-        if !watched {
-            // Nobody is left to answer the sheets the host drew for dialogs.
-            for response in self.ui.close_dialogs(true) {
-                self.process.transport.client.send(response)?;
-            }
-        }
         if watched == self.piui_on {
             return Ok(());
         }
