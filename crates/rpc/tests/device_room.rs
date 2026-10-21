@@ -51,6 +51,9 @@ struct RelayState {
     /// Zombie-path simulation: the host stays "connected" (no bounce) but
     /// client→host frames vanish — the 2026-08-19 dead edge↔host leg.
     blackhole_host_bound: bool,
+    /// Frames the edge runtime would reject for exceeding its 1 MiB message
+    /// cap. Any value > 0 on the host socket is the #199 failure.
+    oversize_messages: usize,
 }
 
 struct FakeRelay {
@@ -100,6 +103,12 @@ impl FakeRelay {
         self.state.lock().expect("lock").blackhole_host_bound = on;
     }
 
+    /// Sender frames the real edge runtime would have rejected as "message too
+    /// big" (closing the sender's socket) instead of relaying.
+    fn oversize_messages(&self) -> usize {
+        self.state.lock().expect("lock").oversize_messages
+    }
+
     /// Deliver a nudge frame to the connected host (the DO's /nudge live path).
     fn nudge(&self, chat_id: &str) {
         self.nudge_receipt(chat_id, None);
@@ -124,6 +133,12 @@ fn relay_error(code: &str) -> Vec<u8> {
         .to_string()
         .into_bytes()
 }
+
+/// The edge runtime closes a WebSocket message larger than this before the DO
+/// handler runs (Cloudflare Workers' 1 MiB message cap). The fake must
+/// reproduce that: the oversize-reply regression is precisely a host frame
+/// this rule would kill the host socket over.
+const MAX_RELAY_MESSAGE_BYTES: usize = 1024 * 1024;
 
 async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayState>>) {
     let mut uri = String::new();
@@ -188,6 +203,12 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
             Ok(WsMessage::Close(_)) | Err(_) => break,
             Ok(_) => continue,
         };
+        if bytes.len() > MAX_RELAY_MESSAGE_BYTES {
+            // Runtime protocol violation: the sender's socket closes and the DO
+            // never sees the frame.
+            state.lock().expect("lock").oversize_messages += 1;
+            break;
+        }
         let Ok((header, payload)) = decode_device_frame(&bytes) else {
             break;
         };
@@ -272,6 +293,9 @@ struct TestService {
     active_streams: Arc<AtomicUsize>,
 }
 
+/// Comfortably over the relay transport's 1 MiB message cap.
+const OVERSIZE_REPLY_BYTES: usize = 2 * 1024 * 1024;
+
 impl TestService {
     fn new(label: &str) -> Arc<Self> {
         Arc::new(Self {
@@ -296,6 +320,16 @@ impl RpcService for TestService {
             methods::LIST_HARNESSES => Ok(RpcReply::Value(serde_json::json!([]))),
             "Echo" => Ok(RpcReply::Value(
                 serde_json::json!({ "host": self.label, "params": params }),
+            )),
+            "Huge" => Ok(RpcReply::Value(serde_json::json!({
+                "blob": "x".repeat(OVERSIZE_REPLY_BYTES)
+            }))),
+            "HugeStream" => Ok(RpcReply::Stream(
+                futures::stream::iter([
+                    serde_json::json!({ "blob": "x".repeat(OVERSIZE_REPLY_BYTES) }),
+                    serde_json::json!({ "after": true }),
+                ])
+                .boxed(),
             )),
             "Count" => {
                 let n = params.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -584,6 +618,86 @@ async fn relay_serves_multiple_clients_end_to_end() {
     );
     assert_eq!(x.expect("x")["params"], serde_json::json!(1));
     assert_eq!(y.expect("y")["params"], serde_json::json!(2));
+}
+
+#[tokio::test]
+async fn oversize_relay_reply_stays_bounded_and_socket_survives() {
+    let relay = FakeRelay::start().await;
+    let _host = HostRelay::spawn(
+        relay_config(&relay.edge_url(), 100),
+        TestService::new("host-a"),
+        noop_nudge(),
+    );
+    relay.wait_host_connected().await;
+
+    let links = cache(&relay.edge_url());
+    let client = links.client("dev-a").await.expect("client dials");
+
+    // Unary oversize reply, raced with a normal call: the big request gets a
+    // bounded error and the small one is answered normally (no id mix-up).
+    // The fake relay enforces the runtime's 1 MiB message cap, so without the
+    // bound this frame would close the host socket and fail both calls.
+    let (oversize, normal) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call("Huge", serde_json::json!({})),
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call("Echo", serde_json::json!({ "probe": "concurrent" })),
+        ),
+    );
+    let err = oversize
+        .expect("oversize reply must be answered within the bounded wait")
+        .expect_err("a >1 MiB reply must not be delivered");
+    match err {
+        RpcError::Failed(message) => assert!(
+            message.contains("reply too large"),
+            "expected a correlated oversize error, got: {message}"
+        ),
+        other => panic!("expected a JSON-RPC error, got: {other}"),
+    }
+    let echoed = normal
+        .expect("concurrent call must be answered within the bounded wait")
+        .expect("the concurrent call still succeeds");
+    assert_eq!(echoed["params"]["probe"], "concurrent");
+
+    // Streamed items go through the same boundary: the oversize item becomes
+    // a correlated error and the rest of that stream is drained silently.
+    let stream_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.subscribe_checked("HugeStream", serde_json::Value::Null),
+    )
+    .await
+    .expect("oversize stream must answer within the bounded wait");
+    let stream_err = match stream_result {
+        Ok(_) => panic!("an oversize stream item must not be delivered"),
+        Err(err) => err,
+    };
+    match stream_err {
+        RpcError::Failed(message) => assert!(
+            message.contains("reply too large"),
+            "expected a correlated oversize error, got: {message}"
+        ),
+        other => panic!("expected a JSON-RPC error, got: {other}"),
+    }
+
+    // Same relay socket: a normal RPC still succeeds and the host stayed up.
+    let after = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.call("Echo", serde_json::json!({ "after": "oversize" })),
+    )
+    .await
+    .expect("follow-up call must be answered within the bounded wait")
+    .expect("the relay socket survives an oversize reply");
+    assert_eq!(after["host"], "host-a");
+    assert_eq!(after["params"]["after"], "oversize");
+    assert_eq!(
+        relay.oversize_messages(),
+        0,
+        "an oversize frame would make the edge close the host socket"
+    );
+    assert!(relay.host_connected(), "host relay must stay connected");
 }
 
 #[tokio::test]

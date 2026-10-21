@@ -14,8 +14,10 @@
 //! The RPC path multiplexes NOTHING new: each distinct client `connId` becomes a virtual
 //! string-frame connection feeding the existing [`serve_connection`] seam, so every RPC
 //! handler works through the relay untouched (the port of zeron's `device-room-host.ts`).
+//! Replies larger than [`MAX_DEVICE_FRAME_BYTES`] are replaced with a correlated
+//! `{id, err}` frame at that seam: one oversize reply must not close the host socket.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -25,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{RpcClient, RpcError, RpcService, serve_connection};
+use crate::{RpcClient, RpcError, RpcService, ServerFrame, serve_connection};
 
 /// Relay-emitted control frames. MUST byte-match the DO's `RELAY_KIND` (yes, it has a
 /// leading space — clients compare with equality; a mismatch makes host_offline invisible).
@@ -34,6 +36,14 @@ pub const RELAY_KIND: &str = " relay";
 pub const NUDGE_KIND: &str = "nudge";
 /// The RPC stream over the relay: both `s` (stream id) and `k` (kind) are `"rpc"`.
 pub const RPC_KIND: &str = "rpc";
+
+/// Largest encoded device frame we put on the relay socket. The edge runtime
+/// closes WebSocket messages at 1 MiB, so a larger frame is a protocol
+/// violation — on the HOST socket it takes every virtual RPC connection
+/// multiplexed on it down with it. Keep headroom for the uleb128 length prefix
+/// and JSON header so a payload sized against this limit never crosses the
+/// transport cap.
+pub const MAX_DEVICE_FRAME_BYTES: usize = 1024 * 1024 - 4096;
 
 /// Relay error codes (payload `{"error": code}` on [`RELAY_KIND`] frames).
 pub const HOST_OFFLINE: &str = "host_offline";
@@ -441,6 +451,18 @@ struct VirtualConn {
     in_tx: mpsc::Sender<String>,
 }
 
+/// A reply that cannot ride the relay, correlated to its request: the caller
+/// sees an ordinary JSON-RPC error for that id instead of a dead host socket.
+fn correlated_reply_error(header: &DeviceFrameHeader, id: u64, reason: &str) -> Option<Vec<u8>> {
+    let frame = ServerFrame {
+        id,
+        err: Some(reason.to_string()),
+        ..Default::default()
+    };
+    let text = serde_json::to_string(&frame).ok()?;
+    encode_device_frame(header, text.as_bytes()).ok()
+}
+
 fn make_virtual_conn(
     service: Arc<dyn RpcService>,
     conn_id: String,
@@ -450,15 +472,84 @@ fn make_virtual_conn(
     let (srv_out_tx, mut srv_out_rx) = mpsc::channel::<String>(256);
     tokio::spawn(serve_connection(service, srv_out_tx, in_rx));
     tokio::spawn(async move {
+        // Streams whose oversize item was already replaced by an error: the
+        // client has been told, so drain the rest of that stream silently
+        // instead of emitting one transport error per remaining item.
+        let mut rejected_streams: HashSet<u64> = HashSet::new();
         while let Some(text) = srv_out_rx.recv().await {
+            if !rejected_streams.is_empty()
+                && let Ok(reply) = serde_json::from_str::<ServerFrame>(&text)
+                && rejected_streams.contains(&reply.id)
+            {
+                if reply.done {
+                    rejected_streams.remove(&reply.id);
+                }
+                continue;
+            }
             let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(conn_id.clone());
-            match encode_device_frame(&header, text.as_bytes()) {
+            let frame = match encode_device_frame(&header, text.as_bytes()) {
+                Ok(frame) if frame.len() <= MAX_DEVICE_FRAME_BYTES => frame,
                 Ok(frame) => {
-                    if host_out.send(frame).await.is_err() {
-                        break; // relay socket gone
+                    // Oversize reply: keep the relay socket (and every other
+                    // conn on it) alive by replacing it with a bounded,
+                    // correlated JSON-RPC error.
+                    let Ok(reply) = serde_json::from_str::<ServerFrame>(&text) else {
+                        tracing::error!(
+                            bytes = frame.len(),
+                            limit = MAX_DEVICE_FRAME_BYTES,
+                            "device-room: oversize relay reply without a parseable id; dropping"
+                        );
+                        continue;
+                    };
+                    if reply.item.is_some() {
+                        rejected_streams.insert(reply.id);
+                    }
+                    tracing::warn!(
+                        id = reply.id,
+                        bytes = frame.len(),
+                        limit = MAX_DEVICE_FRAME_BYTES,
+                        "device-room: relay reply exceeds the frame limit; sending a correlated error"
+                    );
+                    let reason = format!(
+                        "reply too large: {} bytes exceeds the {} byte relay frame limit",
+                        frame.len(),
+                        MAX_DEVICE_FRAME_BYTES
+                    );
+                    match correlated_reply_error(&header, reply.id, &reason) {
+                        Some(error) => error,
+                        None => {
+                            tracing::error!(
+                                id = reply.id,
+                                "device-room: correlated oversize error encode failed"
+                            );
+                            continue;
+                        }
                     }
                 }
-                Err(err) => tracing::error!(error = %err, "device-room: frame encode failed"),
+                Err(err) => {
+                    // Same rule for an unencodable reply: fail its own call
+                    // rather than let it ride out the link's silence lease.
+                    let Ok(reply) = serde_json::from_str::<ServerFrame>(&text) else {
+                        tracing::error!(error = %err, "device-room: frame encode failed");
+                        continue;
+                    };
+                    if reply.item.is_some() {
+                        rejected_streams.insert(reply.id);
+                    }
+                    tracing::error!(
+                        id = reply.id,
+                        error = %err,
+                        "device-room: frame encode failed; sending a correlated error"
+                    );
+                    let reason = format!("reply encoding failed: {err}");
+                    match correlated_reply_error(&header, reply.id, &reason) {
+                        Some(error) => error,
+                        None => continue,
+                    }
+                }
+            };
+            if host_out.send(frame).await.is_err() {
+                break; // relay socket gone
             }
         }
     });
@@ -539,9 +630,14 @@ async fn handle_host_frame(
         if let Some(from) = header.from {
             let reply = DeviceFrameHeader::new(ECHO_KIND, ECHO_KIND).with_to(from);
             match encode_device_frame(&reply, &payload) {
-                Ok(frame) => {
+                Ok(frame) if frame.len() <= MAX_DEVICE_FRAME_BYTES => {
                     let _ = out_tx.send(frame).await;
                 }
+                Ok(frame) => tracing::warn!(
+                    bytes = frame.len(),
+                    limit = MAX_DEVICE_FRAME_BYTES,
+                    "device-room: echo payload exceeds the frame limit; dropping"
+                ),
                 Err(err) => tracing::error!(error = %err, "device-room: echo encode failed"),
             }
         }
