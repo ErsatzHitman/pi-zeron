@@ -27,6 +27,8 @@ const BLOCKED: &str = "Blocked: Claude Fable and GPT Astra class models are rese
 
 pub struct AdvisorCard {
     state: Entity<AppState>,
+    /// The device whose `loop.json` is shown (`None` = this engine's own).
+    device: Option<String>,
     settings: Loadable<AdvisorSettings>,
     pickers: Vec<Entity<Pickers>>,
     error: Option<String>,
@@ -52,21 +54,28 @@ impl AdvisorCard {
             picked.push(cx.subscribe(
                 &picker,
                 move |this: &mut Self, _, event: &TitleModelPicked, cx| {
-                    // Pi's catalog ids are already `provider/id` specs.
-                    if let Some(model) = event.0.model.as_deref().and_then(advisor_settings::spec) {
-                        this.set_row(row, Some(model), cx);
-                    }
+                    // Pi's catalog ids are already `provider/id` specs; a pick
+                    // that is not one (Pi's own default row) clears the row.
+                    let model = crate::settings::picked_pi_model(event.0.model.as_deref());
+                    this.set_row(row, model, cx);
                 },
             ));
             pickers.push(picker);
         }
-        // Settings can open before the engine connects: load once it does.
-        let state_sub = cx.observe(&state, |this: &mut Self, _, cx| {
-            if matches!(this.settings, Loadable::Idle) {
+        // Settings can open before the engine connects: load once it does. A
+        // device switch is another `loop.json`: reload through it.
+        let state_sub = cx.observe(&state, |this: &mut Self, state, cx| {
+            let device = crate::settings::target_device(&state.read(cx));
+            if device != this.device {
+                this.device = device;
+                this.settings = Loadable::Idle;
+                this.call(None, cx);
+            } else if matches!(this.settings, Loadable::Idle) {
                 this.call(None, cx);
             }
         });
         let mut card = Self {
+            device: crate::settings::target_device(&state.read(cx)),
             state,
             settings: Loadable::Idle,
             pickers,
@@ -101,8 +110,9 @@ impl AdvisorCard {
         }
     }
 
-    /// `GetAdvisorSettings`, or `SetAdvisorSettings` when saving; either
-    /// reply is what the device's `loop.json` now sets.
+    /// `GetAdvisorSettings`, or `SetAdvisorSettings` when saving, at the
+    /// device whose `loop.json` this card shows; either reply is what that
+    /// file now sets.
     fn call(&mut self, save: Option<AdvisorSettings>, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -114,6 +124,7 @@ impl AdvisorCard {
             ),
             None => (methods::GET_ADVISOR_SETTINGS, serde_json::json!({})),
         };
+        let params = crate::settings::with_target_device(params, self.device.as_deref());
         if matches!(self.settings, Loadable::Idle) {
             self.settings = Loadable::Loading;
         }

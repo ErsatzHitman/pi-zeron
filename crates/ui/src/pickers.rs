@@ -1346,8 +1346,10 @@ impl Pickers {
     /// nor codex installed — user report: "can't load codex models/traits
     /// anywhere" from a Mac without codex).
     fn space_target(&self, cx: &App) -> Option<String> {
-        // Thread naming is this device's setting; so are its catalogs.
-        if self.title.is_some() {
+        // Thread naming is this device's setting; so are its catalogs. A Pi
+        // model setting (the advisor's, the default subagent's) is a file on
+        // the device the composer targets, so its catalogs come from there.
+        if self.title.is_some() && self.pi_only.is_none() {
             return None;
         }
         let state = self.state.read(cx);
@@ -8026,6 +8028,32 @@ mod tests {
             // Only the device switch re-targets the per-device catalogs; the
             // same-device projectless pick kept them.
             assert_eq!(pickers.target_generation, 1);
+        });
+    }
+
+    /// A Pi model setting (the advisor's, the default subagent's) lives on the
+    /// device the composer targets, so its picker's catalogs come from there;
+    /// thread naming stays this device's own.
+    #[gpui::test]
+    fn pi_model_settings_follow_the_composers_device_and_titles_do_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.selected_device = Some("remote".into());
+            state
+        });
+        let pi_model =
+            cx.new(|cx| Pickers::new_for_pi_model(state.clone(), None, "Pi default", cx));
+        let titles =
+            cx.new(|cx| Pickers::new_for_titles(state.clone(), TitleSettings::default(), cx));
+        pi_model.update(cx, |pickers, cx| {
+            assert_eq!(pickers.space_target(cx).as_deref(), Some("remote"));
+        });
+        titles.update(cx, |pickers, cx| {
+            assert_eq!(pickers.space_target(cx), None);
         });
     }
 

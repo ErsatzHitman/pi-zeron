@@ -21,6 +21,9 @@ const NO_SUBQ_KEY: &str = "Add a SubQ key in Settings → API keys: the gate can
 
 pub struct DecisionGateCard {
     state: Entity<AppState>,
+    /// The device whose `decisions-model.json` is shown (`None` = this
+    /// engine's own).
+    device: Option<String>,
     settings: Loadable<DecisionSettings>,
     model_select: widgets::SelectState,
     error: Option<String>,
@@ -30,13 +33,20 @@ pub struct DecisionGateCard {
 
 impl DecisionGateCard {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        // Settings can open before the engine connects: load once it does.
-        let state_sub = cx.observe(&state, |this: &mut Self, _, cx| {
-            if matches!(this.settings, Loadable::Idle) {
+        // Settings can open before the engine connects: load once it does. A
+        // device switch is another `decisions-model.json`: reload through it.
+        let state_sub = cx.observe(&state, |this: &mut Self, state, cx| {
+            let device = crate::settings::target_device(&state.read(cx));
+            if device != this.device {
+                this.device = device;
+                this.settings = Loadable::Idle;
+                this.call(None, cx);
+            } else if matches!(this.settings, Loadable::Idle) {
                 this.call(None, cx);
             }
         });
         let mut card = Self {
+            device: crate::settings::target_device(&state.read(cx)),
             state,
             settings: Loadable::Idle,
             model_select: widgets::SelectState::default(),
@@ -48,8 +58,9 @@ impl DecisionGateCard {
         card
     }
 
-    /// `GetDecisionSettings`, or `SetDecisionSettings` when saving; either
-    /// reply is what the device's `decisions-model.json` now sets.
+    /// `GetDecisionSettings`, or `SetDecisionSettings` when saving, at the
+    /// device whose `decisions-model.json` this card shows; either reply is
+    /// what that file now sets.
     fn call(&mut self, save: Option<DecisionModel>, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -61,6 +72,7 @@ impl DecisionGateCard {
             ),
             None => (methods::GET_DECISION_SETTINGS, serde_json::json!({})),
         };
+        let params = crate::settings::with_target_device(params, self.device.as_deref());
         if matches!(self.settings, Loadable::Idle) {
             self.settings = Loadable::Loading;
         }
