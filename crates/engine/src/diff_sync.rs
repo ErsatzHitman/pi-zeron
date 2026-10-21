@@ -86,6 +86,9 @@ const INTEREST_LINGER: Duration = Duration::from_secs(30);
 /// under this; a node_modules/vendored tree blows past it. The repair tick
 /// still covers skipped checkouts.
 const MAX_WATCH_DIRS: usize = 8_000;
+/// stderr kept from a git capture for its failure message; the rest is drained
+/// and dropped.
+const MAX_GIT_STDERR_BYTES: usize = 8 * 1024;
 /// `git hash-object -t tree /dev/null` — diff base for repos with no commits yet.
 const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -1252,13 +1255,69 @@ async fn capture_git_in<S: AsRef<OsStr>>(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+    let output = read_child(child, max_bytes).await?;
+    if !output.status.success() && !output.truncated {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
+        return Err(EngineError::Other(if message.is_empty() {
+            format!("git exited {}", output.status)
+        } else {
+            format!("git: {message}")
+        }));
+    }
+    Ok(Capture {
+        stdout: output.stdout,
+        truncated: output.truncated,
+    })
+}
+
+/// Everything one spawned git said, once it exited.
+struct ChildOutput {
+    stdout: Vec<u8>,
+    truncated: bool,
+    status: std::process::ExitStatus,
+    stderr: Vec<u8>,
+}
+
+/// Read a spawned child's pipes to EOF: stdout under `max_bytes` (the child is
+/// killed once the cap is hit), stderr drained alongside it, keeping only its
+/// first [`MAX_GIT_STDERR_BYTES`] for the failure message.
+///
+/// stderr must be drained *while* stdout is read. git warns freely — Windows
+/// CRLF conversions most of all — and a child blocked writing into a full
+/// stderr pipe never closes stdout, so reading stdout to EOF first would hang
+/// the capture forever.
+async fn read_child(
+    mut child: tokio::process::Child,
+    max_bytes: usize,
+) -> Result<ChildOutput, EngineError> {
     let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| EngineError::Other("git stderr unavailable".into()))?;
+    let drain = tokio::spawn(async move {
+        let mut kept: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; 8 * 1024];
+        loop {
+            match stderr.read(&mut buf).await {
+                Ok(0) => return kept,
+                // Past the cap the warnings are still drained (a blocked child
+                // would never exit), just not kept.
+                Ok(n) => {
+                    let room = MAX_GIT_STDERR_BYTES.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+                Err(_) => return kept,
+            }
+        }
+    });
     let mut out: Vec<u8> = Vec::new();
     // Keep the read buffer out of nested async state: inline storage grows
     // every caller's future and can overflow a standard RPC worker's stack.
@@ -1281,22 +1340,15 @@ async fn capture_git_in<S: AsRef<OsStr>>(
         }
         out.extend_from_slice(&buf[..n]);
     }
-    let output = child
-        .wait_with_output()
+    let status = child
+        .wait()
         .await
         .map_err(|e| EngineError::Other(format!("git wait failed: {e}")))?;
-    if !output.status.success() && !truncated {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let message = stderr.trim();
-        return Err(EngineError::Other(if message.is_empty() {
-            format!("git exited {}", output.status)
-        } else {
-            format!("git: {message}")
-        }));
-    }
-    Ok(Capture {
+    Ok(ChildOutput {
         stdout: out,
         truncated,
+        status,
+        stderr: drain.await.unwrap_or_default(),
     })
 }
 
@@ -2659,5 +2711,60 @@ mod watch_budget_tests {
         // A self-referential symlink cycle must not send the walk into a spin.
         std::os::unix::fs::symlink(root.join("real"), root.join("real/inner/loop")).unwrap();
         assert!(!exceeds_watch_budget(root)); // terminates, under budget
+    }
+}
+
+#[cfg(all(test, unix))]
+mod capture_tests {
+    use super::{MAX_GIT_STDERR_BYTES, read_child};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::process::Command;
+
+    /// git warns freely (Windows CRLF conversions most of all). A capture that
+    /// waits for stdout to close while leaving stderr undrained hangs as soon
+    /// as the warnings outgrow one pipe buffer.
+    #[tokio::test]
+    async fn a_noisy_stderr_does_not_stall_the_capture() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            // ~128 KiB of stderr — twice a 64 KiB pipe buffer — then stdout.
+            .arg(
+                "i=0; while [ $i -lt 2048 ]; do \
+                 printf '%032d warning: LF will be replaced by CRLF\\n' \"$i\" >&2; \
+                 i=$((i+1)); done; printf hello",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().expect("spawn sh");
+        let output = tokio::time::timeout(Duration::from_secs(30), read_child(child, 1024))
+            .await
+            .expect("a noisy stderr must not deadlock the capture")
+            .expect("capture");
+        assert_eq!(output.stdout, b"hello");
+        assert!(!output.truncated);
+        assert!(output.status.success());
+        // Only the message-sized head is kept.
+        assert_eq!(output.stderr.len(), MAX_GIT_STDERR_BYTES);
+    }
+
+    /// The stdout ceiling still ends the capture early: the child is killed and
+    /// exactly `max_bytes` are kept.
+    #[tokio::test]
+    async fn stdout_over_the_cap_truncates_and_kills() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("i=0; while [ $i -lt 4096 ]; do printf '0123456789abcdef'; i=$((i+1)); done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().expect("spawn sh");
+        let output = tokio::time::timeout(Duration::from_secs(30), read_child(child, 4096))
+            .await
+            .expect("capped capture must not wait for the whole stream")
+            .expect("capture");
+        assert!(output.truncated);
+        assert_eq!(output.stdout.len(), 4096);
     }
 }
