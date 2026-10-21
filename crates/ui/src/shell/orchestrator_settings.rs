@@ -6,9 +6,35 @@
 //! (`zeron_proto::orchestrator_project`).
 
 use super::*;
+use crate::settings::widgets;
 use std::collections::{HashMap, HashSet};
+use zeron_proto::Model;
 use zeron_proto::orchestrator;
-use zeron_proto::orchestrator_project::{MemoryNote, OrchestratorProject, TreePolicy, dollars};
+use zeron_proto::orchestrator_project::{
+    ALLOWED_MODELS_MAX, MemoryNote, OrchestratorProject, TreePolicy, dollars,
+};
+
+/// Model rows the picker shows at once; the filter narrows the catalog, and
+/// its list scrolls for the rest.
+const PICKER_ROWS: usize = 60;
+
+/// The allow-list with `model` added once: ids compare case-insensitively, as
+/// the policy's own check does, and it stops at the policy's cap.
+fn with_model(mut models: Vec<String>, model: &str) -> Vec<String> {
+    let known = models.iter().any(|m| m.eq_ignore_ascii_case(model));
+    if !known && models.len() < ALLOWED_MODELS_MAX {
+        models.push(model.to_owned());
+    }
+    models
+}
+
+/// The allow-list without its `ix`th model.
+fn without_model(mut models: Vec<String>, ix: usize) -> Vec<String> {
+    if ix < models.len() {
+        models.remove(ix);
+    }
+    models
+}
 
 pub(super) struct OrchestratorSettingsDialog {
     root_id: String,
@@ -17,7 +43,14 @@ pub(super) struct OrchestratorSettingsDialog {
     instructions: Entity<ComposerInput>,
     heavy: Entity<ComposerInput>,
     writers: Entity<ComposerInput>,
-    models: Entity<ComposerInput>,
+    /// Pi's model catalog: what the allowed-models picker offers.
+    catalog: Loadable<Vec<Model>>,
+    /// The picker's filter, while it is open.
+    model_search: Entity<ComposerInput>,
+    /// Whether the allowed-models picker is open, and its filter still to be
+    /// focused once it draws.
+    picking_models: bool,
+    model_focus_pending: bool,
     cap: Entity<ComposerInput>,
     /// The policy as loaded: what the form leaves out (the warning
     /// percentage) is saved unchanged.
@@ -29,6 +62,7 @@ pub(super) struct OrchestratorSettingsDialog {
     error: Option<String>,
     focus_pending: bool,
     _load: Option<Task<()>>,
+    _catalog: Option<Task<()>>,
     _events: Vec<Subscription>,
 }
 
@@ -66,18 +100,11 @@ fn policy_from_form(
         }
         Some((dollars * 100.0).round() as u64)
     };
-    let allowed_models = dialog
-        .models
-        .read(cx)
-        .text()
-        .split([',', '\n'])
-        .map(|model| model.trim().to_owned())
-        .filter(|model| !model.is_empty())
-        .collect();
+    // The allow-list is edited with the picker (and kept in `policy`), so it
+    // needs no parsing here.
     Ok(TreePolicy {
         heavy_command_limit,
         writer_limit,
-        allowed_models,
         spend_cap_cents,
         ..dialog.policy.clone()
     })
@@ -192,9 +219,10 @@ impl Shell {
         };
         let heavy = rule("No limit", cx);
         let writers = rule("No limit", cx);
-        let models = rule("Any model, or ids separated by commas", cx);
         let cap = rule("No cap, or dollars such as 25", cx);
-        let events = [&name, &goal]
+        let model_search =
+            cx.new(|cx| ComposerInput::new("Search Pi's models", cx).with_single_line());
+        let mut events: Vec<Subscription> = [&name, &goal]
             .into_iter()
             .map(|input| {
                 cx.subscribe(input, |this: &mut Shell, _, event, cx| {
@@ -204,6 +232,13 @@ impl Shell {
                 })
             })
             .collect();
+        // Typing in the picker's filter narrows its list.
+        events.push(cx.subscribe(&model_search, |_: &mut Shell, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                cx.notify();
+            }
+        }));
+        let catalog_engine = engine.clone();
         let load_root = root_id.clone();
         let load = cx.spawn(async move |this, cx| {
             let reply = engine
@@ -240,9 +275,6 @@ impl Shell {
                         dialog.writers.update(cx, |input, cx| {
                             input.set_text(text(policy.writer_limit.map(|n| n.to_string())), cx)
                         });
-                        dialog.models.update(cx, |input, cx| {
-                            input.set_text(policy.allowed_models.join(", "), cx)
-                        });
                         dialog.cap.update(cx, |input, cx| {
                             input.set_text(
                                 text(policy.spend_cap_cents.map(|c| dollars(c).replace('$', ""))),
@@ -263,6 +295,41 @@ impl Shell {
             })
             .ok();
         });
+        // The picker offers what Pi actually runs, so an allow-list can only
+        // name a model the catalog has.
+        let catalog_root = root_id.clone();
+        let device = self.state.read(cx).effective_device_id();
+        let catalog = cx.spawn(async move |this, cx| {
+            let params = match device {
+                Some(device) => serde_json::json!({
+                    "harness": HarnessId::Pi,
+                    "targetDeviceId": device,
+                }),
+                None => serde_json::json!({ "harness": HarnessId::Pi }),
+            };
+            let reply = catalog_engine
+                .client()
+                .call(methods::LIST_MODELS, params)
+                .await;
+            this.update(cx, |shell, cx| {
+                let Some(dialog) = shell
+                    .orchestrator_settings
+                    .as_mut()
+                    .filter(|dialog| dialog.root_id == catalog_root)
+                else {
+                    return;
+                };
+                dialog.catalog = match reply {
+                    Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
+                        Ok(models) => Loadable::Ready(models),
+                        Err(err) => Loadable::Error(err.to_string()),
+                    },
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        });
         self.orchestrator_settings = Some(OrchestratorSettingsDialog {
             root_id,
             name,
@@ -270,7 +337,10 @@ impl Shell {
             instructions,
             heavy,
             writers,
-            models,
+            catalog: Loadable::Idle,
+            model_search,
+            picking_models: false,
+            model_focus_pending: false,
             cap,
             policy: TreePolicy::default(),
             original_name,
@@ -280,6 +350,7 @@ impl Shell {
             error: None,
             focus_pending: true,
             _load: Some(load),
+            _catalog: Some(catalog),
             _events: events,
         });
         cx.notify();
@@ -363,6 +434,39 @@ impl Shell {
             }
             cx.notify();
         }
+    }
+
+    /// Show or hide the allowed-models picker; closing it clears the filter.
+    fn toggle_orchestrator_model_picker(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.orchestrator_settings.as_mut() else {
+            return;
+        };
+        dialog.picking_models = !dialog.picking_models;
+        dialog.model_focus_pending = dialog.picking_models;
+        if !dialog.picking_models {
+            dialog
+                .model_search
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+        }
+        cx.notify();
+    }
+
+    /// Hold the tree to `model`, one picked from Pi's catalog.
+    fn allow_orchestrator_model(&mut self, model: String, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.orchestrator_settings.as_mut() {
+            dialog.policy.allowed_models =
+                with_model(std::mem::take(&mut dialog.policy.allowed_models), &model);
+        }
+        cx.notify();
+    }
+
+    /// Drop the `ix`th model from the allow-list (an empty list allows any).
+    fn disallow_orchestrator_model(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.orchestrator_settings.as_mut() {
+            dialog.policy.allowed_models =
+                without_model(std::mem::take(&mut dialog.policy.allowed_models), ix);
+        }
+        cx.notify();
     }
 
     fn forget_orchestrator_note(&mut self, note_id: String, cx: &mut Context<Self>) {
@@ -543,6 +647,9 @@ impl Shell {
         if std::mem::take(&mut dialog.focus_pending) {
             window.focus(&dialog.goal.focus_handle(cx), cx);
         }
+        if std::mem::take(&mut dialog.model_focus_pending) {
+            window.focus(&dialog.model_search.focus_handle(cx), cx);
+        }
         let root_id = dialog.root_id.clone();
         let paused = self.orchestrator_projects.paused(&root_id);
         let (name, goal, instructions) = (
@@ -552,12 +659,16 @@ impl Shell {
         );
         let (loaded, saving, error) = (dialog.loaded, dialog.saving, dialog.error.clone());
         let notes: Vec<MemoryNote> = dialog.memory.clone();
-        let (heavy, writers, models, cap) = (
+        let (heavy, writers, cap, model_search) = (
             dialog.heavy.clone(),
             dialog.writers.clone(),
-            dialog.models.clone(),
             dialog.cap.clone(),
+            dialog.model_search.clone(),
         );
+        let allowed: Vec<String> = dialog.policy.allowed_models.clone();
+        let catalog = dialog.catalog.clone();
+        let picking = dialog.picking_models;
+        let query = model_search.read(cx).text().trim().to_lowercase();
         let (github_only, preflight) = (
             dialog.policy.github_only_tests,
             dialog.policy.require_preflight,
@@ -626,6 +737,189 @@ impl Shell {
                 .text_color(theme.text_muted)
                 .child(SharedString::from(text.to_owned()))
         };
+        // The allow-list: a chip per model, and a picker over Pi's catalog, so
+        // a rule can only name a model Pi actually runs.
+        let chips: Vec<AnyElement> = allowed
+            .iter()
+            .enumerate()
+            .map(|(ix, model)| {
+                let model = model.clone();
+                let offered = match &catalog {
+                    Loadable::Ready(models) => models.iter().any(|row| row.id == model),
+                    _ => true,
+                };
+                div()
+                    .id(SharedString::from(format!("orchestrator-allowed-{model}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded_full()
+                    .bg(theme.wash(0.08))
+                    .text_size(crate::typography::ui_rems(11.5))
+                    .text_color(if offered { theme.text } else { theme.warning })
+                    .tooltip(crate::settings::widgets::text_tooltip(if offered {
+                        "Allowed in this tree; remove it to allow any model again"
+                    } else {
+                        "Not in Pi's catalog any more"
+                    }))
+                    .child(SharedString::from(model.clone()))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("orchestrator-forbid-{model}")))
+                            .flex_none()
+                            .cursor_pointer()
+                            .role(gpui::Role::Button)
+                            .tooltip(crate::settings::widgets::text_tooltip("Remove"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.disallow_orchestrator_model(ix, cx)
+                            }))
+                            .child(
+                                icon(icons::CLOSE)
+                                    .size(px(12.0))
+                                    .text_color(theme.text_faint),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let catalog_rows: Vec<AnyElement> = match &catalog {
+            Loadable::Ready(models) => models
+                .iter()
+                .filter(|row| {
+                    query.is_empty()
+                        || row.id.to_lowercase().contains(&query)
+                        || row.label.to_lowercase().contains(&query)
+                })
+                .take(PICKER_ROWS)
+                .map(|row| {
+                    let id = row.id.clone();
+                    let chosen = allowed.iter().any(|model| model == &id);
+                    let row_id: SharedString = format!("orchestrator-model-{id}").into();
+                    widgets::select_row(&theme, chosen, false, row_id.clone())
+                        .id(row_id)
+                        .role(gpui::Role::MenuItemRadio)
+                        .aria_label(row.label.clone())
+                        .aria_toggled(if chosen {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.allow_orchestrator_model(id.clone(), cx)
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(row.label.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(crate::typography::ui_rems(10.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(row.id.clone())),
+                        )
+                        .child(widgets::select_check(&theme, chosen))
+                        .into_any_element()
+                })
+                .collect(),
+            Loadable::Error(err) => vec![
+                div()
+                    .px(px(4.0))
+                    .py(px(6.0))
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(theme.danger)
+                    .child(SharedString::from(format!(
+                        "Pi's models could not be listed: {err}"
+                    )))
+                    .into_any_element(),
+            ],
+            _ => vec![
+                div()
+                    .px(px(4.0))
+                    .py(px(6.0))
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("Loading Pi's models…"))
+                    .into_any_element(),
+            ],
+        };
+        let full = allowed.len() >= ALLOWED_MODELS_MAX;
+        let allowed_models = popover::dialog_field(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .when(allowed.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(
+                                "Any model. Add some to hold the whole tree to them.",
+                            )),
+                    )
+                })
+                .when(!allowed.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(6.0))
+                            .children(chips),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .when(full, |el| {
+                            el.child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(11.5))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from(format!(
+                                        "At most {ALLOWED_MODELS_MAX} models"
+                                    ))),
+                            )
+                        })
+                        .child(
+                            popover::btn_ghost(
+                                &theme,
+                                if picking { "Done" } else { "Add a model…" },
+                                "orchestrator-add-model",
+                            )
+                            .id("orchestrator-add-model")
+                            .when(full, |el| el.opacity(0.5))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_orchestrator_model_picker(cx)
+                            })),
+                        ),
+                )
+                .when(picking, |el| {
+                    el.child(popover::dialog_field(model_search.into_any_element()))
+                        .child(
+                            div()
+                                .id("orchestrator-model-list")
+                                .max_h(px(160.0))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .children(catalog_rows),
+                        )
+                })
+                .into_any_element(),
+        );
         let memory = if notes.is_empty() {
             div()
                 .text_size(crate::typography::ui_rems(12.0))
@@ -716,7 +1010,7 @@ impl Shell {
             .child(label("Writing sessions at once (1-16)"))
             .child(popover::dialog_field(writers.into_any_element()))
             .child(label("Allowed models"))
-            .child(popover::dialog_field(models.into_any_element()))
+            .child(allowed_models)
             .child(label("Spending cap in dollars, all sessions together"))
             .child(popover::dialog_field(cap.into_any_element()))
             .child(label("Memory"))
@@ -866,6 +1160,26 @@ fn fold_stop_report(report: &mut serde_json::Value, more: serde_json::Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_allow_list_takes_a_model_once_and_gives_it_back() {
+        let models = with_model(Vec::new(), "anthropic/claude-sonnet-5");
+        let models = with_model(models, "anthropic/claude-sonnet-5");
+        assert_eq!(models, ["anthropic/claude-sonnet-5"], "no repeats");
+        let models = with_model(models, "openai/gpt-5.6");
+        assert_eq!(models, ["anthropic/claude-sonnet-5", "openai/gpt-5.6"]);
+        assert_eq!(without_model(models, 0), ["openai/gpt-5.6"]);
+        assert!(without_model(Vec::new(), 3).is_empty(), "nothing to remove");
+    }
+
+    #[test]
+    fn the_allow_list_stops_at_the_policys_cap() {
+        let mut models = Vec::new();
+        for n in 0..ALLOWED_MODELS_MAX + 4 {
+            models = with_model(models, &format!("openai/model-{n}"));
+        }
+        assert_eq!(models.len(), ALLOWED_MODELS_MAX);
+    }
 
     #[test]
     fn the_stop_toast_says_what_stopped_and_what_did_not() {
