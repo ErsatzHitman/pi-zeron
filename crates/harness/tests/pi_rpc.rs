@@ -1154,6 +1154,63 @@ async fn a_model_switch_applies_to_the_live_process() {
 }
 
 #[tokio::test]
+async fn a_refused_model_switch_keeps_pi_and_still_delivers_the_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    let mut opening = request(dir.path(), "which-model");
+    opening.model = Some("mock/mock".into());
+    let mut switched = opening.clone();
+    switched.model = Some("mock/mock-2".into());
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(opening, c)
+        .await
+        .unwrap();
+    let mut text = String::new();
+    let mut errors = Vec::new();
+    let mut statuses = Vec::new();
+    let mut started = 0;
+    while statuses.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match event {
+            AgentEvent::SessionStarted { .. } => started += 1,
+            AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+            AgentEvent::Error { message } => errors.push(message),
+            AgentEvent::Done { status, .. } => {
+                statuses.push(status);
+                text.push('|');
+                if statuses.len() == 1 {
+                    // Pi's catalog lost the model between the two messages.
+                    std::fs::write(dir.path().join("refuse-model"), "").unwrap();
+                    tx.send(SteerMessage {
+                        config: Some(Box::new(switched.clone())),
+                        ..SteerMessage::text("which-model")
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+            _ => {}
+        }
+    }
+    // The message went out on the settings Pi already had, and the process
+    // (with its background work) never went away.
+    assert_eq!(started, 1);
+    assert_eq!(statuses, vec![DoneStatus::Completed; 2]);
+    assert!(text.contains("reply:mock/medium|reply:mock/medium|"), "{text}");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Could not apply") && error.contains("mock-2")),
+        "{errors:?}"
+    );
+}
+
+#[tokio::test]
 async fn pi_older_than_1_1_is_refused_with_a_clear_error() {
     let dir = tempfile::tempdir().unwrap();
     #[cfg(windows)]

@@ -371,7 +371,8 @@ pub(super) async fn review(
         false,
         Some("zeron-ysk"),
         false,
-    )?;
+    )
+    .await?;
     let result = async {
         let mut backlog = vec![];
         process

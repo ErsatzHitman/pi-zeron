@@ -245,6 +245,13 @@ fn main() {
                 response(&v, json!({"levels":["off","low","medium","high"]}))
             }
             "set_model" => {
+                // A model that disappeared from the provider's catalog.
+                if std::path::Path::new("refuse-model").exists() {
+                    emit(
+                        json!({"type":"response","id":v["id"],"command":"set_model","success":false,"error":format!("Model {} is not available", v["modelId"].as_str().unwrap_or(""))}),
+                    );
+                    continue;
+                }
                 model = v["modelId"].as_str().unwrap().into();
                 response(
                     &v,

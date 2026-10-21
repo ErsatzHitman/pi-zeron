@@ -160,6 +160,28 @@ impl PiHarness {
         check_version(&exe, &version)?;
         Ok((exe, version))
     }
+    /// [`Self::verified_executable`] for the async callers: the `--version`
+    /// probe can wait seconds (Pi run from source) and must not stall a
+    /// runtime worker.
+    async fn verified_executable_async(&self) -> Result<(PathBuf, semver::Version), HarnessError> {
+        let exe = self.resolve_executable()?;
+        let probe = {
+            let exe = exe.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::executable::binary_version_within(&exe, VERSION_PROBE)
+            })
+            .await
+            .map_err(|error| HarnessError::Protocol(format!("Pi version probe failed: {error}")))?
+        };
+        let version = probe.ok_or_else(|| {
+            HarnessError::NotInstalled(format!(
+                "Could not read the Pi version from {} (`--version` failed)",
+                exe.display()
+            ))
+        })?;
+        check_version(&exe, &version)?;
+        Ok((exe, version))
+    }
     /// `models`: `Some(force)` reads the model catalog, refreshing it first
     /// (from the network, past Pi's freshness window when `force`); `None`
     /// reads the commands.
@@ -179,7 +201,7 @@ impl PiHarness {
             },
             _ => None,
         };
-        let mut process = self.spawn(cwd, &args, None, false, None, false)?;
+        let mut process = self.spawn(cwd, &args, None, false, None, false).await?;
         let (mut tx, rx) = tokio::sync::oneshot::channel();
         let grace = self.kill_grace;
         tokio::spawn(async move {
@@ -208,7 +230,7 @@ impl PiHarness {
     }
     /// `usage_surface` names the run in Pi's usage ledger. A `read_only`
     /// run has the guard block every edit (see `guard.mjs`).
-    fn spawn(
+    async fn spawn(
         &self,
         cwd: &Path,
         args: &[String],
@@ -217,7 +239,7 @@ impl PiHarness {
         usage_surface: Option<&str>,
         read_only: bool,
     ) -> Result<Process, HarnessError> {
-        let (exe, _) = self.verified_executable()?;
+        let (exe, _) = self.verified_executable_async().await?;
         let mut cmd = Command::new(&exe);
         // Process group plus the same env scrubbing the ACP launch applied.
         crate::process::owned::configure(&mut cmd);
@@ -630,7 +652,8 @@ impl Harness for PiHarness {
             false,
             Some(usage_surface),
             false,
-        )?;
+        )
+        .await?;
         let grace = self.kill_grace;
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
@@ -725,7 +748,8 @@ impl Harness for PiHarness {
             true,
             None,
             request.sandbox == zeron_proto::SandboxLevel::ReadOnly,
-        )?;
+        )
+        .await?;
         let commands_cache = (
             self.commands.clone(),
             self.commands_file(),
@@ -1498,19 +1522,39 @@ impl Runner {
                     if let Some(mut steer) = self.queued.pop_front() {
                         // A changed model or thinking level applies on the
                         // live process before the message it was sent with.
+                        // A refusal is the user's setting being unavailable,
+                        // not a broken Pi: the message still goes, on the
+                        // settings the process already runs, and it is
+                        // reported. Ending the run here would take Pi, its
+                        // extensions and their background work down with it.
                         if let Some(next) = &steer.config {
                             let mut backlog = vec![];
-                            self.configure(next, &mut backlog).await?;
-                            self.request.model = next.model.clone();
-                            if let Some(model) = next.model.clone().filter(|m| m != "default") {
-                                self.live_model = Some(model);
-                            }
-                            self.request.reasoning = next.reasoning;
-                            self.request.model_options = next.model_options.clone();
+                            let applied = self.configure(next, &mut backlog).await;
                             for frame in backlog {
                                 self.frame(frame).await?;
                             }
-                            // Applied: a resend must not configure again.
+                            match applied {
+                                Ok(()) => {
+                                    self.request.model = next.model.clone();
+                                    if let Some(model) =
+                                        next.model.clone().filter(|m| m != "default")
+                                    {
+                                        self.live_model = Some(model);
+                                    }
+                                    self.request.reasoning = next.reasoning;
+                                    self.request.model_options = next.model_options.clone();
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "Pi refused the queued model or thinking level; sending the message with the current settings");
+                                    self.emit(AgentEvent::Error {
+                                        message: format!(
+                                            "Could not apply the selected model or thinking level: {error}"
+                                        ),
+                                    })
+                                    .await?;
+                                }
+                            }
+                            // Done with: a resend must not configure again.
                             steer.config = None;
                         }
                         let was_active = self.active;
