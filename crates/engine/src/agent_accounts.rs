@@ -784,6 +784,48 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
+/// The live logins one list detected, snapshotting them into their slots —
+/// everything the rows need except usage, which is probed (outside the ops
+/// lock) and read from the cache when [`AgentAccounts::assemble`] builds them.
+struct LiveView {
+    warnings: Vec<AgentAccountWarning>,
+    /// Per agent, the live logins' account keys — one for single-login
+    /// agents, one per model provider for OpenCode / Pi.
+    active_keys: HashMap<HarnessId, std::collections::HashSet<String>>,
+    /// Live logins listed without a slot: credentials unreadable (Keychain
+    /// denied) or identity unresolvable (an opaque token whose profile call
+    /// failed). Active, never switchable.
+    unreadable: Vec<(HarnessId, Detected)>,
+    providers: Vec<(HarnessId, Vec<Slot>)>,
+    /// Every OpenCode Go key with whether Pi uses it now.
+    go_keys: Vec<(Slot, bool)>,
+    antigravity: Option<AntigravityLogin>,
+}
+
+impl LiveView {
+    /// Every `(harness, slot, in-use)` a forced list probes.
+    fn usage_targets(&self) -> Vec<(HarnessId, &Slot, bool)> {
+        self.providers
+            .iter()
+            .flat_map(|(harness, slots)| {
+                let active = self.active_keys.get(harness);
+                slots.iter().map(move |slot| {
+                    (
+                        *harness,
+                        slot,
+                        active.is_some_and(|keys| keys.contains(&slot.account_key)),
+                    )
+                })
+            })
+            .chain(
+                self.go_keys
+                    .iter()
+                    .map(|(slot, in_use)| (HarnessId::Pi, slot, *in_use)),
+            )
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentAccounts {
     inner: Arc<Inner>,
@@ -902,12 +944,36 @@ impl AgentAccounts {
     /// accounts concurrently — skipping any still inside a Retry-After /
     /// backoff window or probed in the last [`FORCED_MIN_INTERVAL`].
     pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
-        let _ops = self.inner.ops.lock().await;
-        self.list_locked(force_usage).await
+        // Detection and snapshotting are the local inspect-then-mutate work
+        // [`Inner::ops`] exists to serialise. The probes a forced list runs are
+        // network calls (up to [`HTTP_TIMEOUT`] each): they run OUTSIDE the
+        // lock, so the Accounts page and the footer never queue behind a
+        // forced refresh — another window's, or the page's own paint-then-
+        // refresh. A probe writes back only the state it refreshed (its own
+        // slot, its own usage entry — atomically, so never a torn file), never
+        // a store, and overlapping forced lists share one probe per account
+        // (see `refresh_usage`).
+        let view = {
+            let _ops = self.inner.ops.lock().await;
+            self.detect_live().await?
+        };
+        if force_usage {
+            let targets = view.usage_targets();
+            self.refresh_usage(&targets).await;
+        }
+        Ok(self.assemble(view))
     }
 
-    /// Caller holds [`Inner::ops`].
-    async fn list_locked(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
+    /// A plain list for callers that already hold [`Inner::ops`] (activate /
+    /// forget): no probing, so the lock is never held across the network.
+    async fn list_locked(&self) -> Result<AgentAccountsSnapshot, EngineError> {
+        let view = self.detect_live().await?;
+        Ok(self.assemble(view))
+    }
+
+    /// Detect the live logins and snapshot them into their slots. Caller holds
+    /// [`Inner::ops`].
+    async fn detect_live(&self) -> Result<LiveView, EngineError> {
         let mut warnings: Vec<AgentAccountWarning> = Vec::new();
         // Per agent, the live logins' account keys — one for single-login
         // agents, one per model provider for OpenCode / Pi.
@@ -997,29 +1063,24 @@ impl AgentAccounts {
         let (hermes, hermes_active) = self.hermes_slots();
         active_keys.insert(HarnessId::Hermes, hermes_active);
         providers.push((HarnessId::Hermes, hermes));
-        let go_keys = self.opencode_go_keys();
-        if force_usage {
-            let targets: Vec<(HarnessId, &Slot, bool)> = providers
-                .iter()
-                .flat_map(|(harness, slots)| {
-                    let active = active_keys.get(harness);
-                    slots.iter().map(move |slot| {
-                        (
-                            *harness,
-                            slot,
-                            active.is_some_and(|keys| keys.contains(&slot.account_key)),
-                        )
-                    })
-                })
-                .chain(go_keys.iter().map(|(slot, in_use)| (HarnessId::Pi, slot, *in_use)))
-                .collect();
-            self.refresh_usage(&targets).await;
-            // A probe can teach a slot who it is (Devin's key file names no
-            // one): show that in this very list.
-            for (harness, slots) in providers.iter_mut() {
-                if *harness == HarnessId::Devin {
-                    *slots = self.read_slots(*harness);
-                }
+        Ok(LiveView {
+            warnings,
+            active_keys,
+            unreadable,
+            providers,
+            go_keys: self.opencode_go_keys(),
+            antigravity,
+        })
+    }
+
+    /// The rows for one detected view, with the usage cache as it now stands.
+    fn assemble(&self, view: LiveView) -> AgentAccountsSnapshot {
+        let mut providers = view.providers;
+        // A probe can teach a slot who it is (Devin's key file names no one):
+        // show that in this very list.
+        for (harness, slots) in providers.iter_mut() {
+            if *harness == HarnessId::Devin {
+                *slots = self.read_slots(*harness);
             }
         }
         let now = now_ms();
@@ -1027,7 +1088,7 @@ impl AgentAccounts {
         let mut accounts: Vec<AgentAccount> = Vec::new();
         for (harness, slots) in &providers {
             let harness = *harness;
-            let active_set = active_keys.get(&harness);
+            let active_set = view.active_keys.get(&harness);
             for slot in slots {
                 let active = active_set.is_some_and(|keys| keys.contains(&slot.account_key));
                 let entry = usage.get(&usage_key(harness, &slot.account_key));
@@ -1068,7 +1129,7 @@ impl AgentAccounts {
             }
             // A live login whose credentials we couldn't read has no slot — still
             // show it (active, but not re-activatable until the Keychain relents).
-            for (_, u) in unreadable.iter().filter(|(h, _)| *h == harness) {
+            for (_, u) in view.unreadable.iter().filter(|(h, _)| *h == harness) {
                 if slots.iter().any(|s| s.account_key == u.account_key) {
                     continue;
                 }
@@ -1092,7 +1153,7 @@ impl AgentAccounts {
         }
         // Every OpenCode Go key, each with its own quota: the one Pi uses
         // now is the active row (the footer reads it); none switches here.
-        for (slot, in_use) in &go_keys {
+        for (slot, in_use) in &view.go_keys {
             let entry = usage.get(&usage_key(HarnessId::Pi, &slot.account_key));
             accounts.push(AgentAccount {
                 id: slot.id.clone(),
@@ -1125,10 +1186,13 @@ impl AgentAccounts {
         }
         // Antigravity keeps exactly one login whose token zeron never reads:
         // one active, unswitchable row, and no usage (it has no quota view).
-        if let Some(login) = antigravity {
+        if let Some(login) = view.antigravity {
             accounts.push(login.account());
         }
-        Ok(AgentAccountsSnapshot { accounts, warnings })
+        AgentAccountsSnapshot {
+            accounts,
+            warnings: view.warnings,
+        }
     }
 
     // ── swap ────────────────────────────────────────────────────────────────
@@ -1157,7 +1221,7 @@ impl AgentAccounts {
         // The pre-swap snapshot must hold the CURRENT tokens (the CLI may have
         // rotated its refresh token seconds ago) — never a cached read.
         *lock(&self.inner.claude_credentials) = None;
-        self.list_locked(false).await?;
+        self.list_locked().await?;
         let slot = self
             .read_slots(harness)
             .into_iter()
@@ -1188,7 +1252,7 @@ impl AgentAccounts {
             }
         }
         *lock(&self.inner.claude_credentials) = None;
-        self.list_locked(false).await
+        self.list_locked().await
     }
 
     async fn activate_claude(&self, slot: &Slot) -> Result<(), EngineError> {
@@ -1424,7 +1488,7 @@ impl AgentAccounts {
             ));
         }
         let _ops = self.inner.ops.lock().await;
-        let snapshot = self.list_locked(false).await?;
+        let snapshot = self.list_locked().await?;
         let row = snapshot
             .accounts
             .iter()
@@ -1457,7 +1521,7 @@ impl AgentAccounts {
         if file.exists() {
             std::fs::remove_file(&file)?;
         }
-        self.list_locked(false).await
+        self.list_locked().await
     }
 
     // ── add-account OAuth flows ─────────────────────────────────────────────

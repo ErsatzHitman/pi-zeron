@@ -2303,3 +2303,73 @@ async fn a_failed_sign_ins_output_is_redacted_before_the_ui_sees_it() {
         "failed at https://auth.x.ai/device?… with code [code] token=[redacted]"
     );
 }
+
+// ── the ops lock and the network ────────────────────────────────────────────
+
+/// A forced list probes every account: those probes are network calls, so
+/// they must run OUTSIDE the global ops lock — the Accounts page and the
+/// footer list while one is in flight instead of queueing behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forced_list_probes_outside_the_ops_lock() {
+    // The probe hangs inside the handler until the test releases it, so it is
+    // provably in flight while the assertions below run.
+    let (arrived_tx, mut arrived) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let server = MockServer::start(move |_method, path, _body| {
+        assert!(
+            path.ends_with("SeatManagementService/GetUserStatus"),
+            "{path}"
+        );
+        let _ = arrived_tx.send(());
+        let _ = lock(&release_rx).recv();
+        (
+            200,
+            serde_json::json!({ "userStatus": {
+                "email": "dev@devin.ai",
+                "planStatus": { "dailyQuotaRemainingPercent": 50 },
+            }})
+            .to_string(),
+        )
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    write(
+        &config.devin_credentials_file,
+        &format!(
+            "windsurf_api_key = \"key-a\"\napi_server_url = \"{}\"\n",
+            server.base
+        ),
+    );
+
+    let forced = tokio::spawn({
+        let accounts = accounts.clone();
+        async move { accounts.list(true).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), arrived.recv())
+        .await
+        .expect("the forced list probes usage")
+        .expect("the probe reaches the mock");
+    assert!(
+        accounts.inner.ops.try_lock().is_ok(),
+        "the ops lock must not be held across a usage probe"
+    );
+    // The page's paint (or the footer) lists while the probe is still open.
+    let plain = tokio::time::timeout(Duration::from_secs(10), accounts.list(false))
+        .await
+        .expect("a plain list never waits for a probe")
+        .unwrap();
+    let devin = rows(&plain, HarnessId::Devin);
+    assert_eq!(devin.len(), 1);
+    assert!(
+        devin[0].usage_windows.is_empty(),
+        "the probe hasn't answered yet"
+    );
+
+    release_tx.send(()).unwrap();
+    let forced = forced.await.unwrap().unwrap();
+    let devin = rows(&forced, HarnessId::Devin);
+    assert!((devin[0].usage_windows[0].used_fraction - 0.5).abs() < 1e-6);
+    assert_eq!(devin[0].email.as_deref(), Some("dev@devin.ai"));
+}
