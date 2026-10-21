@@ -483,6 +483,21 @@ fn queue_text_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
+/// The chats whose turn is in flight in a published session list — the same
+/// reading as `SessionsEngine::turn_in_flight` (a chat parked on a question
+/// still owns its turn).
+fn in_flight_chats(rows: &[zeron_proto::Session]) -> HashSet<String> {
+    rows.iter()
+        .filter(|row| {
+            matches!(
+                row.status,
+                zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
+            )
+        })
+        .map(|row| row.chat_id.clone())
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(
     tag = "outcome",
@@ -1094,16 +1109,32 @@ impl DocHost {
 
     /// The turn-end hook for held messages. Doc changes drive `drain_queue` for
     /// everything else, but a turn ENDING is not a doc change the queue can
-    /// see — so watch session status instead and re-drain every warm chat.
-    /// `drain_queue` is a cheap no-op for empty queues and busy agents, which
-    /// is why this can afford to be indiscriminate.
+    /// see — so watch session status and re-drain the chat whose turn just
+    /// ended. Only that edge matters: every row change (a working chat's
+    /// heartbeat, a subagent badge, a queue position) re-sends the whole list,
+    /// and waking every warm chat for those made a heartbeat as expensive as
+    /// the turn-end it was standing in for (audit #116).
     fn spawn_queue_flush_watcher(&self, mut statuses: watch::Receiver<Vec<zeron_proto::Session>>) {
         let host = self.clone();
         self.spawn_worker(async move {
-            while statuses.changed().await.is_ok() {
-                let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
-                for handle in handles {
-                    host.drain_queue(&handle).await;
+            // Chats whose turn was in flight at the last published list.
+            let mut in_flight = in_flight_chats(&statuses.borrow());
+            loop {
+                if statuses.changed().await.is_err() {
+                    return;
+                }
+                let ended = {
+                    let rows = statuses.borrow_and_update();
+                    let running = in_flight_chats(&rows);
+                    let ended: Vec<String> = in_flight.difference(&running).cloned().collect();
+                    in_flight = running;
+                    ended
+                };
+                for chat_id in ended {
+                    let handle = lock(&host.inner.handles).get(&chat_id).cloned();
+                    if let Some(handle) = handle {
+                        host.drain_queue(&handle).await;
+                    }
                 }
             }
         });
