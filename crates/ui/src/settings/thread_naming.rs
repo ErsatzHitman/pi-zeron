@@ -9,11 +9,16 @@ use zeron_rpc::methods;
 use crate::pickers::{Pickers, TitleModelPicked};
 use crate::popover::Loadable;
 use crate::settings::widgets;
-use crate::state::AppState;
+use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 pub struct ThreadNamingCard {
     state: Entity<AppState>,
+    /// The device whose titles are shown (`None` = this engine's own): they
+    /// are written by the agent the composer runs.
+    device: Option<String>,
+    /// The engine `settings` came from: an account switch replaces it.
+    engine: Option<EngineHandle>,
     settings: Loadable<TitleSettings>,
     picker: Entity<Pickers>,
     error: Option<String>,
@@ -34,13 +39,30 @@ impl ThreadNamingCard {
                 this.call(Some(event.0.clone()), cx);
             },
         );
-        // Settings can open before the engine connects: load once it does.
-        let state_sub = cx.observe(&state, |this: &mut Self, _, cx| {
-            if matches!(this.settings, Loadable::Idle) {
+        // Settings can open before the engine connects: load once it does. A
+        // device switch is another `harness-prefs.json`, and a replaced engine
+        // (an account switch, a reconnect) another answer: reload through both.
+        let state_sub = cx.observe(&state, |this: &mut Self, state, cx| {
+            let (device, engine) = {
+                let state = state.read(cx);
+                (
+                    crate::settings::target_device(&state),
+                    state.engine().cloned(),
+                )
+            };
+            if device != this.device
+                || crate::settings::engine_replaced(this.engine.as_ref(), engine.as_ref())
+            {
+                this.device = device;
+                this.settings = Loadable::Idle;
+                this.call(None, cx);
+            } else if matches!(this.settings, Loadable::Idle) {
                 this.call(None, cx);
             }
         });
         let mut card = Self {
+            device: crate::settings::target_device(&state.read(cx)),
+            engine: None,
             state,
             settings: Loadable::Idle,
             picker,
@@ -67,6 +89,7 @@ impl ThreadNamingCard {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        self.engine = Some(engine.clone());
         let (method, params) = match save {
             Some(settings) => (
                 methods::SET_TITLE_SETTINGS,
@@ -74,9 +97,11 @@ impl ThreadNamingCard {
             ),
             None => (methods::GET_TITLE_SETTINGS, serde_json::json!({})),
         };
+        let params = crate::settings::with_target_device(params, self.device.as_deref());
         if matches!(self.settings, Loadable::Idle) {
             self.settings = Loadable::Loading;
         }
+        let asked = engine.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -87,6 +112,15 @@ impl ThreadNamingCard {
                     serde_json::from_value::<TitleSettings>(v).map_err(|e| e.to_string())
                 });
             this.update(cx, |card, cx| {
+                // A replaced engine owns the card now: this is another
+                // runtime's answer, error included.
+                if !card
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.same_connection(&asked))
+                {
+                    return;
+                }
                 match result {
                     Ok(settings) => {
                         card.picker.update(cx, |picker, cx| {
@@ -211,5 +245,67 @@ impl Render for ThreadNamingCard {
                             })),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+
+    /// Titles are written by the agent the composer runs: the card reads the
+    /// composer's device, and a switch (another device, or the engine replaced
+    /// by an account switch) re-reads that device's answer.
+    #[gpui::test]
+    fn titles_follow_the_composer_device_and_reload_on_a_switch(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, Default::default());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rpc = ScriptedRpc::new({
+            let asked = asked.clone();
+            move |method, params| {
+                let asked = asked.clone();
+                async move {
+                    assert_eq!(method, methods::GET_TITLE_SETTINGS);
+                    let device = params
+                        .get("targetDeviceId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    asked.lock().unwrap().push(device.clone());
+                    zeron_rpc::RpcReply::value(&TitleSettings {
+                        harness: None,
+                        model: Some(device.unwrap_or_else(|| "this-device".into())),
+                    })
+                }
+            }
+        });
+        let state = cx.update(|cx| fixture::state(cx, Some(rpc.client())));
+        state.update(cx, |state, _| {
+            state.local_device_id = Some("local".into());
+            state.selected_device = Some("remote".into());
+        });
+        let card = cx.new(|cx| ThreadNamingCard::new(state.clone(), cx));
+        rpc.settle(cx, &runtime, |cx| {
+            card.read_with(cx, |card, _| {
+                matches!(&card.settings, Loadable::Ready(settings)
+                    if settings.model.as_deref() == Some("remote"))
+            })
+        });
+        // Back to This PC: another `harness-prefs.json`, read without a target.
+        state.update(cx, |state, cx| {
+            state.selected_device = Some("local".into());
+            cx.notify();
+        });
+        rpc.settle(cx, &runtime, |cx| {
+            card.read_with(cx, |card, _| {
+                matches!(&card.settings, Loadable::Ready(settings)
+                    if settings.model.as_deref() == Some("this-device"))
+            })
+        });
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            [Some("remote".to_owned()), None]
+        );
     }
 }

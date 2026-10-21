@@ -397,6 +397,21 @@ pub(crate) fn target_device(state: &crate::state::AppState) -> Option<String> {
     (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
 }
 
+/// Whether an engine-backed card must re-read: the engine it read from is
+/// gone or replaced (an account switch, a reconnect), so what it shows is
+/// another runtime's answers, and the `Error` that runtime gave would never
+/// clear. This PC's parked engine comes back as the same connection, so its
+/// settings stay.
+pub(crate) fn engine_replaced(
+    loaded_from: Option<&crate::state::EngineHandle>,
+    engine: Option<&crate::state::EngineHandle>,
+) -> bool {
+    matches!(
+        (loaded_from, engine),
+        (Some(loaded), Some(engine)) if !loaded.same_connection(engine)
+    )
+}
+
 /// `value` addressed at `target` (a no-op for the engine's own device).
 pub(crate) fn with_target_device(
     mut value: serde_json::Value,

@@ -187,6 +187,7 @@ impl ShortcutsPage {
         self.thread_naming.update(cx, |card, cx| card.refresh(cx));
         self.advisor.update(cx, |card, cx| card.refresh(cx));
         self.decision_gate.update(cx, |card, cx| card.refresh(cx));
+        self.pi.update(cx, |card, cx| card.refresh(cx));
     }
 
     fn start_recording(&mut self, id: ShortcutId, window: &mut Window, cx: &mut Context<Self>) {
