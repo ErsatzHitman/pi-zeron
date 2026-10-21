@@ -54,6 +54,10 @@ struct SpaceEntry {
 struct SpacesSyncInner {
     repos: Repos,
     workspace: WorkspaceHost,
+    /// Chat deletions here go through the same teardown as every other delete
+    /// path (`SessionsEngine::discard_chat`), so a swept orphan leaves no
+    /// session row or doc behind (audit #115).
+    sessions: crate::sessions::SessionsEngine,
     device_id: String,
     entries: Mutex<HashMap<String, Arc<SpaceEntry>>>,
     /// Ends the supervisor loop eagerly on shutdown (weak refs alone only end
@@ -74,11 +78,17 @@ pub struct SpacesSync {
 impl SpacesSync {
     /// Build and start the sync loop: follows the workspace spaces watch and
     /// runs the repair tick. Requires a tokio runtime.
-    pub fn start(repos: Repos, workspace: WorkspaceHost, device_id: &str) -> Self {
+    pub fn start(
+        repos: Repos,
+        workspace: WorkspaceHost,
+        sessions: crate::sessions::SessionsEngine,
+        device_id: &str,
+    ) -> Self {
         let sync = Self {
             inner: Arc::new(SpacesSyncInner {
                 repos,
                 workspace: workspace.clone(),
+                sessions,
                 device_id: device_id.to_string(),
                 entries: Mutex::new(HashMap::new()),
                 cancel: CancellationToken::new(),
@@ -262,7 +272,7 @@ async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) 
 
 /// Host-side repair: delete OUR chats whose `spaceId` dangles (create-vs-delete
 /// race). Chats hosted by other devices are left alone.
-fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
+async fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
     // NEVER sweep off a replica that hasn't heard from the server this boot:
     // a gapped/pre-heal/offline-at-boot view is missing rows, and "space row
     // absent" on it is not evidence the space was deleted — sweeping there
@@ -287,7 +297,10 @@ fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
         tracing::info!(chat = %chat.id, space = %space_id, "deleting orphaned chat (space gone)");
         if let Err(err) = inner.workspace.delete_chat(&chat.id) {
             tracing::warn!(chat = %chat.id, error = %err, "spaces: orphan delete failed");
+            continue;
         }
+        // The row is gone, so its runtime and per-chat engine state go too.
+        inner.sessions.discard_chat(&chat.id).await;
     }
 }
 
@@ -324,7 +337,7 @@ async fn spaces_task(
                 for entry in lock(&inner.entries).values() {
                     let _ = entry.kick_tx.send(());
                 }
-                sweep_orphans(&inner);
+                sweep_orphans(&inner).await;
             }
         }
     }

@@ -571,7 +571,7 @@ pub struct ChatDocHandle {
     /// change without a dirty flag.
     queue_tx: watch::Sender<Vec<QueuedMessage>>,
     /// Serializes everything that TAKES from the queue. Both the doc-change
-    /// task and the turn-end status watcher call `drain_queue`, and nothing
+    /// task and the turn-end notify call `drain_queue`, and nothing
     /// keeps those two apart: without this they interleave across the
     /// `dispatch` await, each taking a different head and each sending, so a
     /// queue meant to release one message releases all of them.
@@ -1072,7 +1072,6 @@ impl DocHost {
 
     /// Wire the sessions engine (engine assembly; see `SessionsEngine::set_doc_host`).
     pub fn set_sessions(&self, sessions: SessionsEngine) {
-        let statuses = sessions.watch_sessions();
         {
             // First set wins (the OnceLock contract this slot replaced).
             let mut slot = lock(&self.inner.sessions);
@@ -1089,22 +1088,29 @@ impl DocHost {
                 host.drain_queue(&handle).await;
             });
         }
-        self.spawn_queue_flush_watcher(statuses);
     }
 
     /// The turn-end hook for held messages. Doc changes drive `drain_queue` for
     /// everything else, but a turn ENDING is not a doc change the queue can
-    /// see — so watch session status instead and re-drain every warm chat.
-    /// `drain_queue` is a cheap no-op for empty queues and busy agents, which
-    /// is why this can afford to be indiscriminate.
-    fn spawn_queue_flush_watcher(&self, mut statuses: watch::Receiver<Vec<zeron_proto::Session>>) {
+    /// see — so the sessions engine calls this when a chat's status leaves
+    /// `Working`/`AwaitingInput`, and the chat's held rows are re-drained.
+    ///
+    /// Notified from the producer (one call per settled turn) rather than
+    /// watched off the published status list: that list arrives over a
+    /// coalescing watch, so a turn that started AND ended while this device was
+    /// busy draining another chat is a state transition no watcher ever sees —
+    /// the row would then sit in the queue until an unrelated doc change. Every
+    /// row change (a working chat's heartbeat, a subagent badge, a queue
+    /// position) also re-sends the whole list, and waking every warm chat for
+    /// those made a heartbeat as expensive as the turn-end it was standing in
+    /// for (audit #116).
+    pub fn notify_turn_end(&self, chat_id: &str) {
         let host = self.clone();
+        let chat_id = chat_id.to_string();
         self.spawn_worker(async move {
-            while statuses.changed().await.is_ok() {
-                let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
-                for handle in handles {
-                    host.drain_queue(&handle).await;
-                }
+            let handle = lock(&host.inner.handles).get(&chat_id).cloned();
+            if let Some(handle) = handle {
+                host.drain_queue(&handle).await;
             }
         });
     }
@@ -1139,8 +1145,8 @@ impl DocHost {
     }
 
     /// Freeze every open queue before settling live runs during shutdown.
-    /// Interrupting a run publishes Idle, which normally wakes the turn-end
-    /// queue drainer; without this barrier quitting the host could promote a
+    /// Interrupting a run publishes Idle, which normally kicks the turn-end
+    /// queue drain; without this barrier quitting the host could promote a
     /// queued row in the narrow window before workers are retired.
     pub fn pause_all_queues(&self) {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
@@ -4128,7 +4134,7 @@ impl DocHost {
     /// put them.
     ///
     /// - Idle: send the head as the next turn (and loop — the agent is free).
-    /// - Turn in flight: hold. The turn-end watcher comes back for it.
+    /// - Turn in flight: hold. The turn-end notify comes back for it.
     ///
     /// One at a time by design: each send changes the status this reads.
     pub async fn drain_queue(&self, handle: &Arc<ChatDocHandle>) {

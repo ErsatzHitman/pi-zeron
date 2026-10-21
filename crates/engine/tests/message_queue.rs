@@ -39,6 +39,14 @@ struct HeldHarness {
     prompts: Arc<Mutex<Vec<String>>>,
     requests: Mutex<Vec<RunRequest>>,
     mailbox_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Emit one text chunk and then hold the turn open until this gate opens,
+    /// so a test can put a QUIET doc window between the transcript write and
+    /// the `Done` that settles the status (audit #116: the turn-end flush must
+    /// not need a doc change, nor a watcher that sees every status edge).
+    quiet_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Behave like a parked runtime (Pi): the run survives its turn end, so a
+    /// saturated mailbox stays saturated after the turn (audit #116 test).
+    keeps_runtime: std::sync::atomic::AtomicBool,
     /// Park the first turn on a question instead of just hanging, so the chat
     /// sits in `AwaitingInput` rather than `Working`.
     asks: bool,
@@ -72,6 +80,8 @@ impl HeldHarness {
                 prompts: prompts.clone(),
                 requests: Mutex::new(Vec::new()),
                 mailbox_gate: Mutex::new(None),
+                quiet_gate: Mutex::new(None),
+                keeps_runtime: std::sync::atomic::AtomicBool::new(false),
                 asks,
             }),
             prompts,
@@ -89,6 +99,12 @@ impl Harness for HeldHarness {
     }
     fn supports_steering(&self) -> bool {
         true
+    }
+    fn stops_turn_in_place(&self) -> bool {
+        self.keeps_runtime.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn keeps_runtime_alive(&self) -> bool {
+        self.keeps_runtime.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn steering_mode(&self) -> SteeringMode {
         self.steering
@@ -124,6 +140,7 @@ impl Harness for HeldHarness {
         let steering = controls.steering;
         let prompts = self.prompts.clone();
         let gate = self.mailbox_gate.lock().unwrap().take();
+        let quiet_gate = self.quiet_gate.lock().unwrap().clone();
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
             harness: HarnessId::Mock,
             model: "mock-1".into(),
@@ -133,22 +150,52 @@ impl Harness for HeldHarness {
             assistant_message_id: format!("a-{}", request.prompt),
         })]);
         let done = futures::stream::unfold(
-            (finish, steering, prompts, false),
-            |(mut finish, mut steering, prompts, ended)| async move {
-                if ended {
-                    return None;
-                }
-                let (event, ended) = tokio::select! {
-                    _ = finish.recv() => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()), class: None }, true),
-                    steer = steering.recv() => match steer {
-                        Some(message) => {
-                            prompts.lock().unwrap().push(message.prompt);
-                            (AgentEvent::Steered { assistant_message_id: None, next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()) }, false)
-                        }
-                        None => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()), class: None }, true),
+            (finish, steering, prompts, 0u8),
+            move |(mut finish, mut steering, prompts, phase)| {
+                let quiet_gate = quiet_gate.clone();
+                async move {
+                    // 2 = settled, 1 = chunk written and holding for the gate.
+                    if phase == 2 {
+                        return None;
                     }
-                };
-                Some((Ok(event), (finish, steering, prompts, ended)))
+                    if phase == 1 {
+                        if let Some(gate) = quiet_gate {
+                            gate.notified().await;
+                        }
+                        return Some((
+                            Ok(AgentEvent::Done {
+                                status: DoneStatus::Completed,
+                                result: None,
+                                error: None,
+                                session_id: Some("sess-queue".into()),
+                                class: None,
+                            }),
+                            (finish, steering, prompts, 2),
+                        ));
+                    }
+                    let (event, ended) = tokio::select! {
+                        _ = finish.recv() => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()), class: None }, true),
+                        steer = steering.recv() => match steer {
+                            Some(message) => {
+                                prompts.lock().unwrap().push(message.prompt);
+                                (AgentEvent::Steered { assistant_message_id: None, next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()) }, false)
+                            }
+                            None => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()), class: None }, true),
+                        }
+                    };
+                    if ended && quiet_gate.is_some() {
+                        // The transcript write below is a doc change; the status
+                        // only settles when the test opens the gate.
+                        return Some((
+                            Ok(AgentEvent::TextDelta {
+                                text: "still working".into(),
+                            }),
+                            (finish, steering, prompts, 1),
+                        ));
+                    }
+                    let next = if ended { 2 } else { 0 };
+                    Some((Ok(event), (finish, steering, prompts, next)))
+                }
             },
         );
         let gated = futures::stream::once(async move {
@@ -1748,9 +1795,9 @@ async fn queue_completion_markers_distinguish_normal_turns_from_interrupts() {
     }
 }
 
-/// A pending agent update holds back only that agent's next turn. The single
-/// turn-end flush watcher drains chats one after another, so it must keep
-/// releasing held queues for chats on every other agent meanwhile.
+/// A pending agent update holds back only that agent's next turn. A turn end
+/// kicks that chat's own drain, so it must keep releasing held queues for chats
+/// on every other agent meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_update_does_not_stall_another_chats_queue_flush() {
     const OTHER: &str = "chat-queue-other";
@@ -1851,6 +1898,153 @@ async fn pending_update_does_not_stall_another_chats_queue_flush() {
     )
     .await;
     let _ = updating.finish.send(());
+    let _ = other.finish.send(());
+    core.shutdown().await;
+}
+
+/// The regression audit #116 found in the turn-end watcher: the published
+/// session list arrives over a COALESCING watch, so a chat whose whole turn
+/// happened while this device was busy draining another chat had its Working
+/// state coalesced away, and its held row was only released by luck. Here one
+/// chat's drain is stuck on a saturated steering mailbox across the entire turn
+/// of the other chat, whose own last transcript write is followed by a quiet
+/// window before the status settles: the held row must still flush, without
+/// waiting for the stuck drain and without a doc change to notice it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_end_drains_while_another_chats_drain_is_stuck() {
+    const OTHER: &str = "chat-queue-unstuck";
+    let tmp = tempfile::tempdir().unwrap();
+    let (stuck, stuck_prompts) =
+        HeldHarness::build_as(HarnessId::ClaudeCode, SteeringMode::StepBoundary, false);
+    let (other, other_prompts) =
+        HeldHarness::build_as(HarnessId::Codex, SteeringMode::TurnBoundary, false);
+    let registry = Arc::new(HarnessRegistry::new());
+    registry.register(stuck.clone());
+    registry.register(other.clone());
+    let core = EngineCore::assemble(
+        &tmp.path().join("data"),
+        registry.clone(),
+        HarnessId::ClaudeCode,
+        None,
+    )
+    .expect("engine core assembles");
+    create_chat(&core).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat",
+                "chatId": OTHER,
+                "deviceId": core.device_id,
+                "config": { "harness": "codex", "model": null, "reasoning": null, "sandbox": "workspace-write" },
+            }),
+        )
+        .await
+        .expect("createChat");
+    core.workspace
+        .rename_chat(OTHER, "Pre-titled")
+        .expect("rename chat");
+
+    // The stuck chat's runtime never reads its mailbox, so steers pile up in it
+    // until `reserve` waits — which is exactly the await a drain hangs on. Its
+    // runtime is parked (survives the turn end) so the mailbox stays saturated
+    // after its own turn ends, keeping that drain stuck.
+    stuck
+        .keeps_runtime
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *stuck.mailbox_gate.lock().unwrap() = Some(gate.clone());
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(|| stuck_prompts.lock().unwrap().len() == 1, "the stuck turn").await;
+    let sessions = core.sessions.clone();
+    let bursting = tokio::spawn(async move {
+        for i in 0..40 {
+            let _ = sessions
+                .steer(CHAT, &format!("burst {i}"), Some(format!("burst-{i}")))
+                .await;
+        }
+    });
+    wait_for(|| user_messages(&core).len() == 33, "the mailbox to fill").await;
+    // This row can only leave the queue through the saturated mailbox, so the
+    // stuck chat's drain sits on `reserve` from here on.
+    core.doc_host
+        .queue_message(CHAT, "stuck behind the mailbox", Vec::new())
+        .expect("queue a stuck row");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!bursting.is_finished(), "the mailbox is still saturated");
+
+    // The stuck chat's own turn ends now, so a turn-end watcher (the shape
+    // audit #116 was fixed for) would walk into the blocked drain and stop
+    // polling the status list from here.
+    let _ = stuck.finish.send(());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !bursting.is_finished(),
+        "the stuck chat's drain is still blocked"
+    );
+
+    // The other chat now runs a whole turn inside that window, and its turn
+    // ends in two steps: a transcript write, then a quiet window the
+    // doc-change drain has already been through, then `Done` settles the status
+    // with NO further doc change. From there the only thing that can release
+    // its held row is the turn-end signal itself.
+    let settle = Arc::new(tokio::sync::Notify::new());
+    *other.quiet_gate.lock().unwrap() = Some(settle.clone());
+    core.doc_host
+        .queue_message(OTHER, "opening", Vec::new())
+        .expect("queue the other opening");
+    wait_for(
+        || other_prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the other chat's turn to start",
+    )
+    .await;
+    core.doc_host
+        .queue_message(OTHER, "held", Vec::new())
+        .expect("queue the other held row");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !other_prompts.lock().unwrap().iter().any(|p| p == "held"),
+        "a turn-boundary row waits for the turn end"
+    );
+
+    let _ = other.finish.send(());
+    wait_for(
+        || {
+            core.doc_host
+                .open(OTHER)
+                .is_ok_and(|h| h.doc().read_entries().is_ok_and(|entries| {
+                    entries.iter().any(|e| e.role == MessageRole::Assistant)
+                }))
+        },
+        "the turn's last transcript write",
+    )
+    .await;
+    // Give the doc-change drain its chance to run and give up (the turn still
+    // reads Working) before the status settles, so nothing but the turn-end
+    // signal is left to release the row.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !other_prompts.lock().unwrap().iter().any(|p| p == "held"),
+        "no doc change is coming: the row is still held"
+    );
+
+    settle.notify_one();
+    wait_for(
+        || other_prompts.lock().unwrap().iter().any(|p| p == "held"),
+        "the held row to flush at the turn end",
+    )
+    .await;
+    assert!(
+        !bursting.is_finished(),
+        "the flush must not wait for the stuck chat's drain"
+    );
+
+    gate.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(5), bursting).await;
+    let _ = stuck.finish.send(());
     let _ = other.finish.send(());
     core.shutdown().await;
 }

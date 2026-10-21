@@ -696,6 +696,237 @@ async fn session_status_transitions_idle_working_idle() {
 }
 
 #[tokio::test]
+async fn forgetting_a_deleted_chat_drops_its_session_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: mock_script(),
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: false,
+        }),
+    );
+    let mut watch = core.sessions.watch_sessions();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-forget",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::timeout_at(deadline, watch.changed())
+            .await
+            .expect("status change before timeout")
+            .expect("watch alive");
+        if watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Idle) {
+            break;
+        }
+    }
+    assert!(core.sessions.session_status(CHAT).is_some());
+
+    // Deleting the chat through the RPC must not leave its session row (or
+    // the run slot it held) behind — audit #115.
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({ "op": "deleteChat", "chatId": CHAT }),
+        )
+        .await
+        .expect("deleteChat");
+    // The teardown runs off the request, so wait for it to land.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while core.sessions.session_status(CHAT).is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deleted chat's session row must leave the engine"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    assert!(
+        watch.borrow().iter().all(|s| s.chat_id != CHAT),
+        "a deleted chat's row must leave the published list"
+    );
+    assert!(!core.sessions.has_run(CHAT));
+}
+
+/// A run that ignores its interrupt and ends only when the test says so, so the
+/// chat's deletion finds the turn still live.
+struct StubbornHarness {
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Harness for StubbornHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Stubborn"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(8);
+        let release = self.release.clone();
+        tokio::spawn(async move {
+            if tx
+                .send(Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: request.cwd.clone(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Deliberately deaf to the interrupt token: the turn settles when
+            // the test releases it, whatever the engine has already done.
+            release.notified().await;
+            let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
+/// The delete's teardown only waits so long for a run to settle, and a drain or
+/// a peer send can still land afterwards. Neither may put a deleted chat back:
+/// the id stays marked, so no status row is written again and no new turn
+/// starts (audit #115).
+#[tokio::test]
+async fn a_deleted_chat_never_comes_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let core = assemble(
+        dir.path(),
+        Arc::new(StubbornHarness {
+            release: release.clone(),
+        }),
+    );
+    let mut watch = core.sessions.watch_sessions();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-stubborn",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::timeout_at(deadline, watch.changed())
+            .await
+            .expect("status change before timeout")
+            .expect("watch alive");
+        if watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Working) {
+            break;
+        }
+    }
+
+    // The teardown's bounded wait expires with the turn still live, so the row
+    // is forgotten while its run is still going.
+    core.sessions.discard_chat(CHAT).await;
+    assert!(core.sessions.session_status(CHAT).is_none());
+
+    // Now the run settles, and a later send tries to start another turn. Its
+    // status write must find the chat deleted, and the send must be refused.
+    release.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        core.sessions.session_status(CHAT).is_none(),
+        "a settlement after the delete must not resurrect the row"
+    );
+    assert!(
+        core.sessions
+            .dispatch(CHAT, HarnessId::Mock, run_request("again"), None)
+            .await
+            .is_err(),
+        "a deleted chat takes no new turn"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        core.sessions.session_status(CHAT).is_none(),
+        "a refused turn leaves no row either"
+    );
+    assert!(
+        watch.borrow().iter().all(|s| s.chat_id != CHAT),
+        "nor publish it to clients again"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_published_session_list_is_ordered_by_chat_id() {
+    // Audit #115: the status map is ordered, so a publish never has to sort
+    // every row — this pins the order that sort used to provide.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: mock_script(),
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: false,
+        }),
+    );
+    let mut watch = core.sessions.watch_sessions();
+    for chat in ["chat-bbb", "chat-aaa"] {
+        let handle = core.doc_host.open(chat).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            &format!("cmd-run-{chat}"),
+            SessionCommandPayload::Run {
+                request: run_request("go"),
+                message_id: "m-1".into(),
+            },
+        );
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::timeout_at(deadline, watch.changed())
+            .await
+            .expect("status change before timeout")
+            .expect("watch alive");
+        let rows = watch.borrow();
+        if rows.len() == 2 && rows.iter().all(|s| s.status == SessionStatus::Idle) {
+            break;
+        }
+    }
+    let ids: Vec<String> = watch
+        .borrow()
+        .iter()
+        .map(|s| s.chat_id.clone())
+        .collect();
+    assert_eq!(ids, vec!["chat-aaa", "chat-bbb"]);
+}
+
+#[tokio::test]
 async fn interrupt_stamps_streaming_entry_aborted() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(

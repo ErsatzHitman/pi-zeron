@@ -70,6 +70,9 @@ impl EngineRpc {
                                 .is_some_and(|d| d.watch_messages().borrow().entries.is_empty())
                             {
                                 let _ = engine.workspace.delete_chat(&chat);
+                                // Deleted means gone: the failed preparation
+                                // leaves no session row or doc behind.
+                                engine.sessions.discard_chat(&chat).await;
                             }
                         }
                         engine.voice.complete_attempt(&key, result);

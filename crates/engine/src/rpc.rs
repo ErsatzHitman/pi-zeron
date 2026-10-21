@@ -1640,18 +1640,17 @@ impl EngineRpc {
         self.workspace
             .delete_chat(chat_id)
             .map_err(|e| RpcError::Failed(e.to_string()))?;
-        self.doc_host.purge_chat(chat_id);
         if let Some(recaps) = &self.recaps {
             recaps.forget(chat_id);
         }
-        // Its live runtime goes with it: one that lives as long as the app
-        // (Pi) is never reaped idle and would outlive it.
+        // Its live runtime and everything else keyed by the chat id go with
+        // it: one that lives as long as the app (Pi) is never reaped idle and
+        // would outlive it, and its session row would stay in the published
+        // list for the life of the process (`discard_chat`).
         let sessions = self.sessions.clone();
         let chat_id = chat_id.to_owned();
         tokio::spawn(async move {
-            if let Err(err) = sessions.terminate(&chat_id).await {
-                tracing::debug!(chat = %chat_id, error = %err, "deleteChat teardown skipped");
-            }
+            sessions.discard_chat(&chat_id).await;
         });
         Ok(())
     }
@@ -1710,7 +1709,6 @@ impl EngineRpc {
                 // (the doc rows are already tombstoned; a straggler run would only
                 // write into an orphaned session doc).
                 let sessions = self.sessions.clone();
-                let doc_host = self.doc_host.clone();
                 let recaps = self.recaps.clone();
                 let chat_ids = deleted.chat_ids;
                 tokio::spawn(async move {
@@ -1718,10 +1716,7 @@ impl EngineRpc {
                         if let Some(recaps) = &recaps {
                             recaps.forget(&chat_id);
                         }
-                        if let Err(err) = sessions.terminate(&chat_id).await {
-                            tracing::debug!(chat = %chat_id, error = %err, "deleteSpace teardown skipped");
-                        }
-                        doc_host.purge_chat(&chat_id);
+                        sessions.discard_chat(&chat_id).await;
                     }
                 });
                 Ok(())

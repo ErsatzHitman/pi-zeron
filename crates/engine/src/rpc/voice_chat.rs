@@ -100,9 +100,10 @@ impl EngineRpc {
             if self.sessions.turn_in_flight(&old.id) {
                 continue;
             }
-            let _ = self.sessions.interrupt(&old.id).await;
             let _ = self.workspace.delete_chat(&old.id);
-            self.doc_host.purge_chat(&old.id);
+            // The segment's runtime and its per-chat engine state go with its
+            // row: a rotation must leave nothing in the published session list.
+            self.sessions.discard_chat(&old.id).await;
         }
     }
 
@@ -189,7 +190,7 @@ mod tests {
         // A failed start removes its empty successor; the old segment is
         // still there, so the next call rotates again on the same thread.
         core.workspace.delete_chat(&next).unwrap();
-        core.doc_host.purge_chat(&next);
+        core.sessions.discard_chat(&next).await;
         let retry = rpc.voice_chat(config("b")).await.unwrap();
         assert!(retry != first && retry != next);
         assert_eq!(core.workspace.chat_harness_session(&retry), inherited);
@@ -205,6 +206,13 @@ mod tests {
             .unwrap();
         assert_eq!(rpc.voice_chat(config("b")).await.unwrap(), retry);
         assert!(core.workspace.chat(&first).unwrap().is_none());
+        // Superseded segments are deleted, not just hidden: a rotation that
+        // leaves a session row behind leaks one per call for the life of the
+        // process (audit #115).
+        assert!(
+            core.sessions.session_status(&first).is_none(),
+            "a superseded segment keeps no session row"
+        );
         assert!(core.workspace.chat(&foreign).unwrap().is_some());
         core.sessions.shutdown().await;
     }

@@ -392,8 +392,10 @@ impl VoiceManager {
             attempt.cancel();
             let empty = doc.watch_messages().borrow().entries.is_empty();
             if !attempted.load(Ordering::Acquire) && empty {
-                let _ = sessions.interrupt(&chat).await;
                 let _ = workspace.delete_chat(&chat);
+                // Deleted means gone: the terminal attempt leaves no session
+                // row or doc behind either.
+                sessions.discard_chat(&chat).await;
             }
         });
         Ok(prepared)
