@@ -191,11 +191,11 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness. Select a project and/or device; catalogs are validated on that host. Set write: true for a session that changes code (in a git project it works in its own new worktree on a zeron/<name> branch, so parallel sessions never touch each other's files), false for one that only reads, searches and reports (every edit is blocked; it runs in the project folder). Claude Fable and GPT Astra class models are reserved for sessions the user starts: a session you create cannot use one, and when your own chat runs on one you must pass a different model. Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
+            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness; there a session starts only sessions below itself, so kind chat and a parent outside the tree are refused (the tree's cap, stop_tree and spend must cover every session it starts). Select a project and/or device; catalogs are validated on that host. Set write: true for a session that changes code (in a git project it works in its own new worktree on a zeron/<name> branch, so parallel sessions never touch each other's files), false for one that only reads, searches and reports (every edit is blocked; it runs in the project folder). Claude Fable and GPT Astra class models are reserved for sessions the user starts: a session you create cannot use one, and when your own chat runs on one you must pass a different model. Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "kind": { "type": "string", "enum": ["chat", "side"], "description": "chat: standalone, no parent allowed. side: requires parent or origin. Omit for legacy defaults." },
+                    "kind": { "type": "string", "enum": ["chat", "side"], "description": "chat: standalone, no parent allowed; refused inside an orchestrator's tree, where sessions start only sessions below themselves. side: requires parent or origin. Omit for legacy defaults." },
                     "project": { "type": "string", "description": "Project id, path, or name. Belongs to a specific device; when device is supplied, search only there. Optional." },
                     "device": { "type": "string", "description": "Host device (id or name). With project, it must own that project. Without either, use the local engine." },
                     "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
@@ -1670,6 +1670,19 @@ impl Tools {
         } else {
             ChatKind::Chat
         };
+        // A session in a tree starts only sessions below it: kind chat, or a
+        // parent outside the tree, would start one outside the tree, where
+        // the tree's live-session cap, stop_tree and spend cannot see it.
+        if let Some(tree) = &tree {
+            let below = parent_chat_id
+                .as_deref()
+                .and_then(|parent| zeron_proto::orchestrator::root_of(&chats, parent))
+                .is_some_and(|root| root.id == tree.root.id);
+            anyhow::ensure!(
+                below,
+                "A session in an orchestrator's tree starts only sessions below itself: kind chat, or a parent outside this tree, would run outside the tree, where its live-session cap, stop_tree and spend cannot see it. Omit kind (and parent) to start it below you."
+            );
+        }
 
         // Sessions of an orchestrator's tree default to their parent's harness.
         let mut inherited_harness = None;
@@ -6542,13 +6555,29 @@ mod tests {
             .call("create_chat", json!({ "project": "space-1" }))
             .await;
         assert!(standalone.is_ok(), "{standalone:?}");
-        let created = from(&full, "orchestrator-root")
+        // Inside the tree, meant to leave it: a top-level session would escape
+        // the tree's cap, stop_tree and spend, so it is refused instead.
+        let before = mutations(&full);
+        for chat in ["orchestrator-root", "live-0"] {
+            let err = from(&full, chat)
+                .call(
+                    "create_chat",
+                    json!({ "kind": "chat", "project": "space-1" }),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.contains("only sessions below itself"), "{chat}: {err}");
+        }
+        // A parent outside the tree is the same escape by another name.
+        let err = from(&full, "orchestrator-root")
             .call(
                 "create_chat",
-                json!({ "kind": "chat", "project": "space-1" }),
+                json!({ "parent": "chat-alpha-1", "project": "space-1" }),
             )
-            .await;
-        assert!(created.is_ok(), "{created:?}");
+            .await
+            .unwrap_err();
+        assert!(err.contains("only sessions below itself"), "{err}");
+        assert_eq!(mutations(&full), before, "nothing was created");
     }
 
     #[tokio::test]
