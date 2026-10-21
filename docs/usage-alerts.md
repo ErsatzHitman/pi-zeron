@@ -40,7 +40,9 @@ are unknown, not "fine": nothing warns before they run out.
   a stopped engine never blocks work.
 - **Scope.** Per active account per provider. A Pi session is affected only
   when its model's provider (`anthropic/…`, `openai-codex/…`,
-  `github-copilot/…`) is the provider of the low account. That is the account
+  `github-copilot/…`) is the provider of the low account; a session left on
+  Pi's own default model counts as the provider `defaultProvider` in Pi's
+  `settings.json` names. That is the account
   Pi uses: Pi keeps one login per provider in `auth.json`, and the accounts
   snapshot marks that entry `active`. Saved, inactive slots never dispatch.
   Only this device's chats are told (another device has its own logins).

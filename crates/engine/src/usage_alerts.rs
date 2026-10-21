@@ -22,8 +22,9 @@
 //!   alert on old numbers.
 //! - **Scope**: per active account per provider. A Pi session is affected
 //!   only when its model's provider (`anthropic/…`, `openai-codex/…`,
-//!   `github-copilot/…`) is that account's provider. Saved, inactive slots
-//!   are listed, never dispatched.
+//!   `github-copilot/…`) is that account's provider; a session on Pi's own
+//!   default model runs on the provider Pi's `settings.json` names. Saved,
+//!   inactive slots are listed, never dispatched.
 //! - **Dedup**: alert key = harness + provider + account + window + reset
 //!   time. Each chat is told once per key; the record is kept until the
 //!   window resets (or [`DELIVERED_TTL`] for windows with no reset time), so
@@ -249,15 +250,56 @@ pub fn model_provider(model: Option<&str>) -> Option<String> {
     (!provider.is_empty() && !rest.is_empty()).then(|| provider.to_ascii_lowercase())
 }
 
-/// Does `alert` concern a session of `harness` on `model`?
-pub fn affects(alert: &UsageAlert, harness: HarnessId, model: Option<&str>) -> bool {
+/// Is this the model Pi picks for itself (`default`), rather than one of a
+/// provider Zeron named?
+pub fn is_harness_default(model: Option<&str>) -> bool {
+    model.is_none_or(|model| model.trim().eq_ignore_ascii_case("default"))
+}
+
+/// The provider Pi's own default model runs on: `defaultProvider` in its
+/// `settings.json` (beside `auth.json`), else the `provider/` prefix of
+/// `defaultModel`. `None` when Pi's settings name neither.
+pub fn pi_default_provider(settings_file: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(settings_file).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let named = |key: &str| {
+        settings
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let provider = match named("defaultProvider") {
+        Some(provider) => provider.to_owned(),
+        // An older Pi may only name the model; a `provider/id` names its own.
+        None => return model_provider(named("defaultModel")),
+    };
+    Some(provider.to_ascii_lowercase())
+}
+
+/// Does `alert` concern a session of `harness` on `model`? A session on the
+/// harness's own default model runs on `default_provider` (Pi's configured
+/// one; there is no provider to read off a `default` model).
+pub fn affects(
+    alert: &UsageAlert,
+    harness: HarnessId,
+    model: Option<&str>,
+    default_provider: Option<&str>,
+) -> bool {
     if alert.harness != harness {
         return false;
     }
     match &alert.provider {
         // Single-login harness: its one active login is every session's.
         None => true,
-        Some(provider) => model_provider(model).as_deref() == Some(provider.as_str()),
+        Some(provider) => {
+            let served = match (model_provider(model), is_harness_default(model)) {
+                (Some(served), _) => Some(served),
+                (None, true) => default_provider.map(str::to_ascii_lowercase),
+                (None, false) => None,
+            };
+            served.as_deref() == Some(provider.as_str())
+        }
     }
 }
 
@@ -391,13 +433,15 @@ fn kind_for(status: Option<SessionStatus>, idle_runs: bool) -> Option<DeliveryKi
     }
 }
 
-/// Plan who is told what. Pure. `paused(root)` says whether the user paused
-/// an orchestrator.
+/// Plan who is told what. Pure. `default_provider` is the provider Pi's own
+/// default model runs on; `paused(root)` says whether the user paused an
+/// orchestrator.
 pub fn plan(
     views: &[ChatView],
     alerts: &[UsageAlert],
     delivered: &Delivered,
     device_id: &str,
+    default_provider: Option<&str>,
     paused: &dyn Fn(&str) -> bool,
 ) -> Vec<Delivery> {
     let mut out = Vec::new();
@@ -413,7 +457,7 @@ pub fn plan(
         }
         let hits: Vec<UsageAlert> = alerts
             .iter()
-            .filter(|a| affects(a, view.harness, view.model.as_deref()))
+            .filter(|a| affects(a, view.harness, view.model.as_deref(), default_provider))
             .cloned()
             .collect();
         if hits.is_empty() {
@@ -690,6 +734,14 @@ impl UsageAlerts {
         let before = delivered.clone();
         delivered.prune(now);
         let views = self.views();
+        // Pi's `settings.json` sits beside the `auth.json` this reader has.
+        let default_provider = pi_default_provider(
+            &self
+                .inner
+                .config
+                .pi_auth_file
+                .with_file_name("settings.json"),
+        );
         let workspace = self.inner.workspace.clone();
         let paused = move |root: &str| workspace.orchestrator_project(root).paused;
         let deliveries = plan(
@@ -697,6 +749,7 @@ impl UsageAlerts {
             alerts,
             &delivered,
             self.inner.doc_host.device_id(),
+            default_provider.as_deref(),
             &paused,
         );
         for delivery in deliveries {
