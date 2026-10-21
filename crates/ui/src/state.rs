@@ -692,6 +692,12 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
 struct PendingSend {
     message_id: String,
     started: DateTime<Utc>,
+    /// The chat row's `last_message_at` when the send fired. The host stamps
+    /// that field in the same causal step as the user-message write, and the
+    /// chats watch carries it for every chat — open or not — so a stamp past
+    /// this baseline is the one delivery proof a chat nobody is looking at
+    /// still gives ([`AppState::ack_pending_send_from_chat_activity`]).
+    activity: Option<DateTime<Utc>>,
 }
 
 /// How long an unadopted send reads as Working/Sending (or Queued when the
@@ -1214,6 +1220,10 @@ impl AppState {
             self.chats_synced = true;
             self.transcript_cache
                 .retain(|cached| self.chats.iter().any(|c| c.id == cached.chat_id));
+        }
+        // A background chat's delivery rides this frame, not a transcript one.
+        if self.ack_pending_send_from_chat_activity() {
+            changed = true;
         }
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
@@ -1779,13 +1789,24 @@ impl AppState {
     /// phantom Working→Idle edge in it rang the done-chime on send (user
     /// report 2026-08-05).
     pub fn begin_pending_send(&mut self, chat_id: &str, message_id: &str, now: DateTime<Utc>) {
+        let activity = self.chat_activity(chat_id);
         self.pending_sends.insert(
             chat_id.to_string(),
             PendingSend {
                 message_id: message_id.to_string(),
                 started: now,
+                activity,
             },
         );
+    }
+
+    /// The chat row's current message stamp, the baseline a pending send
+    /// measures delivery against.
+    fn chat_activity(&self, chat_id: &str) -> Option<DateTime<Utc>> {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(|chat| chat.last_message_at)
     }
 
     /// Send failed — drop the overlay so the dot tells the truth again. Only
@@ -1913,6 +1934,37 @@ impl AppState {
         {
             self.pending_sends.remove(chat_id);
         }
+    }
+
+    /// Same ack, without a transcript to read: a send whose chat the person
+    /// left before the host drained its command never sees the confirming
+    /// frame — this state only ever watches the SELECTED chat's doc — so a
+    /// delivered send sat out its grace window and flipped to the red "Not
+    /// delivered" row (and retry affordance) for a message that had in fact
+    /// arrived. The chat row's `lastMessageAt` is the host's own "a user
+    /// message landed here" stamp, written causally after the message itself
+    /// (engine sessions.rs / doc_host.rs note_message) and carried by the
+    /// chats watch for every chat, open or not. Comparing it with the stamp
+    /// the send fired against proves the doc moved; both stamps come from the
+    /// host's clock, so device skew cancels — the same reasoning as the
+    /// `last_seen_at` seen marker. Returns whether an overlay was dropped.
+    fn ack_pending_send_from_chat_activity(&mut self) -> bool {
+        let chats = &self.chats;
+        let before = self.pending_sends.len();
+        self.pending_sends.retain(|chat_id, pending| {
+            let landed = chats
+                .iter()
+                .find(|chat| &chat.id == chat_id)
+                .and_then(|chat| chat.last_message_at);
+            match (landed, pending.activity) {
+                (Some(landed), Some(fired)) => landed <= fired,
+                // No stamp when the send fired (a chat nothing had written
+                // yet) or none now: nothing proves the doc moved.
+                (Some(_), None) => false,
+                (None, _) => true,
+            }
+        });
+        self.pending_sends.len() != before
     }
 
     /// A send the host held for the next turn shows as its queue row, not
@@ -5886,6 +5938,63 @@ mod tests {
         assert_eq!(ids, vec!["sent"]);
         assert!(!state.pending_sends.contains_key("c1"));
         assert_eq!(state.queue.len(), 1);
+    }
+
+    #[test]
+    fn a_send_on_a_background_chat_is_acked_when_its_row_advances() {
+        let now = clock_epoch();
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("open", 0, Some(-30)), chat("bg", 1, Some(-10))]);
+        state.selected_chat = Some("open".into());
+        state.begin_pending_send("bg", "m1", now);
+        state.begin_pending_send("open", "m2", now);
+        // The chats watch republishes unchanged rows: still no proof.
+        assert!(!state.apply_chats(state.chats.clone()));
+        assert!(state.send_pending("bg", now));
+        // The host drained the queued command and stamped the chat row with
+        // the message time. That chat stays in the background, so its
+        // transcript frame — the only other delivery proof — never arrives.
+        let mut advanced = state.chats.clone();
+        advanced
+            .iter_mut()
+            .find(|chat| chat.id == "bg")
+            .unwrap()
+            .last_message_at = Some(now);
+        assert!(state.apply_chats(advanced));
+        assert!(!state.pending_sends.contains_key("bg"));
+        assert!(
+            !state.send_undelivered(
+                "bg",
+                now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1)
+            ),
+            "a delivered background send must never read as failed"
+        );
+        // The untouched chat keeps its own overlay.
+        assert!(state.send_pending("open", now));
+    }
+
+    #[test]
+    fn a_send_whose_chat_row_never_moves_still_surfaces_as_undelivered() {
+        let now = clock_epoch();
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("open", 0, Some(-30)), chat("bg", 1, Some(-10))]);
+        state.selected_chat = Some("open".into());
+        state.begin_pending_send("bg", "m1", now);
+        // Republished rows, and a stamp older than the one the send saw,
+        // prove nothing.
+        assert!(!state.apply_chats(state.chats.clone()));
+        let mut backdated = state.chats.clone();
+        backdated
+            .iter_mut()
+            .find(|chat| chat.id == "bg")
+            .unwrap()
+            .last_message_at = Some(now - TimeDelta::minutes(60));
+        state.apply_chats(backdated);
+        assert!(state.pending_sends.contains_key("bg"));
+        assert!(state.send_undelivered(
+            "bg",
+            now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1)
+        ));
     }
 
     #[test]
