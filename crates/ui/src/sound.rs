@@ -343,9 +343,24 @@ fn run_checked(program: &str, args: &[&str], path: &Path) -> Result<(), String> 
 // ---------------------------------------------------------------------------
 
 use zeron_proto::{
-    Session,
+    Chat, Session,
     view::{Indicator, effective_indicator},
 };
+
+/// Whether `chat_id`'s session may ring a chime or banner at all. The
+/// sessions the user lists do: a plain chat, or one an orchestrator started
+/// into its tree (the Orchestrator tab), whose outcomes are just as much the
+/// user's to hear. Side chats — btw asides, and a chat's workers outside a
+/// tree — keep their baselines current but stay silent, as do the hidden
+/// voice and orchestrator chats (`Chat::is_top_level` covers the roots).
+pub(crate) fn notifies(chats: &[Chat], chat_id: &str) -> bool {
+    let Some(chat) = chats.iter().find(|chat| chat.id == chat_id) else {
+        return false;
+    };
+    chat.is_top_level()
+        || (!chat.is_btw()
+            && zeron_proto::orchestrator::depth(chats, chat_id).is_some_and(|depth| depth > 0))
+}
 
 /// Notification baseline is separate from the visual activity indicator:
 /// going idle can mean cancellation, expiry, or an internal handoff.
@@ -472,6 +487,40 @@ mod tests {
             last_completed_turn: turn.map(str::to_owned),
             fresh: true,
         }
+    }
+
+    fn chat(id: &str, parent: Option<&str>) -> Chat {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "deviceId": "dev", "title": id, "archived": false,
+            "cwd": null, "branch": null, "checkoutId": null, "config": null,
+            "lastMessagePreview": null, "lastMessageAt": null,
+            "createdAt": "2026-10-14T00:00:00Z", "parentChatId": parent,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn orchestrated_sessions_ring_and_side_chats_stay_silent() {
+        let root = zeron_proto::orchestrator::new_root_chat_id();
+        let chats = vec![
+            chat(&root, None),
+            chat("member", Some(&root)),
+            chat("grandchild", Some("member")),
+            chat("plain", None),
+            chat("worker", Some("plain")),
+            chat("btw-aside", Some("member")),
+            chat("btw-plain", Some("plain")),
+            chat("voice-orchestrator-1", None),
+        ];
+        assert!(!notifies(&chats, &root), "the hidden root never rings");
+        assert!(notifies(&chats, "member"), "an orchestrator's session");
+        assert!(notifies(&chats, "grandchild"));
+        assert!(!notifies(&chats, "voice-orchestrator-1"));
+        assert!(notifies(&chats, "plain"));
+        assert!(!notifies(&chats, "worker"), "a chat's worker stays silent");
+        assert!(!notifies(&chats, "btw-aside"), "even inside a tree");
+        assert!(!notifies(&chats, "btw-plain"));
+        assert!(!notifies(&chats, "missing"));
     }
 
     #[test]
