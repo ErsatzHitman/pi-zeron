@@ -947,7 +947,21 @@ pub(crate) fn is_protected(device: &str, path: &str) -> bool {
 
 /// Replace the eviction shield with the given keys (see [`protected`]).
 pub fn protect_attachments(keys: std::collections::HashSet<(String, String)>) {
+    #[cfg(test)]
+    PROTECT_PUBLISHES.with(|count| count.set(count.get() + 1));
     *protected().lock().unwrap() = keys;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread publish count. The shield itself is process-global, so a
+    /// test asserting on REBUILDS must not read other tests' publishes.
+    static PROTECT_PUBLISHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn protect_publishes() -> usize {
+    PROTECT_PUBLISHES.with(|count| count.get())
 }
 
 fn key(device_id: &str, path: &str) -> AttachmentKey {

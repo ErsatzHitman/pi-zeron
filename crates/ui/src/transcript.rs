@@ -2854,6 +2854,10 @@ impl HighlightStore {
 pub(crate) struct TranscriptPreparation {
     entries: Vec<SessionMessageEntry>,
     cache: HashMap<String, Arc<Vec<Row>>>,
+    /// The same entry split for compact mode. Both splits are prepared here so
+    /// a mode the UI polls per frame never falls back to building rows (and
+    /// fingerprinting, and parsing) on the UI thread.
+    compact_cache: HashMap<String, Arc<Vec<Row>>>,
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
     baseline: Option<zeron_doc::TranscriptBaseline>,
@@ -2861,6 +2865,8 @@ pub(crate) struct TranscriptPreparation {
 
 pub(crate) struct PreparedTranscript {
     pub(crate) rows: HashMap<String, Arc<Vec<Row>>>,
+    /// Per-entry rows with the compact-mode split (see [`TranscriptPreparation`]).
+    pub(crate) compact_rows: HashMap<String, Arc<Vec<Row>>>,
     pub(crate) historical: HashMap<String, Vec<Row>>,
     fully_historical: HashSet<String>,
     pub(crate) navigation_baseline: Arc<zeron_doc::TranscriptBaseline>,
@@ -2875,6 +2881,7 @@ impl TranscriptPreparation {
         match &update.frame {
             zeron_doc::TranscriptFrame::Reset { .. } => {
                 self.cache.clear();
+                self.compact_cache.clear();
                 self.tree_cache.clear();
                 self.live_parsers.clear();
             }
@@ -2894,6 +2901,7 @@ impl TranscriptPreparation {
                     .chain(remove.iter())
                 {
                     self.cache.remove(id);
+                    self.compact_cache.remove(id);
                 }
             }
         }
@@ -2902,14 +2910,15 @@ impl TranscriptPreparation {
             self.baseline = Some(baseline.clone());
         }
         let mut rows = HashMap::new();
+        let mut compact_rows = HashMap::new();
         let mut historical = HashMap::new();
         let mut fully_historical = HashSet::new();
         let mut bytes = 0;
         for entry in &self.entries {
+            let streaming = entry.status == Some(MessageStatus::Streaming);
             let built = if let Some(rows) = self.cache.get(&entry.id) {
                 rows.clone()
             } else {
-                let streaming = entry.status == Some(MessageStatus::Streaming);
                 let built = Arc::new(rows_for_entry(entry, false, false, &mut |key, text| {
                     parse_for_row(
                         streaming,
@@ -2924,6 +2933,25 @@ impl TranscriptPreparation {
                 built
             };
             rows.insert(entry.id.clone(), built);
+            // The compact split shares this entry's parsed trees, so it only
+            // re-partitions them into the work group.
+            let compact = if let Some(rows) = self.compact_cache.get(&entry.id) {
+                rows.clone()
+            } else {
+                let built = Arc::new(rows_for_entry(entry, false, true, &mut |key, text| {
+                    parse_for_row(
+                        streaming,
+                        key,
+                        text,
+                        &mut self.live_parsers,
+                        &mut self.tree_cache,
+                    )
+                    .0
+                }));
+                self.compact_cache.insert(entry.id.clone(), built.clone());
+                built
+            };
+            compact_rows.insert(entry.id.clone(), compact);
             if self.baseline.as_ref().is_some_and(|b| b.covers(entry)) {
                 fully_historical.insert(entry.id.clone());
             }
@@ -2947,8 +2975,11 @@ impl TranscriptPreparation {
                     .sum::<usize>();
         }
         self.cache.retain(|id, _| rows.contains_key(id));
+        self.compact_cache
+            .retain(|id, _| compact_rows.contains_key(id));
         Ok(Arc::new(PreparedTranscript {
             rows,
+            compact_rows,
             historical,
             fully_historical,
             bytes,
@@ -3716,6 +3747,10 @@ pub struct Transcript {
     visuals: HashMap<SharedString, Entity<crate::visuals::VisualFrame>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
+    /// Devices the last published attachment shield was built for, so a sync
+    /// that leaves user rows and owning devices alone skips the rebuild (see
+    /// [`Transcript::sync_protected_attachments`]).
+    protected_attachment_devices: Option<Vec<String>>,
     /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
     /// chat2-sync A3). `Ready` holds the UPGRADED detail, built once on
     /// arrival — render swaps it in per chip; rows never rebuild for it.
@@ -4218,6 +4253,7 @@ impl Transcript {
             doc_loads: HashMap::new(),
             visuals: HashMap::new(),
             attachment_retries: HashMap::new(),
+            protected_attachment_devices: None,
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
@@ -5368,6 +5404,7 @@ impl Transcript {
             self.rows.clear();
             self.tool_images.clear(cx);
             self.row_cache.clear();
+            self.protected_attachment_devices = None;
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
@@ -5445,10 +5482,19 @@ impl Transcript {
                 .as_ref()
                 .and_then(|id| state.prepared_transcripts.get(id));
             for entry in entries {
-                if !self.compact_mode
-                    && let Some(rows) = prepared.and_then(|p| p.rows.get(&entry.id))
-                {
-                    new_rows.extend(rows.iter().cloned());
+                let cached = prepared.and_then(|p| {
+                    if self.compact_mode {
+                        p.compact_rows.get(&entry.id)
+                    } else {
+                        p.rows.get(&entry.id)
+                    }
+                });
+                if let Some(rows) = cached {
+                    if self.compact_mode {
+                        new_rows.extend(self.adopt_compact_rows(rows, entry));
+                    } else {
+                        new_rows.extend(rows.iter().cloned());
+                    }
                 } else {
                     new_rows.extend(self.rows_for(entry, false));
                 }
@@ -5585,122 +5631,174 @@ impl Transcript {
                 fold.disclosure_at = None;
             }
         }
-        let previous_tools: HashMap<SharedString, HashMap<String, Option<Instant>>> = self
-            .rows
-            .iter()
-            .filter(|row| !fully_historical.contains(&row.entry_id))
-            .filter_map(|row| match &row.kind {
-                RowKind::ToolGroup { tools, .. } => {
-                    let reveal = self.tool_group_reveals.get(&row.id);
-                    Some((
-                        row.id.clone(),
-                        tools
+        // The row diff decides what the passes below actually have to do, so
+        // it is computed BEFORE them: an unchanged row set (with no attach or
+        // baseline bookkeeping due) makes every one of them a no-op, and they
+        // are all O(total transcript) by nature.
+        let change = diff_rows(&self.rows, &new_rows);
+        let settled = !attached && change.is_none() && !baseline_changed && !replay_baseline;
+        // Only a User row can contribute a protected attachment key, so a
+        // commit that leaves every user row alone keeps the previous shield
+        // instead of rebuilding that global set.
+        let user_rows_changed = match &change {
+            None => false,
+            Some((old_range, count)) => self.rows[old_range.clone()]
+                .iter()
+                .chain(new_rows[old_range.start..old_range.start + *count].iter())
+                .any(|row| matches!(row.kind, RowKind::User { .. })),
+        };
+        if !settled {
+            // Previous chip layouts, borrowed by row id: carrying arrival
+            // instants forward must not clone a part id per chip in the whole
+            // transcript on every streaming commit.
+            let previous_groups: HashMap<&str, &[ToolItem]> = self
+                .rows
+                .iter()
+                .filter(|row| !fully_historical.contains(&row.entry_id))
+                .filter_map(|row| match &row.kind {
+                    RowKind::ToolGroup { tools, .. } => Some((row.id.as_ref(), tools.as_slice())),
+                    _ => None,
+                })
+                .collect();
+            let now = Instant::now();
+            let mut live_tool_groups = HashSet::new();
+            for row in &new_rows {
+                let RowKind::ToolGroup { tools, .. } = &row.kind else {
+                    continue;
+                };
+                // Agent/spawn groups are standalone cards, not task trees —
+                // except under compact mode, where they collapse like the rest.
+                if !self.compact_mode && !tool_group_collapses(tools) {
+                    continue;
+                }
+                live_tool_groups.insert(row.id.clone());
+                let historical = historical_tools.get(&row.entry_id);
+                let whole_group_historical = fully_historical.contains(&row.entry_id)
+                    || (replay_baseline && baseline.is_none());
+                let is_historical = |tool: &ToolItem| {
+                    whole_group_historical
+                        || historical.is_some_and(|ids| ids.contains(&tool.part_id))
+                };
+                let historical_count = if whole_group_historical {
+                    tools.len()
+                } else {
+                    tools.iter().filter(|tool| is_historical(tool)).count()
+                };
+                // Chip part id → the instant it arrived, from the layout this
+                // commit replaces. Built per live group (borrowed part ids)
+                // rather than for every group in the transcript.
+                let previous: Option<HashMap<&str, Option<Instant>>> =
+                    previous_groups.get(row.id.as_ref()).map(|previous| {
+                        let starts = self
+                            .tool_group_reveals
+                            .get(&row.id)
+                            .map(|reveal| reveal.starts.as_slice());
+                        previous
                             .iter()
                             .enumerate()
                             .map(|(ix, tool)| {
                                 (
-                                    tool.part_id.clone(),
-                                    reveal.and_then(|r| r.starts.get(ix).copied().flatten()),
+                                    tool.part_id.as_str(),
+                                    starts.and_then(|starts| starts.get(ix).copied().flatten()),
                                 )
                             })
-                            .collect(),
-                    ))
-                }
-                _ => None,
-            })
-            .collect();
-        let now = Instant::now();
-        let mut live_tool_groups = HashSet::new();
-        for row in &new_rows {
-            let RowKind::ToolGroup { tools, .. } = &row.kind else {
-                continue;
-            };
-            // Agent/spawn groups are standalone cards, not task trees —
-            // except under compact mode, where they collapse like the rest.
-            if !self.compact_mode && !tool_group_collapses(tools) {
-                continue;
-            }
-            live_tool_groups.insert(row.id.clone());
-            let historical = historical_tools.get(&row.entry_id);
-            let whole_group_historical =
-                fully_historical.contains(&row.entry_id) || (replay_baseline && baseline.is_none());
-            let is_historical = |tool: &ToolItem| {
-                whole_group_historical || historical.is_some_and(|ids| ids.contains(&tool.part_id))
-            };
-            let historical_count = if whole_group_historical {
-                tools.len()
-            } else {
-                tools.iter().filter(|tool| is_historical(tool)).count()
-            };
-            let previous = previous_tools.get(&row.id);
-            let is_new_group = historical_count == 0 && previous.is_none();
-            let reveal = self.tool_group_reveals.entry(row.id.clone()).or_default();
-            if baseline_changed && historical_count > 0 {
-                reveal.rendered_open = None;
-                if let Some(fold) = self.folds.get_mut(&row.id) {
-                    fold.toggled_at = None;
-                    fold.disclosure_at = None;
-                }
-            }
-            reveal.shimmer_started_at.get_or_insert(now);
-            if is_new_group {
-                reveal.header_started_at.get_or_insert(now);
-            }
-            if baseline_changed && historical_count == tools.len() {
-                reveal.header_started_at = None;
-            }
-            let first_row_delay = is_new_group.then_some(TOOL_FIRST_ROW_DELAY_MS).unwrap_or(0);
-            let mut arrival_ix = 0;
-            if whole_group_historical {
-                reveal.starts.clear();
-                reveal.starts.resize(tools.len(), None);
-                continue;
-            }
-            reveal.starts = tools
-                .iter()
-                .map(|tool| {
-                    if is_historical(tool) {
-                        return None;
+                            .collect()
+                    });
+                let is_new_group = historical_count == 0 && previous.is_none();
+                let reveal = self.tool_group_reveals.entry(row.id.clone()).or_default();
+                if baseline_changed && historical_count > 0 {
+                    reveal.rendered_open = None;
+                    if let Some(fold) = self.folds.get_mut(&row.id) {
+                        fold.toggled_at = None;
+                        fold.disclosure_at = None;
                     }
-                    if let Some(start) = previous.and_then(|tools| tools.get(&tool.part_id)) {
-                        return *start;
-                    }
-                    let start = now
-                        + Duration::from_millis(first_row_delay + arrival_ix * TOOL_ROW_STAGGER_MS);
-                    arrival_ix += 1;
-                    Some(start)
-                })
-                .collect();
-        }
-        self.tool_group_reveals
-            .retain(|row_id, _| live_tool_groups.contains(row_id));
+                }
+                reveal.shimmer_started_at.get_or_insert(now);
+                if is_new_group {
+                    reveal.header_started_at.get_or_insert(now);
+                }
+                if baseline_changed && historical_count == tools.len() {
+                    reveal.header_started_at = None;
+                }
+                let first_row_delay = is_new_group.then_some(TOOL_FIRST_ROW_DELAY_MS).unwrap_or(0);
+                let mut arrival_ix = 0;
+                if whole_group_historical {
+                    reveal.starts.clear();
+                    reveal.starts.resize(tools.len(), None);
+                    continue;
+                }
+                reveal.starts = tools
+                    .iter()
+                    .map(|tool| {
+                        if is_historical(tool) {
+                            return None;
+                        }
+                        if let Some(start) = previous
+                            .as_ref()
+                            .and_then(|previous| previous.get(tool.part_id.as_str()))
+                        {
+                            return *start;
+                        }
+                        let start = now
+                            + Duration::from_millis(
+                                first_row_delay + arrival_ix * TOOL_ROW_STAGGER_MS,
+                            );
+                        arrival_ix += 1;
+                        Some(start)
+                    })
+                    .collect();
+            }
+            self.tool_group_reveals
+                .retain(|row_id, _| live_tool_groups.contains(row_id));
 
-        // Runtime scroll handles follow the stable code rows exactly. A live
-        // block keeps its handle through completion; deleted/reindexed tail
-        // blocks and the previous chat cannot accumulate stale handles.
-        let active_code_fences: HashSet<SharedString> = new_rows
-            .iter()
-            .flat_map(|row| match &row.kind {
-                RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix } => {
-                    tree.blocks
-                        .get(*block_ix)
-                        .map(|top| {
-                            render::code_block_indices(&top.block, *block_ix)
-                                .into_iter()
-                                .map(|ix| format!("{}#code{ix}", row.id).into())
-                                .collect()
-                        })
-                        .unwrap_or_default()
+            // Runtime scroll handles follow the stable code rows exactly. A
+            // live block keeps its handle through completion; deleted/
+            // reindexed tail blocks and the previous chat cannot accumulate
+            // stale handles.
+            if !self.code_fences.is_empty() {
+                let live_rows: HashSet<&str> = new_rows
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row.kind,
+                            RowKind::Markdown { .. } | RowKind::LiveMarkdown { .. }
+                        )
+                    })
+                    .map(|row| row.id.as_ref())
+                    .collect();
+                // A row that survives this commit keeps its fences; only the
+                // rows the diff replaced can have lost one, so the exact
+                // per-fence set is rebuilt for those alone — no tree walk and
+                // no formatted key per fence in the transcript.
+                let mut replaced_rows: HashSet<&str> = HashSet::new();
+                let mut replaced_fences: HashSet<SharedString> = HashSet::new();
+                if let Some((range, count)) = &change {
+                    for row in &new_rows[range.start..range.start + count] {
+                        if let RowKind::Markdown { tree, block_ix }
+                        | RowKind::LiveMarkdown { tree, block_ix } = &row.kind
+                        {
+                            replaced_rows.insert(row.id.as_ref());
+                            if let Some(top) = tree.blocks.get(*block_ix) {
+                                for ix in render::code_block_indices(&top.block, *block_ix) {
+                                    replaced_fences.insert(format!("{}#code{ix}", row.id).into());
+                                }
+                            }
+                        }
+                    }
                 }
-                _ => Vec::new(),
-            })
-            .collect();
-        self.code_fences
-            .retain(|key, _| active_code_fences.contains(key));
-        // Diagram source toggles follow the same stable row identity.
-        if self.diagrams.borrow().has_source_toggles() {
-            let row_ids: HashSet<&str> = new_rows.iter().map(|row| row.id.as_ref()).collect();
-            self.diagrams.borrow_mut().retain_rows(&row_ids);
+                self.code_fences.retain(|key, _| {
+                    let Some((row_id, _)) = key.rsplit_once("#code") else {
+                        return false;
+                    };
+                    live_rows.contains(row_id)
+                        && (!replaced_rows.contains(row_id) || replaced_fences.contains(key))
+                });
+            }
+            // Diagram source toggles follow the same stable row identity.
+            if self.diagrams.borrow().has_source_toggles() {
+                let row_ids: HashSet<&str> = new_rows.iter().map(|row| row.id.as_ref()).collect();
+                self.diagrams.borrow_mut().retain_rows(&row_ids);
+            }
         }
 
         // Text already streamed before this (re)attach is the veil BASELINE:
@@ -5722,16 +5820,23 @@ impl Transcript {
 
         // Veils live exactly as long as their live row — drop them on the
         // live→complete flip (any mid-fade chunk snaps to full, matching the
-        // row's version splice).
-        let active_markdown: HashSet<&SharedString> = new_rows
-            .iter()
-            .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
-            .map(|row| &row.id)
-            .collect();
-        self.veils.retain(|id, _| active_markdown.contains(id));
-        self.veil_baseline.retain(|id| active_markdown.contains(id));
-        self.historical_markdown
-            .retain(|id, _| active_markdown.contains(id));
+        // row's version splice). Nothing can be dropped while the row set is
+        // unchanged, and nothing to scan while all three sets are empty.
+        if !settled
+            && !(self.veils.is_empty()
+                && self.veil_baseline.is_empty()
+                && self.historical_markdown.is_empty())
+        {
+            let active_markdown: HashSet<&SharedString> = new_rows
+                .iter()
+                .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+                .map(|row| &row.id)
+                .collect();
+            self.veils.retain(|id, _| active_markdown.contains(id));
+            self.veil_baseline.retain(|id| active_markdown.contains(id));
+            self.historical_markdown
+                .retain(|id, _| active_markdown.contains(id));
+        }
 
         // Capture this before the row splice changes the list's measured end.
         // When the user is truly live-following, retaining the end anchor
@@ -5742,10 +5847,10 @@ impl Transcript {
             should_anchor_live_stream(self.pinned, self.distance_from_bottom(), tail_streaming);
         let was_empty = self.rows.is_empty();
         let old_last = self.rows.len().checked_sub(1);
-        match diff_rows(&self.rows, &new_rows) {
+        match change {
             None => {
                 self.rows = new_rows;
-                self.refresh_protected_attachments(cx);
+                self.sync_protected_attachments(user_rows_changed, cx);
                 self.release_departed_tool_images(cx);
                 self.reconcile_own_turn_prompt();
                 // Replay readiness is independent of row content: an empty
@@ -5798,7 +5903,7 @@ impl Transcript {
                 });
             }
         }
-        self.refresh_protected_attachments(cx);
+        self.sync_protected_attachments(user_rows_changed, cx);
         self.release_departed_tool_images(cx);
         self.reconcile_own_turn_prompt();
         self.restore_pending_viewport(replay);
@@ -5909,18 +6014,45 @@ impl Transcript {
                 },
             );
         }
-        rows.retain(|row| match &row.compact_fold {
+        rows.retain(|row| self.fold_row_kept(row));
+        rows
+    }
+
+    /// Per-instance UI state over a background-prepared compact row set: the
+    /// "Worked for" seconds and the open work fold's body trim. The split
+    /// itself — fingerprinting, parsing, tool summaries — already happened off
+    /// the UI thread, so adopting costs one pass over this entry's rows.
+    fn adopt_compact_rows(&self, rows: &[Row], entry: &SessionMessageEntry) -> Vec<Row> {
+        let mut rows = rows.to_vec();
+        if let Some(secs) = self.compact_worked_secs_for(entry) {
+            for row in &mut rows {
+                if let RowKind::ToolGroup {
+                    worked_secs,
+                    compact_shell: true,
+                    ..
+                } = &mut row.kind
+                {
+                    *worked_secs = Some(secs);
+                }
+            }
+        }
+        rows.retain(|row| self.fold_row_kept(row));
+        rows
+    }
+
+    /// A fold body row is mounted only while its work fold is open. A closing
+    /// fold keeps its body through the TOOL_FOLD tween; the shell's settle
+    /// sweep drops the rows afterwards.
+    fn fold_row_kept(&self, row: &Row) -> bool {
+        match &row.compact_fold {
             None => true,
-            // A closing fold keeps its body mounted through the TOOL_FOLD
-            // tween; the shell's settle sweep drops the rows afterwards.
             Some(id) => self.folds.get(id).is_some_and(|fold| {
                 fold.open == Some(true)
                     || fold
                         .toggled_at
                         .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW)
             }),
-        });
-        rows
+        }
     }
 
     /// Fetch a sidecar blob (full tool output or diff) and build its upgraded
@@ -6221,6 +6353,22 @@ impl Transcript {
             return;
         }
         crate::attachments::protect_attachments(self.protected_attachment_keys(cx));
+    }
+
+    /// [`refresh_protected_attachments`](Self::refresh_protected_attachments)
+    /// for a row sync: the set is a string pair per attachment × device over
+    /// the WHOLE transcript, so it is only rebuilt when a commit could have
+    /// changed it — a user row moved, or the owning devices did.
+    fn sync_protected_attachments(&mut self, user_rows_changed: bool, cx: &Context<Self>) {
+        if self.doc_override.is_some() {
+            return;
+        }
+        let devices = self.attachment_device_ids(cx);
+        if !user_rows_changed && self.protected_attachment_devices.as_ref() == Some(&devices) {
+            return;
+        }
+        self.protected_attachment_devices = Some(devices);
+        self.refresh_protected_attachments(cx);
     }
 
     fn protected_attachment_keys(&self, cx: &Context<Self>) -> HashSet<(String, String)> {
@@ -12279,6 +12427,201 @@ mod tests {
                 historical_entrances,
                 vec![0, 0],
                 "tools accumulated while away must not acquire entrance animations in either catch-up batch"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn unchanged_sync_does_not_republish_the_attachment_shield(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        let path = "/data/uploads/ab12-red.png";
+        let user = |body: &str| {
+            let content = crate::attachments::with_attachments(body, &[path.to_string()]);
+            let mut entry = assistant(
+                "u1",
+                MessageStatus::Complete,
+                vec![text_part("t0", &content)],
+            );
+            entry.role = MessageRole::User;
+            entry.status = None;
+            entry
+        };
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("chat-a".into());
+            state.local_device_id = Some("local-dev".into());
+            state.transcript_replayed = true;
+            state.transcript = vec![user("what color is this?")];
+            state.transcript_revision += 1;
+        });
+        transcript.update(cx, |this, cx| this.sync(cx));
+        assert!(crate::attachments::is_protected("local-dev", path));
+        let publishes = crate::attachments::protect_publishes();
+
+        // A revision bump that leaves every row alone must not rebuild the
+        // transcript-wide string-pair set (or replace the global shield).
+        state.update(cx, |state, _| state.transcript_revision += 1);
+        transcript.update(cx, |this, cx| this.sync(cx));
+        assert_eq!(
+            crate::attachments::protect_publishes(),
+            publishes,
+            "an unchanged row set keeps the published shield"
+        );
+
+        // Replacing the user row does republish it.
+        state.update(cx, |state, _| {
+            state.transcript = vec![user("what color is this? Exactly.")];
+            state.transcript_revision += 1;
+        });
+        transcript.update(cx, |this, cx| this.sync(cx));
+        assert_eq!(
+            crate::attachments::protect_publishes(),
+            publishes + 1,
+            "a changed user row republishes the shield"
+        );
+        assert!(crate::attachments::is_protected("local-dev", path));
+    }
+
+    #[test]
+    fn background_preparation_builds_the_compact_split_too() {
+        let mut worker = TranscriptPreparation::default();
+        let entries = vec![assistant(
+            "turn",
+            MessageStatus::Complete,
+            vec![
+                tool_part("one", "pwd"),
+                MessagePart::Text {
+                    id: "narration".into(),
+                    text: "Listing the tree".into(),
+                },
+                tool_part("two", "ls"),
+                MessagePart::Text {
+                    id: "reply".into(),
+                    text: "## Done".into(),
+                },
+            ],
+        )];
+        let prepared = worker
+            .prepare(&zeron_doc::TranscriptUpdate {
+                frame: zeron_doc::TranscriptFrame::reset(&entries),
+                context_usage: None,
+                replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
+            })
+            .unwrap();
+        let expected = rows_for_entry(&entries[0], false, true, &mut |_, text| {
+            Arc::new(parse_full(text))
+        });
+        let identity = |rows: &[Row]| -> Vec<(SharedString, u64)> {
+            rows.iter()
+                .map(|row| (row.id.clone(), row.version))
+                .collect()
+        };
+        assert_eq!(
+            identity(&prepared.compact_rows["turn"]),
+            identity(&expected),
+            "the background compact split must match the UI's"
+        );
+        // One folded work header for both calls and the narration chip; the
+        // reply keeps its own row.
+        let shell = prepared.compact_rows["turn"]
+            .iter()
+            .find(|row| {
+                matches!(
+                    &row.kind,
+                    RowKind::ToolGroup {
+                        compact_shell: true,
+                        ..
+                    }
+                )
+            })
+            .expect("compact split has a work header");
+        let RowKind::ToolGroup { tools, .. } = &shell.kind else {
+            unreachable!()
+        };
+        assert_eq!(tools.len(), 3);
+        assert!(
+            prepared.compact_rows["turn"]
+                .iter()
+                .any(|row| row.id == "turn#reply.0"),
+            "the reply stays a visible row"
+        );
+        // Unchanged entries keep the same compact rows across frames.
+        let mut changed = entries.clone();
+        changed[0].parts.push(MessagePart::Text {
+            id: "tail".into(),
+            text: "All clean".into(),
+        });
+        let next = worker
+            .prepare(&zeron_doc::TranscriptUpdate {
+                frame: zeron_doc::diff_transcript(&entries, &changed),
+                context_usage: None,
+                replay_baseline: None,
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &prepared.compact_rows["turn"],
+            &next.compact_rows["turn"]
+        ));
+    }
+
+    #[gpui::test]
+    fn compact_sync_adopts_prepared_rows_instead_of_building_them(cx: &mut gpui::TestAppContext) {
+        with_tool_group_navigation(cx, |state, transcript, cx| {
+            let entries = vec![assistant(
+                "turn",
+                MessageStatus::Complete,
+                vec![
+                    tool_part("one", "pwd"),
+                    MessagePart::Text {
+                        id: "narration".into(),
+                        text: "Listing the tree".into(),
+                    },
+                    tool_part("two", "ls"),
+                ],
+            )];
+            let update = zeron_doc::TranscriptUpdate {
+                replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(&entries)),
+                frame: zeron_doc::TranscriptFrame::Reset {
+                    reset: entries.clone(),
+                },
+                context_usage: None,
+            };
+            let prepared = std::thread::spawn({
+                let update = update.clone();
+                move || TranscriptPreparation::default().prepare(&update).unwrap()
+            })
+            .join()
+            .unwrap();
+            state.update(cx, |state, cx| state.select_chat(Some("whale".into()), cx));
+            transcript.update(cx, |this, cx| this.sync(cx));
+            state.update(cx, |state, cx| {
+                state
+                    .receive_opening_transcript_update(update, false, cx)
+                    .unwrap();
+                state
+                    .prepared_transcripts
+                    .insert("whale".into(), prepared);
+            });
+            transcript.update(cx, |this, _| this.compact_mode = true);
+            FORBID_ROW_PREPARATION.with(|flag| flag.set(true));
+            transcript.update(cx, |this, cx| this.sync(cx));
+            FORBID_ROW_PREPARATION.with(|flag| flag.set(false));
+            let this = transcript.read(cx);
+            assert!(
+                this.rows.iter().any(|row| matches!(
+                    &row.kind,
+                    RowKind::ToolGroup {
+                        compact_shell: true,
+                        ..
+                    }
+                )),
+                "compact mode must adopt the prepared rows"
             );
         });
     }
