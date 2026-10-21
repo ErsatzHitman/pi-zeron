@@ -98,6 +98,60 @@ fn one_shot_requests(state: &ExtensionUiState) -> ExtensionUiState {
     }
 }
 
+/// Give `slot` `next`'s value, copying only when it differs: a frame mostly
+/// repeats the one before it, and `clone_from` reuses the storage it holds.
+fn copy_if_changed<T: Clone + PartialEq>(slot: &mut T, next: &T) {
+    if *slot != *next {
+        slot.clone_from(next);
+    }
+}
+
+/// Give `frame`'s element `at` the value `next`, copying only when it differs.
+fn sync_element(frame: &mut Vec<Value>, at: usize, next: &Value) {
+    match frame.get_mut(at) {
+        Some(slot) if *slot == *next => {}
+        Some(slot) => slot.clone_from(next),
+        None => frame.push(next.clone()),
+    }
+}
+
+/// Make `frame`'s elements `state` followed by `extras` (the sheets and
+/// reports Zeron draws itself), copying only the ones that changed.
+fn sync_elements<'a>(
+    frame: &mut Vec<Value>,
+    state: &'a [Value],
+    extras: impl Iterator<Item = &'a Value>,
+) {
+    for (at, next) in state.iter().enumerate() {
+        sync_element(frame, at, next);
+    }
+    let mut len = state.len();
+    for next in extras {
+        sync_element(frame, len, next);
+        len += 1;
+    }
+    frame.truncate(len);
+}
+
+/// Make `frame`'s channels the state's plus the host's (which win), copying
+/// only the payloads that changed and dropping the ones nobody holds.
+fn sync_channels(
+    frame: &mut std::collections::BTreeMap<String, Value>,
+    state: &std::collections::BTreeMap<String, Value>,
+    host: &std::collections::BTreeMap<String, Value>,
+) {
+    frame.retain(|name, _| state.contains_key(name) || host.contains_key(name));
+    for (name, next) in state.iter().chain(host.iter()) {
+        match frame.get_mut(name) {
+            Some(slot) if slot == next => {}
+            Some(slot) => slot.clone_from(next),
+            None => {
+                frame.insert(name.clone(), next.clone());
+            }
+        }
+    }
+}
+
 fn last_request_seq(state: &ExtensionUiState) -> u64 {
     let notices = state.notices.iter().map(|n| n.seq);
     let durable = state.durable.iter().map(|d| d.seq);
@@ -329,24 +383,35 @@ impl ExtensionUi {
 
     fn publish(&mut self) {
         self.state.revision += 1;
-        if let Some(sink) = &self.sink {
-            let mut state = self.state.clone();
-            state
-                .channels
-                .extend(self.host.iter().map(|(name, value)| (name.clone(), value.clone())));
-            state
-                .elements
-                .extend(self.dialogs.iter().map(|dialog| dialog.element.clone()));
-            state
-                .elements
-                .extend(self.reports.iter().map(|(_, element)| element.clone()));
-            state.elements.extend(
-                self.host_elements
-                    .iter()
-                    .map(|(_, element)| element.clone()),
-            );
-            sink.send_replace(state);
-        }
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        // The frame in the watch is patched in place: Pi patches at ten
+        // frames a second, and cloning the whole state per frame (elements and
+        // channel payloads included) then adding the host's pieces to the
+        // copy was two copies of state nobody had changed. What repeats costs
+        // a comparison here; only what changed is copied. Every field of
+        // `ExtensionUiState` is synced below: a new one belongs here too.
+        let state = &self.state;
+        let extras = self
+            .dialogs
+            .iter()
+            .map(|dialog| &dialog.element)
+            .chain(self.reports.iter().map(|(_, element)| element))
+            .chain(self.host_elements.iter().map(|(_, element)| element));
+        sink.send_modify(|frame| {
+            frame.revision = state.revision;
+            frame.connected = state.connected;
+            copy_if_changed(&mut frame.instance, &state.instance);
+            sync_elements(&mut frame.elements, &state.elements, extras);
+            sync_channels(&mut frame.channels, &state.channels, &self.host);
+            copy_if_changed(&mut frame.statuses, &state.statuses);
+            copy_if_changed(&mut frame.widgets, &state.widgets);
+            copy_if_changed(&mut frame.notices, &state.notices);
+            copy_if_changed(&mut frame.editor_text, &state.editor_text);
+            copy_if_changed(&mut frame.title, &state.title);
+            copy_if_changed(&mut frame.durable, &state.durable);
+        });
     }
 
     /// Show a plain dialog as a sheet; false for a method no sheet answers.
@@ -856,6 +921,83 @@ mod tests {
         ui.host_channel("zeron:compact", Some(json!({})));
         ui.closed();
         assert!(rx.borrow().channels.is_empty());
+    }
+
+    /// The frame a UI gets, built the plain way: the state, then the pieces
+    /// Zeron draws itself. [`ExtensionUi::publish`] patches the frame in the
+    /// watch in place instead, so this is what it must match.
+    fn frame_of(ui: &ExtensionUi) -> ExtensionUiState {
+        let mut frame = ui.state().clone();
+        frame.channels.extend(ui.host.clone());
+        frame
+            .elements
+            .extend(ui.dialogs.iter().map(|dialog| dialog.element.clone()));
+        frame
+            .elements
+            .extend(ui.reports.iter().map(|(_, element)| element.clone()));
+        frame
+            .elements
+            .extend(ui.host_elements.iter().map(|(_, element)| element.clone()));
+        frame
+    }
+
+    #[test]
+    fn every_patched_frame_matches_the_state_it_describes() {
+        let (tx, rx) = watch::channel(ExtensionUiState::default());
+        let mut ui = ExtensionUi::new(Some(tx));
+        let check = |ui: &ExtensionUi, step: &str| {
+            assert_eq!(rx.borrow().clone(), frame_of(ui), "{step}");
+        };
+        ui.handle(&set(
+            1,
+            "a",
+            json!({"id":"jobs","ns":"bash","kind":"roster","placement":"pinned",
+                "rows":[{"id":"j1","label":"build","state":"running"}]}),
+        ));
+        check(&ui, "set");
+        ui.handle(&set(
+            2,
+            "a",
+            json!({"id":"list","ns":"todo","kind":"panel","placement":"pinned",
+                "durable":true}),
+        ));
+        ui.handle(&notify(json!({"v":1,"agentSeq":3,"instance":"a","op":"patch",
+            "ns":"bash","id":"jobs","patch":{"title":"Jobs"}})));
+        check(&ui, "patch");
+        ui.handle(&notify(json!({"v":1,"agentSeq":4,"instance":"a","op":"append",
+            "ns":"bash","id":"jobs","data":"line"})));
+        ui.handle(&notify(json!({"v":1,"agentSeq":5,"instance":"a","op":"channel",
+            "channel":"subagents:fleet","payload":{"entries":[]}})));
+        check(&ui, "append and channel");
+        ui.host_channel("zeron:compact", Some(json!({"compacting": true})));
+        ui.host_element(
+            "zeron:notice",
+            Some(json!({"id":"notice","ns":"zeron","placement":"inline"})),
+        );
+        check(&ui, "host pieces");
+        ui.open_dialog(&json!({"id":"s","method":"select","title":"Pick","options":["a","b"]}));
+        check(&ui, "dialog");
+        // A removal shifts the elements behind it.
+        ui.handle(&notify(json!({"v":1,"agentSeq":6,"instance":"a","op":"remove",
+            "ns":"todo","id":"list"})));
+        check(&ui, "remove");
+        ui.handle(&json!({"method":"setStatus","statusKey":"goal","statusText":"running"}));
+        ui.handle(&json!({"method":"setWidget","widgetKey":"btw","widgetLines":["a"]}));
+        ui.handle(&json!({"method":"setTitle","title":"Refactor"}));
+        ui.handle(&json!({"method":"set_editor_text","text":"draft"}));
+        ui.toast("saved".into(), NoticeLevel::Info);
+        ui.host_status("zeron:retry", Some("Retrying".into()));
+        check(&ui, "plain ui");
+        ui.close_dialogs(true);
+        ui.host_element("zeron:notice", None);
+        ui.host_channel("zeron:compact", None);
+        check(&ui, "after close");
+        ui.handle(&notify(json!({"v":1,"agentSeq":7,"instance":"a","op":"reset"})));
+        check(&ui, "reset");
+        ui.disconnect();
+        check(&ui, "disconnect");
+        ui.closed();
+        check(&ui, "closed");
     }
 
     fn notify(envelope: Value) -> Value {

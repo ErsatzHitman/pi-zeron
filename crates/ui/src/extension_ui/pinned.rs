@@ -427,10 +427,12 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
 }
 
 impl Composer {
-    fn live_extension_ui(&self, cx: &App) -> Option<ExtensionUiState> {
+    /// The selected chat's live UI, borrowed: renderers read it on every
+    /// frame, and a copy of it per frame copied every element and payload.
+    fn live_extension_ui<'a>(&self, cx: &'a App) -> Option<&'a ExtensionUiState> {
         let state = self.state.read(cx);
         let chat = state.selected_chat.as_deref()?;
-        state.extension_ui.of(chat).cloned()
+        state.extension_ui.of(chat)
     }
 
     /// The pinned trays, outermost first. `below_queue`: a queue tray follows.
@@ -446,7 +448,7 @@ impl Composer {
         let Some(state) = self.live_extension_ui(cx) else {
             return Vec::new();
         };
-        let elements = tray_elements(&state, !self.side_chat);
+        let elements = tray_elements(state, !self.side_chat);
         if elements.is_empty() {
             return Vec::new();
         }
@@ -626,8 +628,7 @@ impl Composer {
 
     /// Status chips for the session footer, or `None` without any.
     pub(crate) fn render_extension_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let state = self.live_extension_ui(cx)?;
-        let chips = footer_metrics(footer_chips(&state));
+        let chips = footer_metrics(footer_chips(self.live_extension_ui(cx)?));
         if chips.is_empty() {
             return None;
         }

@@ -1403,31 +1403,28 @@ impl FilesSurface {
         else {
             return;
         };
-        let source = editor.read(cx).value().to_string();
-        let revision = {
+        {
             let Some(document) = self.preview.documents.get_mut(path) else {
                 return;
             };
             document.mark_user_edit();
-            document.revision
-        };
+        }
         self.sync_editor_comment_lines(path, &editor, cx);
         if !self.staged_file_comments(path, cx).is_empty() {
             self.require_review_comment_flush(path, cx);
         }
-        self.request_editor_highlight(path.to_string(), source, revision, cx);
+        // The buffer is read (and hashed) only once the typing pauses, inside
+        // the task: a keystroke must not copy and hash a whole file.
+        self.request_editor_highlight(path.to_string(), cx);
         self.schedule_autosave(path.to_string(), cx);
         cx.emit(FilesEvent::TitleChanged);
         cx.notify();
     }
 
-    fn request_editor_highlight(
-        &mut self,
-        path: String,
-        source: String,
-        revision: u64,
-        cx: &mut Context<Self>,
-    ) {
+    /// Highlight the editor's buffer once typing has paused. The buffer is
+    /// read after the debounce and hashed off the UI thread, so a keystroke
+    /// costs neither a copy nor a SHA-256 of everything typed so far.
+    fn request_editor_highlight(&mut self, path: String, cx: &mut Context<Self>) {
         let Some(language) = zeron_syntax::language_for_path(&path) else {
             return;
         };
@@ -1439,25 +1436,33 @@ impl FilesSurface {
         else {
             return;
         };
-        let cache_key = DocumentHighlightKey::new(language, &source);
         let task_path = path.clone();
         let task_document_key = document_key.clone();
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(120))
                 .await;
+            let Ok(Some((source, revision))) = this.update(cx, |surface, cx| {
+                let document = surface.preview.documents.get(&task_path)?;
+                let editor = document.editor.as_ref()?;
+                Some((editor.read(cx).value().to_string(), document.revision))
+            }) else {
+                return;
+            };
             let request_path = task_path.clone();
             let source_for_parse = source.clone();
-            let highlighted = cx
+            let (cache_key, highlighted) = cx
                 .background_executor()
                 .spawn(async move {
-                    zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                    let key = DocumentHighlightKey::new(language, &source_for_parse);
+                    let highlighted = zeron_syntax::highlight(zeron_syntax::HighlightRequest {
                         source: &source_for_parse,
                         path: Some(&request_path),
                         fence_tag: None,
                     })
                     .ok()
-                    .map(Arc::new)
+                    .map(Arc::new);
+                    (key, highlighted)
                 })
                 .await;
             let _ = this.update(cx, |surface, cx| {
@@ -1992,9 +1997,8 @@ impl FilesSurface {
             {
                 self.read_file(path.clone(), cx);
             } else if let Some(document) = self.preview.documents.get(path) {
-                if let Some(editor) = &document.editor {
-                    let source = editor.read(cx).value().to_string();
-                    self.request_editor_highlight(path.clone(), source, document.revision, cx);
+                if document.editor.is_some() {
+                    self.request_editor_highlight(path.clone(), cx);
                 } else if let Some((text, hash)) = document
                     .file
                     .as_ref()
