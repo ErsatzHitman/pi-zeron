@@ -52,7 +52,12 @@ impl McpConfig {
 
 /// Run the MCP server on this process's stdin/stdout until stdin closes.
 pub async fn run(config: McpConfig) -> anyhow::Result<()> {
+    // A plain chat (no orchestrator role in the env Zeron gave this server)
+    // is not offered the tree's tools.
+    let plain_chat = config.origin.chat_id.is_some()
+        && zeron_proto::orchestrator::Role::from_env(&std::env::vars().collect())
+            == zeron_proto::orchestrator::Role::Chat;
     let zeron = Zeron::new(format!("ws://127.0.0.1:{}", config.ipc_port), config.origin);
-    let tools = Tools::new(std::sync::Arc::new(zeron));
+    let tools = Tools::new(std::sync::Arc::new(zeron)).in_plain_chat(plain_chat);
     serve_stdio(std::sync::Arc::new(tools)).await
 }

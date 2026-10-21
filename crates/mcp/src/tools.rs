@@ -44,6 +44,8 @@ pub struct ToolDef {
 
 pub struct Tools {
     zeron: Arc<Zeron>,
+    /// Leave out the orchestrator tree's tools ([`Tools::in_plain_chat`]).
+    plain_chat: bool,
     // Remember successful sends on this MCP connection so wait_for_turn after
     // wait:false also waits for a newly created chat with no session row yet.
     pending_turns: tokio::sync::Mutex<HashMap<String, Arc<PendingTurn>>>,
@@ -297,12 +299,14 @@ fn catalog() -> Vec<ToolDef> {
             "Send messages to multiple independent chats concurrently. Prefer this to delegate parallel work to existing chats. Each request has send_message arguments; wait defaults to false. If wait=true, requests still run concurrently. Results preserve request order and include per-request errors; successful sends are not rolled back. Do not include dependent messages to the same chat.",
         ),
     ] {
-        let item_schema = tools
-            .iter()
-            .find(|tool| tool.name == single)
-            .unwrap()
-            .input_schema
-            .clone();
+        // The single tool's schema sits right beside it: naming it keeps the
+        // batch from carrying a second copy. The server checks each request
+        // as that tool's arguments.
+        assert!(tools.iter().any(|tool| tool.name == single));
+        let item_schema = json!({
+            "type": "object",
+            "description": format!("{single}'s arguments: the same fields and rules."),
+        });
         tools.push(ToolDef {
             name, description,
             input_schema: json!({
@@ -323,13 +327,17 @@ fn catalog() -> Vec<ToolDef> {
                     "description": "The Luau visual script: setup at the top level, ending with `return function() return ui.column { ... } end`."
                 },
                 "title": { "type": "string", "description": "Short name for the visual." },
+                "reference": {
+                    "type": "string",
+                    "enum": ["canvas", "scene", "assets", "shader"],
+                    "description": "Instead of showing a visual: return the full API of ui.canvas, ui.scene, assets or ui.shader. Read it before a script uses one."
+                },
                 "assets": {
                     "type": "object",
                     "additionalProperties": { "type": "string" },
                     "description": "Files the script uses, by the name it uses them: { \"prism.glb\": \"models/prism.glb\", \"sky.hdr\": \"/tmp/sky.hdr\" }. Paths are on this machine, relative to your working directory. glTF models (.glb, or .gltf with everything embedded), PNG, JPEG, WebP, and Radiance .hdr images; at most 16 files, 8 MB each, 10 MB together."
                 }
-            },
-            "required": ["script", "title"]
+            }
         }),
     });
     tools.push(ToolDef {
@@ -538,6 +546,18 @@ const INSPECT_MESSAGES: usize = 10;
 /// to an agent Zeron launched (`ZERON_CHAT_ID` set).
 const BOARD_POST: &str = "board_post";
 const BOARD_READ: &str = "board_read";
+/// Tools for a session in an orchestrator's tree (or its root): not offered
+/// to a plain chat, where they only refuse.
+const IN_TREE_ONLY: [&str; 8] = [
+    BOARD_POST,
+    BOARD_READ,
+    PROJECT_READ,
+    PROJECT_REMEMBER,
+    PROJECT_FORGET,
+    PROJECT_UPDATE,
+    MERGE_PREVIEW,
+    STOP_TREE,
+];
 /// Tools that act for the calling chat.
 const IN_CHAT_ONLY: [&str; 9] = [
     SHOW_VISUAL,
@@ -605,62 +625,10 @@ opens like a chat link.\n\
 - Controls: ui.tabs { options = { ... }, value, on_change = function(option) end }, ui.toggle { label, \
 value = bool, on_change = function(on) end }, ui.slider { label, value, min, max, step, unit, on_change \
 = function(n) end }, ui.button { label, on_click = function() end, primary = bool }.\n\
-- ui.canvas { height = 240, draw = function(g, w, h, t) ... end, animate = bool, on_click = \
-function(x, y) end }: 2D drawing in pixels, origin top-left, w = the reply column's width. \
-g:line(x1, y1, x2, y2, { color, width, dash }), g:polyline(pts, { color, width }), g:polygon(pts, \
-{ fill, stroke, width }), g:rect(x, y, w, h, { fill, stroke, radius }), g:circle(x, y, r, { fill, \
-stroke }), g:arc(x, y, r, a0, a1, { color } or { fill, inner = radius } for pie and donut sectors; \
-radians clockwise from 3 o'clock), g:text(x, y, str, { size, color, weight, align = \
-\"start|center|end\", baseline = \"top|middle|bottom\", mono }). pts are { x1, y1, x2, y2, ... } or \
-{ { x, y }, ... }. g.pointer is { x, y, down } while the pointer is over the canvas (draw hover \
-effects with it); t is seconds, and animate = true redraws every frame while visible.\n\
-- ui.scene { height = 320, draw = function(s, t) ... end, orbit = true, spin = 0.3 (turntable \
-radians per second), camera = { yaw = 0.6, pitch = 0.45, zoom = 1 }, animate = bool }: real 3D, y up, \
-rendered on the GPU with depth, soft shadows from a key light, and bloom. Zeron frames the camera on \
-your geometry and the reader drags to orbit. Solids (box, sphere, cylinder, surface, mesh) take \
-material props: roughness (0 mirror to 1 matte), metal (0-1), glow (emits its color and blooms; \
-use for lamps, beams, highlights), glass = true (refracts what's behind it; ior = 1.5, dispersion \
-= 0-1 splits it into a rainbow, as a prism does). Build real forms from several primitives (legs, \
-tops, rims), not single boxes, and give materials so surfaces read as wood, metal, or glass. s:box { at = { x, y, z }, size = { w, h, d } or n, color }, s:sphere { at, radius, color }, \
-s:cylinder { at (base center), radius, height, color }, s:surface { x = { min, max }, z = { min, max }, \
-f = function(x, z) return y end or values = { { ... } }, detail = 32, colors = { \"chart1\", \"chart3\" } \
-(a ramp by height), wire = bool }, s:mesh { vertices = { { x, y, z }, ... }, faces = { { 1, 2, 3 }, ... }, \
-color }, s:line(a, b, { color, width }), s:path(points, { color, width }), s:point(at, { radius, \
-color, hint = \"shown on hover\" }), s:label(at, text, { color, size }), s:grid { size = 10, step = 1 }, \
-s:axes { size = 1, labels = { \"x\", \"y\", \"z\" } }. Physical colors may be \"#rrggbb\" in scenes \
-(a material's own color: gold, glass, wood), and only there.\n\
-- Assets: pass real files in show_visual's assets (name -> path) and scripts use them by name. \
-s:model { asset = \"prism.glb\", at, rotate = { x, y, z } degrees, scale, fit = 2 (center it and size \
-its longest side), color and material props override the model's own } draws a glTF model with its \
-materials and textures. Solids take texture = \"wood.jpg\" (multiplied by color; mesh takes uvs = { { u, v \
-}, ... } per vertex). s:environment { asset = \"studio.hdr\", intensity = 1, background = false } lights \
-the scene from an equirectangular image (an HDR is best) that metal and glass reflect and glass bends; \
-background = true also draws it behind the scene. s:sprite { at, size = 48 (pixels), color, glow = 1, \
-asset = \"flare.png\" } adds a camera-facing light (a flare or glint; a soft round glow without an \
-asset) that blooms. ui.shader takes textures = { \"rock.jpg\", ... } as iTexture0-iTexture3 \
-(repeating, mipmapped). Find or make assets with your own tools (download, convert KTX2 or EXR to PNG \
-or HDR) before calling.\n\
-- ui.shader { height = 360, code = [[ GLSL ]], buffers = { [[ GLSL ]], ... }, inputs = { speed = \
-s.speed }, blend = \"alpha|light|opaque\", bloom = 0-3, orbit = bool, spin, camera = { yaw, pitch, \
-zoom }, animate = true }: GPU shaders for what geometry can't express: raymarched SDFs and \
-fractals, light and optics (beams, refraction, dispersion), volumes, fluids, particles, generative \
-art. Write each pass as on Shadertoy: void mainImage(out vec4 fragColor, in vec2 fragCoord), with \
-iResolution (vec3: width and height in pixels, then the display's pixel density), iTime, \
-iTimeDelta, iFrame, iMouse (pixels from the bottom-left; xy where the pointer is, zw where it went \
-down while it's held, negative otherwise), iCamera (vec4 yaw, pitch, zoom, 0; orbit = true lets the reader drag \
-it), every inputs name as a float (bind them to state so sliders and toggles drive the shader), \
-iNoise (a tiling 256x256 random RGBA texture), and iChannel0-iChannel3 with iChannelResolution: \
-buffers run first, in order, each into a float texture that every pass reads as iChannel<i> (an \
-earlier buffer's current frame; a buffer's own previous frame), for multi-pass work like blur, \
-trails, accumulation, and simulation. The shader sits on the chat, never in a box: don't paint a \
-background, vignette, or floor color. By default (blend = \"light\") the output is emitted light: \
-brightness is opacity and black is clear, right for beams, glows, sparks, and light through glass. \
-For solid shaded objects (fractals, SDF bodies) set blend = \"alpha\" and write alpha 0 where the ray \
-misses. bloom = 0.6-1.5 adds a soft glow around bright light. \
-The width varies with the reader (a phone is about 350px wide, often narrower than the shader is \
-tall): scale the scene by min(iResolution.x, iResolution.y), not one axis, and keep the subject \
-centered with room on both sides, so it fits and stays centered at any aspect. \
-GLSL errors come back with the pass and line number.\n\
+- ui.canvas (2D drawing, pointer and animation), ui.scene (real 3D on the GPU: solids with \
+materials, glTF models, environment light), assets (files a scene or shader uses) and ui.shader \
+(Shadertoy-style GLSL passes): before using one, call this tool with only reference = \"canvas\", \
+\"scene\", \"assets\" or \"shader\" for its full API.\n\
 - Helpers: ui.scale(d0, d1, r0, r1) returns a mapping function; ui.ticks(lo, hi, n); ui.fmt(n, { unit, \
 prefix, decimals }) groups digits; ui.map(list, function(v, i) end); ui.range(a, b, step); ui.clamp; \
 ui.lerp; ui.series(i) is \"chart<i>\"; ui.color(token, alpha); ui.mix(a, b, t). print(...) output comes \
@@ -681,6 +649,84 @@ in Zeron's interface font at the reader's text size: body for most text, sm and 
 notes, lg and xl for headings, 2xl for a headline figure. The width is the reply column (about 720px, \
 as narrow as 360px), so lay out fluidly with grow, wrap, and grid, and give charts, canvases, and \
 scenes heights of 160-420px.";
+
+/// The parts of the `ui.*` API `show_visual` returns on request (its
+/// `reference` argument), kept out of its description: most visuals never
+/// use them, and every turn of every chat would carry them.
+const VISUAL_REFERENCE: [(&str, &str); 4] = [
+    (
+        "canvas",
+        "\
+ui.canvas { height = 240, draw = function(g, w, h, t) ... end, animate = bool, on_click = \
+function(x, y) end }: 2D drawing in pixels, origin top-left, w = the reply column's width. \
+g:line(x1, y1, x2, y2, { color, width, dash }), g:polyline(pts, { color, width }), g:polygon(pts, \
+{ fill, stroke, width }), g:rect(x, y, w, h, { fill, stroke, radius }), g:circle(x, y, r, { fill, \
+stroke }), g:arc(x, y, r, a0, a1, { color } or { fill, inner = radius } for pie and donut sectors; \
+radians clockwise from 3 o'clock), g:text(x, y, str, { size, color, weight, align = \
+\"start|center|end\", baseline = \"top|middle|bottom\", mono }). pts are { x1, y1, x2, y2, ... } or \
+{ { x, y }, ... }. g.pointer is { x, y, down } while the pointer is over the canvas (draw hover \
+effects with it); t is seconds, and animate = true redraws every frame while visible.",
+    ),
+    (
+        "scene",
+        "\
+ui.scene { height = 320, draw = function(s, t) ... end, orbit = true, spin = 0.3 (turntable \
+radians per second), camera = { yaw = 0.6, pitch = 0.45, zoom = 1 }, animate = bool }: real 3D, y up, \
+rendered on the GPU with depth, soft shadows from a key light, and bloom. Zeron frames the camera on \
+your geometry and the reader drags to orbit. Solids (box, sphere, cylinder, surface, mesh) take \
+material props: roughness (0 mirror to 1 matte), metal (0-1), glow (emits its color and blooms; \
+use for lamps, beams, highlights), glass = true (refracts what's behind it; ior = 1.5, dispersion \
+= 0-1 splits it into a rainbow, as a prism does). Build real forms from several primitives (legs, \
+tops, rims), not single boxes, and give materials so surfaces read as wood, metal, or glass. s:box { at = { x, y, z }, size = { w, h, d } or n, color }, s:sphere { at, radius, color }, \
+s:cylinder { at (base center), radius, height, color }, s:surface { x = { min, max }, z = { min, max }, \
+f = function(x, z) return y end or values = { { ... } }, detail = 32, colors = { \"chart1\", \"chart3\" } \
+(a ramp by height), wire = bool }, s:mesh { vertices = { { x, y, z }, ... }, faces = { { 1, 2, 3 }, ... }, \
+color }, s:line(a, b, { color, width }), s:path(points, { color, width }), s:point(at, { radius, \
+color, hint = \"shown on hover\" }), s:label(at, text, { color, size }), s:grid { size = 10, step = 1 }, \
+s:axes { size = 1, labels = { \"x\", \"y\", \"z\" } }. Physical colors may be \"#rrggbb\" in scenes \
+(a material's own color: gold, glass, wood), and only there.",
+    ),
+    (
+        "assets",
+        "\
+Assets: pass real files in show_visual's assets (name -> path) and scripts use them by name. \
+s:model { asset = \"prism.glb\", at, rotate = { x, y, z } degrees, scale, fit = 2 (center it and size \
+its longest side), color and material props override the model's own } draws a glTF model with its \
+materials and textures. Solids take texture = \"wood.jpg\" (multiplied by color; mesh takes uvs = { { u, v \
+}, ... } per vertex). s:environment { asset = \"studio.hdr\", intensity = 1, background = false } lights \
+the scene from an equirectangular image (an HDR is best) that metal and glass reflect and glass bends; \
+background = true also draws it behind the scene. s:sprite { at, size = 48 (pixels), color, glow = 1, \
+asset = \"flare.png\" } adds a camera-facing light (a flare or glint; a soft round glow without an \
+asset) that blooms. ui.shader takes textures = { \"rock.jpg\", ... } as iTexture0-iTexture3 \
+(repeating, mipmapped). Find or make assets with your own tools (download, convert KTX2 or EXR to PNG \
+or HDR) before calling.",
+    ),
+    (
+        "shader",
+        "\
+ui.shader { height = 360, code = [[ GLSL ]], buffers = { [[ GLSL ]], ... }, inputs = { speed = \
+s.speed }, blend = \"alpha|light|opaque\", bloom = 0-3, orbit = bool, spin, camera = { yaw, pitch, \
+zoom }, animate = true }: GPU shaders for what geometry can't express: raymarched SDFs and \
+fractals, light and optics (beams, refraction, dispersion), volumes, fluids, particles, generative \
+art. Write each pass as on Shadertoy: void mainImage(out vec4 fragColor, in vec2 fragCoord), with \
+iResolution (vec3: width and height in pixels, then the display's pixel density), iTime, \
+iTimeDelta, iFrame, iMouse (pixels from the bottom-left; xy where the pointer is, zw where it went \
+down while it's held, negative otherwise), iCamera (vec4 yaw, pitch, zoom, 0; orbit = true lets the reader drag \
+it), every inputs name as a float (bind them to state so sliders and toggles drive the shader), \
+iNoise (a tiling 256x256 random RGBA texture), and iChannel0-iChannel3 with iChannelResolution: \
+buffers run first, in order, each into a float texture that every pass reads as iChannel<i> (an \
+earlier buffer's current frame; a buffer's own previous frame), for multi-pass work like blur, \
+trails, accumulation, and simulation. The shader sits on the chat, never in a box: don't paint a \
+background, vignette, or floor color. By default (blend = \"light\") the output is emitted light: \
+brightness is opacity and black is clear, right for beams, glows, sparks, and light through glass. \
+For solid shaded objects (fractals, SDF bodies) set blend = \"alpha\" and write alpha 0 where the ray \
+misses. bloom = 0.6-1.5 adds a soft glow around bright light. \
+The width varies with the reader (a phone is about 350px wide, often narrower than the shader is \
+tall): scale the scene by min(iResolution.x, iResolution.y), not one axis, and keep the subject \
+centered with room on both sides, so it fits and stays centered at any aspect. \
+GLSL errors come back with the pass and line number.",
+    ),
+];
 
 /// Read `show_visual`'s asset files (paths relative to the agent's working
 /// directory), base64-encoded by name for the engine.
@@ -755,10 +801,11 @@ async fn read_visual_assets(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ShowVisualArgs {
-    script: String,
-    title: String,
+    script: Option<String>,
+    title: Option<String>,
     #[serde(default)]
     assets: std::collections::BTreeMap<String, String>,
+    reference: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1152,9 +1199,17 @@ impl Tools {
     pub fn new(zeron: Arc<Zeron>) -> Self {
         Self {
             zeron,
+            plain_chat: false,
             pending_turns: Default::default(),
             reserved: Default::default(),
         }
+    }
+
+    /// For a server whose chat is a plain chat (not in an orchestrator's
+    /// tree): the tree's tools are left out of the list.
+    pub fn in_plain_chat(mut self, plain: bool) -> Self {
+        self.plain_chat = plain;
+        self
     }
 
     fn reserved(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slots>> {
@@ -1191,6 +1246,7 @@ impl Tools {
         catalog()
             .into_iter()
             .filter(|tool| in_chat || !IN_CHAT_ONLY.contains(&tool.name))
+            .filter(|tool| !self.plain_chat || !IN_TREE_ONLY.contains(&tool.name))
             .collect()
     }
 
@@ -2785,6 +2841,16 @@ impl Tools {
             .chat_id
             .clone()
             .context("show_visual only works from an agent Zeron launched in a chat")?;
+        if let Some(topic) = args.reference {
+            let (_, reference) = VISUAL_REFERENCE
+                .iter()
+                .find(|(name, _)| *name == topic)
+                .with_context(|| format!("no reference named {topic:?}: canvas, scene, assets or shader"))?;
+            return Ok(json!({ "reference": topic, "api": reference }));
+        }
+        let (Some(script), Some(title)) = (args.script, args.title) else {
+            anyhow::bail!("show_visual needs script and title (or only reference, to read an API)");
+        };
         let assets = read_visual_assets(&args.assets).await?;
         let shown = self
             .zeron
@@ -2792,8 +2858,8 @@ impl Tools {
                 zeron_rpc::methods::PUBLISH_VISUAL,
                 json!({
                     "chatId": chat_id,
-                    "title": args.title,
-                    "script": args.script,
+                    "title": title,
+                    "script": script,
                     "assets": assets,
                 }),
             )
@@ -3587,6 +3653,54 @@ mod tests {
             assert_eq!(def.input_schema["type"], "object", "{}", def.name);
             assert!(!def.description.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn a_plain_chat_is_not_offered_the_trees_tools() {
+        let world = orchestrator_world(false, Vec::new());
+        let plain = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        )
+        .in_plain_chat(true);
+        for name in IN_TREE_ONLY {
+            assert!(!plain.has(name), "{name}");
+        }
+        assert!(plain.has("create_chat") && plain.has(SHOW_VISUAL));
+        assert!(from(&world, "member-a").has("board_post"));
+    }
+
+    #[tokio::test]
+    async fn show_visual_returns_the_api_it_keeps_out_of_its_description() {
+        let inside = tools(
+            Arc::new(World::default()),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        for (topic, needle) in [
+            ("canvas", "g:polyline"),
+            ("scene", "s:surface"),
+            ("assets", "s:model"),
+            ("shader", "iChannel0"),
+        ] {
+            assert!(!SHOW_VISUAL_DESCRIPTION.contains(needle), "{needle}");
+            let read = inside
+                .call(SHOW_VISUAL, json!({ "reference": topic }))
+                .await
+                .unwrap();
+            assert!(read["api"].as_str().unwrap().contains(needle), "{topic}");
+            assert!(SHOW_VISUAL_DESCRIPTION.contains(&format!("\"{topic}\"")));
+        }
+        let missing = inside
+            .call(SHOW_VISUAL, json!({ "title": "x" }))
+            .await
+            .unwrap_err();
+        assert!(missing.contains("needs script and title"), "{missing}");
     }
 
     #[test]
@@ -6296,7 +6410,7 @@ mod tests {
         }
         let find = |name: &str| tools.iter().find(|t| t.name == name).unwrap();
         let item = &find("create_chats").input_schema["properties"]["requests"]["items"];
-        assert_eq!(item["additionalProperties"], false);
+        assert!(item["description"].as_str().unwrap().starts_with("create_chat's arguments"));
         let answers = &find("respond_to_input").input_schema["properties"]["answers"]["items"];
         assert_eq!(answers["additionalProperties"], false);
         assert_eq!(

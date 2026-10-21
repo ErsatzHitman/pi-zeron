@@ -23,12 +23,34 @@ if (process.argv[2] === 'server') {
   assert.equal(callTimeoutMs('tools/call', {name: 'read_chat', arguments: {}}), 660_000);
   assert.equal(callTimeoutMs('tools/call', {arguments: {timeout_secs: 3600}}), 3_630_000);
   assert.equal(callTimeoutMs('tools/call', {arguments: {requests: [{timeout_secs: 60}, {timeout_secs: 1800}]}}), 1_830_000);
-  for (const chat of ['first', 'second']) {
+  // A plain chat defers the tools it rarely needs; a tree member keeps all.
+  for (const [chat, role] of [['first', undefined], ['second', 'member']]) {
+    if (role) process.env.ZERON_ROLE = role; else delete process.env.ZERON_ROLE;
     process.env.ZERON_PI_MCP = JSON.stringify({name:'zeron',command:process.execPath,args:[process.argv[1],'server'],env:{ZERON_CHAT_ID:chat}});
     const handlers = {}, tools = {};
-    extension({on:(event,fn)=>handlers[event]=fn,registerTool:tool=>tools[tool.name]=tool});
+    let active = ['read'];
+    extension({
+      on:(event,fn)=>handlers[event]=fn,
+      registerTool:tool=>{ tools[tool.name]=tool; if (!tool.exposure) active.push(tool.name); },
+      getActiveTools:()=>[...active],
+      setActiveTools:names=>{ active = names; },
+      getAllTools:()=>[{name:'tool_search'}, ...Object.values(tools)],
+    });
     try {
       await handlers.session_start();
+      const options = {sections: {}};
+      handlers.before_agent_start({systemPromptOptions: options});
+      if (role) {
+        assert.equal(tools.zeron_whoami.exposure, undefined);
+        assert.ok(!active.includes('tool_search'));
+        assert.equal(options.sections.zeron_tools, undefined);
+      } else {
+        assert.equal(tools.zeron_whoami.exposure, 'deferred');
+        assert.equal(tools.zeron_create_chat.exposure, undefined);
+        assert.ok(active.includes('tool_search') && !active.includes('zeron_whoami'));
+        assert.match(options.sections.zeron_tools, /tool_search/);
+        assert.match(options.sections.zeron_tools, /zeron_whoami: /);
+      }
       for (const name of ['create_chat','create_chats','read_chat','send_message','wait_for_turn']) {
         assert.equal((await tools[`zeron_${name}`].execute('delegation',{})).content[0].text, chat);
       }

@@ -327,7 +327,7 @@ profile instead of the coding one:
   independent;
 - `--tools` limited to `orchestrator::ROOT_TOOLS` (the `zeron_*` tools,
   read-only `read`/`ls`/`find`/`grep`, `web_search`/`web_fetch`, `ask_user`,
-  `todo`, `goal_*` and the memory reads): no bash, edits or extension
+  `todo`, the goal tools and the memory reads): no bash, edits or extension
   delegation tools;
 - `--no-mcp`, `--no-skills`, `--no-prompt-templates` and
   `--no-context-files`.
