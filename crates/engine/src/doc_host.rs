@@ -3449,8 +3449,8 @@ impl DocHost {
         let handle = self.open(chat_id)?;
         let id = new_id();
         let now = now_ms();
-        let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
-            turn_id: Some(m.id.clone()),
+        let based_on = handle.doc.last_entry_id().map(|turn_id| CommandBasedOn {
+            turn_id: Some(turn_id),
             frontier: None,
         });
         let is_message = matches!(
