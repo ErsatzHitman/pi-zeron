@@ -4537,7 +4537,14 @@ impl RpcService for EngineRpc {
                 // has no parents.
                 let chats = self.workspace.read_chats().unwrap_or_default();
                 let ancestors = model_policy::ancestors(&chats, &p.chat_id);
-                RpcReply::value(&model_policy::session(&dir, &p.chat_id, &ancestors))
+                // Every session below an orchestrator answers to its tree's
+                // allow-list, the same one the guard reads; outside a tree
+                // nothing is held to one.
+                let allowed = zeron_proto::orchestrator::root_of(&chats, &p.chat_id)
+                    .map(|root| self.workspace.orchestrator_project(&root.id))
+                    .map(|project| project.policy.allowed_models)
+                    .unwrap_or_default();
+                RpcReply::value(&model_policy::session(&dir, &p.chat_id, &ancestors, allowed))
             }
             methods::POST_BOARD => {
                 use zeron_proto::board::{BOARD_MAX_TEXT, BoardEntry, folder_of};

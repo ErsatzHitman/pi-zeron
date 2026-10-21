@@ -22,13 +22,16 @@ pub struct Policy {
     pub disabled: Vec<String>,
 }
 
-/// What a picker shows for a chat: its own list, and what its parents
-/// disable (which it cannot lift).
+/// What a picker shows for a chat: its own list, what its parents
+/// disable (which it cannot lift), and the models its orchestrator tree
+/// allows (empty allows every model, and nothing outside a tree).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionPolicy {
     pub disabled: Vec<String>,
     pub inherited: Vec<String>,
+    #[serde(default)]
+    pub allowed: Vec<String>,
 }
 
 /// FNV-1a: stable across Rust versions, unlike `DefaultHasher`.
@@ -136,11 +139,19 @@ pub fn ancestors(chats: &[zeron_proto::Chat], chat_id: &str) -> Vec<String> {
     out
 }
 
-/// A chat's lists for the picker.
-pub fn session(data_dir: &Path, chat_id: &str, ancestors: &[String]) -> SessionPolicy {
+/// A chat's lists for the picker. `allowed` is its orchestrator tree's
+/// allow-list, as [`zeron_proto::orchestrator_project::TreePolicy`] holds it
+/// (the guard reads the same list); empty admits every model.
+pub fn session(
+    data_dir: &Path,
+    chat_id: &str,
+    ancestors: &[String],
+    allowed: Vec<String>,
+) -> SessionPolicy {
     SessionPolicy {
         disabled: read(data_dir, chat_id),
         inherited: normalize(ancestors.iter().flat_map(|id| read(data_dir, id))),
+        allowed: normalize(allowed),
     }
 }
 
@@ -200,25 +211,44 @@ mod tests {
         .unwrap();
         let up = ancestors(&chats, "leaf");
         assert_eq!(up, ["member", "root"]);
-        let policy = session(dir.path(), "leaf", &up);
+        let policy = session(dir.path(), "leaf", &up, vec![]);
         assert!(policy.disabled.is_empty());
         assert_eq!(
             policy.inherited,
             ["anthropic/claude-opus-4-5", "OpenAI/GPT-5.5"]
         );
+        assert!(policy.allowed.is_empty());
         assert_eq!(
             read(dir.path(), "member"),
             ["anthropic/claude-opus-4-5", "OpenAI/GPT-5.5"]
         );
         // Session-scoped: an unrelated chat restricts nothing.
         assert_eq!(
-            session(dir.path(), "other", &ancestors(&chats, "other")),
+            session(dir.path(), "other", &ancestors(&chats, "other"), vec![]),
             SessionPolicy::default()
         );
         // Cleared: the file goes, and clearing again is fine.
         write(dir.path(), "root", vec![]).unwrap();
         write(dir.path(), "root", vec![]).unwrap();
         assert!(!file(dir.path(), "root").exists());
+    }
+
+    #[test]
+    fn the_pickers_list_carries_the_trees_allow_list() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tidied like the project's own policy file, so a pick compares to it
+        // one way whichever end of the round trip wrote it.
+        let policy = session(
+            dir.path(),
+            "member",
+            &[],
+            vec![
+                " anthropic/claude-opus-5 ".into(),
+                "ANTHROPIC/Claude-Opus-5".into(),
+                "".into(),
+            ],
+        );
+        assert_eq!(policy.allowed, ["anthropic/claude-opus-5"]);
     }
 
     #[test]

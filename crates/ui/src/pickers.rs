@@ -630,14 +630,17 @@ struct ModelRowsKey {
 }
 
 /// A session's model restrictions as the picker shows them: the chat's own
-/// disabled models, and those its parent chats (an orchestrator, a side
-/// chat's parent) disable, which it cannot lift. A new chat's own list is a
-/// draft its first send saves (`take_session_model_draft`).
+/// disabled models, those its parent chats (an orchestrator, a side
+/// chat's parent) disable, which it cannot lift, and the models its
+/// orchestrator tree allows (empty allows every one — the same list Pi's
+/// guard holds the running session to). A new chat's own list is a draft its
+/// first send saves (`take_session_model_draft`).
 #[derive(Debug, Default, Clone)]
 struct SessionModels {
     chat_id: Option<String>,
     disabled: Vec<String>,
     inherited: Vec<String>,
+    allowed: Vec<String>,
 }
 
 impl SessionModels {
@@ -650,6 +653,17 @@ impl SessionModels {
 
     fn inherits(&self, model: &str) -> bool {
         self.inherited.iter().any(|m| m.eq_ignore_ascii_case(model))
+    }
+
+    /// Whether the tree's allow-list leaves `model` out. Matched the way the
+    /// guard and `create_chat` match it: a bare id in the list names the model
+    /// on any provider.
+    fn outside(&self, model: &str) -> bool {
+        !self.allowed.is_empty()
+            && !self
+                .allowed
+                .iter()
+                .any(|allowed| zeron_proto::orchestrator_project::model_matches(allowed, model))
     }
 }
 
@@ -688,6 +702,16 @@ fn row_provider(row: &ModelRowData) -> Option<zeron_proto::model_provider::Model
         return zeron_proto::model_provider::of_id(&row.model.id);
     }
     zeron_proto::model_provider::of_model(&row.model)
+}
+
+/// Whether `model` is one a child an agent launches may never run on: Claude
+/// Fable and GPT Astra class models are reserved for sessions the user starts
+/// (see [`zeron_proto::reserved_models`]), so a setting that names a child's
+/// model must not offer them. The id and the label are both checked: Pi's
+/// catalog can carry a family name in either.
+fn is_reserved_model(model: &Model) -> bool {
+    zeron_proto::reserved_models::reserved_family(&model.id).is_some()
+        || zeron_proto::reserved_models::reserved_family(&model.label).is_some()
 }
 
 fn row_group(row: &ModelRowData) -> ModelGroup {
@@ -2049,6 +2073,14 @@ impl Pickers {
         self.session_models.chat_id == chat && self.session_models.blocks(model)
     }
 
+    /// Whether the open chat's orchestrator tree leaves `model` out. Pi's
+    /// guard would switch off it on the next turn, so the pick must not offer
+    /// it in the first place.
+    fn session_outside(&self, model: &str, cx: &App) -> bool {
+        let chat = self.state.read(cx).selected_chat_row().map(|c| c.id.clone());
+        self.session_models.chat_id == chat && self.session_models.outside(model)
+    }
+
     /// Load the open chat's model restrictions; a new chat keeps its draft.
     fn load_session_models(&mut self, cx: &mut Context<Self>) {
         if self.title.is_some() {
@@ -2110,6 +2142,7 @@ impl Pickers {
         };
         self.session_models.disabled = list("disabled");
         self.session_models.inherited = list("inherited");
+        self.session_models.allowed = list("allowed");
         cx.notify();
     }
 
@@ -2754,6 +2787,13 @@ impl Pickers {
         if let Some(provider) = self.viewed_provider(cx) {
             rows.retain(|row| row.harness != HarnessId::Pi || row_group(row).key == provider);
         }
+        // A Pi model setting names the model a child runs on (the advisor,
+        // every subagent): reserved models are never a child's, so they are
+        // not offered there — the engine would refuse the pick after the chip
+        // had already flipped.
+        if self.pi_only.is_some() {
+            rows.retain(|row| !is_reserved_model(&row.model));
+        }
         mark_ambiguous(&mut rows);
         rows
     }
@@ -2804,8 +2844,11 @@ impl Pickers {
         if row.selected_only {
             return;
         }
-        // Disabled in this session: listed, never picked.
-        if row.harness == HarnessId::Pi && self.session_blocks(&row.model.id, cx) {
+        // Disabled in this session, or outside the orchestrator tree's
+        // allow-list: listed, never picked.
+        if row.harness == HarnessId::Pi
+            && (self.session_blocks(&row.model.id, cx) || self.session_outside(&row.model.id, cx))
+        {
             return;
         }
         if self.effective_harness(cx) != Some(row.harness) {
@@ -5179,12 +5222,16 @@ impl Pickers {
             row_attribution(row)
         };
         // Session model restrictions: a disabled row stays listed, dimmed,
-        // and cannot be picked; the current pick cannot be disabled.
+        // and cannot be picked; the current pick cannot be disabled. A model
+        // the orchestrator tree does not allow is listed the same way, with
+        // no toggle: that rule is the tree's, not this chat's.
         let session_off = row.harness == HarnessId::Pi && self.session_blocks(&row.model.id, cx);
+        let tree_off = row.harness == HarnessId::Pi && self.session_outside(&row.model.id, cx);
         let inherited_off = session_off && self.session_models.inherits(&row.model.id);
         let can_restrict = self.title.is_none()
             && row.harness == HarnessId::Pi
             && !row.selected_only
+            && !tree_off
             && row.model.id != "default"
             && (session_off || !is_selected);
         let restrict_model = row.model.id.clone();
@@ -5311,7 +5358,14 @@ impl Pickers {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.activate_model_index(ix, cx);
             }))
-            .child(div().flex_1().min_w_0().flex().when(session_off, |el| el.opacity(0.45)).child(body));
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .when(session_off || tree_off, |el| el.opacity(0.45))
+                    .child(body),
+            );
         if ix < 9 {
             el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
         }
@@ -5391,6 +5445,35 @@ impl Pickers {
                     self.config_on_left,
                 ));
             }
+        }
+        if tree_off {
+            // Nothing this chat can do lifts the tree's rule, so no toggle:
+            // the row just says why it is out.
+            el = el.child(
+                div()
+                    .id(("model-tree-blocked", ix))
+                    .flex_none()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(is_active, |el| {
+                        el.tooltip(|_, cx| {
+                            cx.new(|_| {
+                                compact::PickerHint(SharedString::from(
+                                    "Not allowed in this orchestrator tree",
+                                ))
+                            })
+                            .into()
+                        })
+                    })
+                    .child(
+                        crate::icons::icon(crate::icons::EYE_CLOSED)
+                            .size(px(13.0))
+                            .text_color(theme.warning),
+                    ),
+            );
         }
         if can_restrict {
             // Shown on the hovered row, and always on a disabled one.
@@ -10071,6 +10154,46 @@ mod tests {
             flags.contains(&("glm", false)),
             "other harness: not a clash"
         );
+    }
+
+    #[test]
+    fn a_pi_model_setting_never_offers_a_reserved_model() {
+        // Claude Fable and GPT Astra are for sessions the user starts; a
+        // setting that names a child's model (the advisor, every subagent)
+        // would only earn the engine's refusal after the pick.
+        assert!(is_reserved_model(&bare_model(
+            "anthropic/claude-fable-5",
+            "Claude Fable 5"
+        )));
+        assert!(is_reserved_model(&bare_model(
+            "openai/gpt-5.5",
+            "GPT Astra"
+        )));
+        assert!(!is_reserved_model(&bare_model(
+            "anthropic/claude-opus-5",
+            "Claude Opus 5"
+        )));
+    }
+
+    #[test]
+    fn a_trees_allow_list_matches_a_pick_the_way_the_guard_does() {
+        let tree = SessionModels {
+            allowed: vec!["claude-opus-5".into()],
+            ..Default::default()
+        };
+        // A bare entry names the model on any provider; a `provider/id` entry
+        // needs both sides, compares without case.
+        assert!(!tree.outside("anthropic/claude-opus-5"));
+        assert!(!tree.outside("Anthropic/Claude-Opus-5"));
+        assert!(tree.outside("anthropic/claude-sonnet-5"));
+        let pinned = SessionModels {
+            allowed: vec!["opencode/claude-opus-5".into()],
+            ..Default::default()
+        };
+        assert!(pinned.outside("anthropic/claude-opus-5"));
+        assert!(!pinned.outside("opencode/claude-opus-5"));
+        // No list admits every model.
+        assert!(!SessionModels::default().outside("anthropic/claude-sonnet-5"));
     }
 
     #[test]
