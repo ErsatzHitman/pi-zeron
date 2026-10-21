@@ -25,6 +25,9 @@ enum Request {
 
 pub struct PiSettingsCard {
     state: Entity<AppState>,
+    /// The device whose `harness-prefs.json` (and Pi install) is shown
+    /// (`None` = this engine's own).
+    device: Option<String>,
     settings: Loadable<PiSettings>,
     input: Entity<ComposerInput>,
     saving: bool,
@@ -44,13 +47,20 @@ impl PiSettingsCard {
                 this.save(cx);
             }
         });
-        // Settings can open before the engine connects: load once it does.
-        let state_sub = cx.observe(&state, |this: &mut Self, _, cx| {
-            if matches!(this.settings, Loadable::Idle) {
+        // Settings can open before the engine connects: load once it does. A
+        // device switch is another Pi: reload through it.
+        let state_sub = cx.observe(&state, |this: &mut Self, state, cx| {
+            let device = crate::settings::target_device(&state.read(cx));
+            if device != this.device {
+                this.device = device;
+                this.settings = Loadable::Idle;
+                this.call(Request::Get, cx);
+            } else if matches!(this.settings, Loadable::Idle) {
                 this.call(Request::Get, cx);
             }
         });
         let mut card = Self {
+            device: crate::settings::target_device(&state.read(cx)),
             state,
             settings: Loadable::Idle,
             input,
@@ -83,8 +93,8 @@ impl PiSettingsCard {
     }
 
     /// `GetPiSettings`, `SetPiSettings` saving the executable, or
-    /// `SetDeleteGuard`; each reply is the device's settings plus a fresh
-    /// check of the Pi it resolves to.
+    /// `SetDeleteGuard`, at the device this card shows; each reply is that
+    /// device's settings plus a fresh check of the Pi it resolves to.
     fn call(&mut self, request: Request, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -109,6 +119,7 @@ impl PiSettingsCard {
                 serde_json::json!({ "enabled": on }),
             ),
         };
+        let params = crate::settings::with_target_device(params, self.device.as_deref());
         if matches!(self.settings, Loadable::Idle) {
             self.settings = Loadable::Loading;
         }

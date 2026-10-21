@@ -380,6 +380,34 @@ pub fn current(cx: &App) -> UiSettings {
         .unwrap_or_default()
 }
 
+/// A Pi model picker's pick as one settings row's model: Pi's catalog ids are
+/// already `provider/id` specs, while its own default row (id `default`,
+/// listed while Pi's catalog cannot load) and a cleared pick are not. They
+/// clear the row, which is what "Pi default" means for these settings.
+pub(crate) fn picked_pi_model(model: Option<&str>) -> Option<String> {
+    model.and_then(zeron_engine::advisor_settings::spec)
+}
+
+/// The device a settings card reads and writes (`targetDeviceId`), or `None`
+/// for the engine's own device. Pi's `loop.json`, `subagents.json` and
+/// `decisions-model.json` live where the composer sends agents, so a card
+/// follows the composer's device instead of this one's.
+pub(crate) fn target_device(state: &crate::state::AppState) -> Option<String> {
+    let device = state.effective_device_id()?;
+    (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
+}
+
+/// `value` addressed at `target` (a no-op for the engine's own device).
+pub(crate) fn with_target_device(
+    mut value: serde_json::Value,
+    target: Option<&str>,
+) -> serde_json::Value {
+    if let (Some(target), Some(object)) = (target, value.as_object_mut()) {
+        object.insert("targetDeviceId".into(), serde_json::json!(target));
+    }
+    value
+}
+
 /// Read the picker preference without cloning the full settings for each model row.
 pub fn compact_model_picker(cx: &App) -> bool {
     cx.try_global::<SettingsStore>()
@@ -2093,6 +2121,46 @@ pub use zeron_proto::SidebarSection;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pi_default_pick_clears_the_row_instead_of_vanishing() {
+        // Pi's fallback catalog lists a row with id `default` ("Pi default")
+        // while its own catalog cannot load; it is no `provider/id` spec, so
+        // these settings take it as "cleared" — Pi's default — and save it.
+        assert_eq!(
+            picked_pi_model(Some("anthropic/claude-opus-5")).as_deref(),
+            Some("anthropic/claude-opus-5")
+        );
+        assert_eq!(
+            picked_pi_model(Some("openrouter/x-ai/grok-4")).as_deref(),
+            Some("openrouter/x-ai/grok-4")
+        );
+        assert_eq!(picked_pi_model(Some("default")), None);
+        assert_eq!(picked_pi_model(None), None);
+    }
+
+    #[test]
+    fn settings_cards_address_the_composers_device_only_when_it_is_not_this_one() {
+        let mut state = crate::state::AppState::new();
+        // Nothing known yet: this engine's own device, no passthrough.
+        assert_eq!(target_device(&state), None);
+        state.local_device_id = Some("local".into());
+        assert_eq!(target_device(&state), None);
+        state.selected_device = Some("local".into());
+        assert_eq!(target_device(&state), None);
+        // The composer points at another machine: its `loop.json` is there.
+        state.selected_device = Some("remote".into());
+        assert_eq!(target_device(&state).as_deref(), Some("remote"));
+        assert_eq!(
+            with_target_device(serde_json::json!({}), Some("remote"))["targetDeviceId"],
+            "remote"
+        );
+        assert!(
+            with_target_device(serde_json::json!({}), None)
+                .get("targetDeviceId")
+                .is_none()
+        );
+    }
 
     #[test]
     fn skill_completion_defaults_overrides_and_persistence_are_per_harness() {

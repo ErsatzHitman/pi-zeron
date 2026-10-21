@@ -7,7 +7,6 @@
 //! Pi's `subagents.json`, which those children re-read at each launch.
 
 use gpui::{AnyElement, Context, Entity, Subscription, Task, div, prelude::*, px};
-use zeron_engine::advisor_settings;
 use zeron_engine::registry::TitleSettings;
 use zeron_engine::subagent_settings::{
     MAX_FALLBACKS, SubagentFallback, SubagentSettings, THINKING_LEVELS,
@@ -44,6 +43,8 @@ const DEFAULT_LEVEL: &str = "Default's level";
 
 pub struct DefaultSubagentCard {
     state: Entity<AppState>,
+    /// The device whose `subagents.json` is shown (`None` = this engine's own).
+    device: Option<String>,
     settings: Loadable<SubagentSettings>,
     pickers: Vec<Entity<Pickers>>,
     thinking_select: widgets::SelectState,
@@ -71,21 +72,28 @@ impl DefaultSubagentCard {
             picked.push(cx.subscribe(
                 &picker,
                 move |this: &mut Self, _, event: &TitleModelPicked, cx| {
-                    // Pi's catalog ids are already `provider/id` specs.
-                    if let Some(model) = event.0.model.as_deref().and_then(advisor_settings::spec) {
-                        this.change(|settings| set_row(settings, row, Some(model)), cx);
-                    }
+                    // Pi's catalog ids are already `provider/id` specs; a pick
+                    // that is not one (Pi's own default row) clears the row.
+                    let model = crate::settings::picked_pi_model(event.0.model.as_deref());
+                    this.change(|settings| set_row(settings, row, model), cx);
                 },
             ));
             pickers.push(picker);
         }
-        // Settings can open before the engine connects: load once it does.
-        let state_sub = cx.observe(&state, |this: &mut Self, _, cx| {
-            if matches!(this.settings, Loadable::Idle) {
+        // Settings can open before the engine connects: load once it does. A
+        // device switch is another `subagents.json`: reload through it.
+        let state_sub = cx.observe(&state, |this: &mut Self, state, cx| {
+            let device = crate::settings::target_device(&state.read(cx));
+            if device != this.device {
+                this.device = device;
+                this.settings = Loadable::Idle;
+                this.call(None, cx);
+            } else if matches!(this.settings, Loadable::Idle) {
                 this.call(None, cx);
             }
         });
         let mut card = Self {
+            device: crate::settings::target_device(&state.read(cx)),
             state,
             settings: Loadable::Idle,
             pickers,
@@ -123,8 +131,9 @@ impl DefaultSubagentCard {
         }
     }
 
-    /// `GetSubagentSettings`, or `SetSubagentSettings` when saving; either
-    /// reply is what the device's `subagents.json` now sets.
+    /// `GetSubagentSettings`, or `SetSubagentSettings` when saving, at the
+    /// device whose `subagents.json` this card shows; either reply is what
+    /// that file now sets.
     fn call(&mut self, save: Option<SubagentSettings>, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -136,6 +145,7 @@ impl DefaultSubagentCard {
             ),
             None => (methods::GET_SUBAGENT_SETTINGS, serde_json::json!({})),
         };
+        let params = crate::settings::with_target_device(params, self.device.as_deref());
         if matches!(self.settings, Loadable::Idle) {
             self.settings = Loadable::Loading;
         }
