@@ -33,6 +33,28 @@ pub(super) fn cycle_target(
     Some(order[next].clone())
 }
 
+/// The row cycling steps from. The selection itself when the drawn list has
+/// it — every row of the Orchestrator tree names a parent that is also a row,
+/// so remapping there would step from the parent's place instead. A side chat
+/// the list does not draw (the Sessions list never shows one) steps from the
+/// session it nests under. Pure.
+pub(super) fn cycle_start(
+    order: &[String],
+    selected: Option<&str>,
+    parent: Option<&str>,
+) -> Option<String> {
+    let selected = selected?;
+    if order.iter().any(|row| row == selected) {
+        return Some(selected.to_string());
+    }
+    Some(
+        parent
+            .filter(|parent| order.iter().any(|row| row == parent))
+            .unwrap_or(selected)
+            .to_string(),
+    )
+}
+
 pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
     if expanded {
         icons::COLLAPSE_ARROWS
@@ -168,9 +190,14 @@ impl Shell {
         });
     }
 
-    /// Ctrl+Tab / Ctrl+Shift+Tab: step through the sidebar's Sessions list in
-    /// the order it is drawn. Selection is immediate (no MRU overlay held open
+    /// Ctrl+Tab / Ctrl+Shift+Tab: step through the list the sidebar is
+    /// drawing — the Sessions rows, or the Orchestrator tab's tree — in the
+    /// order it is drawn. Selection is immediate (no MRU overlay held open
     /// on the modifier) — one press, one session.
+    ///
+    /// Staying in the tab matters: cycling onto an orchestrated session from
+    /// the Sessions list would otherwise jump the sidebar to the Orchestrator
+    /// tab and leave the user somewhere they never asked for.
     ///
     /// Works from Settings too, landing back in chat like a jump; the
     /// shortcut recorder intercepts these keys while it records. Quiet under
@@ -181,16 +208,21 @@ impl Shell {
         if self.overlay_owns_keyboard(cx) {
             return;
         }
-        // The same list `render_active_rows` draws and the jump shortcuts
-        // count — one function, so neither can drift from the screen.
-        let order = self.sidebar_visible_order(cx);
-        let selected = self.state.read(cx).selected_chat.clone().map(|id| {
-            // A selected side chat steps from the session it nests under.
-            self.sidebar_child_parent(&id, cx)
-                .filter(|parent| order.contains(parent))
-                .unwrap_or(id)
-        });
-        if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
+        // The same list the sidebar draws for the open tab, and the jump
+        // shortcuts count — one function each, so neither can drift from the
+        // screen.
+        let order = if self.settings.sidebar_tab == settings::SidebarTab::Orchestrator {
+            self.orchestrator_visible_order(cx)
+        } else {
+            self.sidebar_visible_order(cx)
+        };
+        let selected = self.state.read(cx).selected_chat.clone();
+        // A selected side chat steps from the session it nests under.
+        let parent = selected
+            .as_deref()
+            .and_then(|id| self.sidebar_child_parent(id, cx));
+        let start = cycle_start(&order, selected.as_deref(), parent.as_deref());
+        if let Some(target) = cycle_target(&order, start.as_deref(), forward) {
             self.open_chat(target, cx);
         }
     }
@@ -799,9 +831,66 @@ mod cycle_tests {
         assert_eq!(cycle_target(&[], Some("a"), true), None);
     }
 
-    // Cycling walks the rows the sidebar is drawing, not every chat: that
-    // guarantee is structural now — `cycle_session` reads the same
-    // `AppState::sidebar_chats` the sidebar and the jump shortcuts read, and
-    // `jump_slots_count_the_rows_the_sidebar_draws` (state.rs) covers the
-    // space-filter behaviour for all of them.
+    #[test]
+    fn the_orchestrator_tab_cycles_through_its_own_rows() {
+        // The tree as `orchestrator_order` draws it: root -> a (no children),
+        // b -> c. Every row but the root names a parent that is also a row.
+        let list = order(&["root", "a", "b", "c"]);
+        let parents = [("a", "root"), ("b", "root"), ("c", "b")];
+        let start = |id: &str| {
+            let parent = parents
+                .iter()
+                .find(|(kid, _)| *kid == id)
+                .map(|(_, parent)| *parent);
+            cycle_start(&list, Some(id), parent)
+        };
+        // From the root both directions leave it into the tree below.
+        assert_eq!(
+            cycle_target(&list, start("root").as_deref(), true).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            cycle_target(&list, start("root").as_deref(), false).as_deref(),
+            Some("c")
+        );
+        // A mid-tree row steps from its own place, not its parent's (a parent
+        // draws earlier, so that remap would stand still or rewind).
+        assert_eq!(
+            cycle_target(&list, start("b").as_deref(), true).as_deref(),
+            Some("c")
+        );
+        assert_eq!(
+            cycle_target(&list, start("b").as_deref(), false).as_deref(),
+            Some("a")
+        );
+        // A nested row circles out of the tree rather than dead-ending.
+        assert_eq!(
+            cycle_target(&list, start("c").as_deref(), true).as_deref(),
+            Some("root")
+        );
+        assert_eq!(
+            cycle_target(&list, start("a").as_deref(), false).as_deref(),
+            Some("root")
+        );
+    }
+
+    #[test]
+    fn a_row_the_list_does_not_draw_steps_from_the_session_it_nests_under() {
+        let list = order(&["a", "b", "c"]);
+        assert_eq!(
+            cycle_start(&list, Some("side"), Some("b")),
+            Some("b".into())
+        );
+        assert_eq!(
+            cycle_start(&list, Some("side"), Some("gone")),
+            Some("side".into()),
+            "a parent outside the list leaves the selection to enter from the end"
+        );
+        assert_eq!(cycle_start(&list, Some("side"), None), Some("side".into()));
+        assert_eq!(
+            cycle_start(&list, None, Some("b")),
+            None,
+            "the canvas enters from the end like any other missing selection"
+        );
+    }
 }

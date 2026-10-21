@@ -211,6 +211,9 @@ fn tree_rows<'a>(
 
 /// Every live orchestrator, newest first, with its sessions grouped by
 /// folder. Folders with the latest activity lead, like the session list.
+///
+/// An archived session takes no row, but the sessions it started keep their
+/// place: archiving one hides it alone, never the live work below it.
 pub(super) fn orchestrator_trees(chats: &[Chat], spaces: &[Space]) -> Vec<OrchestratorTree> {
     let activity = |id: &str| {
         chats
@@ -236,6 +239,7 @@ pub(super) fn orchestrator_trees(chats: &[Chat], spaces: &[Space]) -> Vec<Orches
                 }
                 let path = chat_folder(child, spaces);
                 let key = folder_key(&path);
+                // Materialize a folder only after finding drawable rows.
                 let at = match groups.iter().position(|group| group.key == key) {
                     Some(at) => at,
                     None => {
@@ -258,6 +262,31 @@ pub(super) fn orchestrator_trees(chats: &[Chat], spaces: &[Space]) -> Vec<Orches
             }
         })
         .collect()
+}
+
+/// The key a folder's disclosure state is kept under.
+fn group_collapse_key(root: &str, group: &str) -> String {
+    format!("orchestrator:{root}:{group}")
+}
+
+/// The rows the Orchestrator tab draws, top to bottom: each tree's root and
+/// the sessions of its open folders. Session cycling reads this projection,
+/// so a Ctrl+Tab inside the tab stays inside the tree it is showing.
+pub(super) fn orchestrator_order(
+    trees: &[OrchestratorTree],
+    collapsed: &HashSet<String>,
+) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for tree in trees {
+        order.push(tree.root.clone());
+        for group in &tree.groups {
+            if collapsed.contains(&group_collapse_key(&tree.root, &group.key)) {
+                continue;
+            }
+            order.extend(group.rows.iter().map(|(id, _)| id.clone()));
+        }
+    }
+    order
 }
 
 impl Shell {
@@ -313,6 +342,15 @@ impl Shell {
         }
         cx.notify();
         true
+    }
+
+    /// [`orchestrator_order`] over the state and folders on screen.
+    pub(super) fn orchestrator_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
+        let trees = {
+            let state = self.state.read(cx);
+            orchestrator_trees(&state.chats, &state.spaces)
+        };
+        orchestrator_order(&trees, &self.sidebar_collapsed_groups)
     }
 
     /// Show the tab `chat_id` lists in, so an orchestrated session opened
@@ -703,7 +741,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let collapse_key = format!("orchestrator:{root}:{}", group.key);
+        let collapse_key = group_collapse_key(root, &group.key);
         let motion_key = format!("group:{collapse_key}");
         let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
         let (label, row_labels): (SharedString, Vec<SharedString>) = {
@@ -1123,5 +1161,69 @@ mod tests {
             .collect();
         live.sort_unstable();
         assert_eq!(live, ["live-below-archived", "live-deep", "live-member"]);
+    }
+
+    fn rows_of(trees: &[OrchestratorTree]) -> Vec<(&str, usize)> {
+        trees[0]
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .rows
+                    .iter()
+                    .map(|(id, level)| (id.as_str(), *level))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn archiving_a_session_keeps_the_sessions_it_started_in_the_tree() {
+        let root = "orchestrator-arch";
+        let mut archived = chat("talk-1", Some(root), "D:\\OpenTalk", 1);
+        archived.archived = true;
+        let chats = vec![
+            chat(root, None, "/scratch", 0),
+            archived,
+            chat("talk-1-sub", Some("talk-1"), "D:\\OpenTalk", 2),
+            chat("talk-1-sub-sub", Some("talk-1-sub"), "C:\\pi", 3),
+            chat("talk-2", Some(root), "D:\\OpenTalk", 4),
+        ];
+        let trees = orchestrator_trees(&chats, &[]);
+        assert_eq!(
+            rows_of(&trees),
+            [("talk-1-sub", 0), ("talk-1-sub-sub", 1), ("talk-2", 0)],
+            "the archived session takes no row; its sessions take its place"
+        );
+    }
+
+    #[test]
+    fn an_archived_session_with_nothing_live_below_it_leaves_no_folder() {
+        let root = "orchestrator-empty";
+        let mut archived = chat("gone", Some(root), "D:\\gone", 1);
+        archived.archived = true;
+        let chats = vec![chat(root, None, "/scratch", 0), archived];
+        assert!(orchestrator_trees(&chats, &[])[0].groups.is_empty());
+    }
+
+    #[test]
+    fn the_cycling_order_walks_roots_then_each_open_folder() {
+        let root = "orchestrator-o";
+        let chats = vec![
+            chat(root, None, "/scratch", 0),
+            chat("a", Some(root), "D:\\A", 1),
+            chat("b", Some(root), "D:\\B", 2),
+        ];
+        let trees = orchestrator_trees(&chats, &[]);
+        assert_eq!(
+            orchestrator_order(&trees, &HashSet::new()),
+            [root, "b", "a"],
+            "the tab's newest folder leads, the root first"
+        );
+        let closed = HashSet::from([group_collapse_key(&trees[0].root, &trees[0].groups[0].key)]);
+        assert_eq!(
+            orchestrator_order(&trees, &closed),
+            [root, "a"],
+            "a closed folder's rows are not drawn, so they are not cycled"
+        );
     }
 }
