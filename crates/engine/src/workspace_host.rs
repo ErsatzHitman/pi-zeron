@@ -1525,7 +1525,16 @@ pub(crate) fn linked_worktree_root(path: &std::path::Path) -> Option<String> {
     if worktrees.file_name()? != "worktrees" || dot_git.file_name()? != ".git" {
         return None;
     }
-    Some(dot_git.parent()?.to_string_lossy().into_owned())
+    // Git writes the `gitdir` line with forward slashes even on Windows, while
+    // space paths (`C:\...`) and worktree spec repo paths keep the native
+    // separator. Returning one form minted a second space for the same
+    // checkout and missed the just-created worktree on the setup handoff.
+    Some(
+        dot_git
+            .parent()?
+            .to_string_lossy()
+            .replace('/', std::path::MAIN_SEPARATOR_STR),
+    )
 }
 
 /// Local live statuses win for this device's chats; every other device's rows come
@@ -2175,6 +2184,27 @@ mod tests {
             linked_worktree_root(&wt).as_deref(),
             Some(root.to_str().unwrap())
         );
+    }
+
+    /// A `gitdir` written with forward slashes (git's Windows form) still
+    /// resolves to the native-separator checkout root, so it matches the space
+    /// row recorded from the project cwd instead of minting a phantom space.
+    #[test]
+    fn forward_slash_gitdir_resolves_to_the_native_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let wt = dir.path().join("clever-ember");
+        std::fs::create_dir_all(root.join(".git").join("worktrees").join("clever-ember")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        let gitdir = root.join(".git/worktrees/clever-ember");
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        let resolved = linked_worktree_root(&wt).unwrap();
+        assert_eq!(resolved, root.to_string_lossy());
+        assert_eq!(std::path::Path::new(&resolved), root);
     }
 
     #[test]
