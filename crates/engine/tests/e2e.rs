@@ -696,6 +696,96 @@ async fn session_status_transitions_idle_working_idle() {
 }
 
 #[tokio::test]
+async fn forgetting_a_deleted_chat_drops_its_session_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: mock_script(),
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: false,
+        }),
+    );
+    let mut watch = core.sessions.watch_sessions();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-forget",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-1".into(),
+        },
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::timeout_at(deadline, watch.changed())
+            .await
+            .expect("status change before timeout")
+            .expect("watch alive");
+        if watch.borrow().first().map(|s| s.status) == Some(SessionStatus::Idle) {
+            break;
+        }
+    }
+    assert!(core.sessions.session_status(CHAT).is_some());
+
+    // Deleting the chat must not leave its session row (or the run slot it
+    // held) behind — audit #115.
+    core.sessions.terminate(CHAT).await.unwrap();
+    core.sessions.forget_chat(CHAT);
+
+    assert!(core.sessions.session_status(CHAT).is_none());
+    assert!(
+        watch.borrow().is_empty(),
+        "a deleted chat's row must leave the published list"
+    );
+    assert!(!core.sessions.has_run(CHAT));
+}
+
+#[tokio::test]
+async fn the_published_session_list_is_ordered_by_chat_id() {
+    // Audit #115: the status map is ordered, so a publish never has to sort
+    // every row — this pins the order that sort used to provide.
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: mock_script(),
+            step_delay: Duration::from_millis(5),
+            hang_until_interrupt: false,
+        }),
+    );
+    let mut watch = core.sessions.watch_sessions();
+    for chat in ["chat-bbb", "chat-aaa"] {
+        let handle = core.doc_host.open(chat).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            &format!("cmd-run-{chat}"),
+            SessionCommandPayload::Run {
+                request: run_request("go"),
+                message_id: "m-1".into(),
+            },
+        );
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::timeout_at(deadline, watch.changed())
+            .await
+            .expect("status change before timeout")
+            .expect("watch alive");
+        let rows = watch.borrow();
+        if rows.len() == 2 && rows.iter().all(|s| s.status == SessionStatus::Idle) {
+            break;
+        }
+    }
+    let ids: Vec<String> = watch
+        .borrow()
+        .iter()
+        .map(|s| s.chat_id.clone())
+        .collect();
+    assert_eq!(ids, vec!["chat-aaa", "chat-bbb"]);
+}
+
+#[tokio::test]
 async fn interrupt_stamps_streaming_entry_aborted() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(

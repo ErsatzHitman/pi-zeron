@@ -136,6 +136,12 @@ impl ExtensionUiHub {
         self.chat(chat_id).state.borrow().clone()
     }
 
+    /// Forget a deleted chat's live UI state. Dropping the last handle also
+    /// closes the state watch, so a fleet follower of that chat returns.
+    pub fn forget(&self, chat_id: &str) {
+        lock(&self.chats).remove(chat_id);
+    }
+
     /// Deliver a UI action to the chat's live harness process.
     pub fn act(&self, chat_id: &str, action: ExtensionUiAction) -> Result<(), String> {
         let chat = self.chat(chat_id);

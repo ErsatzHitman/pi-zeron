@@ -17,7 +17,7 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -221,7 +221,10 @@ struct Inner {
     runs: Mutex<HashMap<String, RunHandle>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
-    statuses: Mutex<HashMap<String, Session>>,
+    /// chat_id → session row. A `BTreeMap`: the published list is in chat-id
+    /// order, so no status change has to clone AND sort the whole map (there is
+    /// one status change per heartbeat of every working chat — audit #115).
+    statuses: Mutex<BTreeMap<String, Session>>,
     sessions_tx: watch::Sender<Vec<Session>>,
     /// Slots of the global running-turn cap and the queue of starts waiting
     /// for one. Lock order: `statuses` before `admission`.
@@ -343,7 +346,7 @@ impl SessionsEngine {
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
-                statuses: Mutex::new(HashMap::new()),
+                statuses: Mutex::new(BTreeMap::new()),
                 sessions_tx,
                 admission: Mutex::new(Admission::default()),
                 last_requests: Mutex::new(HashMap::new()),
@@ -1417,6 +1420,35 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// Drop every per-chat thing a DELETED chat left behind: its session row
+    /// (a leftover row reappears in every published status list), its journal
+    /// hub, its resume cache, its last request, its cancelled-send ledger and
+    /// its live extension UI. Nothing else ever prunes those maps, so a chat
+    /// kept them for the life of the process (audit #115). Call after
+    /// [`Self::terminate`], whose settlement can still write a row.
+    pub fn forget_chat(&self, chat_id: &str) {
+        let dropped = {
+            // `statuses` before `admission` (lock order); publish inside like
+            // every other status change.
+            let mut statuses = lock(&self.inner.statuses);
+            let dropped = statuses.remove(chat_id).is_some();
+            if dropped {
+                let list: Vec<Session> = statuses.values().cloned().collect();
+                self.inner.sessions_tx.send_replace(list);
+            }
+            dropped
+        };
+        lock(&self.inner.hubs).remove(chat_id);
+        lock(&self.inner.last_requests).remove(chat_id);
+        lock(&self.inner.harness_sessions).remove(chat_id);
+        lock(&self.inner.cancelled_sends).remove(chat_id);
+        self.inner.extension_ui.forget(chat_id);
+        self.inner.forget_admission(chat_id);
+        if dropped {
+            tracing::info!(chat = %chat_id, "session state dropped with the chat");
+        }
+    }
+
     /// Fold an engine-made event (a `show_visual` page) into the chat's live
     /// run, after whatever the harness streamed so far. Returns `false` when
     /// the chat has no run on this device.
@@ -1851,8 +1883,7 @@ impl Inner {
             }
             entry.updated_at = now;
             let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            let list: Vec<Session> = statuses.values().cloned().collect();
             self.sessions_tx.send_replace(list);
             session
         };
@@ -1890,8 +1921,7 @@ impl Inner {
             entry.background_jobs = jobs;
             entry.updated_at = Utc::now();
             let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            let list: Vec<Session> = statuses.values().cloned().collect();
             self.sessions_tx.send_replace(list);
             session
         };
@@ -1924,8 +1954,7 @@ impl Inner {
             entry.subagents = list;
             entry.updated_at = Utc::now();
             let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            let list: Vec<Session> = statuses.values().cloned().collect();
             self.sessions_tx.send_replace(list);
             session
         };
@@ -1951,8 +1980,7 @@ impl Inner {
             entry.retry = retry;
             entry.updated_at = Utc::now();
             let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            let list: Vec<Session> = statuses.values().cloned().collect();
             self.sessions_tx.send_replace(list);
             session
         };
@@ -2058,8 +2086,7 @@ impl Inner {
                 }
             }
             let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            let list: Vec<Session> = statuses.values().cloned().collect();
             // send_replace: keep the current value fresh even with no receivers,
             // so late WatchSessions subscribers see the last transition.
             self.sessions_tx.send_replace(list);
@@ -2174,8 +2201,7 @@ impl Inner {
             if changed.is_empty() {
                 return;
             }
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            let list: Vec<Session> = statuses.values().cloned().collect();
             self.sessions_tx.send_replace(list);
             changed
         };
@@ -2201,8 +2227,7 @@ impl Inner {
             entry.updated_at = now;
             entry.queue_position = 0;
             let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            let list: Vec<Session> = statuses.values().cloned().collect();
             self.sessions_tx.send_replace(list);
             session
         };

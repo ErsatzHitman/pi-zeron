@@ -1622,6 +1622,9 @@ impl EngineRpc {
             if let Err(err) = sessions.terminate(&chat_id).await {
                 tracing::debug!(chat = %chat_id, error = %err, "deleteChat teardown skipped");
             }
+            // Then drop the state the deleted chat left in the engine's
+            // per-chat maps (its session row included).
+            sessions.forget_chat(&chat_id);
         });
         Ok(())
     }
@@ -1691,6 +1694,7 @@ impl EngineRpc {
                         if let Err(err) = sessions.terminate(&chat_id).await {
                             tracing::debug!(chat = %chat_id, error = %err, "deleteSpace teardown skipped");
                         }
+                        sessions.forget_chat(&chat_id);
                         doc_host.purge_chat(&chat_id);
                     }
                 });
