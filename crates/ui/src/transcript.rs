@@ -5404,6 +5404,7 @@ impl Transcript {
             self.rows.clear();
             self.tool_images.clear(cx);
             self.row_cache.clear();
+            self.code_fences.clear();
             self.protected_attachment_devices = None;
             self.live_parsers.clear();
             self.tree_cache.clear();
@@ -5637,151 +5638,202 @@ impl Transcript {
         // are all O(total transcript) by nature.
         let change = diff_rows(&self.rows, &new_rows);
         let settled = !attached && change.is_none() && !baseline_changed && !replay_baseline;
+        // Every pass below is keyed by row id and would be O(total transcript)
+        // if it walked a whole list, so they are all scoped to the diff: the
+        // new rows it replaces and the old rows that region held. A streaming
+        // commit appends or re-versions rows without dropping any, which makes
+        // the retire passes no-ops.
+        let (replaced_rows, old_changed): (&[Row], &[Row]) = match &change {
+            Some((range, count)) => (
+                &new_rows[range.start..range.start + count],
+                &self.rows[range.clone()],
+            ),
+            None => (&new_rows[..0], &self.rows[..0]),
+        };
+        // Ids the commit drops outright: the old range minus the ids the new
+        // range still carries. Only these can leave per-row state stale.
+        let dropped_rows: HashSet<&str> = {
+            let kept: HashSet<&str> = replaced_rows.iter().map(|row| row.id.as_ref()).collect();
+            old_changed
+                .iter()
+                .map(|row| row.id.as_ref())
+                .filter(|id| !kept.contains(id))
+                .collect()
+        };
+        // Live markdown rows whose life ends here: dropped, or flipped to a
+        // settled Markdown row in place (the live→complete splice keeps the id).
+        let ended_live: HashSet<&str> = {
+            let still_live: HashSet<&str> = replaced_rows
+                .iter()
+                .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+                .map(|row| row.id.as_ref())
+                .collect();
+            old_changed
+                .iter()
+                .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+                .map(|row| row.id.as_ref())
+                .filter(|id| !still_live.contains(id))
+                .collect()
+        };
         // Only a User row can contribute a protected attachment key, so a
         // commit that leaves every user row alone keeps the previous shield
         // instead of rebuilding that global set.
-        let user_rows_changed = match &change {
-            None => false,
-            Some((old_range, count)) => self.rows[old_range.clone()]
-                .iter()
-                .chain(new_rows[old_range.start..old_range.start + *count].iter())
-                .any(|row| matches!(row.kind, RowKind::User { .. })),
-        };
+        let user_rows_changed = old_changed
+            .iter()
+            .chain(replaced_rows)
+            .any(|row| matches!(row.kind, RowKind::User { .. }));
         if !settled {
-            // Previous chip layouts, borrowed by row id: carrying arrival
-            // instants forward must not clone a part id per chip in the whole
-            // transcript on every streaming commit.
-            let previous_groups: HashMap<&str, &[ToolItem]> = self
-                .rows
+            // A moved baseline reclassifies historical chips in rows the diff
+            // does not touch (and the replay reset dropped every reveal), so
+            // those two cases walk the whole transcript; otherwise the pass
+            // visits the groups inside the changed range alone. An untouched
+            // group keeps its layout AND its arrival instants.
+            let full_group_pass = baseline_changed || replay_baseline;
+            let (group_rows, previous_rows): (&[Row], &[Row]) = if full_group_pass {
+                (new_rows.as_slice(), self.rows.as_slice())
+            } else {
+                (replaced_rows, old_changed)
+            };
+            if group_rows
                 .iter()
-                .filter(|row| !fully_historical.contains(&row.entry_id))
-                .filter_map(|row| match &row.kind {
-                    RowKind::ToolGroup { tools, .. } => Some((row.id.as_ref(), tools.as_slice())),
-                    _ => None,
-                })
-                .collect();
-            let now = Instant::now();
-            let mut live_tool_groups = HashSet::new();
-            for row in &new_rows {
-                let RowKind::ToolGroup { tools, .. } = &row.kind else {
-                    continue;
-                };
-                // Agent/spawn groups are standalone cards, not task trees —
-                // except under compact mode, where they collapse like the rest.
-                if !self.compact_mode && !tool_group_collapses(tools) {
-                    continue;
-                }
-                live_tool_groups.insert(row.id.clone());
-                let historical = historical_tools.get(&row.entry_id);
-                let whole_group_historical = fully_historical.contains(&row.entry_id)
-                    || (replay_baseline && baseline.is_none());
-                let is_historical = |tool: &ToolItem| {
-                    whole_group_historical
-                        || historical.is_some_and(|ids| ids.contains(&tool.part_id))
-                };
-                let historical_count = if whole_group_historical {
-                    tools.len()
-                } else {
-                    tools.iter().filter(|tool| is_historical(tool)).count()
-                };
-                // Chip part id → the instant it arrived, from the layout this
-                // commit replaces. Built per live group (borrowed part ids)
-                // rather than for every group in the transcript.
-                let previous: Option<HashMap<&str, Option<Instant>>> =
-                    previous_groups.get(row.id.as_ref()).map(|previous| {
-                        let starts = self
-                            .tool_group_reveals
-                            .get(&row.id)
-                            .map(|reveal| reveal.starts.as_slice());
-                        previous
-                            .iter()
-                            .enumerate()
-                            .map(|(ix, tool)| {
-                                (
-                                    tool.part_id.as_str(),
-                                    starts.and_then(|starts| starts.get(ix).copied().flatten()),
-                                )
-                            })
-                            .collect()
-                    });
-                let is_new_group = historical_count == 0 && previous.is_none();
-                let reveal = self.tool_group_reveals.entry(row.id.clone()).or_default();
-                if baseline_changed && historical_count > 0 {
-                    reveal.rendered_open = None;
-                    if let Some(fold) = self.folds.get_mut(&row.id) {
-                        fold.toggled_at = None;
-                        fold.disclosure_at = None;
-                    }
-                }
-                reveal.shimmer_started_at.get_or_insert(now);
-                if is_new_group {
-                    reveal.header_started_at.get_or_insert(now);
-                }
-                if baseline_changed && historical_count == tools.len() {
-                    reveal.header_started_at = None;
-                }
-                let first_row_delay = is_new_group.then_some(TOOL_FIRST_ROW_DELAY_MS).unwrap_or(0);
-                let mut arrival_ix = 0;
-                if whole_group_historical {
-                    reveal.starts.clear();
-                    reveal.starts.resize(tools.len(), None);
-                    continue;
-                }
-                reveal.starts = tools
+                .chain(previous_rows)
+                .any(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
+            {
+                // Previous chip layouts of those rows, borrowed by id: carrying
+                // arrival instants forward must not clone a part id per chip in
+                // the whole transcript on every streaming commit.
+                let previous_groups: HashMap<&str, &[ToolItem]> = previous_rows
                     .iter()
-                    .map(|tool| {
-                        if is_historical(tool) {
-                            return None;
+                    .filter(|row| !fully_historical.contains(&row.entry_id))
+                    .filter_map(|row| match &row.kind {
+                        RowKind::ToolGroup { tools, .. } => {
+                            Some((row.id.as_ref(), tools.as_slice()))
                         }
-                        if let Some(start) = previous
-                            .as_ref()
-                            .and_then(|previous| previous.get(tool.part_id.as_str()))
-                        {
-                            return *start;
-                        }
-                        let start = now
-                            + Duration::from_millis(
-                                first_row_delay + arrival_ix * TOOL_ROW_STAGGER_MS,
-                            );
-                        arrival_ix += 1;
-                        Some(start)
+                        _ => None,
                     })
                     .collect();
+                let now = Instant::now();
+                let mut range_groups = HashSet::new();
+                let mut live_tool_groups = HashSet::new();
+                for row in group_rows {
+                    let RowKind::ToolGroup { tools, .. } = &row.kind else {
+                        continue;
+                    };
+                    // Every group the pass visits: a row that stops being a
+                    // collapsible group loses its reveal even though its id
+                    // survives, so this set is checked alongside the live one.
+                    range_groups.insert(row.id.as_ref());
+                    // Agent/spawn groups are standalone cards, not task trees —
+                    // except under compact mode, where they collapse like the rest.
+                    if !self.compact_mode && !tool_group_collapses(tools) {
+                        continue;
+                    }
+                    live_tool_groups.insert(row.id.as_ref());
+                    let historical = historical_tools.get(&row.entry_id);
+                    let whole_group_historical = fully_historical.contains(&row.entry_id)
+                        || (replay_baseline && baseline.is_none());
+                    let is_historical = |tool: &ToolItem| {
+                        whole_group_historical
+                            || historical.is_some_and(|ids| ids.contains(&tool.part_id))
+                    };
+                    let historical_count = if whole_group_historical {
+                        tools.len()
+                    } else {
+                        tools.iter().filter(|tool| is_historical(tool)).count()
+                    };
+                    // Chip part id → the instant it arrived, from the layout this
+                    // commit replaces. Built per live group (borrowed part ids)
+                    // rather than for every group in the transcript.
+                    let previous: Option<HashMap<&str, Option<Instant>>> =
+                        previous_groups.get(row.id.as_ref()).map(|previous| {
+                            let starts = self
+                                .tool_group_reveals
+                                .get(&row.id)
+                                .map(|reveal| reveal.starts.as_slice());
+                            previous
+                                .iter()
+                                .enumerate()
+                                .map(|(ix, tool)| {
+                                    (
+                                        tool.part_id.as_str(),
+                                        starts.and_then(|starts| starts.get(ix).copied().flatten()),
+                                    )
+                                })
+                                .collect()
+                        });
+                    let is_new_group = historical_count == 0 && previous.is_none();
+                    let reveal = self.tool_group_reveals.entry(row.id.clone()).or_default();
+                    if baseline_changed && historical_count > 0 {
+                        reveal.rendered_open = None;
+                        if let Some(fold) = self.folds.get_mut(&row.id) {
+                            fold.toggled_at = None;
+                            fold.disclosure_at = None;
+                        }
+                    }
+                    reveal.shimmer_started_at.get_or_insert(now);
+                    if is_new_group {
+                        reveal.header_started_at.get_or_insert(now);
+                    }
+                    if baseline_changed && historical_count == tools.len() {
+                        reveal.header_started_at = None;
+                    }
+                    let first_row_delay =
+                        is_new_group.then_some(TOOL_FIRST_ROW_DELAY_MS).unwrap_or(0);
+                    let mut arrival_ix = 0;
+                    if whole_group_historical {
+                        reveal.starts.clear();
+                        reveal.starts.resize(tools.len(), None);
+                        continue;
+                    }
+                    reveal.starts = tools
+                        .iter()
+                        .map(|tool| {
+                            if is_historical(tool) {
+                                return None;
+                            }
+                            if let Some(start) = previous
+                                .as_ref()
+                                .and_then(|previous| previous.get(tool.part_id.as_str()))
+                            {
+                                return *start;
+                            }
+                            let start = now
+                                + Duration::from_millis(
+                                    first_row_delay + arrival_ix * TOOL_ROW_STAGGER_MS,
+                                );
+                            arrival_ix += 1;
+                            Some(start)
+                        })
+                        .collect();
+                }
+                // Reveals follow the group rows exactly: a dropped row's goes,
+                // and so does one whose row stopped being a collapsible group.
+                // Groups outside the visited region are untouched.
+                self.tool_group_reveals.retain(|row_id, _| {
+                    let id = row_id.as_ref();
+                    !dropped_rows.contains(id)
+                        && (!range_groups.contains(id) || live_tool_groups.contains(id))
+                });
             }
-            self.tool_group_reveals
-                .retain(|row_id, _| live_tool_groups.contains(row_id));
 
             // Runtime scroll handles follow the stable code rows exactly. A
-            // live block keeps its handle through completion; deleted/
-            // reindexed tail blocks and the previous chat cannot accumulate
-            // stale handles.
-            if !self.code_fences.is_empty() {
-                let live_rows: HashSet<&str> = new_rows
-                    .iter()
-                    .filter(|row| {
-                        matches!(
-                            row.kind,
-                            RowKind::Markdown { .. } | RowKind::LiveMarkdown { .. }
-                        )
-                    })
-                    .map(|row| row.id.as_ref())
-                    .collect();
-                // A row that survives this commit keeps its fences; only the
-                // rows the diff replaced can have lost one, so the exact
-                // per-fence set is rebuilt for those alone — no tree walk and
-                // no formatted key per fence in the transcript.
-                let mut replaced_rows: HashSet<&str> = HashSet::new();
+            // row that survives this commit keeps its handle; only the rows the
+            // diff replaced or dropped can lose one, so the exact per-fence set
+            // is rebuilt for those alone — no tree walk and no formatted key
+            // per fence in the transcript.
+            if !self.code_fences.is_empty()
+                && !(replaced_rows.is_empty() && dropped_rows.is_empty())
+            {
+                let mut replaced_row_ids: HashSet<&str> = HashSet::new();
                 let mut replaced_fences: HashSet<SharedString> = HashSet::new();
-                if let Some((range, count)) = &change {
-                    for row in &new_rows[range.start..range.start + count] {
-                        if let RowKind::Markdown { tree, block_ix }
-                        | RowKind::LiveMarkdown { tree, block_ix } = &row.kind
-                        {
-                            replaced_rows.insert(row.id.as_ref());
-                            if let Some(top) = tree.blocks.get(*block_ix) {
-                                for ix in render::code_block_indices(&top.block, *block_ix) {
-                                    replaced_fences.insert(format!("{}#code{ix}", row.id).into());
-                                }
+                for row in replaced_rows {
+                    if let RowKind::Markdown { tree, block_ix }
+                    | RowKind::LiveMarkdown { tree, block_ix } = &row.kind
+                    {
+                        replaced_row_ids.insert(row.id.as_ref());
+                        if let Some(top) = tree.blocks.get(*block_ix) {
+                            for ix in render::code_block_indices(&top.block, *block_ix) {
+                                replaced_fences.insert(format!("{}#code{ix}", row.id).into());
                             }
                         }
                     }
@@ -5790,12 +5842,15 @@ impl Transcript {
                     let Some((row_id, _)) = key.rsplit_once("#code") else {
                         return false;
                     };
-                    live_rows.contains(row_id)
-                        && (!replaced_rows.contains(row_id) || replaced_fences.contains(key))
+                    !dropped_rows.contains(row_id)
+                        && (!replaced_row_ids.contains(row_id) || replaced_fences.contains(key))
                 });
             }
-            // Diagram source toggles follow the same stable row identity.
-            if self.diagrams.borrow().has_source_toggles() {
+            // Diagram source toggles follow the same stable row identity: only
+            // a dropped row can leave one behind. An attach replaces the whole
+            // row list, so that case sweeps.
+            if (attached || !dropped_rows.is_empty()) && self.diagrams.borrow().has_source_toggles()
+            {
                 let row_ids: HashSet<&str> = new_rows.iter().map(|row| row.id.as_ref()).collect();
                 self.diagrams.borrow_mut().retain_rows(&row_ids);
             }
@@ -5820,22 +5875,14 @@ impl Transcript {
 
         // Veils live exactly as long as their live row — drop them on the
         // live→complete flip (any mid-fade chunk snaps to full, matching the
-        // row's version splice). Nothing can be dropped while the row set is
-        // unchanged, and nothing to scan while all three sets are empty.
-        if !settled
-            && !(self.veils.is_empty()
-                && self.veil_baseline.is_empty()
-                && self.historical_markdown.is_empty())
-        {
-            let active_markdown: HashSet<&SharedString> = new_rows
-                .iter()
-                .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
-                .map(|row| &row.id)
-                .collect();
-            self.veils.retain(|id, _| active_markdown.contains(id));
-            self.veil_baseline.retain(|id| active_markdown.contains(id));
+        // row's version splice). Both the drop and the flip are in the diff, so
+        // an untouched row keeps whatever it has.
+        if !ended_live.is_empty() {
+            self.veils.retain(|id, _| !ended_live.contains(id.as_ref()));
+            self.veil_baseline
+                .retain(|id| !ended_live.contains(id.as_str()));
             self.historical_markdown
-                .retain(|id, _| active_markdown.contains(id));
+                .retain(|id, _| !ended_live.contains(id.as_ref()));
         }
 
         // Capture this before the row splice changes the list's measured end.
@@ -12604,9 +12651,7 @@ mod tests {
                 state
                     .receive_opening_transcript_update(update, false, cx)
                     .unwrap();
-                state
-                    .prepared_transcripts
-                    .insert("whale".into(), prepared);
+                state.prepared_transcripts.insert("whale".into(), prepared);
             });
             transcript.update(cx, |this, _| this.compact_mode = true);
             FORBID_ROW_PREPARATION.with(|flag| flag.set(true));
@@ -13028,6 +13073,118 @@ mod tests {
                     assert!(reveal.header_started_at.is_some());
                     assert!(reveal.starts[0].is_some());
                 }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn dropped_tool_group_retires_only_its_reveal(cx: &mut gpui::TestAppContext) {
+        with_tool_group_navigation(cx, |state, transcript, cx| {
+            state.update(cx, |state, _| {
+                state.transcript = vec![
+                    assistant(
+                        "keep",
+                        MessageStatus::Streaming,
+                        vec![tool_part("a", "pwd")],
+                    ),
+                    assistant("gone", MessageStatus::Streaming, vec![tool_part("b", "ls")]),
+                ];
+                state.transcript_revision += 1;
+            });
+            transcript.update(cx, |this, cx| this.sync(cx));
+            let (keep, starts) = transcript.update(cx, |this, _| {
+                let row = this
+                    .rows
+                    .iter()
+                    .find(|row| row.id.as_ref().starts_with("keep"))
+                    .expect("live group row");
+                let reveal = this
+                    .tool_group_reveals
+                    .get(&row.id)
+                    .expect("live group reveal");
+                (row.id.clone(), reveal.starts.clone())
+            });
+            state.update(cx, |state, _| {
+                state.transcript.truncate(1);
+                state.transcript_revision += 1;
+            });
+            transcript.update(cx, |this, cx| {
+                this.sync(cx);
+                assert_eq!(
+                    this.tool_group_reveals[&keep].starts, starts,
+                    "a group outside the diff keeps its arrival instants"
+                );
+                assert!(
+                    this.tool_group_reveals
+                        .keys()
+                        .all(|id| !id.as_ref().starts_with("gone")),
+                    "the dropped group's reveal goes with it"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn code_fence_handles_follow_only_the_changed_rows(cx: &mut gpui::TestAppContext) {
+        with_tool_group_navigation(cx, |state, transcript, cx| {
+            state.update(cx, |state, _| {
+                state.transcript = vec![assistant(
+                    "reply",
+                    MessageStatus::Streaming,
+                    vec![text_part("one", MD), text_part("two", MD)],
+                )];
+                state.transcript_revision += 1;
+            });
+            transcript.update(cx, |this, cx| this.sync(cx));
+            // Handles no tree owns (`#code100`): they stand in for a fence a
+            // live block lost, which is what the prune has to notice.
+            let (first, second) = transcript.update(cx, |this, _| {
+                let live: Vec<SharedString> = this
+                    .rows
+                    .iter()
+                    .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+                    .map(|row| row.id.clone())
+                    .collect();
+                assert!(live.len() >= 2, "one live row per streamed block");
+                for id in [&live[0], live.last().unwrap()] {
+                    this.code_fences
+                        .insert(format!("{id}#code100").into(), Default::default());
+                }
+                (live[0].clone(), live.last().unwrap().clone())
+            });
+            // Streaming growth replaces the first part's first block alone.
+            state.update(cx, |state, _| {
+                state.transcript[0].parts[0] =
+                    text_part("one", &MD.replace("# Title", "# Bigger title"));
+                state.transcript_revision += 1;
+            });
+            transcript.update(cx, |this, cx| {
+                this.sync(cx);
+                assert!(
+                    !this
+                        .code_fences
+                        .contains_key(&SharedString::from(format!("{first}#code100"))),
+                    "a replaced row loses the fence its new tree does not have"
+                );
+                assert!(
+                    this.code_fences
+                        .contains_key(&SharedString::from(format!("{second}#code100"))),
+                    "an untouched row keeps its handle"
+                );
+            });
+            // Dropping the second part drops its handles and nothing else.
+            state.update(cx, |state, _| {
+                state.transcript[0].parts.truncate(1);
+                state.transcript_revision += 1;
+            });
+            transcript.update(cx, |this, cx| {
+                this.sync(cx);
+                assert!(
+                    !this
+                        .code_fences
+                        .contains_key(&SharedString::from(format!("{second}#code100"))),
+                    "a dropped row releases its handles"
+                );
             });
         });
     }
