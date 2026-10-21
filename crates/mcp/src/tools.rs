@@ -191,7 +191,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness; there a session starts only sessions below itself, so kind chat and a parent outside the tree are refused (the tree's cap, stop_tree and spend must cover every session it starts). Select a project and/or device; catalogs are validated on that host. Set write: true for a session that changes code (in a git project it works in its own new worktree on a zeron/<name> branch, so parallel sessions never touch each other's files), false for one that only reads, searches and reports (every edit is blocked; it runs in the project folder). Claude Fable and GPT Astra class models are reserved for sessions the user starts: a session you create cannot use one, and when your own chat runs on one you must pass a different model. Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
+            description: "Create a standalone session visible in Sessions with kind chat, or a child with kind side. Omitted kind preserves the default: side with an origin/parent, standalone otherwise. A side chat cannot create chats, except in an orchestrator's tree, where sessions may start sessions up to 4 levels deep and default to their parent's harness; there a session starts only sessions below itself, so kind chat and a parent outside the tree are refused (the tree's cap, stop_tree and spend must cover every session it starts). Select a project and/or device; catalogs are validated on that host. Set write: true for a session that changes code (in a git project it works in its own new worktree on a zeron/<name> branch, so parallel sessions never touch each other's files), false for one that only reads, searches and reports (every edit is blocked; it runs in the project folder). Claude Fable and GPT Astra class models are reserved for sessions the user starts: a session you create cannot use one, and when your own chat runs on one you must pass a different model. Optionally send a first prompt and wait for the reply. Returns the new chat id and the model it runs on; modelNote says when a Pi session falls back to Pi's own default instead. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -200,7 +200,7 @@ fn catalog() -> Vec<ToolDef> {
                     "device": { "type": "string", "description": "Host device (id or name). With project, it must own that project. Without either, use the local engine." },
                     "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
                     "harness": { "type": "string", "description": "Harness id; Pi is the only harness, so omit it or pass \"pi\"." },
-                    "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit for the harness default. Claude Fable and GPT Astra class models are reserved for the user's own sessions and are refused here; when your chat runs on one, always pass a different model." },
+                    "model": { "type": "string", "description": "Model id from list_models on the chosen device. Omit to run on the device's default subagent (Pi); the result says which model that is. Claude Fable and GPT Astra class models are reserved for the user's own sessions and are refused here; when your chat runs on one, always pass a different model." },
                     "reasoning": { "type": "string", "enum": THINKING_LEVELS, "description": "Thinking level: off, minimal, low, medium, high, xhigh or max. Omit for the model's default. Pi runs the closest level the model supports at or below it." },
                     "write": { "type": "boolean", "default": true, "description": "true: the session may change files, and in a git project gets its own worktree. false: read-only; every edit is blocked." },
                     "sandbox": { "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "default": "workspace-write", "description": "Usually leave unset and use write. read-only only with write false." },
@@ -1704,15 +1704,19 @@ impl Tools {
             }
             launcher_models.extend(chat_model(&chat));
         }
-        ensure_model_not_reserved(args.model.as_deref(), &launcher_models)?;
-        if let Some(tree) = &tree {
-            // The new session inherits the restrictions of the chat above it.
-            let holder = parent_chat_id
-                .as_deref()
-                .and_then(|id| chats.iter().find(|chat| chat.id == id))
-                .unwrap_or(&tree.root);
-            self.ensure_model_allowed(tree, holder, args.model.as_deref())
-                .await?;
+        // A named model is checked before anything is read or written. A
+        // session given none may take the device's default subagent, so it is
+        // checked below, once the model it got is known.
+        let named_model = args.model.is_some();
+        if named_model {
+            self.ensure_launch_model(
+                tree.as_ref(),
+                &chats,
+                parent_chat_id.as_deref(),
+                args.model.as_deref(),
+                &launcher_models,
+            )
+            .await?;
         }
         let (mut space, device_id) = match self
             .zeron
@@ -1766,20 +1770,48 @@ impl Tools {
         // on the device's default subagent (Settings → General), or on the
         // first of its fallbacks the device offers when it does not offer the
         // default itself.
+        let mut model_note = None;
         if args.model.is_none() && harness == HarnessId::Pi {
-            let agents = self.default_subagent(&device_id).await;
-            if !agents.is_empty() {
-                let offered = self.zeron.models_on(harness, Some(&device_id)).await?;
-                if let Some((model, thinking)) = agents
-                    .into_iter()
-                    .find(|(model, _)| offered.iter().any(|m| &m.id == model))
-                {
+            let (agents, unavailable) = self.default_subagent(&device_id).await;
+            let offered = if agents.is_empty() {
+                Vec::new()
+            } else {
+                self.zeron.models_on(harness, Some(&device_id)).await?
+            };
+            match agents
+                .into_iter()
+                .find(|(model, _)| offered.iter().any(|m| &m.id == model))
+            {
+                Some((model, thinking)) => {
                     args.model = Some(model);
                     if args.reasoning.is_none() {
                         args.reasoning = thinking;
                     }
                 }
+                None => {
+                    // The result says which model the session actually got:
+                    // the orchestrator cannot otherwise tell Pi's own default
+                    // from the device's default subagent.
+                    model_note = Some(unavailable.unwrap_or_else(|| {
+                        format!(
+                            "the device's default subagent is not offered on device {device_id}, so this session runs on Pi's own default model, which Zeron cannot see (pass `model` to choose one)"
+                        )
+                    }));
+                }
             }
+        }
+        // Whatever model the session got, named or taken from the device's
+        // default subagent, is held to the same reserved, allow-list and
+        // disabled-model rules.
+        if !named_model {
+            self.ensure_launch_model(
+                tree.as_ref(),
+                &chats,
+                parent_chat_id.as_deref(),
+                args.model.as_deref(),
+                &launcher_models,
+            )
+            .await?;
         }
         if let Some(model) = args.model.as_deref() {
             let models = self.zeron.models_on(harness, Some(&device_id)).await?;
@@ -1897,6 +1929,8 @@ impl Tools {
         if let Some(slot) = &mut slot {
             slot.created = Some(chat_id.clone());
         }
+        // The row exists from here: a failure must say which chat it leaves
+        // behind, or a retry creates the same session twice.
         if let Some(title) = args
             .title
             .as_deref()
@@ -1905,7 +1939,12 @@ impl Tools {
         {
             self.zeron
                 .mutate(json!({ "op": "renameChat", "chatId": chat_id, "title": title }))
-                .await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "Chat {chat_id} was created but its title was not set; it exists, so use it (rename_chat) rather than creating another"
+                    )
+                })?;
         }
 
         let workspace = if worktree.is_some() {
@@ -1928,6 +1967,9 @@ impl Tools {
         });
         if let Some(note) = preflight_note {
             result["preflight"] = note;
+        }
+        if let Some(note) = model_note {
+            result["modelNote"] = json!(note);
         }
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
             // The row may not have folded into WatchChats yet; build the
@@ -1962,7 +2004,12 @@ impl Tools {
                     "run",
                     worktree,
                 )
-                .await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "Chat {chat_id} was created but the prompt was not sent; it exists, so send the prompt to it (send_message) rather than creating another"
+                    )
+                })?;
             result["sent"] = sent;
             let pending = Arc::new(PendingTurn {
                 baseline: None,
@@ -1976,7 +2023,12 @@ impl Tools {
             if args.wait {
                 result["turn"] = self
                     .await_pending_turn(&chat, pending, wait_duration(args.timeout_secs))
-                    .await?;
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Chat {chat_id} was created and the prompt was sent, but waiting for its turn failed; read it (read_chat) rather than creating another"
+                        )
+                    })?;
             }
         }
         Ok(result)
@@ -2592,6 +2644,28 @@ impl Tools {
         Ok(())
     }
 
+    /// Refuse a session the reserved, allow-list or disabled-model rules
+    /// refuse: an explicit `model`, or the one the device's default subagent
+    /// picked when the caller named none.
+    async fn ensure_launch_model(
+        &self,
+        tree: Option<&Tree>,
+        chats: &[Chat],
+        parent_chat_id: Option<&str>,
+        model: Option<&str>,
+        launcher_models: &[String],
+    ) -> anyhow::Result<()> {
+        ensure_model_not_reserved(model, launcher_models)?;
+        if let Some(tree) = tree {
+            // The new session inherits the restrictions of the chat above it.
+            let holder = parent_chat_id
+                .and_then(|id| chats.iter().find(|chat| chat.id == id))
+                .unwrap_or(&tree.root);
+            self.ensure_model_allowed(tree, holder, model).await?;
+        }
+        Ok(())
+    }
+
     /// Refuse a model the tree's policy does not allow, or that the chat the
     /// new session is below (or the orchestrator above it) disabled. The
     /// engine that cannot say leaves the disabled list open; Pi's guard
@@ -2721,38 +2795,58 @@ impl Tools {
         Ok(())
     }
 
-    /// `create_chat` named a folder that is not a project yet: register it,
-    /// when the engine finds exactly one folder for the path or short name.
     /// The device's default subagent (`GetSubagentSettings`), then each of
     /// its fallbacks, as models and thinking levels; a fallback with no level
-    /// of its own runs at the default's. Empty when unset or unreadable; a
-    /// device that cannot say leaves the harness default in place.
-    async fn default_subagent(&self, device_id: &str) -> Vec<(String, Option<String>)> {
-        let Ok(reply) = self
+    /// of its own runs at the default's. Empty when unset or unreadable, with
+    /// a note saying why, so `create_chat` can tell the caller which model the
+    /// session runs on instead. A device that cannot say leaves the harness
+    /// default in place.
+    async fn default_subagent(
+        &self,
+        device_id: &str,
+    ) -> (Vec<(String, Option<String>)>, Option<String>) {
+        let reply = match self
             .zeron
             .call(
                 zeron_rpc::methods::GET_SUBAGENT_SETTINGS,
                 json!({ "targetDeviceId": device_id }),
             )
             .await
-            .inspect_err(|error| tracing::debug!(%error, "default subagent unavailable"))
-        else {
-            return Vec::new();
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                tracing::debug!(%error, "default subagent unavailable");
+                return (
+                    Vec::new(),
+                    Some(format!(
+                        "the device's default subagent could not be read ({error}), so this session runs on Pi's own default model, which Zeron cannot see (pass `model` to choose one)"
+                    )),
+                );
+            }
         };
         let Some(model) = reply["model"].as_str() else {
-            return Vec::new();
+            return (
+                Vec::new(),
+                Some(
+                    "the device's default subagent names no model, so this session runs on Pi's own default model, which Zeron cannot see (pass `model` to choose one)"
+                        .into(),
+                ),
+            );
         };
         let thinking = reply["thinking"].as_str().map(str::to_owned);
         let fallbacks = reply["fallbacks"].as_array().into_iter().flatten();
-        std::iter::once((model.to_owned(), thinking.clone()))
+        let agents = std::iter::once((model.to_owned(), thinking.clone()))
             .chain(fallbacks.filter_map(|fallback| {
                 let model = fallback["model"].as_str()?.to_owned();
                 let level = fallback["thinking"].as_str().map(str::to_owned);
                 Some((model, level.or_else(|| thinking.clone())))
             }))
-            .collect()
+            .collect();
+        (agents, None)
     }
 
+    /// `create_chat` named a folder that is not a project yet: register it,
+    /// when the engine finds exactly one folder for the path or short name.
     async fn register_for_create(
         &self,
         args: &CreateChatArgs,
@@ -3384,6 +3478,11 @@ mod tests {
         registered: std::sync::atomic::AtomicBool,
         /// What `GetSubagentSettings` answers; set, Pi is offered too.
         subagent_default: Option<Value>,
+        /// What `GetSessionModelPolicy` answers; unset, the engine cannot say.
+        session_model_policy: Option<Value>,
+        /// A `mutate` op or RPC method that fails, so a failure after the
+        /// chat row is written can be tested.
+        fails: Option<&'static str>,
     }
 
     /// The project `RegisterProject` finds for "t3code".
@@ -3611,6 +3710,10 @@ mod tests {
                     Some(settings) => RpcReply::Value(settings.clone()),
                     None => return Err(RpcError::UnknownMethod(method.into())),
                 },
+                methods::GET_SESSION_MODEL_POLICY => match &self.session_model_policy {
+                    Some(policy) => RpcReply::Value(policy.clone()),
+                    None => return Err(RpcError::UnknownMethod(method.into())),
+                },
                 methods::LIST_MODELS if remote => RpcReply::Value(json!([
                     {"id":"remote-model", "label":"Remote model"}
                 ])),
@@ -3635,7 +3738,12 @@ mod tests {
                     self.writes
                         .lock()
                         .unwrap()
-                        .push((method.to_owned(), params));
+                        .push((method.to_owned(), params.clone()));
+                    if self.fails == Some(method)
+                        || (method == methods::MUTATE && self.fails == params["op"].as_str())
+                    {
+                        return Err(RpcError::Failed("the engine refused this change".into()));
+                    }
                     if method == methods::QUEUE_COMMAND
                         && let Some(barrier) = &self.dispatch_barrier
                     {
@@ -5377,10 +5485,14 @@ mod tests {
             assert_eq!(created["reasoning"], reasoning);
         }
         // A default the device does not offer, with no offered fallback, or
-        // none at all, is no default.
-        for default in [
-            json!({ "model": "x/gone", "fallbacks": [{ "model": "y/gone" }] }),
-            json!({ "model": null }),
+        // none at all, is no default: the session runs on Pi's own default,
+        // and the result says so.
+        for (default, why) in [
+            (
+                json!({ "model": "x/gone", "fallbacks": [{ "model": "y/gone" }] }),
+                "is not offered on device dev-local",
+            ),
+            (json!({ "model": null }), "names no model"),
         ] {
             let world = Arc::new(World {
                 subagent_default: Some(default),
@@ -5388,6 +5500,92 @@ mod tests {
             });
             let created = create(&world, json!({ "harness": "pi" })).await;
             assert!(created["model"].is_null(), "{created}");
+            let note = created["modelNote"].as_str().unwrap_or_default();
+            assert!(note.contains(why), "{created}");
+            assert!(note.contains("Pi's own default model"), "{created}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_subagent_is_checked_like_a_named_model() {
+        // The device's default subagent is substituted into a session that
+        // named no model, so the model it picks must pass the same reserved,
+        // allow-list and disabled-model checks a named one does.
+        let allowed = Arc::new(World {
+            subagent_default: Some(json!({ "model": "sonnet" })),
+            ..policy_world(json!({ "allowedModels": ["opus"] }), 0.0)
+        });
+        let refused = from(&allowed, "orchestrator-root")
+            .call(
+                "create_chat",
+                json!({ "harness": "pi", "project": "space-1", "title": "Sub" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("not allowed in this orchestrator"),
+            "{refused}"
+        );
+        assert!(refused.contains("sonnet"), "{refused}");
+        assert_eq!(mutations(&allowed), 0);
+        // A default the allow-list names runs.
+        let permits = Arc::new(World {
+            subagent_default: Some(json!({ "model": "sonnet" })),
+            ..policy_world(json!({ "allowedModels": ["sonnet"] }), 0.0)
+        });
+        let created = from(&permits, "orchestrator-root")
+            .call(
+                "create_chat",
+                json!({ "harness": "pi", "project": "space-1", "title": "Sub" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["model"], "sonnet");
+        // A default the session policy disables is refused too.
+        let disabled = Arc::new(World {
+            subagent_default: Some(json!({ "model": "sonnet" })),
+            session_model_policy: Some(json!({ "disabled": ["sonnet"] })),
+            ..policy_world(Value::Null, 0.0)
+        });
+        let refused = from(&disabled, "orchestrator-root")
+            .call(
+                "create_chat",
+                json!({ "harness": "pi", "project": "space-1", "title": "Sub" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("is disabled for this session tree"),
+            "{refused}"
+        );
+        assert_eq!(mutations(&disabled), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_row_is_written_names_the_chat() {
+        // An error that loses the new chat's id makes the caller create the
+        // same session again on retry.
+        for (fails, why) in [
+            ("renameChat", "its title was not set"),
+            (methods::QUEUE_COMMAND, "the prompt was not sent"),
+        ] {
+            let world = Arc::new(World {
+                fails: Some(fails),
+                ..World::default()
+            });
+            let err = tools(world.clone(), Origin::default())
+                .call(
+                    "create_chat",
+                    json!({ "project": "space-1", "title": "Review", "prompt": "go" }),
+                )
+                .await
+                .unwrap_err();
+            let writes = world.writes.lock().unwrap();
+            let chat_id = writes[0].1["chatId"].as_str().unwrap().to_owned();
+            assert_eq!(writes[0].1["op"], "createChat");
+            assert!(err.contains(&chat_id), "{fails}: {err}");
+            assert!(err.contains(why), "{fails}: {err}");
+            assert!(err.contains("rather than creating another"), "{err}");
         }
     }
 
