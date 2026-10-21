@@ -86,6 +86,9 @@ use crate::workspace_host::WorkspaceHost;
 
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
+/// Transcript tail (in parts) read to rank an empty @-mention query. Generous
+/// enough to cover the featured-path stop, small enough to stay cheap.
+const FILE_SEARCH_FEATURED_PARTS: usize = 128;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -389,6 +392,32 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
         | ToolCall::Mcp { .. }
         | ToolCall::Unknown { .. } => None,
     }
+}
+
+/// Most-recent-first tool file paths from the transcript tail of a chat doc.
+///
+/// Bounded on purpose: [`zeron_doc::SessionDoc::read_opening_tail`] materializes
+/// only the last `FILE_SEARCH_FEATURED_PARTS` parts, never the whole transcript.
+/// Duplicates are left in — the caller dedupes against its own featured set.
+fn recent_tool_file_paths(doc: &zeron_doc::SessionDoc) -> Vec<String> {
+    let Ok(entries) = doc.read_opening_tail(FILE_SEARCH_FEATURED_PARTS) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for entry in entries.into_iter().rev() {
+        for part in entry.parts.into_iter().rev() {
+            if let MessagePart::Tool { call, .. } = part
+                && let Some(path) = tool_file_path(&call)
+                && !path.trim().is_empty()
+            {
+                paths.push(path.to_string());
+                if paths.len() == FILE_SEARCH_FEATURED_PATHS {
+                    return paths;
+                }
+            }
+        }
+    }
+    paths
 }
 
 #[derive(Debug, Deserialize)]
@@ -1107,28 +1136,29 @@ impl EngineRpc {
     /// files still changed in its checkout. The search worker validates and
     /// normalizes them against the resolved root before using them as ranking
     /// hints, so stale or out-of-workspace tool paths simply disappear.
-    fn featured_file_paths(&self, chat_id: &str) -> Vec<String> {
+    ///
+    /// The transcript half reads a bounded tail of a doc this device already
+    /// holds open, on the blocking pool. An empty @-mention query must never
+    /// materialize the whole transcript on an async worker or cold-open (and
+    /// so sync) the chat: neither is preemptible, so both blew straight
+    /// through this RPC's own deadline while merely opening the picker.
+    async fn featured_file_paths(&self, chat_id: &str) -> Vec<String> {
+        let transcript_paths = match self.doc_host.cached(chat_id) {
+            None => Vec::new(),
+            Some(handle) => {
+                tokio::task::spawn_blocking(move || recent_tool_file_paths(handle.doc()))
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "featured transcript paths read failed");
+                        Vec::new()
+                    })
+            }
+        };
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
-        if let Ok(handle) = self.doc_host.open(chat_id)
-            && let Ok(entries) = handle.doc().read_entries()
-        {
-            for entry in entries.into_iter().rev() {
-                for part in entry.parts.into_iter().rev() {
-                    if let MessagePart::Tool { call, .. } = part
-                        && let Some(path) = tool_file_path(&call)
-                        && !path.trim().is_empty()
-                        && seen.insert(path.to_string())
-                    {
-                        paths.push(path.to_string());
-                        if paths.len() == FILE_SEARCH_FEATURED_PATHS {
-                            break;
-                        }
-                    }
-                }
-                if paths.len() == FILE_SEARCH_FEATURED_PATHS {
-                    break;
-                }
+        for path in transcript_paths {
+            if seen.insert(path.clone()) {
+                paths.push(path);
             }
         }
 
@@ -4042,12 +4072,10 @@ impl RpcService for EngineRpc {
                 }
                 let matches = tokio::time::timeout(FILE_SEARCH_RPC_TIMEOUT, async {
                     let root = self.file_search_root(&p).await?;
-                    let featured_paths = p
-                        .chat_id
-                        .as_deref()
-                        .filter(|_| p.query.is_empty())
-                        .map(|chat_id| self.featured_file_paths(chat_id))
-                        .unwrap_or_default();
+                    let featured_paths = match p.chat_id.as_deref().filter(|_| p.query.is_empty()) {
+                        Some(chat_id) => self.featured_file_paths(chat_id).await,
+                        None => Vec::new(),
+                    };
                     self.repos
                         .search_files(root, p.query, featured_paths)
                         .await
@@ -5786,6 +5814,51 @@ mod tests {
         assert_eq!(canvas_space_id("space-canvas:s1"), Some("s1"));
         assert_eq!(canvas_space_id("space-canvas:"), None);
         assert_eq!(canvas_space_id("chat-1"), None);
+    }
+
+    #[test]
+    fn featured_transcript_paths_are_recent_first_and_stay_in_the_tail() {
+        fn push(doc: &zeron_doc::SessionDoc, id: &str, parts: serde_json::Value) {
+            let entry: zeron_doc::SessionMessageEntry = serde_json::from_value(serde_json::json!({
+                "id": id, "role": "user", "parts": parts, "createdAt": 1, "deviceId": "host"
+            }))
+            .unwrap();
+            doc.push_message(&entry).unwrap();
+        }
+        fn text(id: &str) -> serde_json::Value {
+            serde_json::json!([{ "id": format!("{id}-part"), "kind": "text", "text": "filler" }])
+        }
+        fn tool(id: &str, path: &str) -> serde_json::Value {
+            serde_json::json!([{ "id": format!("{id}-part"), "kind": "tool",
+                "call": { "kind": "readFile", "path": path } }])
+        }
+
+        let doc = zeron_doc::SessionDoc::init("featured").unwrap();
+        // A history longer than the read window: the picker must not walk it.
+        for n in 0..200 {
+            push(&doc, &format!("old-{n}"), text(&format!("old-{n}")));
+        }
+        push(&doc, "recent-a", tool("recent-a", "src/a.rs"));
+        push(&doc, "recent-b", tool("recent-b", "src/b.rs"));
+        assert_eq!(recent_tool_file_paths(&doc), ["src/b.rs", "src/a.rs"]);
+
+        // More recent text slides the bounded window past those tool calls.
+        for n in 0..FILE_SEARCH_FEATURED_PARTS {
+            push(&doc, &format!("filler-{n}"), text(&format!("filler-{n}")));
+        }
+        assert!(recent_tool_file_paths(&doc).is_empty());
+
+        // The featured list itself stays capped.
+        for n in 0..40 {
+            push(
+                &doc,
+                &format!("tool-{n}"),
+                tool(&format!("tool-{n}"), &format!("{n}.rs")),
+            );
+        }
+        let paths = recent_tool_file_paths(&doc);
+        assert_eq!(paths.len(), FILE_SEARCH_FEATURED_PATHS);
+        assert_eq!(paths.first().map(String::as_str), Some("39.rs"));
     }
 
     #[test]

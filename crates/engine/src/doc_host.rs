@@ -1373,6 +1373,20 @@ impl DocHost {
         Ok(handle)
     }
 
+    /// The chat's already-open doc, when this device holds one.
+    ///
+    /// A read-only peek for callers that must not pay a cold open — snapshot
+    /// load, change task, and (through [`Self::open`]) a room dial — as a side
+    /// effect of an unrelated query. Retired handles are never served.
+    pub fn cached(&self, chat_id: &str) -> Option<Arc<ChatDocHandle>> {
+        let handle = lock(&self.inner.handles).get(chat_id).cloned()?;
+        if handle.retired.load(Ordering::Relaxed) {
+            return None;
+        }
+        handle.touch();
+        Some(handle)
+    }
+
     /// Explicit viewport navigation; automatic watch retries and MCP reads use
     /// `open` instead. The sequence also orders focuses in the same millisecond.
     pub fn focus_chat(&self, chat_id: &str) -> Result<(), EngineError> {
@@ -6819,6 +6833,33 @@ mod publication_eviction_tests {
         let same = host.open("local").unwrap();
         assert!(Arc::ptr_eq(&handle, &same));
         assert!(handle.sync_requested.load(Ordering::Acquire));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn cached_serves_only_already_open_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "reader".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        assert!(host.cached("cold").is_none());
+        assert!(
+            lock(&host.inner.handles).is_empty(),
+            "a peek must never open (and so sync) a doc"
+        );
+        let handle = host.open_local("cold").unwrap();
+        assert!(
+            host.cached("cold")
+                .is_some_and(|cached| Arc::ptr_eq(&cached, &handle))
+        );
+        handle.retired.store(true, Ordering::Relaxed);
+        assert!(host.cached("cold").is_none(), "retired handles are skipped");
         host.shutdown_workers().await;
     }
 
