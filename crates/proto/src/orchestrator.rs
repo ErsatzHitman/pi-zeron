@@ -321,35 +321,25 @@ pub fn tree_members<'a>(chats: &'a [Chat], root_id: &str) -> Vec<&'a Chat> {
     if !is_root_chat(root_id) {
         return Vec::new();
     }
-    let mut members: Vec<&Chat> = Vec::new();
-    let mut level = vec![root_id];
-    for _ in 0..MAX_DEPTH {
-        let next: Vec<&Chat> = chats
-            .iter()
-            .filter(|chat| {
-                chat.parent_chat_id
-                    .as_deref()
-                    .is_some_and(|parent| level.contains(&parent))
-                    && chat.id != root_id
-                    && !members.iter().any(|seen| seen.id == chat.id)
-            })
-            .collect();
-        if next.is_empty() {
-            break;
-        }
-        level = next.iter().map(|chat| chat.id.as_str()).collect();
-        members.extend(next);
-    }
-    members
+    below(chats, root_id)
 }
 
 /// Every session below `chat_id` (not `chat_id` itself), archived ones and
 /// btw asides included, parents before their children. [`tree_members`]
 /// starts from a root only; this starts from any chat, to name a branch.
 pub fn subtree_members<'a>(chats: &'a [Chat], chat_id: &str) -> Vec<&'a Chat> {
+    below(chats, chat_id)
+}
+
+/// The walk both trees share: every chat whose lineage passes through
+/// `chat_id`, parents before their children. Unbounded on purpose — a tree
+/// deeper than [`MAX_DEPTH`] (older data, or a lowered limit) must still
+/// list whole, or a delete cascade would orphan what it stopped short of.
+/// Terminates because a level only ever holds chats not already listed.
+fn below<'a>(chats: &'a [Chat], chat_id: &str) -> Vec<&'a Chat> {
     let mut members: Vec<&Chat> = Vec::new();
     let mut level = vec![chat_id];
-    for _ in 0..MAX_DEPTH {
+    while !level.is_empty() {
         let next: Vec<&Chat> = chats
             .iter()
             .filter(|chat| {
@@ -360,9 +350,6 @@ pub fn subtree_members<'a>(chats: &'a [Chat], chat_id: &str) -> Vec<&'a Chat> {
                     && !members.iter().any(|seen| seen.id == chat.id)
             })
             .collect();
-        if next.is_empty() {
-            break;
-        }
         level = next.iter().map(|chat| chat.id.as_str()).collect();
         members.extend(next);
     }
@@ -474,6 +461,35 @@ mod tests {
         assert!(ids("child-b").is_empty(), "a leaf has nothing below it");
         assert!(ids("missing").is_empty());
         assert_eq!(ids(&root).len(), 5, "from a root it is the whole tree");
+    }
+
+    #[test]
+    fn a_tree_lists_whole_past_the_depth_limit() {
+        // A row deeper than the limit can exist (older data, a lowered
+        // MAX_DEPTH); the walk must not stop at the limit and leave it
+        // out of a cascade.
+        let root = new_root_chat_id();
+        let mut chats = vec![chat(&root, None)];
+        let mut parent = root.clone();
+        for level in 1..=MAX_DEPTH + 2 {
+            let id = format!("level-{level}");
+            chats.push(chat(&id, Some(&parent)));
+            parent = id;
+        }
+        let last = format!("level-{}", MAX_DEPTH + 2);
+        let ids: Vec<&str> = tree_members(&chats, &root)
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(ids.len(), MAX_DEPTH + 2, "every level, in order");
+        assert_eq!(ids.last().copied(), Some(last.as_str()));
+        // From a member, the same walk covers the rest of its branch.
+        let below: Vec<&str> = subtree_members(&chats, "level-2")
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(below.len(), MAX_DEPTH, "level-2's own branch only");
+        assert_eq!(below.last().copied(), Some(last.as_str()));
     }
 
     #[test]

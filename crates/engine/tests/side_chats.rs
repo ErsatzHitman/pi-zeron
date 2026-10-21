@@ -1097,3 +1097,85 @@ async fn a_pi_side_chat_forks_its_parent_s_pi_session() {
     assert_eq!(request.resume, None);
     core.shutdown().await;
 }
+
+/// A member of an orchestrator's tree has a parent chat too, but it is not a
+/// side conversation: its first run carries its task, never the "Continue
+/// this side conversation" fork history.
+#[tokio::test]
+async fn an_orchestrator_member_is_not_a_side_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(Capture(requests.clone())));
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None).unwrap();
+    core.workspace
+        .create_chat(
+            "orchestrator-t",
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    core.workspace
+        .create_chat_with_parent(
+            "m1",
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/tmp".into()),
+            Some("orchestrator-t".into()),
+        )
+        .unwrap();
+    // A transcript of its own from before, which a fresh provider session
+    // lacks.
+    let member = core.doc_host.open("m1").unwrap();
+    for (id, role, text) in [
+        ("u1", MessageRole::User, "Earlier task"),
+        ("a1", MessageRole::Assistant, "Earlier answer"),
+    ] {
+        member
+            .doc()
+            .push_message(&message(id, role, text, MessageStatus::Complete))
+            .unwrap();
+    }
+    core.sessions
+        .dispatch(
+            "m1",
+            HarnessId::Mock,
+            RunRequest {
+                mcp: None,
+                prompt: "Now do this".into(),
+                harness: Some(HarnessId::Mock),
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: "/tmp".into(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: true,
+                resume: None,
+                attachments: vec![],
+                worktree: None,
+            },
+            Some("m1-user".into()),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while requests.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let request = requests.lock().unwrap()[0].clone();
+    assert_eq!(request.resume, None, "a fresh provider session");
+    assert_eq!(request.prompt, "Now do this");
+    assert!(
+        !request.prompt.contains("side conversation"),
+        "{}",
+        request.prompt
+    );
+    assert!(member.doc().fork_parent().is_none(), "no fork recorded");
+    core.shutdown().await;
+}

@@ -2604,12 +2604,7 @@ impl Inner {
         provider: ProviderSession<'_>,
         fork: Option<&ForkParent>,
     ) -> Option<String> {
-        if native_command(prompt, harness_id)
-            || !self
-                .workspace()
-                .and_then(|ws| ws.chat(chat_id).ok().flatten())
-                .is_some_and(|chat| chat.parent_chat_id.is_some())
-        {
+        if native_command(prompt, harness_id) || !self.is_side_chat(chat_id) {
             return None;
         }
         let entries: Vec<_> = doc
@@ -2701,6 +2696,15 @@ impl Inner {
         history
     }
 
+    /// A side chat: a chat with a parent, outside an orchestrator's tree —
+    /// the same rule [`Inner::fork_parent`] records a fork by. A member of a
+    /// tree has a parent too, but it starts from its task and its own
+    /// transcript, never as a forked side conversation.
+    fn is_side_chat(&self, chat_id: &str) -> bool {
+        let place = zeron_proto::orchestrator::Place::of(&self.lineage(chat_id), chat_id);
+        place.role == zeron_proto::orchestrator::Role::Chat && place.parent_id.is_some()
+    }
+
     /// The fork a side chat starts from: recorded in its doc at its first
     /// run, read back after. `None` for every chat that is not a side chat
     /// outside an orchestrator's tree (members get their task, not their
@@ -2712,11 +2716,11 @@ impl Inner {
         if let Some(record) = doc.fork_parent() {
             return serde_json::from_str(&record).ok().map(|fork| (fork, false));
         }
-        let lineage = self.lineage(chat_id);
-        let place = zeron_proto::orchestrator::Place::of(&lineage, chat_id);
-        if place.role != zeron_proto::orchestrator::Role::Chat {
+        if !self.is_side_chat(chat_id) {
             return None;
         }
+        let lineage = self.lineage(chat_id);
+        let place = zeron_proto::orchestrator::Place::of(&lineage, chat_id);
         let parent = lineage
             .iter()
             .find(|chat| Some(&chat.id) == place.parent_id.as_ref())?;
