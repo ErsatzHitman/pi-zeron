@@ -36,8 +36,8 @@ const FALLBACK_DESCRIPTION: &str = "Tried in order when the model above cannot s
 const BLOCKED: &str = "Blocked: Claude Fable and GPT Astra class models are reserved for \
      sessions you start. Pick another model.";
 
-/// The thinking menu: the model's own default, then Pi's levels.
-const MODEL_DEFAULT: &str = "Model default";
+/// The thinking menu: the delegating session's own level, then Pi's levels.
+const MODEL_DEFAULT: &str = "Session's level";
 
 /// A fallback's thinking menu: the default's level, then Pi's levels.
 const DEFAULT_LEVEL: &str = "Default's level";
@@ -216,8 +216,8 @@ fn shown_fallbacks(settings: &SubagentSettings) -> usize {
     }
 }
 
-/// The thinking menu's row for `level`: 0 is the model's default (or, for a
-/// fallback, the default's level).
+/// The thinking menu's row for `level`: 0 is the session's own level (or, for
+/// a fallback, the default's level).
 fn thinking_index(level: Option<&str>) -> usize {
     level
         .and_then(|level| THINKING_LEVELS.iter().position(|l| *l == level))
@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn the_thinking_menu_maps_rows_to_levels_and_back() {
         assert_eq!(thinking_index(None), 0);
-        assert_eq!(thinking_at(0), None, "row 0 is the model's default");
+        assert_eq!(thinking_at(0), None, "row 0 is the session's own level");
         for (ix, level) in THINKING_LEVELS.iter().enumerate() {
             assert_eq!(thinking_index(Some(level)), ix + 1);
             assert_eq!(thinking_at(ix + 1).as_deref(), Some(*level));
