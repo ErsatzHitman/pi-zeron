@@ -5,7 +5,11 @@
 //! members and their sub-sessions). They live in Pi's
 //! `<agent dir>/subagents.json` as `defaultModel` and `defaultThinkingLevel`,
 //! which those extensions re-read at each launch, so a change reaches running
-//! chats at their next child. Up to two fallbacks (`fallbackModels`, each a
+//! chats at their next child. A cleared value is written as an explicit
+//! `null`, never removed: Pi reads a missing `defaultModel` as its own
+//! built-in opencode-go/deepseek-flash at max and only `null` as the
+//! session's own model (the missing level's default), which is what the card
+//! shows. Up to two fallbacks (`fallbackModels`, each a
 //! model and an optional level) are tried in order when the default cannot
 //! run a child: a model on an almost used-up account, or a child that fails
 //! before it does any work. Every other key in the file is kept. A child
@@ -227,14 +231,17 @@ pub fn write(agent_dir: &Path, settings: SubagentSettings) -> Result<SubagentSet
     let path = path(agent_dir);
     let mut root = load(&path)?.unwrap_or_default();
     let before = root.clone();
+    // `null` says "no default"; removing the key would only hand the child
+    // back to Pi's built-in default while the card still says the session's
+    // own model.
     for (key, value) in [
         ("defaultModel", &settings.model),
         ("defaultThinkingLevel", &settings.thinking),
     ] {
-        match value {
-            Some(value) => root.insert(key.into(), value.clone().into()),
-            None => root.remove(key),
-        };
+        root.insert(
+            key.into(),
+            value.clone().map(Value::String).unwrap_or(Value::Null),
+        );
     }
     if settings.fallbacks.is_empty() {
         root.remove("fallbackModels");
@@ -303,11 +310,16 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_is_no_default_and_a_save_creates_it() {
+    fn a_missing_file_is_no_default_and_a_save_records_that_explicitly() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read(dir.path()), SubagentSettings::default());
         write(dir.path(), SubagentSettings::default()).unwrap();
-        assert!(!path(dir.path()).exists(), "saving nothing writes nothing");
+        assert_eq!(
+            file_json(dir.path()),
+            serde_json::json!({ "defaultModel": null, "defaultThinkingLevel": null }),
+            "cleared keys are written as null, which Pi reads as the session's own model"
+        );
+        assert_eq!(read(dir.path()), SubagentSettings::default());
         let saved = write(dir.path(), settings(Some(" openai/gpt-5.5 "), Some("high"))).unwrap();
         assert_eq!(saved, settings(Some("openai/gpt-5.5"), Some("high")));
         assert_eq!(read(dir.path()), saved);
@@ -319,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn a_save_keeps_every_other_key_and_clearing_removes_only_its_own() {
+    fn a_save_keeps_every_other_key_and_clearing_writes_null() {
         let dir = tempfile::tempdir().unwrap();
         let original = serde_json::json!({
             "defaultModel": "opencode-go/deepseek-v4.1-flash",
@@ -339,15 +351,18 @@ mod tests {
         .unwrap();
         let mut expected = original.clone();
         expected["defaultModel"] = "anthropic/claude-sonnet-5".into();
-        expected
-            .as_object_mut()
-            .unwrap()
-            .remove("defaultThinkingLevel");
+        // Not removed: Pi would fall back to its own deepseek-flash at max.
+        expected["defaultThinkingLevel"] = Value::Null;
         assert_eq!(file_json(dir.path()), expected);
         write(dir.path(), SubagentSettings::default()).unwrap();
         assert_eq!(
             file_json(dir.path()),
-            serde_json::json!({ "worktreeWrites": true, "profiles": { "scout": { "model": "x/y" } } })
+            serde_json::json!({
+                "defaultModel": null,
+                "defaultThinkingLevel": null,
+                "worktreeWrites": true,
+                "profiles": { "scout": { "model": "x/y" } }
+            })
         );
     }
 
@@ -449,6 +464,11 @@ mod tests {
         // A level alone is fine: children keep their own model at that level.
         write(dir.path(), settings(None, Some("low"))).unwrap();
         assert_eq!(read(dir.path()), settings(None, Some("low")));
+        assert_eq!(
+            file_json(dir.path()),
+            serde_json::json!({ "defaultModel": null, "defaultThinkingLevel": "low" }),
+            "no model is said explicitly, or Pi would run its own at that level"
+        );
     }
 
     #[test]
