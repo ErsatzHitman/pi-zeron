@@ -5532,6 +5532,13 @@ impl Shell {
         {
             page.update(cx, |page, cx| page.refresh(cx));
         }
+        // Each visit shows what the General page's cards now set: they load
+        // once, and the page outlives visits to Settings.
+        if section == SettingsSection::General
+            && let Some(page) = &self.shortcuts_page
+        {
+            page.update(cx, |page, cx| page.refresh_general(cx));
+        }
         if !matches!(self.route, Route::Settings(_)) {
             self.settings_focus_pending = true;
             self.settings_return_route = self.route;

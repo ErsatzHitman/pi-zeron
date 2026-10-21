@@ -178,6 +178,17 @@ impl ShortcutsPage {
         }
     }
 
+    /// Re-read what the General page's cards set. Each loaded once, and this
+    /// page outlives visits to Settings, so their engine-side settings may
+    /// have been saved elsewhere since (another window, another device).
+    pub fn refresh_general(&mut self, cx: &mut Context<Self>) {
+        self.default_subagent
+            .update(cx, |card, cx| card.refresh(cx));
+        self.thread_naming.update(cx, |card, cx| card.refresh(cx));
+        self.advisor.update(cx, |card, cx| card.refresh(cx));
+        self.decision_gate.update(cx, |card, cx| card.refresh(cx));
+    }
+
     fn start_recording(&mut self, id: ShortcutId, window: &mut Window, cx: &mut Context<Self>) {
         self.recording = Some(id);
         crate::appshots::set_recording(true);

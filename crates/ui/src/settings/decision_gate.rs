@@ -48,6 +48,14 @@ impl DecisionGateCard {
         card
     }
 
+    /// Re-read what the device sets: the settings page outlives visits to it,
+    /// so what this card loaded when it opened can be well out of date.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.settings, Loadable::Idle | Loadable::Loading) {
+            self.call(None, cx);
+        }
+    }
+
     /// `GetDecisionSettings`, or `SetDecisionSettings` when saving; either
     /// reply is what the device's `decisions-model.json` now sets.
     fn call(&mut self, save: Option<DecisionModel>, cx: &mut Context<Self>) {
