@@ -255,6 +255,19 @@ impl SheetForm {
             })
     }
 
+    /// No field carries an answer yet, so there is nothing to send. ask_user
+    /// reads an empty submit as a skipped question, so an Enter on a sheet
+    /// nobody has filled in would silently drop the question.
+    fn unanswered(&self, fields: &[PiUiField], cx: &App) -> bool {
+        !fields.is_empty() && !any_answer(fields, &self.picked, |id| self.text(id, cx))
+    }
+
+    /// The form must not be sent yet: a required field is empty, or no field
+    /// has been answered at all.
+    fn blocked(&self, fields: &[PiUiField], cx: &App) -> bool {
+        self.incomplete(fields, cx) || self.unanswered(fields, cx)
+    }
+
     fn pick(&mut self, field: &PiUiField, value: &str) {
         let picked = self.picked.entry(field.id.clone()).or_default();
         if field.kind == PiUiFieldKind::Multiselect {
@@ -292,6 +305,22 @@ impl SheetForm {
             .filter(|(_, option)| option_matches(option, &filter))
             .collect()
     }
+}
+
+/// Whether any field carries an answer: typed text, a pick, or a checkbox
+/// (checked or not, its state is a choice).
+fn any_answer(
+    fields: &[PiUiField],
+    picked: &HashMap<String, Vec<String>>,
+    text: impl Fn(&str) -> String,
+) -> bool {
+    fields.iter().any(|field| match field.kind {
+        PiUiFieldKind::Select | PiUiFieldKind::Multiselect => {
+            picked.get(&field.id).is_some_and(|picks| !picks.is_empty())
+        }
+        PiUiFieldKind::Checkbox => true,
+        _ => !text(&field.id).trim().is_empty(),
+    })
 }
 
 /// The form's main action: `submit` if offered, else the first primary one.
@@ -388,7 +417,7 @@ impl Composer {
             return;
         }
         let submits = actions.iter().any(|a| a.id == action);
-        if submits && form.incomplete(&fields, cx) {
+        if submits && form.blocked(&fields, cx) {
             return;
         }
         let value = submits.then(|| form.value(&fields, cx));
@@ -521,9 +550,9 @@ impl Composer {
         let actions = self.extension_actions(cx);
         let markdown = self.extension.markdown.clone();
         let view = cx.entity_id();
-        let (submitted, incomplete) = {
+        let (submitted, unready) = {
             let form = self.extension.sheet.as_ref()?;
-            (form.submitted, form.incomplete(&fields, cx))
+            (form.submitted, form.blocked(&fields, cx))
         };
 
         // Other prompts waiting show as tabs above the panel.
@@ -660,7 +689,7 @@ impl Composer {
                 let id = action.id.clone();
                 let blocked = action.disabled
                     || submitted
-                    || (Some(action) == primary_action(&form_actions) && incomplete);
+                    || (Some(action) == primary_action(&form_actions) && unready);
                 let button = match action.variant {
                     Some(PiUiVariant::Primary) => {
                         crate::popover::btn_primary(&theme, &label(action)).px(px(16.0))
@@ -1038,6 +1067,35 @@ mod tests {
             {"id":"answer","kind":"textarea"}]}))
         .unwrap();
         assert_ne!(signature(&ask), signature(&next));
+    }
+
+    #[test]
+    fn an_unanswered_sheet_has_nothing_to_submit() {
+        let fields =
+            |value: serde_json::Value| -> Vec<PiUiField> { serde_json::from_value(value).unwrap() };
+        let none: HashMap<String, Vec<String>> = HashMap::new();
+        let empty = |_: &str| String::new();
+        // ask_user's freeform question: Enter on a blank answer must not send
+        // (ask_user reads an empty submit as "skipped").
+        let question = fields(json!([{"id":"answer","kind":"textarea"}]));
+        assert!(!any_answer(&question, &none, empty));
+        assert!(any_answer(&question, &none, |_| "yes".into()));
+        assert!(!any_answer(&question, &none, |_| "  \n ".into()));
+        // A selection sheet: nothing picked is no answer; a pick is one.
+        let select = fields(json!([{"id":"selection","kind":"select",
+            "options":[{"value":"A","label":"A"}]}]));
+        assert!(!any_answer(&select, &none, empty));
+        let mut picked = none.clone();
+        picked.insert("selection".into(), vec!["A".into()]);
+        assert!(any_answer(&select, &picked, empty));
+        // A checkbox is a choice either way, and a form with no fields is
+        // Pi's own dialog: both still submit.
+        assert!(any_answer(
+            &fields(json!([{"id":"remember","kind":"checkbox"}])),
+            &none,
+            empty
+        ));
+        assert!(!any_answer(&[], &none, empty));
     }
 
     #[test]

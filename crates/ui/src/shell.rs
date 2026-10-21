@@ -956,6 +956,15 @@ impl NavHistory {
     }
 }
 
+/// Whether a history entry still leads somewhere: settings and pull requests
+/// always do; a chat route only while that chat exists (`""` is the canvas).
+fn nav_entry_live(entry: &NavEntry, chats: &std::collections::HashSet<String>) -> bool {
+    match entry {
+        NavEntry::Chat(id) => id.is_empty() || chats.contains(id),
+        _ => true,
+    }
+}
+
 /// Sidebar resort glide (feature-inventory §1.6): 260ms
 /// `cubic-bezier(0.22,1,0.36,1)` per-row translate, the View Transitions
 /// equivalent.
@@ -2083,6 +2092,9 @@ pub struct Shell {
     subagent_tabs: std::collections::HashMap<u64, SubagentTab>,
     subagent_seq: u64,
     extension_tabs: std::collections::HashMap<u64, ExtensionTab>,
+    /// Whether an engine was attached at the last state change, so losing it
+    /// (a machine/account switch) reads as a detach, not as boot.
+    engine_attached: bool,
     /// Screens whose element went away; closed on the next frame (closing
     /// a tab needs the window).
     closed_screens: Vec<u64>,
@@ -2658,6 +2670,7 @@ impl Shell {
             subagent_tabs: std::collections::HashMap::new(),
             subagent_seq: 0,
             extension_tabs: std::collections::HashMap::new(),
+            engine_attached: false,
             closed_screens: Vec::new(),
             side_chats: std::collections::HashMap::new(),
             side_chat_seq: 0,
@@ -2922,7 +2935,15 @@ impl Shell {
         self.prune_file_explorers(cx);
         self.refresh_harness_update_watch(cx);
         self.sync_search_warm(cx);
-        if state.read(cx).engine().is_none() {
+        // Engine-scoped tabs close when their engine goes: the replacement
+        // clears the docs and live UI they read, leaving blank views behind.
+        // No engine before the first attach is boot, not a detach.
+        let engine_attached = state.read(cx).engine().is_some();
+        if self.engine_attached && !engine_attached {
+            self.close_engine_surfaces(cx);
+        }
+        self.engine_attached = engine_attached;
+        if !engine_attached {
             self.side_chats.clear();
         }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
@@ -4738,6 +4759,58 @@ impl Shell {
         cx.notify();
     }
 
+    /// Close the surface tabs whose content lives on the engine (a subagent
+    /// doc's transcript, an extension's live screen). Replacing or detaching
+    /// the engine clears those feeds, so leaving the tabs up strands them on
+    /// a blank view with no way back; they close with the engine, like the
+    /// side chats. File, browser and terminal tabs stay — they belong to this
+    /// window.
+    fn close_engine_surfaces(&mut self, cx: &mut Context<Self>) {
+        if self.subagent_tabs.is_empty() && self.extension_tabs.is_empty() {
+            return;
+        }
+        // The engine's own feeds (subagent watches, live extension UI) are
+        // cleared with it by `AppState::prepare_runtime_replacement`.
+        self.subagent_tabs.clear();
+        self.extension_tabs.clear();
+        for key in self.right_tabs.keys().cloned().collect::<Vec<_>>() {
+            let gone: Vec<RightSurface> = self
+                .right_tabs
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|surface| {
+                    matches!(
+                        surface,
+                        RightSurface::Subagent(_) | RightSurface::Extension(_)
+                    )
+                })
+                .collect();
+            if gone.is_empty() {
+                continue;
+            }
+            if let Some(tabs) = self.right_tabs.get_mut(&key) {
+                tabs.retain(|surface| !gone.contains(surface));
+            }
+            for surface in &gone {
+                self.panels.forget_right_surface(&key, *surface);
+            }
+            let fallback = self.panels.right_surface_fallback(
+                &key,
+                self.right_tabs.get(&key).into_iter().flatten().copied(),
+            );
+            self.panels.update(&key, |panel| {
+                if gone.contains(&panel.right_active) {
+                    panel.right_active = fallback;
+                }
+            });
+            self.close_empty_right_pane(&key, cx);
+            self.collapse_surfaces_if_empty(&key, cx);
+        }
+        cx.notify();
+    }
+
     fn on_file_close_ready(
         &mut self,
         surface: RightSurface,
@@ -5709,14 +5782,41 @@ impl Shell {
     // ---- back/forward (route history) ----
 
     fn navigate_back(&mut self, cx: &mut Context<Self>) {
-        if let Some(entry) = self.nav.back() {
-            self.apply_nav(entry, cx);
-        }
+        self.walk_nav(NavHistory::back, cx);
     }
 
     fn navigate_forward(&mut self, cx: &mut Context<Self>) {
-        if let Some(entry) = self.nav.forward() {
-            self.apply_nav(entry, cx);
+        self.walk_nav(NavHistory::forward, cx);
+    }
+
+    /// Back/Forward with the dead entries skipped: history keeps every route
+    /// the user visited, including chats the sidebar (or another viewport)
+    /// has deleted since, and selecting one renders an empty conversation
+    /// with no row to get back to. When every entry in that direction is
+    /// gone, land on the new-chat canvas rather than move the stack alone;
+    /// with no history in that direction the call stays a no-op.
+    fn walk_nav(
+        &mut self,
+        step: impl Fn(&mut NavHistory) -> Option<NavEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let live: std::collections::HashSet<String> = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .map(|chat| chat.id.clone())
+            .collect();
+        let mut walked = false;
+        while let Some(entry) = step(&mut self.nav) {
+            walked = true;
+            if nav_entry_live(&entry, &live) {
+                self.apply_nav(entry, cx);
+                return;
+            }
+        }
+        if walked {
+            self.apply_nav(NavEntry::Chat(String::new()), cx);
         }
     }
 
@@ -16218,6 +16318,93 @@ mod tests {
     }
 
     #[test]
+    fn nav_entry_live_tracks_the_chats_that_still_exist() {
+        let live: std::collections::HashSet<String> = ["kept".to_string()].into_iter().collect();
+        assert!(nav_entry_live(&chat(""), &live), "the canvas always exists");
+        assert!(nav_entry_live(&chat("kept"), &live));
+        assert!(!nav_entry_live(&chat("deleted"), &live));
+        assert!(nav_entry_live(&NavEntry::PullRequests, &live));
+        assert!(nav_entry_live(
+            &NavEntry::Settings(SettingsSection::Devices),
+            &live
+        ));
+    }
+
+    #[gpui::test]
+    fn back_skips_a_chat_that_no_longer_exists(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let row = |id: &str| zeron_proto::Chat {
+            id: id.into(),
+            device_id: "local".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            parent_chat_id: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        };
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_chats(vec![row("kept"), row("gone")]);
+                });
+                shell.open_chat("kept".into(), cx);
+                shell.open_chat("gone".into(), cx);
+                // The sidebar (or another viewport) deletes it while it is
+                // still the route Back would land on.
+                shell
+                    .state
+                    .update(cx, |state, _| state.apply_chats(vec![row("kept")]));
+                shell.navigate_back(cx);
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some("kept"),
+                    "back selected a deleted chat"
+                );
+                assert_eq!(shell.nav.current(), &NavEntry::Chat("kept".into()));
+                // On to the canvas, then past the oldest entry: a no-op, not
+                // a second hop back to the canvas.
+                shell.navigate_back(cx);
+                assert_eq!(shell.nav.current(), &NavEntry::Chat(String::new()));
+                shell.navigate_back(cx);
+                assert_eq!(shell.nav.current(), &NavEntry::Chat(String::new()));
+                assert!(shell.state.read(cx).selected_chat.is_none());
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn nav_settings_sections_are_distinct_entries() {
         let mut nav = NavHistory::new(chat("a"));
         nav.push(NavEntry::Settings(SettingsSection::Devices));
@@ -18565,6 +18752,47 @@ mod right_tab_mouse_regressions {
 
         shell.read_with(cx, |shell, cx| {
             assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(1));
+        });
+    }
+
+    #[gpui::test]
+    fn engine_detach_closes_subagent_and_extension_tabs(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        shell.update(cx, |shell, cx| {
+            shell.open_extension_screen("parent".into(), "btw:thread".into(), "btw".into(), cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.subagent_tabs.len(), 2);
+            assert_eq!(shell.extension_tabs.len(), 1);
+        });
+        // A machine switch / account switch detaches the engine and clears
+        // the docs and live UI those tabs read. The setup shell never booted
+        // one, so mark it attached first: only a lost engine is a detach.
+        shell.update(cx, |shell, cx| {
+            shell.engine_attached = true;
+            shell
+                .state
+                .update(cx, |state, cx| state.prepare_runtime_replacement(cx));
+            shell.on_state_changed(&shell.state.clone(), cx);
+        });
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert!(
+                shell.subagent_tabs.is_empty(),
+                "a subagent tab outlived the engine"
+            );
+            assert!(
+                shell.extension_tabs.is_empty(),
+                "an extension tab outlived the engine"
+            );
+            assert!(
+                shell.right_tabs.values().flatten().all(|surface| !matches!(
+                    surface,
+                    RightSurface::Subagent(_) | RightSurface::Extension(_)
+                )),
+                "a detached tab stayed in the strip"
+            );
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Picker);
         });
     }
 
