@@ -347,10 +347,11 @@ impl Normalizer {
                     self.fail(last.to_owned());
                 }
             }
+            // A failed extension handler (an outbox write, a workflow
+            // notification) is a visible problem, not a failed turn: the
+            // agent's own stop reason decides the run's status.
             "extension_error" => {
                 tracing::warn!(error = %string(frame, "error"), "pi extension error");
-                self.class = None;
-                self.error = Some(string(frame, "error").into());
                 events.push(AgentEvent::Error {
                     message: format!("Pi extension: {}", string(frame, "error")),
                 });
@@ -851,6 +852,30 @@ mod tests {
             message["errorMessage"] = json!(err);
         }
         json!({"type":"message_end","message":message})
+    }
+
+    #[test]
+    fn an_extension_error_is_reported_without_failing_the_turn() {
+        let mut n = Normalizer::default();
+        let frame = json!({"type":"extension_error","error":"outbox: EACCES","extensionPath":"/x/outbox.ts"});
+        let events = n.map(&frame);
+        assert!(
+            matches!(&events[0], AgentEvent::Error { message } if message == "Pi extension: outbox: EACCES")
+        );
+        // The agent went on to finish: the turn did not fail.
+        n.map(&assistant_end("stop", None));
+        assert_eq!(n.status(), DoneStatus::Completed);
+        assert_eq!(n.class(), None);
+        // Nor does one that lands after the last reply, while Pi settles.
+        n.map(&frame);
+        assert_eq!(n.status(), DoneStatus::Completed);
+        // A real failure still decides the status.
+        n.map(&assistant_end("error", Some("429 Too Many Requests")));
+        assert_eq!(n.status(), DoneStatus::Errored);
+        assert!(matches!(
+            n.class(),
+            Some(ErrorClass::RateLimited { resets_at: None })
+        ));
     }
 
     #[test]

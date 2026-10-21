@@ -144,29 +144,59 @@ fn newest_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
 }
 
 type VersionKey = (PathBuf, Option<std::time::SystemTime>, u64);
-/// The version, the names the file was probed under, and the probe deadline.
+/// The version, the names the file was probed under, the probe deadline, and
+/// when the probe ran (a failure is retried, see [`FAILED_PROBE_RETRY`]).
 type VersionEntry = (
     Option<semver::Version>,
     std::collections::HashSet<String>,
     std::time::Duration,
+    std::time::Instant,
 );
-static VERSION_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<VersionKey, VersionEntry>>,
-> = std::sync::OnceLock::new();
+
+/// How long a failed probe is believed. One launch that fails (a busy machine,
+/// a launcher still warming up) says nothing about the next attempt, so a
+/// failure is retried rather than reading as "not installed" until the
+/// executable itself changes.
+const FAILED_PROBE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Default)]
+struct VersionCache {
+    entries: std::collections::HashMap<VersionKey, VersionEntry>,
+    /// Probes run outside the lock; this holds the identities in flight so
+    /// concurrent requests for one executable coalesce instead of racing.
+    probing: std::collections::HashSet<VersionKey>,
+    /// When each executable name was last replaced by [`invalidate_versions`]:
+    /// a probe of that name which started before the install must not put its
+    /// stale answer back.
+    replaced: std::collections::HashMap<String, u64>,
+    sequence: u64,
+}
+
+static VERSION_CACHE: std::sync::OnceLock<(std::sync::Mutex<VersionCache>, std::sync::Condvar)> =
+    std::sync::OnceLock::new();
+
+fn version_cache() -> &'static (std::sync::Mutex<VersionCache>, std::sync::Condvar) {
+    VERSION_CACHE.get_or_init(Default::default)
+}
 
 /// An explicit install may replace wrappers without changing their metadata.
 /// Clear all candidates, including canonical paths behind vendor symlinks.
 pub(crate) fn invalidate_versions(names: &[&str]) {
-    if let Some(cache) = VERSION_CACHE.get() {
-        cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, (_, aliases, _)| !names.iter().any(|name| aliases.contains(*name)));
+    let (lock, _) = version_cache();
+    let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
+    cache.sequence = cache.sequence.wrapping_add(1);
+    let sequence = cache.sequence;
+    for name in names {
+        cache.replaced.insert((*name).to_owned(), sequence);
     }
+    cache
+        .entries
+        .retain(|_, (_, aliases, _, _)| !names.iter().any(|name| aliases.contains(*name)));
 }
 
-/// Probe once per executable identity. Failures are cached too, including timeout.
-/// Keep the lock during the short probe so concurrent descriptor requests coalesce.
+/// Probe once per executable identity. A success is cached until the file
+/// changes; a failure is retried after [`FAILED_PROBE_RETRY`]. No lock is held
+/// while `--version` runs, so one slow launcher blocks nobody else.
 pub fn binary_version(path: &Path) -> Option<semver::Version> {
     binary_version_within(path, std::time::Duration::from_secs(2))
 }
@@ -174,28 +204,49 @@ pub fn binary_version(path: &Path) -> Option<semver::Version> {
 /// [`binary_version`] with a caller-chosen probe deadline, for launchers that
 /// start slowly (Pi run from source through Node takes about a second).
 pub fn binary_version_within(path: &Path, limit: std::time::Duration) -> Option<semver::Version> {
+    binary_version_with_policy(path, limit, FAILED_PROBE_RETRY)
+}
+
+fn binary_version_with_policy(
+    path: &Path,
+    limit: std::time::Duration,
+    retry_failures_after: std::time::Duration,
+) -> Option<semver::Version> {
     #[cfg(not(windows))]
     use std::time::Duration;
     let canonical = path.canonicalize().ok()?;
     let metadata = canonical.metadata().ok()?;
     let key = (canonical, metadata.modified().ok(), metadata.len());
-    let mut cache = VERSION_CACHE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     let alias = path
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    if let Some((version, aliases, probed_within)) = cache.get_mut(&key) {
-        aliases.insert(alias.clone());
-        // A failure under a shorter deadline says nothing about a longer one:
-        // Pi run from source can miss the default 2 s on a busy machine.
-        if version.is_some() || *probed_within >= limit {
-            return version.clone();
+    let (lock, ready) = version_cache();
+    let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let started = loop {
+        if let Some((version, aliases, probed_within, probed_at)) = cache.entries.get_mut(&key) {
+            aliases.insert(alias.clone());
+            // A failure under a shorter deadline says nothing about a longer
+            // one (Pi run from source can miss the default 2 s on a busy
+            // machine), and an old failure says nothing about a retry.
+            let retry = version.is_none() && probed_at.elapsed() >= retry_failures_after;
+            if version.is_some() || (*probed_within >= limit && !retry) {
+                return version.clone();
+            }
         }
-    }
+        // Someone else is already probing this executable: wait for their
+        // answer (then re-read the cache, maybe to probe with a longer
+        // deadline) instead of starting a second copy of it.
+        if cache.probing.contains(&key) {
+            cache = ready.wait(cache).unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+        cache.probing.insert(key.clone());
+        break cache.sequence;
+    };
+    // The probe can take seconds; the cache is not held while it runs.
+    drop(cache);
     #[cfg(not(windows))]
     let probe = || -> Option<semver::Version> {
         use std::io::Read;
@@ -287,15 +338,25 @@ pub fn binary_version_within(path: &Path, limit: std::time::Duration) -> Option<
         .flatten()
     };
     let version = probe();
-    let mut aliases: std::collections::HashSet<String> = [alias].into_iter().collect();
-    cache.retain(|(p, _, _), (_, known, _)| {
-        if p == &key.0 {
-            aliases.extend(known.drain());
-            return false;
-        }
-        true
-    });
-    cache.insert(key, (version.clone(), aliases, limit));
+    let mut cache = lock.lock().unwrap_or_else(|e| e.into_inner());
+    cache.probing.remove(&key);
+    // An install that replaced this executable while the probe ran has the
+    // last word.
+    if cache.replaced.get(&alias).is_none_or(|at| *at <= started) {
+        let mut aliases: std::collections::HashSet<String> = [alias].into_iter().collect();
+        cache.entries.retain(|(p, _, _), (_, known, _, _)| {
+            if p == &key.0 {
+                aliases.extend(known.drain());
+                return false;
+            }
+            true
+        });
+        cache
+            .entries
+            .insert(key, (version.clone(), aliases, limit, std::time::Instant::now()));
+    }
+    drop(cache);
+    ready.notify_all();
     version
 }
 
@@ -704,6 +765,64 @@ mod tests {
         );
         // Now known, the short probe answers from the cache.
         assert_eq!(binary_version(&path).unwrap().to_string(), "1.2.3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_probe_is_retried_instead_of_cached_for_good() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let path = dir.path().join("flaky-pi");
+        // Fails like a launcher whose Node install is still settling.
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then echo 1.4.0; else echo broken >&2; exit 1; fi\n",
+                ready.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let within = std::time::Duration::from_secs(2);
+        let retry = std::time::Duration::from_secs(60);
+        assert_eq!(binary_version_with_policy(&path, within, retry), None);
+        assert_eq!(binary_version_with_policy(&path, within, retry), None);
+        std::fs::write(&ready, "").unwrap();
+        // The cached failure is still fresh.
+        assert_eq!(binary_version_with_policy(&path, within, retry), None);
+        // Past the retry window the failure is not believed any more.
+        assert_eq!(
+            binary_version_with_policy(&path, within, std::time::Duration::ZERO)
+                .map(|version| version.to_string()),
+            Some("1.4.0".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_probe_holds_no_lock_over_another_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let slow = script("slow-pi", "sleep 4\necho 1.2.3");
+        let fast = script("fast-pi", "echo 0.9.0");
+        let probing = std::thread::spawn(move || {
+            binary_version_within(&slow, std::time::Duration::from_secs(10))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            binary_version(&fast).map(|version| version.to_string()),
+            Some("0.9.0".into())
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        probing.join().unwrap().unwrap();
     }
 
     fn env(values: &[(&str, OsString)]) -> impl Fn(&str) -> Option<OsString> + use<> {
