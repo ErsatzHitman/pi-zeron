@@ -329,10 +329,20 @@ pub struct SettingsStore {
     /// the persisted revision, this advances only when the global Fit choice
     /// changes, including a change back to its previous value.
     code_fences_generation: u64,
-    save_task: Option<Task<()>>,
+    /// The same token for the settings a composer's slash menu reads, so its
+    /// observer can skip saves that never touch them (a pane drag).
+    completion_generation: u64,
 }
 
 impl Global for SettingsStore {}
+
+/// The store's pending debounced write, kept out of [`SettingsStore`] so
+/// handing the task around does not notify the settings' observers — a
+/// pointer move of a pane drag saves several times.
+#[derive(Default)]
+struct SettingsSaveTask(Option<Task<()>>);
+
+impl Global for SettingsSaveTask {}
 
 impl SettingsStore {
     fn snapshot(&self) -> (UiSettings, u64) {
@@ -344,16 +354,24 @@ impl SettingsStore {
         self.saved_revision == self.revision
     }
 
+    /// Apply `mutate` to a clamped copy and keep it when it differs. This runs
+    /// on every pane-drag pointer move, so it copies the settings once.
     fn update_current(&mut self, mutate: impl FnOnce(&mut UiSettings)) -> bool {
-        let before = self.current.clone();
-        mutate(&mut self.current);
-        self.current = self.current.clone().clamped();
-        if self.current == before {
+        let mut next = self.current.clone();
+        mutate(&mut next);
+        let next = next.clamped();
+        if next == self.current {
             return false;
         }
-        if self.current.code_fences_fit_content != before.code_fences_fit_content {
+        if next.code_fences_fit_content != self.current.code_fences_fit_content {
             self.code_fences_generation = self.code_fences_generation.wrapping_add(1);
         }
+        if next.skills_in_slash_menu != self.current.skills_in_slash_menu
+            || next.skill_completion_by_harness != self.current.skill_completion_by_harness
+        {
+            self.completion_generation = self.completion_generation.wrapping_add(1);
+        }
+        self.current = next;
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -367,8 +385,9 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
         revision: 0,
         saved_revision: 0,
         code_fences_generation: 0,
-        save_task: None,
+        completion_generation: 0,
     });
+    cx.set_global(SettingsSaveTask::default());
     // After the store: the Voice page shows the saved trigger phrase.
     crate::dictation::init(data_dir, cx);
 }
@@ -378,6 +397,35 @@ pub fn current(cx: &App) -> UiSettings {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
         .unwrap_or_default()
+}
+
+/// The store's revision: it advances on every mutation that changed
+/// something, so a view can tell whether [`current`] moved since it last
+/// copied it.
+pub fn revision(cx: &App) -> u64 {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.revision)
+        .unwrap_or_default()
+}
+
+/// The starred pull request keys. The board reads the stars for every row of
+/// every frame, so it copies just the list, not the whole settings.
+pub(crate) fn pull_request_stars(cx: &App) -> Vec<String> {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.pull_request_stars.clone())
+        .unwrap_or_default()
+}
+
+/// Whether the pull request key `star_key` produced is starred, without
+/// copying the list.
+pub(crate) fn pull_request_starred(cx: &App, key: &str) -> bool {
+    cx.try_global::<SettingsStore>().is_some_and(|store| {
+        store
+            .current
+            .pull_request_stars
+            .iter()
+            .any(|starred| starred == key)
+    })
 }
 
 /// A Pi model picker's pick as one settings row's model: Pi's catalog ids are
@@ -627,6 +675,16 @@ pub fn code_fences_generation(cx: &App) -> u64 {
         .unwrap_or_default()
 }
 
+/// Monotonic id of the settings a composer's slash menu reads (skill
+/// completion). Composers compare it in their store observer so a save that
+/// never touches those — a pane drag publishing geometry — leaves their menus,
+/// mentions and file search alone. Cheap by design: a counter read.
+pub fn completion_generation(cx: &App) -> u64 {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.completion_generation)
+        .unwrap_or_default()
+}
+
 /// Compact transcript mode: each turn's work folds into one collapsed
 /// accordion, leaving only the reply text. Transcripts poll this during
 /// render and rebuild their row split on a flip — cheap by design (a bool
@@ -661,7 +719,7 @@ pub fn replace(settings: UiSettings, policy: SavePolicy, cx: &mut App) -> bool {
 }
 
 fn schedule(policy: SavePolicy, cx: &mut App) {
-    let old_task = cx.global_mut::<SettingsStore>().save_task.take();
+    let old_task = cx.default_global::<SettingsSaveTask>().0.take();
     drop(old_task);
 
     match policy {
@@ -673,7 +731,7 @@ fn schedule(policy: SavePolicy, cx: &mut App) {
                     .await;
                 cx.update(flush_latest);
             });
-            cx.global_mut::<SettingsStore>().save_task = Some(task);
+            cx.default_global::<SettingsSaveTask>().0 = Some(task);
         }
     }
 }
@@ -709,7 +767,7 @@ pub fn flush(cx: &mut App) {
     if !cx.has_global::<SettingsStore>() {
         return;
     }
-    let pending = cx.global_mut::<SettingsStore>().save_task.take();
+    let pending = cx.default_global::<SettingsSaveTask>().0.take();
     drop(pending);
     flush_latest(cx);
 }
@@ -1810,8 +1868,10 @@ impl UiSettings {
     /// fields `edited` changed since `base` win, every other field keeps
     /// `current`. A stale copy therefore never reverts a choice another
     /// surface saved meanwhile. The destructure is exhaustive, so a new field
-    /// does not compile until it is merged here too.
-    pub fn merge_changes(base: &Self, edited: &Self, mut current: Self) -> Self {
+    /// does not compile until it is merged here too. `current` is the
+    /// caller's copy of the store's settings, merged in place (a pane drag
+    /// reaches this on every pointer move).
+    pub fn merge_changes(base: &Self, edited: &Self, current: &mut Self) {
         macro_rules! merge {
             ($($field:ident),* $(,)?) => {{
                 let Self { $($field),* } = edited;
@@ -1928,7 +1988,6 @@ impl UiSettings {
             machines,
             active_machine,
         );
-        current
     }
 
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
@@ -3094,7 +3153,7 @@ mod tests {
             revision: 0,
             saved_revision: 0,
             code_fences_generation: 0,
-            save_task: None,
+            completion_generation: 0,
         };
 
         store.current.sidebar_width = 300.0;
@@ -3152,7 +3211,7 @@ mod tests {
             revision: 0,
             saved_revision: 0,
             code_fences_generation: 0,
-            save_task: None,
+            completion_generation: 0,
         };
 
         assert!(store.update_current(|settings| settings.sidebar_width = 300.0));
@@ -3165,6 +3224,55 @@ mod tests {
 
         assert!(!store.update_current(|settings| settings.code_fences_fit_content = false));
         assert_eq!(store.code_fences_generation, 2);
+    }
+
+    #[test]
+    fn completion_generation_ignores_saves_that_do_not_shape_the_slash_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore {
+            current: UiSettings::default(),
+            data_dir: dir.path().to_path_buf(),
+            revision: 0,
+            saved_revision: 0,
+            code_fences_generation: 0,
+            completion_generation: 0,
+        };
+
+        // A pane drag publishes geometry only; the composer must not rebuild.
+        assert!(store.update_current(|settings| settings.sidebar_width = 300.0));
+        assert!(store.update_current(|settings| settings.right_pane_width = 540.0));
+        assert_eq!(store.completion_generation, 0);
+
+        assert!(store.update_current(|settings| settings.skills_in_slash_menu = true));
+        assert_eq!(store.completion_generation, 1);
+        assert!(store.update_current(|settings| {
+            settings.skill_completion_by_harness.insert(
+                zeron_proto::HarnessId::Pi,
+                SkillCompletionSettings {
+                    dollar: false,
+                    separate_from_slash: false,
+                },
+            );
+        }));
+        assert_eq!(store.completion_generation, 2);
+    }
+
+    #[gpui::test]
+    fn pull_request_stars_read_by_key_without_copying_the_settings(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            init(UiSettings::default(), dir.path(), cx);
+            let key = crate::pull_requests::star_key("https://github.com/acme/zeron/pull/123");
+            assert!(!pull_request_starred(cx, &key));
+            assert!(pull_request_stars(cx).is_empty());
+
+            assert!(update(SavePolicy::Immediate, cx, |settings| {
+                settings.pull_request_stars.push(key.clone());
+            }));
+            assert!(pull_request_starred(cx, &key));
+            assert_eq!(pull_request_stars(cx), vec![key.clone()]);
+            assert!(!pull_request_starred(cx, "acme/zeron#12"));
+        });
     }
 
     #[test]

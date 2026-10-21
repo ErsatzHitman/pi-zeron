@@ -228,9 +228,7 @@ pub(crate) fn star_key(url: &str) -> String {
 
 pub(crate) fn star_button(url: &str, theme: &Theme, cx: &gpui::App) -> gpui::Stateful<gpui::Div> {
     let key = star_key(url);
-    let starred = crate::settings::current(cx)
-        .pull_request_stars
-        .contains(&key);
+    let starred = crate::settings::pull_request_starred(cx, &key);
     let label = if starred {
         "Unstar pull request"
     } else {
@@ -399,7 +397,7 @@ impl PullRequestsPage {
                 Rc::new(items)
             })
             .clone();
-        let stars = crate::settings::current(cx).pull_request_stars;
+        let stars = crate::settings::pull_request_stars(cx);
         let mut collapsed: Vec<_> = self.collapsed_groups.iter().copied().collect();
         collapsed.sort_by_key(|group| group.key());
         let footer = self.paging.next_cursor.is_some();

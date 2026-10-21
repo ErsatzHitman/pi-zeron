@@ -238,6 +238,8 @@ impl AgentListCache {
     }
 }
 
+/// [`agent_list_in`] with a fresh cache: tests build a list once.
+#[cfg(test)]
 pub(super) fn agent_list(state: &AppState, chat: &Chat, now: DateTime<Utc>) -> AgentList {
     agent_list_in(&mut AgentListCache::default(), state, chat, now)
 }

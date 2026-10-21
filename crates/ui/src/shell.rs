@@ -2291,6 +2291,9 @@ pub struct Shell {
     /// The store's settings when `settings` last synced with it. Fields that
     /// differ from this are the Shell's edits; all others follow the store.
     settings_base: UiSettings,
+    /// The store revision `settings_base` was read at: equal to the store's
+    /// means nothing was saved elsewhere since, so there is nothing to merge.
+    settings_revision: u64,
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
@@ -2547,6 +2550,9 @@ impl Shell {
         // Spawn chips open their subagent's transcript as a right-pane tab.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
         let data_dir = boot.data_dir.clone();
+        // Read the revision before the copy: a save that lands while `new`
+        // finishes must still be merged by the first [`Self::pull_settings`].
+        let settings_revision = settings::revision(cx);
         let mut settings = settings::current(cx);
         state.update(cx, |state, cx| {
             state.watch_clock_transitions(cx);
@@ -2800,6 +2806,7 @@ impl Shell {
             boot,
             data_dir,
             settings_base: settings::current(cx),
+            settings_revision,
             settings,
             panels: SessionPanels::default(),
             panel_open_sequence: 0,
@@ -5163,6 +5170,8 @@ impl Shell {
 
     /// Publish this view's working copy to the central settings store. The
     /// store owns the single debounce task and the only production writer.
+    /// A pane drag sends a pointer move every frame, so a move that changed
+    /// nothing publishes nothing.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance = crate::appearance::mode(cx);
         self.settings.git_history_columns = crate::history::configured_columns(cx);
@@ -5173,8 +5182,12 @@ impl Shell {
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
         self.pull_settings(cx);
+        if self.settings == self.settings_base {
+            return;
+        }
         settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
         self.settings_base = settings::current(cx);
+        self.settings_revision = settings::revision(cx);
     }
 
     /// Controls outside the Shell (Voice, typography, diff and transcript
@@ -5182,10 +5195,18 @@ impl Shell {
     /// working copy while keeping the Shell's own edits, so a geometry save
     /// can never publish an older value over another surface's choice.
     fn pull_settings(&mut self, cx: &App) {
-        let current = settings::current(cx);
-        self.settings =
-            UiSettings::merge_changes(&self.settings_base, &self.settings, current.clone());
+        // The store still holds what this view last published (every pointer
+        // move of a drag), so nothing was saved elsewhere and the merge — a
+        // copy of every setting — is skipped.
+        let revision = settings::revision(cx);
+        if revision == self.settings_revision {
+            return;
+        }
+        let mut current = settings::current(cx);
+        UiSettings::merge_changes(&self.settings_base, &self.settings, &mut current);
+        self.settings = current.clone();
         self.settings_base = current;
+        self.settings_revision = revision;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {

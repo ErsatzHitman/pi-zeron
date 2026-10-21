@@ -2838,6 +2838,13 @@ impl ComposerInput {
         self.dictation_task = None;
     }
 
+    /// Whether a dictation is live (or its audio track still finishing). The
+    /// settings observer reads the voice settings only while one is: they
+    /// clone every setting, and saves land on every pane-drag pointer move.
+    pub(crate) fn dictating(&self) -> bool {
+        self.dictation.phase.active() || self.transcriber.is_some()
+    }
+
     fn begin_dictation(
         &mut self,
         transcriber: Box<dyn crate::dictation::Transcriber>,
@@ -6566,10 +6573,19 @@ impl Composer {
                 this.resolve_pasted_references(range.clone(), *revision, cx);
             }
         });
-        cx.observe_global::<crate::settings::SettingsStore>(|this, cx| {
-            if !crate::dictation::enabled(cx) {
+        // Saves land on every pointer move of a pane drag, so only what the
+        // composer reads runs it: a live dictation whose provider lost its key
+        // stops, and a skill-completion choice re-derives the slash menu.
+        let mut completions = crate::settings::completion_generation(cx);
+        cx.observe_global::<crate::settings::SettingsStore>(move |this, cx| {
+            if this.input.read(cx).dictating() && !crate::dictation::enabled(cx) {
                 this.input.update(cx, |input, _| input.cancel_dictation());
             }
+            let generation = crate::settings::completion_generation(cx);
+            if generation == completions {
+                return;
+            }
+            completions = generation;
             this.on_input_edited(cx);
         })
         .detach();

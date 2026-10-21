@@ -325,8 +325,9 @@ impl Shell {
         cx: &App,
     ) -> HashMap<String, SidebarFamily> {
         let index = ChildIndex::build(self.state.read(cx), now);
+        let state = self.state.clone();
         let working = selected
-            .map(|id| super::session_info::sidebar_agents(self.state.read(cx), id, now))
+            .map(|id| self.session_panel.sidebar_agents(state.read(cx), id, now))
             .unwrap_or_default();
         let agent_parent = selected.filter(|_| !working.is_empty());
         let parents: Vec<&str> = parents.into_iter().collect();
