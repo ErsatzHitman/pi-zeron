@@ -925,6 +925,62 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn collapsed_groups_leave_the_jump_and_cycle_order(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell
+                    .settings
+                    .sidebar_pins_mut("local".into())
+                    .push("pin".into());
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.spaces = ["a", "b"].into_iter().map(|id| serde_json::from_value(serde_json::json!({
+                        "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+                    })).unwrap()).collect();
+                    state.chats = [("pin", "a"), ("b-new", "b"), ("a-new", "a"), ("b-old", "b")]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, (id, project))| {
+                            let mut chat = pin_test_chat(id);
+                            chat.space_id = Some(project.into());
+                            chat.created_at = Utc::now() - chrono::Duration::minutes(ix as i64);
+                            chat
+                        })
+                        .collect();
+                });
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["pin", "b-new", "b-old", "a-new"])
+                );
+                // A folded project group draws only its header, so the rows
+                // under it are no slots a jump or Ctrl+Tab may land on. A pin
+                // still shows in the Pinned section above its group.
+                shell
+                    .sidebar_collapsed_groups
+                    .insert("project:b".into());
+                assert_eq!(shell.sidebar_visible_order(cx), ids(&["pin", "a-new"]));
+                // Grouped by device, a folded device group drops out the same
+                // way.
+                shell.settings.sidebar_organization = SidebarOrganization::ByDevice;
+                shell
+                    .sidebar_collapsed_groups
+                    .insert("device:local".into());
+                assert_eq!(shell.sidebar_visible_order(cx), ids(&["pin"]));
+                shell.sidebar_collapsed_groups.clear();
+                assert_eq!(
+                    shell.sidebar_visible_order(cx),
+                    ids(&["pin", "b-new", "a-new", "b-old"])
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     fn sidebar_projects_sharing_a_repository_group_only_by_project(cx: &mut gpui::TestAppContext) {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
@@ -4843,6 +4899,20 @@ impl Shell {
                 !custom_sections
                     .iter()
                     .any(|section| section.session_ids.contains(&chat.id))
+            })
+            .collect();
+        // A folded device/project group draws only its header, so the rows
+        // under it are not on screen: a jump slot or a cycle must not land on
+        // one. Same rule the Orchestrator tree's order already applies to its
+        // folded folders.
+        let chats: Vec<_> = chats
+            .into_iter()
+            .filter(|chat| {
+                self.sidebar_group_key(state, chat).is_none_or(|group| {
+                    !self
+                        .sidebar_collapsed_groups
+                        .contains(&self.sidebar_group_collapse_key(&group))
+                })
             })
             .collect();
         let ordered = if self.settings.sidebar_organization != SidebarOrganization::InOneList {
