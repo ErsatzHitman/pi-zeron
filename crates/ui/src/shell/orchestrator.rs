@@ -1,7 +1,9 @@
 //! The sidebar's Orchestrator tab. A segmented control above the lists
 //! switches between the sessions the user opens and the trees orchestrators
 //! run (`zeron_proto::orchestrator`): each root, then the sessions it started
-//! grouped by folder, with their own sessions nested under them. The
+//! grouped by folder, with their own sessions nested under them. Every level
+//! hangs off its parent on a branch: a rail down under the parent's icon and
+//! a stub across to each child, the last child's rail ending at its stub. The
 //! titlebar names where the open session sits in its tree, every level a
 //! click away.
 
@@ -12,6 +14,81 @@ use zeron_proto::{Chat, ChatIndicator, Space, orchestrator};
 
 /// Indent of each nesting level; its rail runs down the middle of it.
 pub(super) const TREE_INDENT: f32 = 14.0;
+/// Where a level's branch rail runs: under its rows' status dot and its
+/// folders' icon, which both sit at the row's padding.
+const RAIL_X: f32 = Theme::SPACE_SM + SIDEBAR_ACTIVE_HARNESS_ICON_SIZE / 2.0;
+/// Where a branch's stub stops: just short of the child's own icon.
+const STUB_END: f32 = TREE_INDENT + Theme::SPACE_SM - 2.0;
+
+/// The branch lines of a folder's rows, given each row's level: for each
+/// row, whether each ancestor's rail carries on past it (a later sibling of
+/// that ancestor follows), and whether the row is its parent's last child.
+pub(super) fn branch_lines(levels: &[usize]) -> Vec<(Vec<bool>, bool)> {
+    let continues = |after: usize, level: usize| {
+        levels[after + 1..]
+            .iter()
+            .take_while(|later| **later >= level)
+            .any(|later| *later == level)
+    };
+    levels
+        .iter()
+        .enumerate()
+        .map(|(ix, level)| {
+            let ancestors = (0..*level).map(|column| continues(ix, column)).collect();
+            (ancestors, !continues(ix, *level))
+        })
+        .collect()
+}
+
+/// One branch: `content` hung `depth + 1` levels in, with the rails of the
+/// ancestors that carry on past it, its own rail (ending at the stub when it
+/// is the last child) and a stub across at `stub_y`. The rails reach `gap`
+/// up to meet the branch above.
+fn branch(
+    content: AnyElement,
+    depth: usize,
+    ancestors: &[bool],
+    last: bool,
+    stub_y: f32,
+    gap: f32,
+    rail: gpui::Hsla,
+) -> AnyElement {
+    let x = depth as f32 * TREE_INDENT + RAIL_X;
+    let line = |left: f32| {
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(-gap))
+            .w(px(1.0))
+            .bg(rail)
+    };
+    div()
+        .relative()
+        .pl(px((depth + 1) as f32 * TREE_INDENT))
+        .child(content)
+        .children(
+            ancestors
+                .iter()
+                .enumerate()
+                .filter(|(_, carries_on)| **carries_on)
+                .map(|(column, _)| line(column as f32 * TREE_INDENT + RAIL_X).bottom_0()),
+        )
+        .child(
+            line(x)
+                .when(last, |el| el.h(px(stub_y + gap)))
+                .when(!last, |el| el.bottom_0()),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(stub_y))
+                .w(px(depth as f32 * TREE_INDENT + STUB_END - x))
+                .h(px(1.0))
+                .bg(rail),
+        )
+        .into_any_element()
+}
 
 /// One folder's sessions under a root: its top sessions in start order, each
 /// followed by the sessions it started, `level` deep.
@@ -404,12 +481,20 @@ impl Shell {
                     .collect();
                 tree_caption(&statuses, self.orchestrator_projects.paused(&tree.root))
             };
-            let root = self.render_orchestrator_row(&tree.root, 0, caption.into(), now, theme, cx);
+            let root = self.render_orchestrator_row(&tree.root, caption.into(), now, theme, cx);
+            // Each folder hangs off the root, its stub at the folder's header.
+            let rail = theme.hairline(0.12);
+            let last = tree.groups.len().saturating_sub(1);
             let groups: Vec<AnyElement> = tree
                 .groups
                 .iter()
-                .map(|group| {
-                    self.render_orchestrator_group(&tree.root, group, row_height, now, theme, cx)
+                .enumerate()
+                .map(|(ix, group)| {
+                    let folder =
+                        self.render_orchestrator_group(&tree.root, group, row_height, now, theme, cx);
+                    let header_middle =
+                        spaces::SIDEBAR_SECTION_GAP + spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT / 2.0;
+                    branch(folder, 0, &[], ix == last, header_middle, 0.0, rail)
                 })
                 .collect();
             let empty = groups.is_empty();
@@ -493,11 +578,10 @@ impl Shell {
         (div().flex_none().into_any_element(), lists)
     }
 
-    /// A session's sidebar row, indented `level` deep on the tree's rails.
+    /// A session's sidebar row; its branch is drawn by the caller.
     fn render_orchestrator_row(
         &mut self,
         chat_id: &str,
-        level: usize,
         label: SharedString,
         now: DateTime<Utc>,
         theme: &Theme,
@@ -537,27 +621,7 @@ impl Shell {
             theme,
             cx,
         );
-        if level == 0 {
-            return Some(row);
-        }
-        // The transcript's tree rail: a hairline down each ancestor's gutter.
-        let rail = theme.hairline(0.12);
-        Some(
-            div()
-                .relative()
-                .pl(px(level as f32 * TREE_INDENT))
-                .children((0..level).map(|depth| {
-                    div()
-                        .absolute()
-                        .left(px(depth as f32 * TREE_INDENT + TREE_INDENT / 2.0))
-                        .top(px(-SIDEBAR_LIST_GAP))
-                        .bottom_0()
-                        .w(px(1.0))
-                        .bg(rail)
-                }))
-                .child(row)
-                .into_any_element(),
-        )
+        Some(row)
     }
 
     /// One folder's sessions: the project groups' disclosure header and body.
@@ -590,12 +654,24 @@ impl Shell {
                 .collect();
             (folder_label(&group.path, &state.spaces).into(), row_labels)
         };
+        // Each session hangs off its folder, or off the session that started it.
+        let rail = theme.hairline(0.12);
+        let levels: Vec<usize> = group.rows.iter().map(|(_, level)| *level).collect();
         let rows: Vec<AnyElement> = group
             .rows
             .iter()
             .zip(row_labels)
-            .filter_map(|((id, level), row_label)| {
-                self.render_orchestrator_row(id, *level, row_label, now, theme, cx)
+            .zip(branch_lines(&levels))
+            .enumerate()
+            .filter_map(|(ix, (((id, level), row_label), (ancestors, last)))| {
+                let row = self.render_orchestrator_row(id, row_label, now, theme, cx)?;
+                // The first row's rails reach up through the body inset to the header.
+                let gap = if ix == 0 {
+                    spaces::SIDEBAR_DISCLOSURE_BODY_INSET
+                } else {
+                    SIDEBAR_LIST_GAP
+                };
+                Some(branch(row, *level, &ancestors, last, row_height / 2.0, gap, rail))
             })
             .collect();
         let count = rows.len();
@@ -894,5 +970,31 @@ mod tests {
         );
         assert_eq!(folder_label("D:\\OpenTalk\\", &[]), "OpenTalk");
         assert_eq!(folder_label("", &[]), "No folder");
+    }
+
+    #[test]
+    fn each_row_knows_which_rails_carry_on_past_it() {
+        // talk-1, its session and that one's session, then talk-2.
+        assert_eq!(
+            branch_lines(&[0, 1, 2, 0]),
+            [
+                (vec![], false),
+                (vec![true], true),
+                (vec![true, false], true),
+                (vec![], true),
+            ],
+            "the folder's rail runs past talk-1's family to talk-2 and stops there"
+        );
+        assert_eq!(
+            branch_lines(&[0, 1, 1, 0]),
+            [
+                (vec![], false),
+                (vec![true], false),
+                (vec![true], true),
+                (vec![], true),
+            ]
+        );
+        assert_eq!(branch_lines(&[0]), [(vec![], true)]);
+        assert!(branch_lines(&[]).is_empty());
     }
 }
