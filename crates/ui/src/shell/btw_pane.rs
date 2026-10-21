@@ -3,7 +3,7 @@
 //! sidebar, the transcript and the panes alike, and it stays where it was
 //! left for the next side chat. It is a fixed size: the thread scrolls
 //! inside it. It runs its parent's model (no picker). The history button
-//! lists the conversation's side chats, so settled ones stay one click away.
+//! lists the conversation's btw asides, so settled ones stay one click away.
 //! Like Claude Code's side chat, its prompt has no attachments or
 //! microphone (it grows to more lines as it fills) and it shows only the
 //! answers: while a reply works, its trailer ("Puzzling…") stands in for
@@ -78,6 +78,28 @@ pub(super) fn forked_child(parent: &zeron_proto::Chat) -> zeron_proto::Chat {
     chat.harness_session_cwd = None;
     chat.room_gen = Some(2);
     chat
+}
+
+/// The conversation's btw asides: its unarchived btw chats, most recent
+/// activity first. The sessions its agent started through the Zeron MCP
+/// name the same parent, but they are sessions (the sidebar and the session
+/// panel list them), never asides.
+fn side_chat_history(
+    chats: &[zeron_proto::Chat],
+    chat: &zeron_proto::Chat,
+) -> Vec<zeron_proto::Chat> {
+    let mut rows: Vec<_> = chats
+        .iter()
+        .filter(|row| {
+            !row.archived
+                && row.is_btw()
+                && row.parent_chat_id.is_some()
+                && row.parent_chat_id == chat.parent_chat_id
+        })
+        .cloned()
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.last_message_at.unwrap_or(row.created_at)));
+    rows
 }
 
 /// A header button: an icon with its tooltip.
@@ -667,23 +689,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let now = Utc::now();
-        let rows: Vec<zeron_proto::Chat> = {
-            let state = self.state.read(cx);
-            let mut rows: Vec<_> = state
-                .chats
-                .iter()
-                .filter(|row| {
-                    !row.archived
-                        && row.parent_chat_id.is_some()
-                        && row.parent_chat_id == chat.parent_chat_id
-                })
-                .cloned()
-                .collect();
-            rows.sort_by_key(|row| {
-                std::cmp::Reverse(row.last_message_at.unwrap_or(row.created_at))
-            });
-            rows
-        };
+        let rows = side_chat_history(&self.state.read(cx).chats, chat);
         let list = div()
             .id("session-btw-list")
             .size_full()
@@ -796,5 +802,34 @@ mod tests {
         );
         // A small window shrinks it to its room.
         assert_eq!(pane_size((300.0, 400.0)), (276.0, 376.0));
+    }
+
+    fn chat(id: &str, parent: Option<&str>, archived: bool, minute: u32) -> zeron_proto::Chat {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "deviceId": "dev", "title": id, "archived": archived,
+            "config": null, "createdAt": "2026-10-14T00:00:00Z", "parentChatId": parent,
+            "lastMessageAt": format!("2026-10-14T00:{minute:02}:00Z"),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_history_lists_the_conversation_s_btw_asides_only() {
+        let chats = vec![
+            chat("main", None, false, 0),
+            // The pane's open aside (its parent is the conversation).
+            chat("btw-now", Some("main"), false, 5),
+            chat("btw-older", Some("main"), false, 2),
+            chat("btw-archived", Some("main"), true, 3),
+            // Sessions the agent started through the Zeron MCP name the same
+            // parent: never asides.
+            chat("mcp-worker", Some("main"), false, 4),
+            // Another conversation's asides stay out too.
+            chat("btw-elsewhere", Some("other"), false, 6),
+        ];
+        let now = chats.iter().find(|c| c.id == "btw-now").unwrap().clone();
+        let history = side_chat_history(&chats, &now);
+        let ids: Vec<&str> = history.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["btw-now", "btw-older"], "newest first, no workers");
     }
 }

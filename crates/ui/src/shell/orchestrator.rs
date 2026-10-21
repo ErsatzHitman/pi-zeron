@@ -171,21 +171,47 @@ fn folder_label(path: &str, spaces: &[Space]) -> String {
         .to_string()
 }
 
+/// A chat's children in the tree, creation order (id breaks ties), archived
+/// ones included: [`orchestrator_trees`] hides an archived row but still
+/// lists the live sessions it started.
+fn tree_children<'a>(chats: &'a [Chat], parent: &str) -> Vec<&'a Chat> {
+    let mut kids: Vec<&Chat> = chats
+        .iter()
+        .filter(|c| !c.is_btw() && c.parent_chat_id.as_deref() == Some(parent))
+        .collect();
+    kids.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    kids
+}
+
+/// Collect the rows of `chat`'s branch at `level`. An archived chat keeps
+/// its place for the live sessions it started: they list at its own level,
+/// since they still run (and the tree's live-session cap counts them).
+fn tree_rows<'a>(
+    chats: &'a [Chat],
+    chat: &'a Chat,
+    level: usize,
+    seen: &mut HashSet<&'a str>,
+    rows: &mut Vec<(String, usize)>,
+) {
+    if !seen.insert(chat.id.as_str()) {
+        return;
+    }
+    if !chat.archived {
+        rows.push((chat.id.clone(), level));
+    }
+    let below = if chat.archived { level } else { level + 1 };
+    for kid in tree_children(chats, &chat.id) {
+        tree_rows(chats, kid, below, seen, rows);
+    }
+}
+
 /// Every live orchestrator, newest first, with its sessions grouped by
 /// folder. Folders with the latest activity lead, like the session list.
 pub(super) fn orchestrator_trees(chats: &[Chat], spaces: &[Space]) -> Vec<OrchestratorTree> {
-    let children = |parent: &str| -> Vec<&Chat> {
-        let mut kids: Vec<&Chat> = chats
-            .iter()
-            .filter(|c| !c.archived && !c.is_btw() && c.parent_chat_id.as_deref() == Some(parent))
-            .collect();
-        kids.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        kids
-    };
     let activity = |id: &str| {
         chats
             .iter()
@@ -202,7 +228,12 @@ pub(super) fn orchestrator_trees(chats: &[Chat], spaces: &[Space]) -> Vec<Orches
         .map(|root| {
             let mut groups: Vec<OrchestratorGroup> = Vec::new();
             let mut seen: HashSet<&str> = HashSet::from([root.id.as_str()]);
-            for child in children(&root.id) {
+            for child in tree_children(chats, &root.id) {
+                let mut rows: Vec<(String, usize)> = Vec::new();
+                tree_rows(chats, child, 0, &mut seen, &mut rows);
+                if rows.is_empty() {
+                    continue;
+                }
                 let path = chat_folder(child, spaces);
                 let key = folder_key(&path);
                 let at = match groups.iter().position(|group| group.key == key) {
@@ -216,19 +247,7 @@ pub(super) fn orchestrator_trees(chats: &[Chat], spaces: &[Space]) -> Vec<Orches
                         groups.len() - 1
                     }
                 };
-                let mut stack = vec![(child, 0)];
-                while let Some((chat, level)) = stack.pop() {
-                    if !seen.insert(chat.id.as_str()) {
-                        continue;
-                    }
-                    groups[at].rows.push((chat.id.clone(), level));
-                    stack.extend(
-                        children(&chat.id)
-                            .into_iter()
-                            .rev()
-                            .map(|kid| (kid, level + 1)),
-                    );
-                }
+                groups[at].rows.extend(rows);
             }
             groups.sort_by_cached_key(|group| {
                 std::cmp::Reverse(group.rows.iter().filter_map(|(id, _)| activity(id)).max())
@@ -996,5 +1015,63 @@ mod tests {
         );
         assert_eq!(branch_lines(&[0]), [(vec![], true)]);
         assert!(branch_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn an_archived_member_hides_itself_not_the_live_sessions_below_it() {
+        let root = "orchestrator-b";
+        let mut archived = chat("archived-member", Some(root), "D:\\zeron", 2);
+        archived.archived = true;
+        let mut archived_below = chat("archived-deep", Some("archived-member"), "D:\\zeron", 4);
+        archived_below.archived = true;
+        // An archived branch with nothing live below it leaves no row and no group.
+        let mut archived_empty = chat("archived-empty", Some(root), "D:\\other", 3);
+        archived_empty.archived = true;
+        let chats = vec![
+            chat(root, None, "D:\\zeron", 0),
+            chat("live-member", Some(root), "D:\\zeron", 1),
+            archived,
+            chat("live-below-archived", Some("archived-member"), "D:\\zeron", 5),
+            archived_below,
+            chat("live-deep", Some("archived-deep"), "D:\\zeron", 6),
+            archived_empty,
+        ];
+        let trees = orchestrator_trees(&chats, &[]);
+        assert_eq!(trees.len(), 1);
+        let groups: Vec<(&str, Vec<(&str, usize)>)> = trees[0]
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.path.as_str(),
+                    group
+                        .rows
+                        .iter()
+                        .map(|(id, level)| (id.as_str(), *level))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            [(
+                "D:\\zeron",
+                vec![
+                    ("live-member", 0),
+                    // Branch order holds through the hidden rows: live-deep sits
+                    // under an earlier hidden sibling of live-below-archived.
+                    ("live-deep", 0),
+                    ("live-below-archived", 0),
+                ]
+            )],
+            "the archived rows are hidden; the live sessions below them list where they were"
+        );
+        // The live-session cap counts exactly what the tab shows.
+        let mut live: Vec<&str> = zeron_proto::orchestrator::live_members(&chats, root)
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect();
+        live.sort_unstable();
+        assert_eq!(live, ["live-below-archived", "live-deep", "live-member"]);
     }
 }
