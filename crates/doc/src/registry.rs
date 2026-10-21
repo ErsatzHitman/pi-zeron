@@ -1521,6 +1521,7 @@ impl RegistryDoc {
             ("startedAt", opt_ms(session.started_at)),
             ("updatedAt", json!(session.updated_at.timestamp_millis())),
             ("runningSubagents", json!(session.running_subagents)),
+            ("queuePosition", json!(session.queue_position)),
             ("backgroundJobs", json!(session.background_jobs)),
             (
                 "subagents",

@@ -1252,6 +1252,24 @@ fn completion_marker_replicates_and_survives_next_turn() {
 }
 
 #[test]
+fn queue_position_replicates_so_other_devices_see_the_queue() {
+    let mut source = RegistryDoc::new("dev-a");
+    let mut viewer = RegistryDoc::new("dev-b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    let mut row = session("chat-1", "dev-a", SessionStatus::Working);
+    row.queue_position = 2;
+    source.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row.clone()]);
+    // Leaving the queue lowers the position again on the far side.
+    row.queue_position = 0;
+    source.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
+}
+
+#[test]
 fn retry_replicates_and_a_cleared_retry_replaces_it() {
     let mut source = RegistryDoc::new("dev-a");
     let mut viewer = RegistryDoc::new("dev-b");
