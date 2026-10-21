@@ -130,7 +130,14 @@ export default function (pi) {
     }
   });
   pi.on("before_agent_start", event => {
-    const text = onDemandSection(config.name, deferred);
+    // Name only the tools this session can load: a `--tools` allowlist (a btw
+    // chat) registers neither them nor tool_search, and a loaded one is declared.
+    const registered = new Set(pi.getAllTools().map(tool => tool.name));
+    const active = new Set(pi.getActiveTools());
+    const loadable = active.has("tool_search")
+      ? deferred.filter(tool => registered.has(`${config.name}_${tool}`) && !active.has(`${config.name}_${tool}`))
+      : [];
+    const text = onDemandSection(config.name, loadable);
     if (!text) return;
     const options = event.systemPromptOptions;
     if (options && options.forceSystemPrompt === undefined) {
