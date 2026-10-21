@@ -448,6 +448,29 @@ mod tests {
     }
 
     #[test]
+    fn a_returning_reader_is_a_top_level_chat_or_a_tree_member() {
+        let root = new_root_chat_id();
+        let chats = vec![
+            chat(&root, None),
+            chat("child", Some(&root)),
+            chat("plain", None),
+            chat("side", Some("plain")),
+            // A btw aside off a tree member is still a side chat.
+            chat("btw-aside", Some("child")),
+        ];
+        for (id, expected) in [
+            (root.as_str(), true),
+            ("child", true),
+            ("plain", true),
+            ("side", false),
+            ("btw-aside", false),
+        ] {
+            let chat = chats.iter().find(|chat| chat.id == id).unwrap();
+            assert_eq!(chat.has_returning_reader(&chats), expected, "{id}");
+        }
+    }
+
+    #[test]
     fn a_branch_lists_what_hangs_below_it_parents_first() {
         let root = new_root_chat_id();
         let mut archived = chat_archived("grandchild-b", Some("child-a"), true);

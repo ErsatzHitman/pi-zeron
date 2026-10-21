@@ -261,6 +261,18 @@ impl Chat {
         self.id.starts_with(BTW_CHAT_PREFIX)
     }
 
+    /// A chat someone comes back to and reads: a top-level chat, or a session
+    /// in an orchestrator's tree (the Orchestrator tab opens it full screen).
+    /// Never a side chat, a subagent, or a btw aside. `chats` must hold this
+    /// chat and its ancestors.
+    pub fn has_returning_reader(&self, chats: &[Chat]) -> bool {
+        if self.is_btw() {
+            return false;
+        }
+        self.parent_chat_id.is_none()
+            || crate::orchestrator::depth(chats, &self.id).is_some()
+    }
+
     /// True when this chat syncs over the chat2 dumb relay.
     pub fn on_chat2(&self) -> bool {
         self.room_gen.unwrap_or(1) >= 2
