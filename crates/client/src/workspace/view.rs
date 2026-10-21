@@ -103,6 +103,17 @@ pub struct SessionRow {
     pub room_gen: u32,
 }
 
+impl SessionRow {
+    /// A session the user sees in chat lists ([`zeron_proto::Chat::is_top_level`]):
+    /// not another chat's worker, not a hidden voice orchestrator, and not an
+    /// orchestrator root (the Orchestrator tab lists its tree).
+    pub fn is_top_level(&self) -> bool {
+        self.parent_chat_id.is_none()
+            && !zeron_proto::voice::is_orchestrator_chat(&self.id)
+            && !zeron_proto::orchestrator::is_root_chat(&self.id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SectionView {
     pub id: String,
@@ -231,7 +242,9 @@ impl WorkspaceSnapshot {
             .collect()
     }
 
-    /// Side chats / subagent chats hanging off `parent_id`, recency order.
+    /// Live side chats / subagent chats hanging off `parent_id`, recency
+    /// order. Archived chats, btw asides and hidden voice/orchestrator chats
+    /// never nest (the desktop sidebar's `ChildIndex`).
     pub fn children(&self, parent_id: &str) -> &[Arc<SessionRow>] {
         self.children.get(parent_id).map_or(&[], Vec::as_slice)
     }
@@ -251,7 +264,7 @@ impl WorkspaceSnapshot {
         let mut hits: Vec<SearchHit> = self
             .sessions
             .values()
-            .filter(|row| row.parent_chat_id.is_none())
+            .filter(|row| row.is_top_level())
             .filter_map(|row| score_row(row, &terms).map(|(score, field)| (row, score, field)))
             .map(|(row, score, field)| SearchHit {
                 session: row.clone(),
@@ -346,6 +359,20 @@ pub(crate) fn device_online(
         || presence
             .get(device_id)
             .is_some_and(|at| now_ms - at < PRESENCE_FRESH_MS)
+}
+
+/// A chat that nests under its parent in the sidebar (desktop
+/// `sidebar_children::ChildIndex`): archived chats, a chat naming itself, btw
+/// asides, and hidden voice/orchestrator chats never nest.
+fn nests(chat: &Chat) -> bool {
+    let Some(parent) = chat.parent_chat_id.as_deref() else {
+        return false;
+    };
+    !chat.archived
+        && parent != chat.id
+        && !chat.is_btw()
+        && !zeron_proto::voice::is_orchestrator_chat(&chat.id)
+        && !zeron_proto::orchestrator::is_root_chat(&chat.id)
 }
 
 fn sort_key(chat: &Chat) -> DateTime<Utc> {
@@ -671,11 +698,7 @@ pub(crate) fn derive(
     let archived: Vec<Arc<SessionRow>> = archived_chats.iter().map(|c| row(c)).collect();
 
     let mut children: HashMap<String, Vec<Arc<SessionRow>>> = HashMap::new();
-    let mut child_chats: Vec<&Chat> = state
-        .chats
-        .iter()
-        .filter(|c| c.parent_chat_id.is_some())
-        .collect();
+    let mut child_chats: Vec<&Chat> = state.chats.iter().filter(|c| nests(c)).collect();
     sort_recency(&mut child_chats);
     for chat in child_chats {
         if let Some(parent) = &chat.parent_chat_id {
@@ -799,5 +822,91 @@ mod tests {
         assert_eq!(relative_time_label(now - 34 * 60_000, now), "34m");
         assert_eq!(relative_time_label(now - 4 * 3_600_000 - 1, now), "4h");
         assert_eq!(relative_time_label(now - 2 * 86_400_000, now), "2d");
+    }
+
+    fn chat(id: &str, parent: Option<&str>, archived: bool) -> Chat {
+        Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: Some(format!("title {id}")),
+            archived,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: DateTime::from_timestamp_millis(1_000).unwrap(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+            parent_chat_id: parent.map(str::to_owned),
+        }
+    }
+
+    fn derive_of(chats: Vec<Chat>) -> WorkspaceSnapshot {
+        let state = WorkspaceState {
+            devices: vec![],
+            spaces: vec![],
+            chats,
+            sessions: vec![],
+        };
+        let presence = HashMap::new();
+        let change_requests: Vec<CheckoutChangeRequestStatus> = vec![];
+        let send_states = HashMap::new();
+        derive(
+            &state,
+            None,
+            &DeriveContext {
+                self_device_id: "dev",
+                now: DateTime::from_timestamp_millis(10_000).unwrap(),
+                presence: &presence,
+                change_requests: &change_requests,
+                send_states: &send_states,
+                synced: true,
+                previous: None,
+            },
+        )
+    }
+
+    #[test]
+    fn search_lists_sessions_but_not_hidden_or_tree_rows() {
+        let snapshot = derive_of(vec![
+            chat("titled", None, false),
+            chat("btw-title", Some("titled"), false),
+            chat("orchestrator-title", None, false),
+            chat("voice-orchestrator-title", None, false),
+        ]);
+        let ids = |query: &str| {
+            snapshot
+                .search(query, 10)
+                .iter()
+                .map(|hit| hit.session.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("titled"), ["titled"]);
+        assert!(
+            ids("orchestrator").is_empty(),
+            "roots and hidden voice orchestrator chats take no list row"
+        );
+    }
+
+    #[test]
+    fn children_are_live_side_chats_only() {
+        let snapshot = derive_of(vec![
+            chat("parent", None, false),
+            chat("kid", Some("parent"), false),
+            chat("btw-kid", Some("parent"), false),
+            chat("archived-kid", Some("parent"), true),
+        ]);
+        let kids: Vec<&str> = snapshot
+            .children("parent")
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(kids, ["kid"]);
     }
 }
