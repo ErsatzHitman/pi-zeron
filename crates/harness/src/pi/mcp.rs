@@ -9,8 +9,9 @@ use crate::{HarnessError, process::Command, scratch::ScratchDir};
 
 /// Appended to every Pi chat's system prompt.
 pub(crate) const VISUALS_PROMPT: &str = include_str!("visuals.md");
-/// Appended to every Pi run that can run commands (all but btw chats): check
-/// the machine's load before heavy work, and prefer CI or a narrower run.
+/// Appended to every Pi run that can run commands (all but btw chats and an
+/// orchestrator's root, which has no shell): check the machine's load before
+/// heavy work, and prefer CI or a narrower run.
 pub(crate) const HOST_PROMPT: &str = include_str!("host.md");
 
 /// A btw side chat's tools (Pi `--tools`): it answers questions about the
@@ -18,6 +19,16 @@ pub(crate) const HOST_PROMPT: &str = include_str!("host.md");
 /// nothing. Pi's allowlist only filters MCP tools when it names one, so the
 /// chat also runs with `--no-mcp` and gets no server's tools.
 pub(crate) const BTW_TOOLS: &str = "read,grep,find,ls,web_search,web_fetch";
+
+/// The visuals note without its "Showing a visual" section, which names
+/// `zeron_show_visual`, a Zeron tool a btw chat does not have.
+fn fences_only(visuals: &str) -> &str {
+    visuals
+        .split("## Showing a visual")
+        .next()
+        .unwrap_or(visuals)
+        .trim_end()
+}
 const BTW_PROMPT: &str = "This is a btw side chat: the user is asking about the conversation \
 above without interrupting it. Answer from that conversation. You can read files with read, \
 grep, find and ls, and search and read the web with web_search and web_fetch, and nothing else: \
@@ -95,8 +106,16 @@ fn role_args(
 ) -> Result<Vec<OsString>, HarnessError> {
     let extension = scratch.join("zeron-mcp.mjs");
     std::fs::write(&extension, include_str!("mcp.mjs"))?;
+    let btw = place.chat_id.starts_with(zeron_proto::BTW_CHAT_PREFIX);
     let visuals = scratch.join("zeron-visuals.md");
-    std::fs::write(&visuals, VISUALS_PROMPT)?;
+    std::fs::write(
+        &visuals,
+        if btw {
+            fences_only(VISUALS_PROMPT)
+        } else {
+            VISUALS_PROMPT
+        },
+    )?;
     let mut args: Vec<OsString> = vec![
         "--extension".into(),
         extension.into(),
@@ -105,16 +124,21 @@ fn role_args(
     ];
     // A btw side chat only asks, wherever it sits: no role prompt, project
     // or tools beyond its own.
-    if place.chat_id.starts_with(zeron_proto::BTW_CHAT_PREFIX) {
+    if btw {
         let prompt = scratch.join("zeron-btw.md");
         std::fs::write(&prompt, BTW_PROMPT)?;
         args.extend(["--append-system-prompt".into(), prompt.into()]);
-        args.extend(["--tools".into(), BTW_TOOLS.into(), "--no-mcp".into()]);
+        // No skills: a btw chat can only read, so a skill list it cannot act on is dead weight.
+        args.extend(["--tools", BTW_TOOLS, "--no-mcp", "--no-skills"].map(OsString::from));
         return Ok(args);
     }
-    let host = scratch.join("zeron-host.md");
-    std::fs::write(&host, HOST_PROMPT)?;
-    args.extend(["--append-system-prompt".into(), host.into()]);
+    // The root has no shell, so the host note (machine-load commands, CI watches,
+    // workflows, sub-agents) would only name things it cannot run.
+    if place.role != Role::Root {
+        let host = scratch.join("zeron-host.md");
+        std::fs::write(&host, HOST_PROMPT)?;
+        args.extend(["--append-system-prompt".into(), host.into()]);
+    }
     match place.role {
         Role::Chat => {}
         Role::Root => {
@@ -231,7 +255,13 @@ mod tests {
                 ["read", "grep", "find", "ls", "web_search", "web_fetch"]
             );
             assert!(args.iter().any(|arg| arg == "--no-mcp"));
+            assert!(args.iter().any(|arg| arg == "--no-skills"), "it cannot act on a skill");
             assert!(args.iter().any(|arg| arg.ends_with("zeron-btw.md")));
+            // The fences it can draw, not zeron_show_visual, which it does not have.
+            let visuals = args.iter().find(|arg| arg.ends_with("zeron-visuals.md")).unwrap();
+            let visuals = std::fs::read_to_string(visuals).unwrap();
+            assert!(visuals.contains("```chart"));
+            assert!(!visuals.contains("zeron_show_visual"));
             assert!(!args.iter().any(|arg| arg.ends_with("zeron-host.md")), "a btw chat runs nothing");
             assert!(!args.iter().any(|arg| arg.ends_with("zeron-member.md")));
             assert!(!args.iter().any(|arg| arg == "--system-prompt"));
@@ -266,8 +296,9 @@ mod tests {
         ] {
             assert!(args.iter().any(|arg| arg == off), "{off}");
         }
-        // Still draws Zeron's visuals.
+        // Still draws Zeron's visuals, but has no shell to check the host's load with.
         assert!(args.iter().any(|arg| arg.ends_with("zeron-visuals.md")));
+        assert!(!args.iter().any(|arg| arg.ends_with("zeron-host.md")), "the root runs nothing");
     }
 
     #[test]
