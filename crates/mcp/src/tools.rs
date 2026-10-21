@@ -3295,10 +3295,13 @@ fn same_folder(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
+/// The harness a chat that names none runs on: Pi, the only harness Zeron
+/// runs (a device that offers it at all), so its sessions also get the
+/// device's default subagent. Older adapters answer only in fixtures.
 fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
     harnesses
         .iter()
-        .find(|h| h.id == HarnessId::ClaudeCode && h.available())
+        .find(|h| h.id == HarnessId::Pi && h.available())
         .or_else(|| {
             harnesses
                 .iter()
@@ -5339,8 +5342,14 @@ mod tests {
         let created = create(&world, json!({ "harness": "pi", "reasoning": "minimal" })).await;
         assert_eq!(created["model"], "sonnet");
         assert_eq!(created["reasoning"], "minimal");
-        // Another harness keeps its own default.
+        // A session that names no harness defaults to Pi, so it also runs on
+        // the device's default subagent.
         let created = create(&world, json!({})).await;
+        assert_eq!(created["harness"], "pi");
+        assert_eq!(created["model"], "sonnet");
+        assert_eq!(created["reasoning"], "high");
+        // Another harness keeps its own default.
+        let created = create(&world, json!({ "harness": "claude-code" })).await;
         assert_eq!(created["harness"], "claude-code");
         assert!(created["model"].is_null(), "{created}");
         // A default the device does not offer runs on its first offered

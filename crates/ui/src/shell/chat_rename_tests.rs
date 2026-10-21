@@ -401,3 +401,46 @@ fn inline_rename_keeps_the_row_height_in_compact_and_full_rows(cx: &mut TestAppC
         assert!(shell.read_with(cx, |shell, _| shell.chat_rename.is_none()));
     }
 }
+
+/// An orchestrator-launched session has a parent, but its title is edited on
+/// its own row in the Orchestrator tab, not in a side-chat parent's panel.
+#[gpui::test]
+fn rename_opens_a_tree_sessions_row_in_the_orchestrator_tab(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let collapse_key = "orchestrator:orchestrator-1:".to_owned();
+    shell.update(cx, |shell, cx| {
+        shell.state.update(cx, |state, _| {
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "orchestrator-1", "title": "Orchestrator", "deviceId": "local",
+                    "archived": false, "createdAt": Utc::now() - chrono::Duration::minutes(5),
+                }))
+                .unwrap(),
+            );
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "worker", "title": "worker", "deviceId": "local",
+                    "archived": false, "parentChatId": "orchestrator-1",
+                    "createdAt": Utc::now() - chrono::Duration::minutes(4),
+                }))
+                .unwrap(),
+            );
+        });
+        shell.settings.sidebar_tab = settings::SidebarTab::Normal;
+        shell.settings.sidebar_collapsed = true;
+        shell.sidebar_collapsed_groups.insert(collapse_key.clone());
+        cx.notify();
+    });
+    redraw(cx);
+
+    rename(&shell, cx, "worker");
+    shell.read_with(cx, |shell, _| {
+        assert_eq!(shell.settings.sidebar_tab, settings::SidebarTab::Orchestrator);
+        assert!(!shell.settings.sidebar_collapsed);
+        assert!(shell.sidebar_collapsed_groups.is_empty());
+        // The queued reveal became the folder group's opening motion.
+        assert!(shell.sidebar_reveal_motions.is_empty());
+        assert!(shell.sidebar_disclosure_motion.contains_key(&format!("group:{collapse_key}")));
+    });
+    assert!(cx.debug_bounds("chat-title-editor-worker").is_some());
+}

@@ -246,6 +246,56 @@ impl Shell {
         orchestrator::depth(&self.state.read(cx).chats, chat_id).is_some()
     }
 
+    /// A side chat: a chat hanging off another outside an orchestrator's tree,
+    /// which lists nested under its parent and has no Pin, Archive or Copy of
+    /// its own. A tree session has a parent too, but is a session of its own
+    /// in the Orchestrator tab.
+    pub(super) fn is_side_chat(&self, chat_id: &str, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state.chats.iter().any(|chat| {
+            chat.id == chat_id
+                && chat.parent_chat_id.is_some()
+                && !matches!(
+                    orchestrator::Role::of(&state.chats, &chat.id),
+                    orchestrator::Role::Member { .. }
+                )
+        })
+    }
+
+    /// Reveal a tree session's row: show the Orchestrator tab and unfold the
+    /// folder group it lists under. `false` outside an orchestrator's tree.
+    pub(super) fn reveal_orchestrator_chat(
+        &mut self,
+        chat_id: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let collapse_key = {
+            let state = self.state.read(cx);
+            // The tree lists live sessions only; an archived one has no row.
+            let Some(chat) = state.chats.iter().find(|chat| chat.id == chat_id && !chat.archived)
+            else {
+                return false;
+            };
+            let Some(root) = orchestrator::root_of(&state.chats, chat_id) else {
+                return false;
+            };
+            format!(
+                "orchestrator:{}:{}",
+                root.id,
+                folder_key(&chat_folder(chat, &state.spaces))
+            )
+        };
+        self.follow_sidebar_tab(chat_id, cx);
+        if self.sidebar_collapsed_groups.remove(&collapse_key) {
+            self.queue_sidebar_reveal(&format!("group:{collapse_key}"));
+        }
+        if self.settings.sidebar_collapsed {
+            self.toggle_sidebar(cx);
+        }
+        cx.notify();
+        true
+    }
+
     /// Show the tab `chat_id` lists in, so an orchestrated session opened
     /// from anywhere (the palette, a notification) is found in its tree.
     pub(super) fn follow_sidebar_tab(&mut self, chat_id: &str, cx: &mut Context<Self>) {
