@@ -9431,9 +9431,16 @@ impl Composer {
             this.update(cx, |composer, cx| {
                 let same_chat =
                     composer.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str());
-                if same_chat && composer.input.read(cx).text().is_empty() {
+                if same_chat && composer.input.read(cx).text().is_empty() && !composer.sending {
                     let queue = composer.button_mode(cx) == SendButtonMode::Queue;
                     composer.send(command, queue, cx);
+                } else if same_chat && composer.sending {
+                    // A send is already in flight: keep the command as a draft
+                    // instead of starting a second send that would drop it.
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text(command, cx));
+                    cx.notify();
                 } else {
                     crate::toast::error(
                         cx,
@@ -9477,6 +9484,16 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        // One send at a time. `send_task` owns the in-flight future, and
+        // assigning it again DROPS that future mid-flight (staging upload,
+        // createChat or Run) — the first message then never lands and its
+        // staged files are never handed back, the same shape as the
+        // interrupt/`action_task` incident. Nothing is consumed here, so a
+        // second Enter simply leaves the message in the composer as a draft.
+        if self.sending {
+            tracing::debug!("send ignored: a send is already in flight");
+            return;
+        }
         if !self.check_reference_delivery(&text, cx) {
             return;
         }
@@ -13887,6 +13904,44 @@ mod tests {
         // written its frame into the channel by the time the executor parks.
         cx.run_until_parked();
         assert!(server_in.try_recv().is_err());
+    }
+
+    /// #60: a second send while one is in flight must not start. Reassigning
+    /// `send_task` DROPS the first future mid-flight (staging upload,
+    /// createChat or Run): no failure banner, no staged-file hand-back — so
+    /// the second Enter is ignored outright and the draft stays put.
+    #[gpui::test]
+    fn second_submit_while_a_send_is_in_flight_is_ignored(cx: &mut gpui::TestAppContext) {
+        // RpcClient::new spawns its reader on tokio — give the test a reactor.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (out, mut server_in) = tokio::sync::mpsc::channel::<String>(16);
+        let (_server_out, inbound) = tokio::sync::mpsc::channel::<String>(16);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.selected_chat = Some("c".into());
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            // An earlier send still owns `send_task` and has not returned yet.
+            composer.sending = true;
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("second", cx));
+            composer.on_submit(cx);
+            // Nothing consumed, no engine error, no task replaced.
+            assert_eq!(composer.input.read(cx).text(), "second");
+            assert!(composer.failure.is_none());
+            assert!(composer.is_sending());
+        });
+        cx.run_until_parked();
+        assert!(
+            server_in.try_recv().is_err(),
+            "a second send must not reach the engine"
+        );
     }
 
     /// A run that goes stale purely by the clock (no state frame) drops its
