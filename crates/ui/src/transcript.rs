@@ -41,6 +41,7 @@ use gpui::{
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
 use zeron_proto::ToolCall;
+use zeron_proto::extension_ui::PiUiElement;
 
 use crate::markdown::mermaid_cache::{self, MermaidCache};
 use crate::markdown::parser::{
@@ -974,6 +975,33 @@ fn readable_input(input: &serde_json::Value) -> String {
 
 /// Live controls a Pi extension row offers at most.
 const PI_CONTROLS_MAX: usize = 4;
+
+/// Typed elements by `ns:id`, the key rows and their actions address.
+fn index_pi_elements(elements: Vec<PiUiElement>) -> HashMap<String, PiUiElement> {
+    elements
+        .into_iter()
+        .map(|element| (element.key(), element))
+        .collect()
+}
+
+/// One watch's typed Pi elements, valid for one `(chat, harness instance,
+/// revision)`. Every Pi row looks its element up on every frame, so parsing
+/// the element list per row (and per frame) is quadratic in rows × elements.
+struct PiElements {
+    chat: String,
+    instance: Option<String>,
+    revision: u64,
+    elements: Rc<HashMap<String, PiUiElement>>,
+}
+
+impl PiElements {
+    /// Whether this parse still describes the live watch. A new harness
+    /// instance restarts the revision count, so the instance has to match
+    /// too.
+    fn fresh(&self, chat: &str, instance: Option<&str>, revision: u64) -> bool {
+        self.chat == chat && self.instance.as_deref() == instance && self.revision == revision
+    }
+}
 
 /// The element a Pi extension row records (`pi-ui-<run>-<n>-<ns:id>`);
 /// notices and plain widgets have none.
@@ -3522,6 +3550,8 @@ pub struct Transcript {
     tool_details: HashMap<SharedString, FoldState>,
     /// A Pi row control waiting for its confirming second click.
     pi_confirm: Option<SharedString>,
+    /// The watched chat's live Pi elements as types (see [`PiElements`]).
+    pi_element_cache: Option<PiElements>,
     /// Expand/collapse state for user bubbles past [`USER_COLLAPSED_LINES`],
     /// keyed by row id. Render-local like `folds` — never part of the row
     /// fingerprint, so toggling one costs a repaint, not a rebuild.
@@ -3896,6 +3926,39 @@ impl Transcript {
             .linked_tree(tree, roots, ui.source_local)
     }
 
+    /// The watched chat's live Pi elements as types, by `ns:id`, parsed once
+    /// per `(chat, instance, revision)` and shared by every row of the frame.
+    fn pi_elements(&mut self, cx: &gpui::App) -> Option<Rc<HashMap<String, PiUiElement>>> {
+        let state = self.state.read(cx);
+        let live = state
+            .selected_chat
+            .as_deref()
+            .and_then(|chat| state.extension_ui.of(chat).map(|live| (chat, live)));
+        let Some((chat, live)) = live else {
+            // Nothing is watched: the parse must not outlive the watch, since
+            // a re-watch starts a new harness instance and revision count.
+            self.pi_element_cache = None;
+            return None;
+        };
+        let fresh = self
+            .pi_element_cache
+            .as_ref()
+            .is_some_and(|cached| cached.fresh(chat, live.instance.as_deref(), live.revision));
+        // A repaint for the same revision reuses the parse; anything that
+        // changes an element publishes a new revision.
+        if !fresh {
+            self.pi_element_cache = Some(PiElements {
+                chat: chat.to_owned(),
+                instance: live.instance.clone(),
+                revision: live.revision,
+                elements: Rc::new(index_pi_elements(live.typed_elements())),
+            });
+        }
+        self.pi_element_cache
+            .as_ref()
+            .map(|cached| cached.elements.clone())
+    }
+
     /// The newest transcript row recording the Pi element `key`.
     fn newest_pi_row(&self, key: &str) -> Option<&str> {
         self.rows.iter().rev().find_map(|row| match &row.kind {
@@ -3932,15 +3995,8 @@ impl Transcript {
         }
         let key = pi_element_key(&tool.part_id)?.to_owned();
         let controls = {
-            let state = self.state.read(cx);
-            let chat = state.selected_chat.as_deref()?;
-            let element = state
-                .extension_ui
-                .of(chat)?
-                .typed_elements()
-                .into_iter()
-                .find(|element| element.key() == key)?;
-            pi_controls(&element)
+            let elements = self.pi_elements(cx)?;
+            pi_controls(elements.get(&key)?)
         };
         // An element recorded across turns (each advisor consultation) keeps
         // its controls on its newest row only.
@@ -4146,6 +4202,7 @@ impl Transcript {
             historical_markdown: HashMap::new(),
             tool_details: HashMap::new(),
             pi_confirm: None,
+            pi_element_cache: None,
             user_folds: HashMap::new(),
             user_heights: HashMap::new(),
             user_hold_task: None,
@@ -18282,6 +18339,37 @@ impl Transcript {
 mod pi_row_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_pi_element_parse_is_fresh_only_for_the_watch_it_came_from() {
+        let cached = PiElements {
+            chat: "chat-a".to_owned(),
+            instance: Some("host-1".to_owned()),
+            revision: 7,
+            elements: Rc::new(index_pi_elements(Vec::new())),
+        };
+        assert!(cached.fresh("chat-a", Some("host-1"), 7));
+        // A frame for another chat, a changed element or a restarted harness
+        // (its revision count starts over) all want a new parse.
+        assert!(!cached.fresh("chat-b", Some("host-1"), 7));
+        assert!(!cached.fresh("chat-a", Some("host-1"), 8));
+        assert!(!cached.fresh("chat-a", Some("host-2"), 7));
+        assert!(!cached.fresh("chat-a", None, 7));
+    }
+
+    #[test]
+    fn pi_elements_index_by_the_key_their_rows_address() {
+        let index = index_pi_elements(vec![
+            serde_json::from_value(json!({"id":"fleet","ns":"subagents","kind":"roster"})).unwrap(),
+            serde_json::from_value(json!({"id":"panel","ns":"advisor","kind":"panel"})).unwrap(),
+        ]);
+        assert_eq!(index.len(), 2);
+        assert_eq!(
+            index["subagents:fleet"].kind,
+            zeron_proto::extension_ui::PiUiKind::Roster
+        );
+        assert_eq!(index["advisor:panel"].id, "panel");
+    }
 
     #[test]
     fn a_pi_row_finds_its_element_and_offers_its_live_controls() {
