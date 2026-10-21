@@ -2291,6 +2291,9 @@ pub struct Shell {
     /// The store's settings when `settings` last synced with it. Fields that
     /// differ from this are the Shell's edits; all others follow the store.
     settings_base: UiSettings,
+    /// The store revision `settings_base` was read at: equal to the store's
+    /// means nothing was saved elsewhere since, so there is nothing to merge.
+    settings_revision: u64,
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
@@ -2547,7 +2550,13 @@ impl Shell {
         // Spawn chips open their subagent's transcript as a right-pane tab.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
         let data_dir = boot.data_dir.clone();
+        // Snapshot base, revision and working copy together: a save that lands
+        // while `new` finishes must still be merged by the first
+        // [`Self::pull_settings`], which needs the revision and its snapshot to
+        // describe the same copy.
+        let settings_revision = settings::revision(cx);
         let mut settings = settings::current(cx);
+        let settings_base = settings.clone();
         state.update(cx, |state, cx| {
             state.watch_clock_transitions(cx);
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
@@ -2799,7 +2808,8 @@ impl Shell {
             import_current: None,
             boot,
             data_dir,
-            settings_base: settings::current(cx),
+            settings_base,
+            settings_revision,
             settings,
             panels: SessionPanels::default(),
             panel_open_sequence: 0,
@@ -5163,6 +5173,8 @@ impl Shell {
 
     /// Publish this view's working copy to the central settings store. The
     /// store owns the single debounce task and the only production writer.
+    /// A pane drag sends a pointer move every frame, so a move that changed
+    /// nothing publishes nothing.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.settings.appearance = crate::appearance::mode(cx);
         self.settings.git_history_columns = crate::history::configured_columns(cx);
@@ -5173,8 +5185,12 @@ impl Shell {
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
         self.pull_settings(cx);
+        if self.settings == self.settings_base {
+            return;
+        }
         settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
         self.settings_base = settings::current(cx);
+        self.settings_revision = settings::revision(cx);
     }
 
     /// Controls outside the Shell (Voice, typography, diff and transcript
@@ -5182,10 +5198,21 @@ impl Shell {
     /// working copy while keeping the Shell's own edits, so a geometry save
     /// can never publish an older value over another surface's choice.
     fn pull_settings(&mut self, cx: &App) {
-        let current = settings::current(cx);
-        self.settings =
-            UiSettings::merge_changes(&self.settings_base, &self.settings, current.clone());
-        self.settings_base = current;
+        // The store still holds what this view last published (every pointer
+        // move of a drag), so nothing was saved elsewhere and the merge — a
+        // copy of every setting — is skipped.
+        let revision = settings::revision(cx);
+        if revision == self.settings_revision {
+            return;
+        }
+        // `settings_base` must stay the store's snapshot, not the merged copy:
+        // [`Self::schedule_save`] compares against it to tell the Shell's own
+        // edits from store state, and the merge has just proved there are some.
+        let mut merged = settings::current(cx);
+        let base = std::mem::replace(&mut self.settings_base, merged.clone());
+        UiSettings::merge_changes(&base, &self.settings, &mut merged);
+        self.settings = merged;
+        self.settings_revision = revision;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -16929,6 +16956,59 @@ mod exit_regressions {
             after.settings_section,
             SettingsSection::Notifications.canonical()
         );
+        assert_eq!(after.sidebar_width, before.sidebar_width + 10.0);
+    }
+
+    #[gpui::test]
+    fn one_shell_save_after_an_external_save_publishes_the_shells_own_edit(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let before = cx.update(|cx| settings::current(cx));
+        window
+            .update(cx, |shell, _, cx| {
+                // A settings switch outside the Shell writes the store behind
+                // its back; the Shell has not saved since.
+                settings::update(SavePolicy::Immediate, cx, |s| {
+                    s.notifications_enabled = !before.notifications_enabled;
+                });
+                // ONE save: folding the store in must leave the Shell's own
+                // edit staged, so the same save publishes it.
+                shell.settings.sidebar_width += 10.0;
+                shell.schedule_save(cx);
+            })
+            .unwrap();
+        let after = cx.update(|cx| settings::current(cx));
+        assert_eq!(after.notifications_enabled, !before.notifications_enabled);
         assert_eq!(after.sidebar_width, before.sidebar_width + 10.0);
     }
 

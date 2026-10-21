@@ -331,18 +331,30 @@ impl Shell {
     }
 }
 
-/// The selected chat's sub-agents at work (the Pi fleet's and a harness's),
-/// for the sidebar to nest under its row. Only the selected chat's roster
-/// and transcript are watched, so other rows keep their "● N" pill.
-pub(super) fn sidebar_agents(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> Vec<AgentRow> {
-    if state.selected_chat.as_deref() != Some(chat_id) {
-        return Vec::new();
+impl SessionPanel {
+    /// The selected chat's sub-agents at work (the Pi fleet's and a harness's),
+    /// for the sidebar to nest under its row. Only the selected chat's roster
+    /// and transcript are watched, so other rows keep their "● N" pill. The
+    /// panel's cache is reused: the whole-chat links scan and transcript walk
+    /// behind it must not repeat for this, the sidebar's, read of the same
+    /// chat every frame.
+    pub(super) fn sidebar_agents(
+        &mut self,
+        state: &AppState,
+        chat_id: &str,
+        now: DateTime<Utc>,
+    ) -> Vec<AgentRow> {
+        if state.selected_chat.as_deref() != Some(chat_id) {
+            return Vec::new();
+        }
+        state
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map_or_else(Vec::new, |chat| {
+                agents::agent_list_in(&mut self.agent_cache, state, chat, now).active
+            })
     }
-    state
-        .chats
-        .iter()
-        .find(|chat| chat.id == chat_id)
-        .map_or_else(Vec::new, |chat| agents::agent_list(state, chat, now).active)
 }
 
 /// A row's small trailing text.
