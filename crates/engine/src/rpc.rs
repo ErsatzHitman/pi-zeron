@@ -1745,18 +1745,19 @@ impl EngineRpc {
                     .map(drop)
             }
             MutateParams::DeleteChat { chat_id } => {
-                // An orchestrator takes its whole tree with it, deepest
-                // sessions first, so no session is left with a missing parent.
-                if zeron_proto::orchestrator::is_root_chat(&chat_id) {
-                    let chats = self.workspace.read_chats().map_err(failed)?;
-                    let members: Vec<String> =
-                        zeron_proto::orchestrator::tree_members(&chats, &chat_id)
-                            .iter()
-                            .map(|chat| chat.id.clone())
-                            .collect();
-                    for member in members.iter().rev() {
-                        self.delete_one_chat(member)?;
-                    }
+                // A chat takes everything below it with it, deepest sessions
+                // first, so no session is left with a missing parent: an
+                // orchestrator's whole tree, a member's own branch, and the
+                // side chats of any chat.
+                let chats = self.workspace.read_chats().map_err(failed)?;
+                let members: Vec<String> =
+                    zeron_proto::orchestrator::subtree_members(&chats, &chat_id)
+                        .iter()
+                        .rev()
+                        .map(|chat| chat.id.clone())
+                        .collect();
+                for member in members {
+                    self.delete_one_chat(&member)?;
                 }
                 self.delete_one_chat(&chat_id)
             }
