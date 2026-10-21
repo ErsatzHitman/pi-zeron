@@ -1952,27 +1952,29 @@ impl Changes {
         })
     }
 
-    fn resolved(&self, cx: &App) -> Option<CheckoutDiff> {
+    /// Borrow the displayed diff: patches run to megabytes, so callers that
+    /// only read a field must not clone one.
+    fn resolved<'a>(&'a self, cx: &'a App) -> Option<&'a CheckoutDiff> {
         let state = self.state.read(cx);
         let chat = state.selected_chat_row()?;
-        resolve_diff(&self.diffs, chat).cloned()
+        resolve_diff(&self.diffs, chat)
     }
 
     /// The checkout root the scoped RPCs address: the watch-resolved diff's
     /// canonical cwd when available, else the chat row's own.
     fn scoped_cwd(&self, cx: &App) -> Option<String> {
         if let Some(diff) = self.resolved(cx) {
-            return Some(diff.cwd);
+            return Some(diff.cwd.clone());
         }
         self.state.read(cx).selected_chat_row()?.cwd.clone()
     }
 
     /// The diff the pane currently displays: the watch stream for the working
     /// tree, the one-shot scoped capture otherwise.
-    fn active_diff(&self, cx: &App) -> Option<CheckoutDiff> {
+    fn active_diff<'a>(&'a self, cx: &'a App) -> Option<&'a CheckoutDiff> {
         match self.scope {
             DiffScope::WorkingTree => self.resolved(cx),
-            DiffScope::Branch | DiffScope::LatestTurn | DiffScope::Commit => self.scoped.clone(),
+            DiffScope::Branch | DiffScope::LatestTurn | DiffScope::Commit => self.scoped.as_ref(),
             DiffScope::History => None,
         }
     }
@@ -1988,8 +1990,8 @@ impl Changes {
         let chat = self.state.read(cx).selected_chat_row()?;
         Some(DiscardWorkingTreeRequest {
             chat_id: chat.id.clone(),
-            checkout_id: diff.checkout_id,
-            expected_checksum: diff.checksum,
+            checkout_id: diff.checkout_id.clone(),
+            expected_checksum: diff.checksum.clone(),
             target_device_id: self.desired_target(cx),
             file_count: diff.files.len(),
         })
@@ -2127,7 +2129,10 @@ impl Changes {
             base.as_deref().unwrap_or(""),
             commit_sha.as_deref().unwrap_or("")
         );
-        let watch_sum = self.resolved(cx).map(|d| d.checksum).unwrap_or_default();
+        let watch_sum = self
+            .resolved(cx)
+            .map(|d| d.checksum.clone())
+            .unwrap_or_default();
         let key = format!("{context}|{watch_sum}");
         if self.scoped_for.as_deref() == Some(key.as_str())
             || self.scoped_inflight.as_deref() == Some(key.as_str())
@@ -2331,7 +2336,7 @@ impl Changes {
             }
             return;
         };
-        let key = self.parse_key(&diff);
+        let key = self.parse_key(diff);
         if self.parsed.as_ref().is_some_and(|p| p.key == key) {
             self.sync_comment_rows(cx);
             return;
@@ -2349,7 +2354,7 @@ impl Changes {
                 .await;
             this.update(cx, |changes, cx| {
                 // Late results for a superseded diff are re-checked by key.
-                let current = changes.active_diff(cx).map(|d| changes.parse_key(&d));
+                let current = changes.active_diff(cx).map(|d| changes.parse_key(d));
                 if current.as_deref() != Some(key.as_str()) {
                     return;
                 }
@@ -3136,7 +3141,15 @@ impl Changes {
             .ok();
         });
 
-        let active = self.active_diff(cx);
+        // Only the request fields are needed: never clone the diff (and its
+        // possibly multi-megabyte patch) here.
+        let active = self.active_diff(cx).map(|diff| {
+            (
+                diff.checkout_id.clone(),
+                diff.cwd.clone(),
+                diff.checksum.clone(),
+            )
+        });
         let engine = self.state.read(cx).engine().cloned();
         let target = self.desired_target(cx);
         let chat_id = self
@@ -3152,56 +3165,58 @@ impl Changes {
         let fetch_file = file.clone();
         let fetch_path = path.clone();
         let fetch_task = match (active, engine) {
-            (Some(diff), Some(engine)) => Some(cx.spawn(async move |this, cx| {
-                let request = zeron_proto::GetCheckoutFileDiffTextRequest {
-                    checkout_id: diff.checkout_id,
-                    cwd: diff.cwd,
-                    path: fetch_path.clone(),
-                    mode,
-                    base_ref,
-                    chat_id,
-                    commit_sha,
-                    diff_checksum: diff.checksum,
-                };
-                let mut params = serde_json::to_value(request)
-                    .ok()
-                    .and_then(|value| value.as_object().cloned())
-                    .unwrap_or_default();
-                if let Some(target) = target {
-                    params.insert("targetDeviceId".into(), serde_json::Value::String(target));
-                }
-                let response = engine
-                    .client()
-                    .call(
-                        methods::GET_CHECKOUT_FILE_DIFF_TEXT,
-                        serde_json::Value::Object(params),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|value| {
-                        serde_json::from_value::<zeron_proto::CheckoutFileDiffText>(value).ok()
-                    });
-                let highlights = match response {
-                    Some(response) => {
-                        cx.background_executor()
-                            .spawn(async move {
-                                full_highlights(&fetch_file, lang, &response).map(Arc::new)
-                            })
-                            .await
+            (Some((checkout_id, cwd, checksum)), Some(engine)) => {
+                Some(cx.spawn(async move |this, cx| {
+                    let request = zeron_proto::GetCheckoutFileDiffTextRequest {
+                        checkout_id,
+                        cwd,
+                        path: fetch_path.clone(),
+                        mode,
+                        base_ref,
+                        chat_id,
+                        commit_sha,
+                        diff_checksum: checksum,
+                    };
+                    let mut params = serde_json::to_value(request)
+                        .ok()
+                        .and_then(|value| value.as_object().cloned())
+                        .unwrap_or_default();
+                    if let Some(target) = target {
+                        params.insert("targetDeviceId".into(), serde_json::Value::String(target));
                     }
-                    None => None,
-                };
-                this.update(cx, |changes, cx| {
-                    if let Some(slot) = changes.highlights.get_mut(&fetch_path)
-                        && slot.fingerprint == fingerprint
-                        && let Some(highlights) = highlights
-                    {
-                        slot.state = DiffHighlightState::Ready(highlights);
-                        cx.notify();
-                    }
-                })
-                .ok();
-            })),
+                    let response = engine
+                        .client()
+                        .call(
+                            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+                            serde_json::Value::Object(params),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|value| {
+                            serde_json::from_value::<zeron_proto::CheckoutFileDiffText>(value).ok()
+                        });
+                    let highlights = match response {
+                        Some(response) => {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    full_highlights(&fetch_file, lang, &response).map(Arc::new)
+                                })
+                                .await
+                        }
+                        None => None,
+                    };
+                    this.update(cx, |changes, cx| {
+                        if let Some(slot) = changes.highlights.get_mut(&fetch_path)
+                            && slot.fingerprint == fingerprint
+                            && let Some(highlights) = highlights
+                        {
+                            slot.state = DiffHighlightState::Ready(highlights);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }))
+            }
             _ => None,
         };
         self.highlights.insert(
@@ -5092,7 +5107,7 @@ impl Render for Changes {
         let phase = if no_chat {
             DiffPhase::Clean
         } else {
-            diff_phase(active.as_ref())
+            diff_phase(active)
         };
         let error = self.error.clone();
         // Scoped fetch failures replace the content area. "no turn recorded"
