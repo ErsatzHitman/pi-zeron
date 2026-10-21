@@ -168,9 +168,14 @@ impl Shell {
         });
     }
 
-    /// Ctrl+Tab / Ctrl+Shift+Tab: step through the sidebar's Sessions list in
-    /// the order it is drawn. Selection is immediate (no MRU overlay held open
+    /// Ctrl+Tab / Ctrl+Shift+Tab: step through the list the sidebar is
+    /// drawing — the Sessions rows, or the Orchestrator tab's tree — in the
+    /// order it is drawn. Selection is immediate (no MRU overlay held open
     /// on the modifier) — one press, one session.
+    ///
+    /// Staying in the tab matters: cycling onto an orchestrated session from
+    /// the Sessions list would otherwise jump the sidebar to the Orchestrator
+    /// tab and leave the user somewhere they never asked for.
     ///
     /// Works from Settings too, landing back in chat like a jump; the
     /// shortcut recorder intercepts these keys while it records. Quiet under
@@ -181,9 +186,14 @@ impl Shell {
         if self.overlay_owns_keyboard(cx) {
             return;
         }
-        // The same list `render_active_rows` draws and the jump shortcuts
-        // count — one function, so neither can drift from the screen.
-        let order = self.sidebar_visible_order(cx);
+        // The same list the sidebar draws for the open tab, and the jump
+        // shortcuts count — one function each, so neither can drift from the
+        // screen.
+        let order = if self.settings.sidebar_tab == settings::SidebarTab::Orchestrator {
+            self.orchestrator_visible_order(cx)
+        } else {
+            self.sidebar_visible_order(cx)
+        };
         let selected = self.state.read(cx).selected_chat.clone().map(|id| {
             // A selected side chat steps from the session it nests under.
             self.sidebar_child_parent(&id, cx)
