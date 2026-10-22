@@ -1929,6 +1929,16 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // queueing, verification, and the relayed response itself.
         methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // A checkout, a worktree removal and a diff capture over a big working
+        // tree all outlive the interactive default; Pi's file restore waits on
+        // its own 30s answer and then rewrites files.
+        methods::SWITCH_REF
+        | methods::DELETE_WORKTREE
+        | methods::GET_CHECKOUT_FILE_DIFF_TEXT
+        | methods::REWIND_CHAT => Duration::from_secs(120),
+        // An Action launch resolves the checkout (git) before it opens a
+        // terminal.
+        methods::RUN_PROJECT_ACTION => Duration::from_secs(60),
         // Runtimes come down in parallel, each allowed a few seconds, and the
         // report waits (bounded) for them to be gone.
         methods::STOP_TREE => Duration::from_secs(60),
@@ -2776,22 +2786,6 @@ impl RpcService for EngineRpc {
                     }
                     return Err(RpcError::Failed("Chat id already exists".into()));
                 }
-                let source_doc = self.doc_host.open(&p.source_chat_id).map_err(failed)?;
-                let entries = source_doc
-                    .doc()
-                    .read_entries()
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let boundary = entries
-                    .iter()
-                    .rposition(|entry| {
-                        entry.role == zeron_doc::MessageRole::Assistant
-                            && entry.status == Some(zeron_doc::MessageStatus::Complete)
-                    })
-                    .ok_or_else(|| {
-                        RpcError::Failed(
-                            "Wait for a completed response before starting a side chat".into(),
-                        )
-                    })?;
                 let mut chat = source.clone();
                 chat.id = p.chat_id;
                 chat.parent_chat_id = Some(parent_chat_id);
@@ -2804,59 +2798,94 @@ impl RpcService for EngineRpc {
                 chat.harness_session_id = None;
                 chat.harness_session_cwd = None;
                 chat.room_gen = Some(2);
-                // Missing rows open on chat2. Persist history before publishing
-                // the registry row so a crash cannot leave a discoverable empty fork.
-                let target = self.doc_host.open(&chat.id).map_err(failed)?;
-                let existing = target
-                    .doc()
-                    .read_entries()
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                for entry in entries[..=boundary]
-                    .iter()
-                    .filter(|entry| !existing.iter().any(|e| e.id == entry.id))
-                {
-                    let mut entry = entry.clone();
-                    // Historical approvals belong to the source runtime; they
-                    // must never block or send answers from the new composer.
-                    for part in &mut entry.parts {
-                        if let zeron_doc::MessagePart::Input { resolved, .. } = part {
-                            *resolved = true;
-                        }
-                    }
-                    target
-                        .doc()
-                        .push_message(&entry)
+                // Copying the source transcript reads the whole message
+                // container and commits one CRDT write per entry, then exports
+                // the fork's snapshot to disk. Keep all of it off the async
+                // worker, like every other cold `DocHost::open`. Persist
+                // history before publishing the registry row so a crash cannot
+                // leave a discoverable empty fork.
+                let host = self.doc_host.clone();
+                let source_chat_id = source.id.clone();
+                let target_chat_id = chat.id.clone();
+                let source_title = source
+                    .title
+                    .clone()
+                    .or_else(|| source.last_message_preview.clone())
+                    .unwrap_or_else(|| "New session".into());
+                let device_id = self.doc_host.device_id().to_owned();
+                tokio::task::spawn_blocking(move || -> Result<(), RpcError> {
+                    let source_doc = host
+                        .open(&source_chat_id)
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
-                }
-                // The seam: everything above came from the source. Its own
-                // entry (system role, complete) so the copied history and the
-                // fork's first turn never share a row.
-                let marker_id = format!("fork:{}", chat.id);
-                if !existing.iter().any(|e| e.id == marker_id) {
-                    let source_title = source
-                        .title
-                        .clone()
-                        .or_else(|| source.last_message_preview.clone())
-                        .unwrap_or_else(|| "New session".into());
-                    target
+                    let entries = source_doc
                         .doc()
-                        .push_message(&zeron_doc::SessionMessageEntry {
-                            duration_ms: None,
-                            id: marker_id.clone(),
-                            role: zeron_doc::MessageRole::System,
-                            parts: vec![zeron_doc::MessagePart::Fork {
-                                id: marker_id,
-                                source_chat_id: source.id.clone(),
-                                source_title,
-                            }],
-                            created_at: chrono::Utc::now().timestamp_millis(),
-                            device_id: self.doc_host.device_id().to_owned(),
-                            status: Some(zeron_doc::MessageStatus::Complete),
-                            continuation_of: None,
+                        .read_entries()
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let boundary = entries
+                        .iter()
+                        .rposition(|entry| {
+                            entry.role == zeron_doc::MessageRole::Assistant
+                                && entry.status == Some(zeron_doc::MessageStatus::Complete)
                         })
+                        .ok_or_else(|| {
+                            RpcError::Failed(
+                                "Wait for a completed response before starting a side chat".into(),
+                            )
+                        })?;
+                    // Missing rows open on chat2.
+                    let target = host
+                        .open(&target_chat_id)
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
-                }
-                self.doc_host.persist_fork(&target).map_err(failed)?;
+                    let existing = target
+                        .doc()
+                        .read_entries()
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    for entry in entries[..=boundary]
+                        .iter()
+                        .filter(|entry| !existing.iter().any(|e| e.id == entry.id))
+                    {
+                        let mut entry = entry.clone();
+                        // Historical approvals belong to the source runtime; they
+                        // must never block or send answers from the new composer.
+                        for part in &mut entry.parts {
+                            if let zeron_doc::MessagePart::Input { resolved, .. } = part {
+                                *resolved = true;
+                            }
+                        }
+                        target
+                            .doc()
+                            .push_message(&entry)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    // The seam: everything above came from the source. Its own
+                    // entry (system role, complete) so the copied history and the
+                    // fork's first turn never share a row.
+                    let marker_id = format!("fork:{target_chat_id}");
+                    if !existing.iter().any(|e| e.id == marker_id) {
+                        target
+                            .doc()
+                            .push_message(&zeron_doc::SessionMessageEntry {
+                                duration_ms: None,
+                                id: marker_id.clone(),
+                                role: zeron_doc::MessageRole::System,
+                                parts: vec![zeron_doc::MessagePart::Fork {
+                                    id: marker_id,
+                                    source_chat_id: source_chat_id.clone(),
+                                    source_title,
+                                }],
+                                created_at: chrono::Utc::now().timestamp_millis(),
+                                device_id,
+                                status: Some(zeron_doc::MessageStatus::Complete),
+                                continuation_of: None,
+                            })
+                            .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    }
+                    host.persist_fork(&target)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    Ok(())
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))??;
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
                 RpcReply::value(&chat)
             }
@@ -2881,11 +2910,18 @@ impl RpcService for EngineRpc {
                 let stream = if opening_tail {
                     opening_doc_messages_stream(self.doc_host.clone(), p.chat_id).await?
                 } else {
-                    let handle = self
-                        .doc_host
-                        .open(&p.chat_id)
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
-                    doc_messages_stream(handle.watch_messages(), handle.doc_arc())
+                    // A cold open imports the snapshot from disk; keep it off
+                    // the async worker (the openingTail path does the same).
+                    let host = self.doc_host.clone();
+                    let chat_id = p.chat_id.clone();
+                    let (messages, doc) = tokio::task::spawn_blocking(move || {
+                        let handle = host.open(&chat_id)?;
+                        Ok::<_, crate::EngineError>((handle.watch_messages(), handle.doc_arc()))
+                    })
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    doc_messages_stream(messages, doc)
                 };
                 Ok(RpcReply::Stream(
                     stream
@@ -2945,11 +2981,17 @@ impl RpcService for EngineRpc {
             }
             methods::WATCH_QUEUE => {
                 let p: ChatParams = parse_params(params)?;
-                let handle = self
-                    .doc_host
-                    .open(&p.chat_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let rx = handle.watch_queue();
+                // A cold open imports the snapshot from disk; keep it off the
+                // async worker (same as the transcript watch).
+                let host = self.doc_host.clone();
+                let chat_id = p.chat_id.clone();
+                let rx = tokio::task::spawn_blocking(move || {
+                    let handle = host.open(&chat_id)?;
+                    Ok::<_, crate::EngineError>(handle.watch_queue())
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 Ok(RpcReply::Stream(
                     futures::stream::unfold((rx, true), |(mut rx, first)| async move {
                         if !first {
@@ -5669,6 +5711,20 @@ mod tests {
         assert_eq!(
             forward_deadline(methods::CREATE_WORKTREE),
             Duration::from_secs(120)
+        );
+        // Slow-but-alive filesystem/history calls get a leash past the
+        // interactive default instead of failing as a dead link.
+        for method in [
+            methods::SWITCH_REF,
+            methods::DELETE_WORKTREE,
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            methods::REWIND_CHAT,
+        ] {
+            assert_eq!(forward_deadline(method), Duration::from_secs(120));
+        }
+        assert_eq!(
+            forward_deadline(methods::RUN_PROJECT_ACTION),
+            Duration::from_secs(60)
         );
         assert_eq!(
             forward_deadline(methods::CLONE_REPO),
