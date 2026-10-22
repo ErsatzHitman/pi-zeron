@@ -2864,6 +2864,7 @@ impl AppState {
                 cx,
                 handle.clone(),
                 methods::WATCH_SESSIONS,
+                parse_rows::<Session>,
                 AppState::apply_sessions,
             ),
             spawn_chats_watch(cx, handle.clone()),
@@ -2871,30 +2872,35 @@ impl AppState {
                 cx,
                 handle.clone(),
                 methods::WATCH_SIDEBAR_PREFERENCES,
+                parse_frame,
                 AppState::apply_sidebar_preferences,
             ),
             spawn_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_DEVICES,
+                parse_rows::<Device>,
                 AppState::apply_devices,
             ),
             spawn_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_CONNECTIVITY,
+                parse_frame,
                 AppState::apply_connectivity,
             ),
             spawn_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_TRANSFERS,
+                parse_rows::<zeron_proto::TransferProgress>,
                 AppState::apply_transfers,
             ),
             spawn_watch(
                 cx,
                 handle.clone(),
                 methods::WATCH_SPACES,
+                parse_rows::<Space>,
                 AppState::apply_spaces,
             ),
             // Auth frames parse tolerantly — engine and proto tags differ today.
@@ -2902,6 +2908,7 @@ impl AppState {
                 cx,
                 handle.clone(),
                 methods::AUTH_STATUS,
+                parse_frame,
                 AppState::apply_auth_value,
             ),
             spawn_local_device_probe(cx, handle.clone()),
@@ -2911,6 +2918,7 @@ impl AppState {
                 cx,
                 handle.clone(),
                 methods::WATCH_HARNESS_UPDATES,
+                parse_rows::<zeron_proto::HarnessUpdateStatus>,
                 AppState::apply_harness_updates,
             ));
         }
@@ -3334,12 +3342,8 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 }
             };
             while let Some(value) = rx.recv().await {
-                let parsed: Vec<Chat> = match serde_json::from_value(value) {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "dropping malformed chats frame");
-                        continue;
-                    }
+                let Some(parsed) = parse_rows::<Chat>(value, methods::WATCH_CHATS) else {
+                    continue;
                 };
                 let alive = this.update(cx, |state, cx| {
                     // Identical re-published lists skip the re-sort fan-out:
@@ -3460,10 +3464,49 @@ fn spawn_change_request_watch(
     })
 }
 
-fn spawn_watch<T: DeserializeOwned + 'static>(
+/// Parse a scalar watch frame (one shape per frame). A malformed frame is
+/// skipped; the standing watch keeps pumping the next one.
+fn parse_frame<T: DeserializeOwned>(
+    value: serde_json::Value,
+    method: &'static str,
+) -> Option<T> {
+    match serde_json::from_value(value) {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            tracing::warn!(method, error = %err, "dropping malformed watch frame");
+            None
+        }
+    }
+}
+
+/// Parse a list watch frame one row at a time. A single unparsable row (a
+/// field from a newer engine, a truncated record) used to drop the entire
+/// frame, so the sidebar kept showing its stale rows until the next good
+/// frame — and with per-row frames that never came, it stayed frozen for
+/// good. Now only the bad row is dropped and the healthy rows still land.
+fn parse_rows<T: DeserializeOwned>(
+    value: serde_json::Value,
+    method: &'static str,
+) -> Option<Vec<T>> {
+    let serde_json::Value::Array(rows) = value else {
+        tracing::warn!(method, "dropping malformed watch frame: expected a list");
+        return None;
+    };
+    let mut parsed = Vec::with_capacity(rows.len());
+    for row in rows {
+        match serde_json::from_value(row) {
+            Ok(row) => parsed.push(row),
+            Err(err) => tracing::warn!(method, error = %err, "dropping malformed watch row"),
+        }
+    }
+    Some(parsed)
+}
+
+fn spawn_watch<T: 'static>(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     method: &'static str,
+    parse: fn(serde_json::Value, &'static str) -> Option<T>,
     apply: fn(&mut AppState, T) -> bool,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
@@ -3490,12 +3533,8 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 }
             };
             while let Some(value) = rx.recv().await {
-                let parsed: T = match serde_json::from_value(value) {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        tracing::warn!(method, error = %err, "dropping malformed watch frame");
-                        continue;
-                    }
+                let Some(parsed) = parse(value, method) else {
+                    continue;
                 };
                 let alive = this.update(cx, |state, cx| {
                     let changed = apply(state, parsed);
@@ -5702,6 +5741,24 @@ mod tests {
         assert!(state.apply_harness_updates(vec![status(HarnessUpdatePhase::Available)]));
         assert!(!state.apply_harness_updates(vec![status(HarnessUpdatePhase::Available)]));
         assert!(state.apply_harness_updates(vec![status(HarnessUpdatePhase::Current)]));
+    }
+
+    #[test]
+    fn list_watch_frames_keep_the_rows_that_parse() {
+        // A single unparsable row (a field from a newer engine, a truncated
+        // record) used to drop the entire chats/sessions/spaces/devices frame,
+        // freezing the sidebar on its stale rows until the next good frame.
+        let good = serde_json::to_value(space("s1", "dev", "/a", 1)).unwrap();
+        let frame = serde_json::json!([good, { "id": "broken" }, 7]);
+        let parsed = parse_rows::<Space>(frame, methods::WATCH_SPACES).expect("list frame");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "s1");
+
+        // A frame that is not a list at all is still skipped wholesale.
+        assert!(
+            parse_rows::<Space>(serde_json::json!({ "oops": true }), methods::WATCH_SPACES)
+                .is_none()
+        );
     }
 
     #[test]

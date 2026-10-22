@@ -307,10 +307,20 @@ fn control_bytes(key: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Wrap pasted text for the PTY (bracketed-paste aware; strips the one control
-/// sequence a paste could inject).
+/// Wrap pasted text for the PTY (bracketed-paste aware; strips the control
+/// sequences a paste could inject to break out of the paste).
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let sanitized = text.replace("\x1b[201~", "");
+    // A single pass is not enough: removing the end marker can splice its
+    // neighbours into a fresh marker (`ESC[20` + marker + `1~`), which would
+    // still end the paste early. Strip until the text stops changing.
+    let mut sanitized = text.to_string();
+    loop {
+        let next = sanitized.replace("\x1b[201~", "");
+        if next.len() == sanitized.len() {
+            break;
+        }
+        sanitized = next;
+    }
     if bracketed {
         let mut out = b"\x1b[200~".to_vec();
         out.extend_from_slice(sanitized.as_bytes());
@@ -342,6 +352,18 @@ impl InputCoalescer {
 
     pub fn take(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending)
+    }
+
+    /// Put bytes back at the front after a failed write, so they stay ahead of
+    /// anything queued while the write was in flight.
+    pub fn prepend(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut merged = Vec::with_capacity(bytes.len() + self.pending.len());
+        merged.extend_from_slice(bytes);
+        merged.extend_from_slice(&self.pending);
+        self.pending = merged;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -908,6 +930,13 @@ mod tests {
             paste_bytes("a\x1b[201~rm -rf", true),
             b"\x1b[200~arm -rf\x1b[201~".to_vec()
         );
+        // Removing the marker must not splice a fresh one out of its
+        // neighbours: `ESC[20` + marker + `1~` collapses to the marker after
+        // one pass, which would still break out of the paste.
+        assert_eq!(
+            paste_bytes("\x1b[20\x1b[201~1~", true),
+            b"\x1b[200~\x1b[201~".to_vec()
+        );
     }
 
     #[test]
@@ -924,6 +953,21 @@ mod tests {
         // Empty pushes never schedule.
         let mut c = InputCoalescer::default();
         assert!(!c.push(b""));
+    }
+
+    #[test]
+    fn coalescer_prepend_restores_a_failed_write_ahead_of_new_input() {
+        let mut c = InputCoalescer::default();
+        c.push(b"first");
+        let sent = c.take();
+        // Typed while the write was in flight.
+        c.push(b"second");
+        // The write failed: restore the sent bytes at the front.
+        c.prepend(&sent);
+        assert_eq!(c.take(), b"firstsecond".to_vec());
+        // Empty prepends are a no-op.
+        c.prepend(b"");
+        assert!(c.is_empty());
     }
 
     #[test]

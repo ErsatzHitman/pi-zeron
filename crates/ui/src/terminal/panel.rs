@@ -44,6 +44,11 @@ pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
 const SELECTION_SCROLL_TICK_MS: u64 = 24;
 
+/// Retry delay for a flush whose transport is not ready (no engine handle yet,
+/// or a `WriteTerminal` that failed). Long enough not to spin, short enough
+/// that a momentary gap does not strand the buffered keystrokes.
+const FLUSH_RETRY_MS: u64 = 250;
+
 actions!(terminal, [ToggleTerminal]);
 
 /// Bind the terminal keymap (global): Cmd+J on macOS, Ctrl+J elsewhere.
@@ -810,6 +815,7 @@ impl TerminalPanel {
                 }
 
                 // Stream dropped without an exit — reconnect from afterSeq.
+                tracing::debug!(attempt, "terminal: stream ended; reconnecting");
                 let done = this
                     .update(cx, |panel, _| {
                         panel.tab_mut(&chat, key).map(|t| t.exited.is_some()).unwrap_or(true)
@@ -849,7 +855,7 @@ impl TerminalPanel {
                     let engine = engine.clone();
                     let data = encode_base64(&responses);
                     cx.spawn(async move |_, _| {
-                        let _ = engine
+                        if let Err(err) = engine
                             .client()
                             .call(
                                 methods::WRITE_TERMINAL,
@@ -858,7 +864,10 @@ impl TerminalPanel {
                                     &target,
                                 ),
                             )
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(error = %err, "terminal: query response write failed");
+                        }
                     })
                     .detach();
                 }
@@ -901,35 +910,49 @@ impl TerminalPanel {
     }
 
     fn schedule_flush(chat: String, key: u64, cx: &mut Context<Self>) -> Task<()> {
+        Self::schedule_flush_after(chat, key, COALESCE_MS, cx)
+    }
+
+    fn schedule_flush_after(
+        chat: String,
+        key: u64,
+        delay_ms: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(COALESCE_MS))
+                .timer(Duration::from_millis(delay_ms))
                 .await;
             let _ = this.update(cx, |panel, cx| panel.flush_input(chat, key, cx));
         })
     }
 
     fn flush_input(&mut self, chat: String, key: u64, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
+        let engine = self.engine(cx);
         let Some(tab) = self.tab_mut(&chat, key) else {
             return;
         };
-        let target = tab.target_device_id.clone();
-        if tab.coalescer.is_empty() {
+        if tab.coalescer.is_empty() || tab.exited.is_some() {
             return;
         }
-        let Some(id) = tab.terminal_id.clone() else {
-            // OpenTerminal still in flight — keep the buffer, retry shortly.
-            if tab.exited.is_none() {
-                tab.flush_task = Some(Self::schedule_flush(chat, key, cx));
-            }
+        // The engine handle can be momentarily absent while the runtime
+        // attaches. Bailing out here used to strand the buffered keystrokes
+        // forever — nothing else re-armed the flush timer — so keep them and
+        // retry shortly.
+        let Some(engine) = engine else {
+            tab.flush_task = Some(Self::schedule_flush_after(chat, key, FLUSH_RETRY_MS, cx));
             return;
         };
-        let data = encode_base64(&tab.coalescer.take());
-        cx.spawn(async move |_, _| {
-            let _ = engine
+        let Some(id) = tab.terminal_id.clone() else {
+            // OpenTerminal still in flight — keep the buffer, retry shortly.
+            tab.flush_task = Some(Self::schedule_flush(chat, key, cx));
+            return;
+        };
+        let target = tab.target_device_id.clone();
+        let pending = tab.coalescer.take();
+        let data = encode_base64(&pending);
+        cx.spawn(async move |this, cx| {
+            let result = engine
                 .client()
                 .call(
                     methods::WRITE_TERMINAL,
@@ -939,6 +962,26 @@ impl TerminalPanel {
                     ),
                 )
                 .await;
+            let Err(err) = result else {
+                return;
+            };
+            // A failed write used to be dropped on the floor: the bytes were
+            // already taken out of the coalescer, so the keystrokes vanished
+            // with no trace. Restore them at the front (keeping their order
+            // with anything typed while the write was in flight) and retry.
+            tracing::warn!(error = %err, "terminal: WriteTerminal failed; retrying");
+            this.update(cx, |panel, cx| {
+                let Some(tab) = panel.tab_mut(&chat, key) else {
+                    return;
+                };
+                if tab.exited.is_some() {
+                    return;
+                }
+                tab.coalescer.prepend(&pending);
+                tab.flush_task =
+                    Some(Self::schedule_flush_after(chat.clone(), key, FLUSH_RETRY_MS, cx));
+            })
+            .ok();
         })
         .detach();
     }
