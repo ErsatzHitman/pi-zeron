@@ -385,6 +385,10 @@ pub struct UsagePage {
     /// Only this surface's models and lines; every surface stays listed.
     surface: Option<String>,
     status: Status,
+    /// The period and surface `status`'s report was read for. A failed load
+    /// may keep those numbers on screen only while the selection is unchanged;
+    /// after a period switch they belong to another tab.
+    shown_for: Option<(Period, Option<String>)>,
     /// A request is in flight; the painted report stays meanwhile.
     loading: bool,
     hidden: BTreeSet<usize>,
@@ -402,6 +406,7 @@ impl UsagePage {
             metric: Metric::Cost,
             surface: None,
             status: Status::Loading,
+            shown_for: None,
             loading: false,
             hidden: BTreeSet::new(),
             task: None,
@@ -436,6 +441,11 @@ impl UsagePage {
             sessions: None,
         };
         let params = serde_json::to_value(&query).unwrap_or_default();
+        // Only a report for the selection still shown may survive a failure:
+        // the previous period's numbers under the new period's tab would read
+        // as that period's own.
+        let key = (self.period, self.surface.clone());
+        let keeps_report = self.shown_for.as_ref() == Some(&key);
         self.loading = true;
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -445,13 +455,20 @@ impl UsagePage {
             let scanning = result.as_ref().is_ok_and(|report| report.scanning);
             this.update(cx, |page, cx| {
                 page.loading = false;
-                page.status = match result {
-                    Ok(report) => Status::Ready(report),
+                let status = match result {
+                    Ok(report) => {
+                        page.shown_for = Some(key);
+                        Status::Ready(report)
+                    }
                     Err(RpcError::UnknownMethod(_)) => Status::Unsupported,
-                    // A failed refresh keeps the numbers on screen.
-                    Err(_) if matches!(page.status, Status::Ready(_)) => page.status.clone(),
+                    // A failed refresh keeps the numbers on screen while they
+                    // are the numbers for the shown period.
+                    Err(_) if keeps_report && matches!(page.status, Status::Ready(_)) => {
+                        page.status.clone()
+                    }
                     Err(error) => Status::Error(error.to_string()),
                 };
+                page.status = status;
                 cx.notify();
             })
             .ok();
@@ -1342,5 +1359,51 @@ mod tests {
             Some(1_790_879_400_000 - 6 * DAY_MS)
         );
         assert_eq!(Period::All.since_ms(now, 0), None);
+    }
+
+    /// A period switch starts a new query. When that query fails the page must
+    /// say so: the previous period's numbers are not this period's.
+    #[gpui::test]
+    fn a_failed_period_switch_reports_the_failure(cx: &mut gpui::TestAppContext) {
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, Default::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rpc = ScriptedRpc::new({
+            let calls = calls.clone();
+            move |method, _| {
+                assert_eq!(method, methods::GET_USAGE_REPORT);
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        zeron_rpc::RpcReply::value(&UsageReport {
+                            models: vec![row("anthropic", "opus", 100, 5.0, 0.0)],
+                            ..Default::default()
+                        })
+                    } else {
+                        Err(RpcError::Failed("engine busy".into()))
+                    }
+                }
+            }
+        });
+        let state = cx.update(|cx| fixture::state(cx, Some(rpc.client())));
+        let page = cx.new(|cx| UsagePage::new(state, cx));
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| matches!(page.status, Status::Ready(_)))
+        });
+        page.update(cx, |page, cx| page.set_period(Period::Week, cx));
+        rpc.settle(cx, &runtime, |_| rpc.completed() >= 2);
+        page.read_with(cx, |page, _| {
+            assert!(
+                matches!(page.status, Status::Error(_)),
+                "a failed period switch must report the failure, not pass off the \
+                 previous period's report: {:?}",
+                page.status
+            );
+        });
     }
 }
