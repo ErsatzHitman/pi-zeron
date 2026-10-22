@@ -1487,6 +1487,9 @@ impl Composer {
                 .await;
             let mut loaded_attachments = Vec::new();
             let mut loaded_appshots = Vec::new();
+            // The host path each loaded attachment came from, kept so an
+            // unchanged attachment is not re-uploaded on commit (audit #64).
+            let mut loaded_paths = std::collections::HashMap::new();
             if let Ok(reply) = &result
                 && reply.get("outcome").and_then(|v| v.as_str()) == Some("acquired")
             {
@@ -1510,7 +1513,10 @@ impl Composer {
                         ).await
                     };
                     match loaded {
-                        Some(staged) => loaded_attachments.push(staged),
+                        Some(staged) => {
+                            loaded_paths.insert(staged.id.clone(), path);
+                            loaded_attachments.push(staged);
+                        }
                         None => { load_failed = true; break; }
                     }
                 }
@@ -1592,6 +1598,7 @@ impl Composer {
                         composer.editing_queued = Some(id.clone());
                         composer.queue_edit_lease_id = Some(lease_id.to_string());
                         composer.queue_edit_base_text_hash = Some(base_text_hash.to_string());
+                        composer.queue_edit_loaded_paths = std::mem::take(&mut loaded_paths);
                         composer.queue_edit_chat_id = Some(chat_id.clone());
                         composer.queue_edit_host_device_id = Some(host_device_id.clone());
                         composer.swap_in_queued_draft(
@@ -1704,6 +1711,7 @@ impl Composer {
         self.editing_queued = None;
         self.queue_edit_lease_id = None;
         self.queue_edit_base_text_hash = None;
+        self.queue_edit_loaded_paths.clear();
         self.queue_edit_chat_id = None;
         self.queue_edit_host_device_id = None;
         self.queue_edit_pending_id = None;
@@ -1750,6 +1758,10 @@ impl Composer {
         let mut staged = self.staged().to_vec();
         let staged_appshots = self.staged_appshots().to_vec();
         staged.extend(staged_appshots.iter().map(|shot| shot.screenshot.clone()));
+        // An attachment the edit loaded keeps the host path it came from, so
+        // an unchanged attachment is neither re-downloaded nor re-uploaded on
+        // commit (audit #64). Only new attachments take the upload path.
+        let reuse_paths = queued_edit_reuse_paths(&staged, &self.queue_edit_loaded_paths);
         let mut params = serde_json::json!({
             "chatId": chat_id,
             "id": id,
@@ -1769,12 +1781,15 @@ impl Composer {
         let task = cx.spawn(async move |this, cx| {
             let result = async {
                 if action == "commit" {
-                    let mut paths = Vec::new();
-                    for attachment in &staged {
-                        let path = crate::attachments::upload_attachment(
-                            &engine, cx.background_executor(), Some(&host_device_id),
-                            &uuid::Uuid::new_v4().to_string(), attachment, None,
-                        ).await.map_err(|err| err.to_string())?;
+                    let mut paths = Vec::with_capacity(staged.len());
+                    for (attachment, reuse) in staged.iter().zip(&reuse_paths) {
+                        let path = match reuse {
+                            Some(path) => path.clone(),
+                            None => crate::attachments::upload_attachment(
+                                &engine, cx.background_executor(), Some(&host_device_id),
+                                &uuid::Uuid::new_v4().to_string(), attachment, None,
+                            ).await.map_err(|err| err.to_string())?,
+                        };
                         paths.push(path);
                     }
                     let appshot_paths = staged.iter().zip(&paths)
@@ -2024,6 +2039,19 @@ impl Composer {
     }
 }
 
+/// The host path each staged attachment commits under. An attachment the queue
+/// edit loaded keeps the path it came from, so committing an unchanged
+/// attachment neither re-downloads nor re-uploads it (audit #64).
+fn queued_edit_reuse_paths(
+    staged: &[crate::attachments::StagedAttachment],
+    loaded: &std::collections::HashMap<String, String>,
+) -> Vec<Option<String>> {
+    staged
+        .iter()
+        .map(|attachment| loaded.get(&attachment.id).cloned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use zeron_rpc::methods;
@@ -2034,8 +2062,31 @@ mod tests {
         ROW_SLOT,
         available_queue_primary_action, latest_queued_message, one_line, queue_action_needs_host,
         queue_drag_offsets, queue_drop_index, queue_latest_shortcut_visible, queue_lifted_top,
-        queue_mutation_acknowledged, queue_visible_text, visible_queue_rows,
+        queue_mutation_acknowledged, queue_visible_text, queued_edit_reuse_paths,
+        visible_queue_rows,
     };
+
+    #[test]
+    fn a_committed_queue_edit_reuses_only_the_paths_it_loaded() {
+        use crate::attachments::{AttachmentContent, StagedAttachment};
+        fn staged(id: &str) -> StagedAttachment {
+            StagedAttachment {
+                id: id.into(),
+                mention: None,
+                name: id.into(),
+                content: AttachmentContent::File(std::sync::Arc::new(Vec::new())),
+            }
+        }
+        let loaded = std::collections::HashMap::from([
+            ("kept".to_string(), "uploads/kept.png".to_string()),
+            ("dropped".to_string(), "uploads/dropped.png".to_string()),
+        ]);
+        let staged = vec![staged("kept"), staged("added")];
+        assert_eq!(
+            queued_edit_reuse_paths(&staged, &loaded),
+            vec![Some("uploads/kept.png".to_string()), None]
+        );
+    }
 
     #[test]
     fn queue_preview_work_follows_the_visible_rows() {
