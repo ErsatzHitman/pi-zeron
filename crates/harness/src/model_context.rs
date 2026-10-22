@@ -131,6 +131,62 @@ fn field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
 }
+
+/// Fields that change without a different account: OAuth access/refresh
+/// tokens and their expiry. An API key (`key`, `apiKey`) is deliberately not
+/// here — replacing it is an account change that must invalidate the
+/// catalog. A refreshed token is the same account, and hashing it minted a
+/// new disk catalog (and a new file) on every rotation.
+const VOLATILE_FIELDS: &[&str] = &[
+    "access",
+    "refresh",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "expires",
+    "expiresat",
+    "expiresin",
+    "expiry",
+];
+
+fn volatile_field(key: &str) -> bool {
+    let key: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    VOLATILE_FIELDS.contains(&key.as_str())
+}
+
+/// A JSON store with its rotating OAuth fields replaced by a placeholder.
+/// Anything that is not a JSON object/array is returned unchanged, and a
+/// non-JSON file is hashed whole.
+fn stable_json(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    redact_volatile(&mut value, "");
+    serde_json::to_vec(&value).ok()
+}
+
+fn redact_volatile(value: &mut serde_json::Value, key: &str) {
+    if volatile_field(key) {
+        *value = serde_json::Value::String("[volatile]".into());
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (name, entry) in map.iter_mut() {
+                redact_volatile(entry, name);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_volatile(item, key);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn hash_files<'a>(
     hash: &mut Sha256,
     files: impl Iterator<Item = &'a PathBuf>,
@@ -140,10 +196,17 @@ fn hash_files<'a>(
         match std::fs::read(path) {
             Ok(bytes) => {
                 hash.update([1]);
-                field(hash, &bytes);
+                field(hash, stable_json(&bytes).as_deref().unwrap_or(&bytes));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => hash.update([0]),
-            Err(e) => return Err(e.into()),
+            // A credential file another process is rewriting (a Windows
+            // sharing violation, a lock) must not hide the whole model list:
+            // hash it as unreadable, which a later successful read changes.
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "model context file unreadable");
+                hash.update([2]);
+                field(hash, format!("{:?}", e.kind()).as_bytes());
+            }
         }
     }
     Ok(())
@@ -179,5 +242,34 @@ mod tests {
         assert!(!first.contains("account"));
         std::fs::remove_file(&file).unwrap();
         assert_eq!(key(), missing);
+    }
+
+    #[test]
+    fn a_rotated_oauth_token_keeps_the_context_while_an_account_change_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("auth.json");
+        let key = || {
+            let mut hash = Sha256::new();
+            hash_files(&mut hash, std::iter::once(&file)).unwrap();
+            format!("{:x}", hash.finalize())
+        };
+        let entry = |token: &str, email: &str| {
+            format!(
+                r#"{{"anthropic":{{"type":"oauth","access":"{token}","refresh":"r-{token}","expires":1}},"email":"{email}"}}"#
+            )
+        };
+        std::fs::write(&file, entry("tok-1", "a@example.com")).unwrap();
+        let first = key();
+        std::fs::write(&file, entry("tok-2", "a@example.com")).unwrap();
+        assert_eq!(first, key(), "a refreshed token is the same account");
+        std::fs::write(&file, entry("tok-2", "other@example.com")).unwrap();
+        assert_ne!(first, key(), "a different account invalidates");
+        // An API key is an account, not a rotating token.
+        let api =
+            |secret: &str| format!(r#"{{"anthropic":{{"type":"api_key","key":"{secret}"}}}}"#);
+        std::fs::write(&file, api("sk-one")).unwrap();
+        let keyed = key();
+        std::fs::write(&file, api("sk-two")).unwrap();
+        assert_ne!(keyed, key(), "a replaced API key invalidates");
     }
 }

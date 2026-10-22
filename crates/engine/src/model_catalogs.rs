@@ -62,8 +62,31 @@ fn save(path: &Path, context: &ModelContext, models: &[Model]) -> std::io::Resul
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(staging);
+    } else {
+        prune_stale(path);
     }
     result
+}
+
+/// The context hash in the file name changes whenever the credentials or the
+/// binary do, so old names would otherwise accumulate under one harness
+/// forever. One catalog per harness is all the disk fallback needs.
+fn prune_stale(keep: &Path) {
+    let Some(dir) = keep.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry.path();
+        if stale == keep || stale.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(&stale) {
+            tracing::warn!(%error, path = %stale.display(), "Could not prune stale model catalog");
+        }
+    }
 }
 fn unchanged(harness: &dyn Harness, context: &ModelContext) -> bool {
     harness
@@ -464,6 +487,27 @@ mod tests {
         let (result, _) = tokio::join!(list(dir.path(), probe.clone(), false), swap);
         assert!(result.is_err());
         assert!(!dir.path().join("model-catalogs").exists());
+    }
+
+    #[tokio::test]
+    async fn a_changed_context_replaces_the_stale_catalog_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new();
+        list(dir.path(), probe.clone(), true).await.unwrap();
+        let first = probe.model_context().unwrap().unwrap();
+        probe.account.store(2, SeqCst);
+        list(dir.path(), probe.clone(), true).await.unwrap();
+        let second = probe.model_context().unwrap().unwrap();
+        assert!(location(dir.path(), probe.as_ref(), &second).exists());
+        assert!(
+            !location(dir.path(), probe.as_ref(), &first).exists(),
+            "the previous context's catalog is pruned"
+        );
+        let files: Vec<_> = std::fs::read_dir(dir.path().join("model-catalogs/codex"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files.len(), 1, "one catalog per harness: {files:?}");
     }
 
     #[test]
