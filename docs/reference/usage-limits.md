@@ -21,7 +21,8 @@ The page is the settings section **Usage limits** (slug `usage-limits`). It
 opens from the Settings sidebar, from a link, or with
 `ZERON_OPEN_ROUTE=settings/usage-limits`. The old `limits` alias resolves here too. As
 with the other sections, the choice is remembered in `ui-settings.json`
-(`settingsSection`).
+(`settingsSection`). The slug is additive: an older build that does not know
+it reads the unknown value leniently and falls back to General.
 
 ## What it shows
 

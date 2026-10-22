@@ -434,7 +434,9 @@ fn render_card(
     if account.active {
         header = header.child(widgets::badge_active(theme, "In use now"));
     }
-    if let Some(tag) = tag {
+    if let Some(tag) = tag
+        && tag != subscription_label(account)
+    {
         header = header.child(widgets::badge(theme, tag.to_string()));
     }
 
@@ -535,7 +537,7 @@ impl Render for UsageLimitsPage {
         let subscriptions: Vec<&AgentAccount> =
             main.iter().chain(no_quota.iter()).copied().collect();
         let count = subscriptions.len() + other.len();
-        let summary_line = (count > 0).then(|| summary(&subscriptions, now));
+        let summary_line = (!subscriptions.is_empty()).then(|| summary(&subscriptions, now));
 
         let body: Vec<AnyElement> = match &self.snapshot {
             Loadable::Idle | Loadable::Loading => vec![
