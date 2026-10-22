@@ -328,11 +328,23 @@ impl Render for FilesSurface {
             .flex_col()
             .children(header)
             .child(div().flex_1().min_h_0().w_full().child(body))
-            .children(
-                self.mutation_error
-                    .as_ref()
-                    .map(|message| crate::popover::error_row(&theme, message).into_any_element()),
-            )
+            .children(self.mutation_error.as_ref().map(|message| {
+                crate::popover::error_row(&theme, message)
+                    .child(
+                        crate::popover::btn_ghost(
+                            &theme,
+                            "Dismiss",
+                            "files-mutation-error-dismiss",
+                        )
+                        .id("files-mutation-error-dismiss")
+                        .debug_selector(|| "files-mutation-error-dismiss".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.mutation_error = None;
+                            cx.notify();
+                        })),
+                    )
+                    .into_any_element()
+            }))
             .children(editor_context_menu)
             .children(self.render_tree_context_menu(&theme, cx))
             .children(self.render_tree_delete(&theme, window, cx))
@@ -1332,6 +1344,23 @@ mod explorer_tests {
         cx.update(|window, cx| {
             assert!(files.read(cx).tree_focus.is_focused(window));
         });
+    }
+
+    #[gpui::test]
+    fn failed_mutation_error_can_be_dismissed(cx: &mut TestAppContext) {
+        use gpui::Modifiers;
+
+        let (files, cx) = test_support::setup(cx);
+        files.update_in(cx, |files, _, cx| {
+            files.report_mutation_error("Rename failed".into(), cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let dismiss = cx
+            .debug_bounds("files-mutation-error-dismiss")
+            .expect("dismiss control")
+            .center();
+        cx.simulate_click(dismiss, Modifiers::default());
+        files.read_with(cx, |files, _| assert!(files.mutation_error.is_none()));
     }
 
     #[gpui::test]

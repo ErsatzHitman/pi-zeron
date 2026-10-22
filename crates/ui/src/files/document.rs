@@ -173,10 +173,15 @@ impl FileDocument {
         self.is_editable()
             && self.is_dirty()
             && self.pending_save.is_none()
-            && matches!(
-                self.phase,
-                DocumentPhase::Ready | DocumentPhase::SaveFailed(_)
-            )
+            && match &self.phase {
+                DocumentPhase::Ready | DocumentPhase::SaveFailed(_) => true,
+                // An acknowledged conflict stays saveable by overwriting the
+                // version that actually reached the disk. Without a known disk
+                // hash there is nothing to compare the write against, so the
+                // reconcile that reports one has to land first.
+                DocumentPhase::Conflict { disk_hash } => disk_hash.is_some(),
+                _ => false,
+            }
     }
 
     pub fn can_autosave(&self) -> bool {
@@ -196,10 +201,19 @@ impl FileDocument {
         if !self.can_save() {
             return None;
         }
+        // Overwriting is the only write a conflict can accept: the baseline is
+        // the version the conflict reported, not the one the buffer started
+        // from. A further external write conflicts again with a fresher hash.
+        let expected_content_hash = match &self.phase {
+            DocumentPhase::Conflict {
+                disk_hash: Some(hash),
+            } => hash.clone(),
+            _ => self.saved_hash.clone()?,
+        };
         let pending = PendingSave {
             revision: self.revision,
             text,
-            expected_content_hash: self.saved_hash.clone()?,
+            expected_content_hash,
             expected_checkout_id: self.file.as_ref()?.checkout_id.clone(),
             encoding: self.encoding?,
             line_ending: self.line_ending?,
@@ -246,6 +260,16 @@ impl FileDocument {
 
     pub fn mark_external(&mut self, disk_hash: Option<String>) {
         self.autosave_task = None;
+        // A conflict the user already acknowledged must not slide back into a
+        // phase with no save path. Only its overwrite baseline moves, and a
+        // read that reports no hash never clears a baseline we already have: a
+        // stale one just makes the next write conflict again.
+        if let DocumentPhase::Conflict { disk_hash: known } = &mut self.phase {
+            if disk_hash.is_some() {
+                *known = disk_hash;
+            }
+            return;
+        }
         self.phase = DocumentPhase::ExternallyModified { disk_hash };
     }
 
@@ -511,6 +535,56 @@ mod tests {
             } if hash == "disk-hash"
         ));
         assert!(!document.can_autosave());
+    }
+
+    #[test]
+    fn acknowledged_conflict_saves_by_overwriting_the_disk_version() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.set_loaded(text_file());
+        document.mark_user_edit();
+        let revision = document.begin_save("mine".into()).unwrap().revision;
+        assert!(document.conflict_save(revision, Some("disk-hash".into())));
+        assert!(document.can_save());
+        assert!(!document.can_autosave());
+
+        let pending = document.begin_save("mine".into()).unwrap();
+        assert_eq!(pending.expected_content_hash, "disk-hash");
+        assert!(document.finish_save(pending.revision, "mine-hash".into()));
+        assert_eq!(document.saved_hash.as_deref(), Some("mine-hash"));
+        assert!(!document.is_dirty());
+        assert!(matches!(document.phase, DocumentPhase::Ready));
+    }
+
+    #[test]
+    fn conflict_without_a_disk_hash_waits_for_reconciliation() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.set_loaded(text_file());
+        document.mark_user_edit();
+        let revision = document.begin_save("mine".into()).unwrap().revision;
+        assert!(document.conflict_save(revision, None));
+        assert!(!document.can_save());
+
+        // A later read refreshes the overwrite baseline without dropping the
+        // acknowledged conflict back to a phase with no save path.
+        document.mark_external(Some("disk-hash".into()));
+        assert!(matches!(
+            document.phase,
+            DocumentPhase::Conflict {
+                disk_hash: Some(ref hash)
+            } if hash == "disk-hash"
+        ));
+        assert!(document.can_save());
+
+        // A read that reports no hash (a rename retargets the document) keeps
+        // the baseline rather than dropping back to an unsaveable phase.
+        document.mark_external(None);
+        assert!(matches!(
+            document.phase,
+            DocumentPhase::Conflict {
+                disk_hash: Some(ref hash)
+            } if hash == "disk-hash"
+        ));
+        assert!(document.can_save());
     }
 
     #[test]

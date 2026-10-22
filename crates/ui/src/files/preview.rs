@@ -398,6 +398,13 @@ fn document_finishes_review_comment_flush(document: &FileDocument) -> bool {
         )
 }
 
+/// Whether a reconcile read started before the document's last successful save.
+/// Such a snapshot describes a disk state the editor has already written past,
+/// so replaying it would revert the buffer or report a phantom external change.
+fn reconcile_snapshot_is_stale(saved_hash_at_start: Option<&str>, document: &FileDocument) -> bool {
+    document.saved_hash.as_deref() != saved_hash_at_start
+}
+
 fn comment_anchor_range(
     text: &gpui_base::input::Rope,
     line: u32,
@@ -1775,6 +1782,10 @@ impl FilesSurface {
         }
         let key = document.key.clone();
         let generation = document.generation;
+        // The read describes the disk as it was when the request went out. A
+        // save that lands while it is in flight moves the document past that
+        // snapshot, so its result must not be replayed as an external change.
+        let saved_hash_at_start = document.saved_hash.clone();
         let request = ReadWorkspaceFileRequest {
             target: context.target.clone(),
             path: path.clone(),
@@ -1810,11 +1821,20 @@ impl FilesSurface {
                 let Ok(file) = result else {
                     return;
                 };
+                if reconcile_snapshot_is_stale(saved_hash_at_start.as_deref(), document) {
+                    surface.reconcile_document(task_path.clone(), cx);
+                    return;
+                }
                 if file.content_hash == document.saved_hash {
                     let recovered = if matches!(document.phase, DocumentPhase::DeletedOnDisk) {
                         document.restore_on_disk(file);
                         true
-                    } else if matches!(document.phase, DocumentPhase::ExternallyModified { .. }) {
+                    } else if matches!(
+                        document.phase,
+                        DocumentPhase::ExternallyModified { .. } | DocumentPhase::Conflict { .. }
+                    ) {
+                        // The disk matches the last save again, so there is no
+                        // external change left to acknowledge.
                         document.phase = DocumentPhase::Ready;
                         true
                     } else {
@@ -2363,9 +2383,9 @@ impl FilesSurface {
                     DocumentPhase::Conflict { .. } => Some((
                         "Save conflict",
                         theme.warning_muted,
-                        false,
+                        can_save,
                         Some(SharedString::from(
-                            "The file changed on disk. Your editor buffer was preserved.",
+                            "The file changed on disk. Your editor buffer was preserved; saving overwrites the version on disk, or reload to take it.",
                         )),
                     )),
                     DocumentPhase::DeletedOnDisk => Some((
@@ -2381,7 +2401,7 @@ impl FilesSurface {
                         theme.warning_muted,
                         false,
                         Some(SharedString::from(
-                            "The file changed on disk. Review it before saving.",
+                            "The file changed on disk. Keep editing to save over it, or reload from disk.",
                         )),
                     )),
                     _ => None,
@@ -3873,6 +3893,33 @@ mod tests {
 
         assert_eq!(preview.request_reload(path), ReloadDecision::ReloadNow);
         assert!(preview.reload_confirmation.is_none());
+    }
+
+    #[test]
+    fn reconcile_snapshot_from_before_a_save_is_stale() {
+        let mut document = cached_document("src/lib.rs", "saved");
+        document.set_loaded(zeron_proto::WorkspaceFileText {
+            checkout_id: "checkout-1".into(),
+            path: "src/lib.rs".into(),
+            text: Some("saved".into()),
+            content_hash: Some("hash-1".into()),
+            size: 5,
+            modified_at: None,
+            encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+            line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+            read_only_reason: None,
+            truncated: false,
+        });
+        let started = document.saved_hash.clone();
+
+        document.mark_user_edit();
+        let pending = document.begin_save("edited".into()).unwrap();
+        assert!(document.finish_save(pending.revision, "hash-2".into()));
+        assert!(reconcile_snapshot_is_stale(started.as_deref(), &document));
+
+        // A read issued after that save still describes the current document.
+        let started = document.saved_hash.clone();
+        assert!(!reconcile_snapshot_is_stale(started.as_deref(), &document));
     }
 
     #[test]
