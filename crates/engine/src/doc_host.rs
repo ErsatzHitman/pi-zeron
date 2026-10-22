@@ -106,6 +106,12 @@ const ATTACHMENT_WAIT_MAX_MS: i64 = ATTACHMENT_WAIT_MAX.as_millis() as i64;
 /// timer only covers the give-up transition and missed kicks).
 const ATTACHMENT_WAIT_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Resolved command entries kept in a doc's ledger after an outcome lands.
+/// Anything older is inert history (the processed-command table is the replay
+/// dedupe), and every doc change re-reads the ledger twice — so it is compacted
+/// rather than retained for the life of the chat.
+const KEEP_RESOLVED_COMMANDS: usize = 50;
+
 /// Transfer attempt outcome: transient failures retry (the link may heal),
 /// permanent ones stop (the host actively refused, or the bytes are gone).
 enum TransferError {
@@ -5195,6 +5201,13 @@ impl DocHost {
         if !self.is_host(&handle.chat_id) {
             return;
         }
+        // Cheap probe first: both watchers (main drain + controls-only) run
+        // this on EVERY doc change, and materialising the whole ledger as
+        // JSON for an idle chat was pure overhead — the streaming path pays
+        // it twice a tick. No Pending entry = nothing for either kind to do.
+        if !handle.doc.has_pending_commands() {
+            return;
+        }
         // Do not let another drain overtake a prompt waiting for mailbox
         // capacity (or preflight). Controls bypass this lock so a stalled
         // provider can still be interrupted or have its question answered.
@@ -5493,6 +5506,17 @@ impl DocHost {
                 command = %command_id,
                 error = %err,
                 "command outcome write failed"
+            );
+            return;
+        }
+        // The outcome is in the doc, so this entry is now inert history:
+        // compact the ledger instead of letting it grow (and be re-read) for
+        // the life of the chat.
+        if let Err(err) = handle.doc.prune_resolved_commands(KEEP_RESOLVED_COMMANDS) {
+            tracing::warn!(
+                chat = %handle.chat_id,
+                error = %err,
+                "command ledger prune failed"
             );
         }
     }
