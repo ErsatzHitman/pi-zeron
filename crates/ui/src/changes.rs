@@ -2137,10 +2137,17 @@ impl Changes {
             base.as_deref().unwrap_or(""),
             commit_sha.as_deref().unwrap_or("")
         );
-        let watch_sum = self
-            .resolved(cx)
-            .map(|d| d.checksum.clone())
-            .unwrap_or_default();
+        // Only the scopes that render the live working tree key their capture
+        // on its checksum: a pinned commit is immutable, so folding the stream
+        // in would refetch it on every working-tree change (and hold the
+        // subscription open — see [`DiffScope::watches_working_tree`]).
+        let watch_sum = if self.scope.watches_working_tree() {
+            self.resolved(cx)
+                .map(|d| d.checksum.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let key = format!("{context}|{watch_sum}");
         if self.scoped_for.as_deref() == Some(key.as_str())
             || self.scoped_inflight.as_deref() == Some(key.as_str())
