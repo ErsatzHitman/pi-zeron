@@ -17,6 +17,16 @@ use serde_json::Value;
 
 /// pi-goal's state channel: `{active, status, text, detail, startedAt}`;
 /// `status` is `active`, `waiting`, `paused`, `blocked` or `budget_limited`.
+///
+/// `waiting` means the goal loop is parked on an external event (`goal_wait`,
+/// a backoff, an idle check-in) and `detail` says what it waits on. It stays
+/// `waiting` while the session answers a user message typed during that wait:
+/// that turn is an ordinary manual run that does not resume the goal, which
+/// goes on when the wait's deadline elapses, a check-in fires or `/goal resume`
+/// is asked for. So `waiting` is neither idle nor awaiting the user: a reader
+/// counting live work keeps counting it, while one showing state keeps it at
+/// `Waiting` with `detail` verbatim rather than calling it running or asking
+/// the user anything.
 pub const GOAL_CHANNEL: &str = "pi-goal:status";
 
 /// Zeron's own compaction status for a Pi chat ([`CompactStatus`]).

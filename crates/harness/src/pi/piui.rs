@@ -876,7 +876,10 @@ impl ExtensionUi {
                 _ => 0,
             }
         };
-        // A goal loop waits on timers (`goal_wait`, backoff, check-ins).
+        // A goal loop waits on timers (`goal_wait`, backoff, check-ins), and
+        // it keeps waiting while the session answers a user message typed
+        // during that wait: the turn is an ordinary manual run that does not
+        // resume the goal, so the parked loop is still work nobody stopped.
         let goal = self
             .state
             .channels
@@ -1312,6 +1315,8 @@ mod tests {
             "pi-goal:status",
             json!({"active":true,"status":"waiting"}),
         ));
+        // A waiting goal is live work: it is parked on a timer and stays
+        // parked through a user turn typed during the wait.
         assert_eq!(ui.background_tasks(), 3);
         // A live workflow counts once whether it sends one channel or both;
         // a finished one keeps its state on the channel but is not work.
@@ -1328,6 +1333,19 @@ mod tests {
             6,
             "workflow:state",
             json!({"v":1,"run":{"id":"wf","status":"completed","startedAt":1,"endedAt":2}}),
+        ));
+        assert_eq!(ui.background_tasks(), 3);
+        // Paused is not work; waiting is again.
+        ui.handle(&channel(
+            7,
+            "pi-goal:status",
+            json!({"active":true,"status":"paused"}),
+        ));
+        assert_eq!(ui.background_tasks(), 2);
+        ui.handle(&channel(
+            8,
+            "pi-goal:status",
+            json!({"active":true,"status":"waiting","detail":"waiting: CI"}),
         ));
         assert_eq!(ui.background_tasks(), 3);
         // Nobody watching: the channels still count.
