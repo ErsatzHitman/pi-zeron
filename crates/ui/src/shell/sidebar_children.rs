@@ -585,6 +585,7 @@ impl Shell {
             state.chats.iter().find(|chat| chat.id == id).map(|chat| {
                 (
                     SharedString::from(transcript::single_line(&child_title(chat))),
+                    Some(chat.device_id.clone()),
                     SharedString::from(format_time_ago(
                         chat.last_message_at.unwrap_or(chat.created_at),
                         now,
@@ -592,11 +593,12 @@ impl Shell {
                 )
             })
         };
-        let Some((title, time_ago)) = row else {
+        let Some((title, device_id, time_ago)) = row else {
             return div().into_any_element();
         };
         self.render_chat_row(
             id.to_owned(),
+            device_id,
             title,
             time_ago,
             SharedString::default(),

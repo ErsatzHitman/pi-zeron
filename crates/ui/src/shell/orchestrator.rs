@@ -694,13 +694,14 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (title, time_ago, status, selected) = {
+        let (title, device_id, time_ago, status, selected) = {
             let state = self.state.read(cx);
             let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
             (
                 SharedString::from(transcript::single_line(
                     &chat.title.clone().unwrap_or_else(|| "New session".into()),
                 )),
+                Some(chat.device_id.clone()),
                 SharedString::from(format_time_ago(
                     chat.last_message_at.unwrap_or(chat.created_at),
                     now,
@@ -711,6 +712,7 @@ impl Shell {
         };
         let row = self.render_chat_row(
             chat_id.to_owned(),
+            device_id,
             title,
             time_ago,
             label,
