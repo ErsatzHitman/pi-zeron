@@ -153,8 +153,11 @@ fn thinking_option(data: &Value) -> Vec<ModelOption> {
         ],
     }]
 }
-/// Extension commands that act only on Pi's terminal screen.
-const TERMINAL_ONLY: [&str; 1] = ["claude-refusal-rewind"];
+/// Extension commands that act only on Pi's terminal screen: they pick
+/// through Pi's own `ui.select` and write to its editor, none of which Zeron
+/// sees, so offering them would leave the two out of step. Zeron's rewind is
+/// its own (`pi_ui_rewind`, from the message's menu).
+const TERMINAL_ONLY: [&str; 2] = ["claude-refusal-rewind", "rewind"];
 /// The user extension `00-zeron-completions.ts`: run as a prompt, it answers
 /// with one notify carrying every command's argument completions, which
 /// Pi's RPC `get_commands` leaves out.
@@ -406,10 +409,12 @@ mod tests {
         let listed = commands(&json!({"commands":[
             {"name":"pi_ui_event","description":"Internal","source":"extension"},
             {"name":"claude-refusal-rewind","description":"Redraw","source":"extension"},
+            {"name":"rewind","description":"Rewind","source":"extension"},
             {"name":"todo","description":"Todos","source":"extension"},
         ]}));
         assert!(listed.iter().all(|c| !c.name.starts_with("pi_ui_")));
         assert!(listed.iter().all(|c| c.name != "claude-refusal-rewind"));
+        assert!(listed.iter().all(|c| c.name != "rewind"), "terminal only");
         assert!(listed.iter().any(|c| c.name == "todo"));
     }
 
