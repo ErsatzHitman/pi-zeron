@@ -485,6 +485,10 @@ impl UsagePage {
             self.period = period;
             self.hidden.clear();
             self.load(false, cx);
+        } else if matches!(self.status, Status::Error(_)) {
+            // A failed switch left this tab showing the error; selecting it
+            // again retries rather than stranding the page on the failure.
+            self.load(false, cx);
         }
     }
 
@@ -1377,15 +1381,17 @@ mod tests {
             let calls = calls.clone();
             move |method, _| {
                 assert_eq!(method, methods::GET_USAGE_REPORT);
-                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                // The first load succeeds, the switch's query fails, and a
+                // retry of the failed tab succeeds again.
+                let call = calls.fetch_add(1, Ordering::SeqCst);
                 async move {
-                    if first {
+                    if call == 1 {
+                        Err(RpcError::Failed("engine busy".into()))
+                    } else {
                         zeron_rpc::RpcReply::value(&UsageReport {
                             models: vec![row("anthropic", "opus", 100, 5.0, 0.0)],
                             ..Default::default()
                         })
-                    } else {
-                        Err(RpcError::Failed("engine busy".into()))
                     }
                 }
             }
@@ -1402,6 +1408,17 @@ mod tests {
                 matches!(page.status, Status::Error(_)),
                 "a failed period switch must report the failure, not pass off the \
                  previous period's report: {:?}",
+                page.status
+            );
+        });
+        // Selecting the failed tab again retries, so the page is not stranded
+        // on the error once the engine recovers.
+        page.update(cx, |page, cx| page.set_period(Period::Week, cx));
+        rpc.settle(cx, &runtime, |_| rpc.completed() >= 3);
+        page.read_with(cx, |page, _| {
+            assert!(
+                matches!(page.status, Status::Ready(_)),
+                "retrying the failed tab must load the report again: {:?}",
                 page.status
             );
         });

@@ -1479,6 +1479,114 @@ mod tests {
             );
         });
     }
+
+    /// Switching away and back to the same device must not let the first visit's
+    /// in-flight toggle reply (or its catalog) land on the returned list.
+    #[gpui::test]
+    fn a_toggle_from_a_previous_visit_to_the_same_device_never_lands(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        use gpui::AppContext;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use zeron_rpc::methods;
+
+        fn descriptor(
+            id: zeron_proto::HarnessId,
+            name: &str,
+        ) -> zeron_engine::registry::HarnessDescriptor {
+            zeron_engine::registry::HarnessDescriptor {
+                id,
+                name: name.into(),
+                supports_steering: false,
+                steering_mode: zeron_proto::SteeringMode::TurnBoundary,
+                reasoning_levels: Vec::new(),
+                installed: true,
+                can_install: false,
+                enabled: Some(true),
+            }
+        }
+
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, Default::default());
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let rpc = ScriptedRpc::new({
+            let started = started.clone();
+            let release = release.clone();
+            move |method, params| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    match method.as_str() {
+                        methods::LIST_HARNESSES => {
+                            let device = params
+                                .get("targetDeviceId")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("local")
+                                .to_owned();
+                            zeron_rpc::RpcReply::value(&vec![descriptor(
+                                zeron_proto::HarnessId::Pi,
+                                &device,
+                            )])
+                        }
+                        methods::SET_HARNESS_ENABLED => {
+                            started.store(true, Ordering::SeqCst);
+                            release.notified().await;
+                            zeron_rpc::RpcReply::value(&vec![descriptor(
+                                zeron_proto::HarnessId::Mock,
+                                "stale",
+                            )])
+                        }
+                        other => panic!("unexpected RPC: {other}"),
+                    }
+                }
+            }
+        });
+        let state = cx.update(|cx| fixture::state(cx, Some(rpc.client())));
+        let page = cx.new(|cx| super::HarnessesPage::new(state, cx));
+        fn shows(
+            page: &gpui::Entity<super::HarnessesPage>,
+            cx: &mut gpui::TestAppContext,
+            name: &str,
+        ) -> bool {
+            page.read_with(cx, |page, _| {
+                matches!(&page.harnesses, super::Loadable::Ready(list)
+                    if list.iter().any(|d| d.name == name))
+            })
+        }
+        rpc.settle(cx, &runtime, |cx| shows(&page, cx, "local"));
+        page.update(cx, |page, cx| {
+            page.set_target_device(Some("a".into()), cx)
+        });
+        rpc.settle(cx, &runtime, |cx| shows(&page, cx, "a"));
+        page.update(cx, |page, cx| {
+            page.set_enabled(zeron_proto::HarnessId::Pi, false, cx)
+        });
+        rpc.settle(cx, &runtime, |_| started.load(Ordering::SeqCst));
+        page.update(cx, |page, cx| {
+            page.set_target_device(Some("b".into()), cx)
+        });
+        rpc.settle(cx, &runtime, |cx| shows(&page, cx, "b"));
+        page.update(cx, |page, cx| {
+            page.set_target_device(Some("a".into()), cx)
+        });
+        rpc.settle(cx, &runtime, |cx| shows(&page, cx, "a"));
+        // The toggle from the first visit to A is still in flight; its reply
+        // must not repaint the A list the user just came back to.
+        release.notify_one();
+        rpc.settle(cx, &runtime, |_| rpc.completed() >= 5);
+        page.read_with(cx, |page, _| {
+            assert!(page.pending_toggle.is_none());
+            assert!(
+                matches!(&page.harnesses, super::Loadable::Ready(list)
+                    if list.iter().all(|d| d.name == "a")),
+                "a reply from the previous visit to this device must be dropped"
+            );
+        });
+    }
 }
 
 #[cfg(test)]

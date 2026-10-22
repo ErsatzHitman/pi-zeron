@@ -2992,6 +2992,48 @@ mod tests {
         });
     }
 
+    /// A pick that is cancelled after the managed file has been staged but
+    /// before the settings commit must not leak that file into the managed
+    /// directory: dropping `PreparedBackgroundFile` retires it.
+    #[gpui::test]
+    fn a_cancelled_async_background_install_leaves_no_managed_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("chosen.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([20, 100, 200, 255]))
+            .save(&source)
+            .unwrap();
+        let backgrounds = dir.path().join(NEW_THREAD_BACKGROUND_DIR);
+        let task = cx.update(|cx| {
+            init(UiSettings::default(), dir.path(), cx);
+            install_new_thread_composer_background_async(source.clone(), cx)
+        });
+        // Step the scheduler one task at a time until the worker has staged
+        // the managed file, then drop the pick before the commit can run.
+        let mut staged = false;
+        for _ in 0..64 {
+            if std::fs::read_dir(&backgrounds).map(|dir| dir.count()).unwrap_or(0) == 1 {
+                staged = true;
+                break;
+            }
+            if !cx.executor().tick() {
+                break;
+            }
+        }
+        assert!(staged, "the worker must stage the managed file first");
+        drop(task);
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_dir(&backgrounds)
+                .map(|dir| dir.count())
+                .unwrap_or(0),
+            0,
+            "a cancelled pick must not leak a managed file"
+        );
+        cx.update(|cx| assert!(current(cx).new_thread_composer_background.is_none()));
+    }
+
     #[gpui::test]
     fn invalid_initial_background_import_does_not_create_managed_files_or_settings(
         cx: &mut gpui::TestAppContext,
