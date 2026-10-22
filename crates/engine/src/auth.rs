@@ -555,7 +555,12 @@ impl Auth {
         *lock(&self.inner.stored) = None;
         *lock(&self.inner.access) = None;
         self.retry_refresh();
-        self.persist::<&StoredSession>(None);
+        // Sign-out must complete even if the file cannot be removed: the
+        // in-memory session is already gone, and a leftover file only matters
+        // after a restart, where the rejected refresh signs the user out again.
+        if let Err(err) = self.persist(None) {
+            tracing::warn!(error = %err, "auth: failed to remove the persisted session");
+        }
         self.inner.state_tx.send_replace(AuthState::SignedOut);
         self.inner
             .token_tx
@@ -728,13 +733,18 @@ impl Auth {
             ));
         }
         let org_id = jwt_claims(&result.access_token).and_then(|c| c.org_id);
-        *lock(&self.inner.access) = Some(AccessEntry::fresh(result.access_token));
         let session = StoredSession {
             refresh_token: result.refresh_token,
             user: result.user.clone(),
             org_id: org_id.clone(),
         };
-        self.persist(Some(&session));
+        // Persist before committing any in-memory state: a session that cannot
+        // be saved would look signed in until the next launch, then silently
+        // sign out. Surface the failure so the user can retry instead.
+        self.persist(Some(&session)).map_err(|err| {
+            EngineError::Other(format!("signed in, but the session could not be saved: {err}"))
+        })?;
+        *lock(&self.inner.access) = Some(AccessEntry::fresh(result.access_token));
         *lock(&self.inner.stored) = Some(session);
         self.retry_refresh();
         tracing::info!(email = %result.user.email, org = org_id.as_deref().unwrap_or("<none>"),
@@ -886,8 +896,16 @@ impl Auth {
             }
         };
         let status = res.status().as_u16();
-        if (400..500).contains(&status) && !matches!(status, 408 | 429) && organization_id.is_none()
-        {
+        // Only 400/401/403 mean the credential itself was rejected (revoked
+        // session, deleted user, `invalid_grant`): that can NEVER succeed again,
+        // so degrade to SignedOut and quiet every downstream retry loop. Every
+        // other 4xx (404/405 from an edge that predates this route, 408/413/415/
+        // 422/429 from a proxy, …) is infrastructure, not a dead session —
+        // signing out there costs the user a needless re-login, so retry with
+        // backoff instead. (Org-switch refreshes are exempt either way: a 4xx
+        // there means "not a member", not a dead session.)
+        let revoked = matches!(status, 400 | 401 | 403);
+        if revoked && organization_id.is_none() {
             let mut sign_in = lock(&self.inner.sign_in);
             if sign_in.generation != generation
                 || lock(&self.inner.stored)
@@ -896,11 +914,6 @@ impl Auth {
             {
                 return Ok(None);
             }
-            // Timeouts/rate limits are retryable. Other 4xx responses mean a
-            // rejected refresh (revoked session,
-            // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
-            // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
-            // there means "not a member", not a dead session.)
             tracing::warn!(
                 status,
                 "auth: refresh rejected — session revoked; signing out"
@@ -947,7 +960,13 @@ impl Auth {
                 None => return Ok(None), // signed out mid-refresh
             }
         };
-        self.persist(lock(&self.inner.stored).as_ref());
+        // The rotated refresh token is already live in memory; failing the
+        // refresh here would strand every consumer behind a retry cooldown for
+        // a disk problem a retry cannot fix. Log loudly instead: the on-disk
+        // session is now stale, so the next launch may need a fresh sign-in.
+        if let Err(err) = self.persist(lock(&self.inner.stored).as_ref()) {
+            tracing::error!(error = %err, "auth: failed to persist the rotated session");
+        }
         if org_changed {
             self.inner.state_tx.send_replace(state_for(user, org_id));
         }
@@ -961,21 +980,22 @@ impl Auth {
         self.inner.config.data_dir.join("session.json")
     }
 
-    /// Persist (0600) or remove the stored session. Never panics: a disk error degrades
-    /// to a logged warning, not a crash mid-refresh.
-    fn persist<S: std::borrow::Borrow<StoredSession>>(&self, session: Option<S>) {
+    /// Persist (0600) or remove the stored session. The write is atomic, so a
+    /// crash or a full disk can never leave a truncated `session.json` behind:
+    /// the previous file survives intact until the replacement is durable.
+    /// Callers decide whether a disk error is fatal (sign-in) or only logged
+    /// (the session is still valid in memory).
+    fn persist(&self, session: Option<&StoredSession>) -> std::io::Result<()> {
         let path = self.session_file();
-        let outcome = match session {
-            Some(session) => serde_json::to_vec(session.borrow())
-                .map_err(std::io::Error::other)
-                .and_then(|bytes| write_private(&path, &bytes)),
+        match session {
+            Some(session) => {
+                let bytes = serde_json::to_vec(session).map_err(std::io::Error::other)?;
+                write_private(&path, &bytes)
+            }
             None => match std::fs::remove_file(&path) {
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
                 _ => Ok(()),
             },
-        };
-        if let Err(err) = outcome {
-            tracing::warn!(error = %err, "auth: failed to persist session");
         }
     }
 
@@ -1262,31 +1282,74 @@ fn url_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Write a file readable only by the owner (0600). On non-unix targets a plain write.
+/// Write a file readable only by the owner (0600), atomically: the bytes are
+/// staged in the destination directory, synced, then renamed into place, so a
+/// crash or a full disk never leaves a truncated `session.json` (which would
+/// hold a refresh token the server has already rotated away).
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        // An existing file keeps its old mode through OpenOptions — enforce 0600 anyway.
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        file.write_all(bytes)
+        use std::os::unix::fs::PermissionsExt;
+        // An existing file keeps its old mode through a plain write — enforce
+        // 0600 on the staging file so the rename can never publish it wider.
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
+    std::io::Write::write_all(&mut tmp, bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|err| err.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_private_replaces_the_session_in_place_with_owner_only_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, b"old").unwrap();
+
+        write_private(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "session file must stay private");
+        }
+        // The staging file is renamed into place, never left beside it.
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "no temp file may survive the write");
+    }
+
+    #[test]
+    fn persist_reports_a_write_error_instead_of_swallowing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // A data dir that does not exist: staging the atomic write cannot
+        // succeed, so the error must reach the caller (sign-in fails loudly).
+        let config = AuthConfig::new("https://edge.invalid", dir.path().join("missing"));
+        let auth = Auth::new(config);
+        let session = StoredSession {
+            refresh_token: "refresh-1".into(),
+            user: AuthUser {
+                id: "user_1".into(),
+                email: "u@example.com".into(),
+                name: None,
+            },
+            org_id: None,
+        };
+        assert!(auth.persist(Some(&session)).is_err());
+    }
 
     #[tokio::test]
     async fn concurrent_dns_failure_is_shared_with_http_and_room_consumers() {
