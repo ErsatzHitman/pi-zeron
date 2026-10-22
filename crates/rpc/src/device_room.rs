@@ -336,9 +336,9 @@ impl HostRelay {
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
             // away, client dials bounce with "readiness check failed" (user
-            // report) — so a session that ENDED CLEANLY after a healthy
-            // stretch rejoins near-instantly, and only rapid consecutive
-            // failures walk the backoff.
+            // report) — so a session that ENDED after a healthy stretch rejoins
+            // near-instantly, and only a session that connects and then dies
+            // (cleanly or not) walks the backoff.
             let mut delay = HOST_REJOIN_MIN;
             loop {
                 match config.token.token().await {
@@ -415,8 +415,8 @@ impl Drop for HostRelay {
     }
 }
 
-/// Floor for host-relay rejoins after a clean/healthy session end — the DO
-/// evicting an idle host must not leave a multi-second unreachable window.
+/// Floor for host-relay rejoins: the DO evicting an idle host must not leave a
+/// multi-second unreachable window, and a healthy session's end resets to it.
 const HOST_REJOIN_MIN: Duration = Duration::from_millis(250);
 /// A session that lasted at least this long counts as healthy: its end is the
 /// DO's lifecycle, not our failure, so the rejoin does not escalate.
@@ -433,6 +433,7 @@ fn rejoin_delay(healthy: bool, delay: Duration, retry: Duration) -> Duration {
         (delay * 2).min(retry)
     }
 }
+
 /// In-call dial retries (see [`LinkCache::client`]): total attempts, and the
 /// spacing multiplier between them (1.5s, then 3s — ~4.5s of cover, several
 /// times the host's post-eviction rejoin window).

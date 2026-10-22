@@ -701,8 +701,10 @@ pub fn resolve_space_in(spaces: &[Space], key: &str) -> anyhow::Result<Space> {
 }
 
 /// One path spelled the way every host spells it: separators unified, trailing
-/// ones dropped, and Windows paths (drive letter or UNC) folded to lower case,
-/// where the file system is case-insensitive.
+/// ones dropped, and Windows paths folded to lower case — a host that hands
+/// back `c:/Users/Me/T3Code` names the same folder as `C:\Users\me\t3code`.
+/// The folding is for lookup only, so two Windows folders that really do
+/// differ in case surface as an ambiguity error rather than a silent pick.
 fn path_key(path: &str) -> String {
     let path = path.trim().replace('\\', "/");
     let path = path.trim_end_matches('/');
@@ -713,17 +715,15 @@ fn path_key(path: &str) -> String {
     }
 }
 
+/// A drive letter (`C:`), or a UNC root (a Windows host spells it with
+/// backslashes; forward ones reach us as a `//server/share` prefix).
 fn is_windows_path(path: &str) -> bool {
     path.as_bytes().get(1) == Some(&b':') || path.starts_with("//")
 }
 
 fn same_path(a: &str, b: &str) -> bool {
-    let (a, b) = (path_key(a), path_key(b));
-    if is_windows_path(&a) || is_windows_path(&b) {
-        a.eq_ignore_ascii_case(&b)
-    } else {
-        a == b
-    }
+    // `path_key` already folded a Windows path, so plain equality says it.
+    path_key(a) == path_key(b)
 }
 
 /// Whether `suffix` names the tail of `path` on a folder boundary.
@@ -933,6 +933,19 @@ mod tests {
             assert_eq!(resolve_space_in(&spaces, key).unwrap().id, "win", "{key}");
         }
         assert!(resolve_space_in(&spaces, "Users").is_err());
+        // A POSIX path keeps its case: only Windows spellings fold.
+        let spaces = vec![space("posix", "/home/ana/Comet", None)];
+        assert!(resolve_space_in(&spaces, "/home/ana/comet").is_err());
+        // Folding is for lookup, so two Windows twins differing in case are an
+        // ambiguity to resolve by id, never a silent pick.
+        let spaces = vec![
+            space("upper", r"C:\Repo\Comet", None),
+            space("lower", r"C:\repo\comet", None),
+        ];
+        let err = resolve_space_in(&spaces, "c:/repo/comet")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 projects match"), "{err}");
         // A twin folder that merely starts the same way is not a match.
         let spaces = vec![space("old", "/code/t3code-old", None)];
         let err = resolve_space_in(&spaces, "t3code").unwrap_err().to_string();
