@@ -5,7 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use zeron_proto::{
-    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceContentRequest,
+    Chat, ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceContentRequest,
     SearchWorkspaceFilesRequest, WarmWorkspaceSearchRequest, WarmWorkspaceSearchResult,
     WatchWorkspaceFilesRequest, WorkspaceContentSearchResult, WorkspaceDirectoryPage,
     WorkspaceFileSearchMatch, WorkspaceFileText, WorkspaceTarget, WriteWorkspaceFileOutcome,
@@ -26,6 +26,13 @@ pub struct FilesRequestContext {
 impl FilesRequestContext {
     pub fn for_chat(state: &AppState, chat_id: &str) -> Option<Self> {
         let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
+        Self::for_chat_row(state, chat)
+    }
+
+    /// Build the context from a chat row the caller already resolved. The
+    /// files surface keeps the row it scanned for its own target check, so it
+    /// does not scan `state.chats` a second time per render (audit #88).
+    pub fn for_chat_row(state: &AppState, chat: &Chat) -> Option<Self> {
         let cwd = chat
             .cwd
             .clone()
@@ -399,6 +406,71 @@ mod tests {
             space_id: None,
             checkout_path: None,
         }
+    }
+
+    fn chat(id: &str, device: &str, cwd: Option<&str>, space: Option<&str>) -> Chat {
+        Chat {
+            id: id.into(),
+            device_id: device.into(),
+            title: None,
+            archived: false,
+            cwd: cwd.map(str::to_string),
+            branch: None,
+            checkout_id: space.map(|_| "checkout".to_string()),
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
+                .unwrap()
+                .to_utc(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            parent_chat_id: None,
+            space_id: space.map(str::to_string),
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    #[test]
+    fn context_from_a_resolved_row_matches_the_by_id_lookup() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        state.chats = vec![
+            chat("local", "local", Some("/work"), Some("space")),
+            chat("remote", "other", Some("/remote"), None),
+            // A space chat without a cwd has no workspace to open.
+            chat("no-cwd", "local", None, Some("space")),
+            // A projectless chat roots at the home directory.
+            chat("projectless", "local", None, None),
+        ];
+        for row in &state.chats {
+            let by_id = FilesRequestContext::for_chat(&state, &row.id);
+            let by_row = FilesRequestContext::for_chat_row(&state, row);
+            assert_eq!(by_id, by_row, "{}", row.id);
+        }
+        assert_eq!(
+            FilesRequestContext::for_chat_row(&state, &state.chats[0])
+                .unwrap()
+                .target_device_id,
+            None,
+            "the local device is addressed directly"
+        );
+        assert_eq!(
+            FilesRequestContext::for_chat_row(&state, &state.chats[1])
+                .unwrap()
+                .target_device_id
+                .as_deref(),
+            Some("other")
+        );
+        assert!(FilesRequestContext::for_chat_row(&state, &state.chats[2]).is_none());
+        assert_eq!(
+            FilesRequestContext::for_chat_row(&state, &state.chats[3])
+                .unwrap()
+                .cwd,
+            "~"
+        );
     }
 
     fn directory_page(name: &str, next: Option<&str>) -> Value {

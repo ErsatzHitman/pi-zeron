@@ -216,14 +216,22 @@ impl FilesSurface {
                 // and bottom edges while there is more to scroll to, read
                 // from the list's own offset at paint time.
                 let overflow = self.tree_list.clone();
+                // Rows share one theme clone per frame instead of cloning it
+                // per visible row (audit #88).
+                let row_theme = theme.clone();
                 crate::edge_fade::edge_faded(
                     TREE_FADE_BAND,
                     true,
                     true,
-                    list(self.tree_list.clone(), cx.processor(Self::render_tree_row))
-                        .flex_1()
-                        .min_h_0()
-                        .with_sizing_behavior(ListSizingBehavior::Auto),
+                    list(
+                        self.tree_list.clone(),
+                        cx.processor(move |this: &mut Self, index, window, cx| {
+                            this.render_tree_row(index, &row_theme, window, cx)
+                        }),
+                    )
+                    .flex_1()
+                    .min_h_0()
+                    .with_sizing_behavior(ListSizingBehavior::Auto),
                 )
                 .fade_overflow_y_with(move |_| tree_scroll_overflow(&overflow))
             })
@@ -234,13 +242,16 @@ impl FilesSurface {
     fn render_tree_row(
         &mut self,
         index: usize,
+        theme: &Theme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(row) = self.tree.visible_rows().get(index).cloned() else {
+        // Borrow the row and node instead of cloning them per frame; only the
+        // strings that must outlive the element (element ids, drop targets and
+        // listener payloads) are cloned (audit #88).
+        let Some(row) = self.tree.visible_rows().get(index) else {
             return gpui::Empty.into_any_element();
         };
-        let theme = Theme::of(cx).clone();
         let padding = 8.0 + row.depth as f32 * TREE_INDENT;
         let drop_key = row.path.clone();
         let drop_target = match &row.kind {
@@ -248,9 +259,9 @@ impl FilesSurface {
             VisibleRowKind::Empty { directory } => Some(directory.clone()),
             _ => None,
         };
-        let content = match row.kind {
+        let content = match &row.kind {
             VisibleRowKind::Entry => {
-                let Some(node) = self.tree.node(&row.path).cloned() else {
+                let Some(node) = self.tree.node(&row.path) else {
                     return gpui::Empty.into_any_element();
                 };
                 let path = row.path.clone();
@@ -272,7 +283,7 @@ impl FilesSurface {
                 let rename_element = self.render_tree_rename(&path, cx);
                 let expanded = is_directory && self.tree.is_expanded(&path);
                 let text_color = if let Some(decoration) = decoration {
-                    decoration.color(&theme)
+                    decoration.color(theme)
                 } else if selected {
                     theme.text
                 } else {
@@ -376,7 +387,7 @@ impl FilesSurface {
                             .font_family(theme.font_sans.clone())
                             .text_size(px(11.5))
                             .text_color(text_color)
-                            .child(node.entry.name)
+                            .child(node.entry.name.clone())
                             .into_any_element()
                     }))
                     .into_any_element()
@@ -386,73 +397,80 @@ impl FilesSurface {
                 padding + TREE_INDENT,
                 "Loading…",
                 theme.text_faint,
-                &theme,
+                theme,
             ),
             VisibleRowKind::Empty { .. } => status_row(
                 index,
                 padding + TREE_INDENT,
                 "Empty folder",
                 theme.text_faint.opacity(0.7),
-                &theme,
+                theme,
             ),
-            VisibleRowKind::Error { directory, message } => div()
-                .id(("files-tree-error", index))
-                .h(px(TREE_ROW_HEIGHT))
-                .w_full()
-                .flex_none()
-                .pl(px(padding + TREE_INDENT))
-                .pr(px(8.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::wash(0.055)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let cursor = this
-                        .tree
-                        .node(&directory)
-                        .and_then(|node| match &node.load {
-                            DirectoryLoadState::Error { cursor, .. } => cursor.clone(),
-                            _ => None,
-                        });
-                    this.load_directory(directory.clone(), cursor, cx);
-                }))
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(10.5))
-                        .text_color(theme.danger.opacity(0.82))
-                        .child(format!("{message} — Retry")),
-                )
-                .into_any_element(),
-            VisibleRowKind::LoadMore { directory, cursor } => div()
-                .id(("files-tree-more", index))
-                .h(px(TREE_ROW_HEIGHT))
-                .w_full()
-                .flex_none()
-                .pl(px(padding + TREE_INDENT))
-                .pr(px(8.0))
-                .flex()
-                .items_center()
-                .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::wash(0.055)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.load_directory(directory.clone(), Some(cursor.clone()), cx);
-                }))
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_muted)
-                        .child("Load more…"),
-                )
-                .into_any_element(),
+            VisibleRowKind::Error { directory, message } => {
+                let directory = directory.clone();
+                div()
+                    .id(("files-tree-error", index))
+                    .h(px(TREE_ROW_HEIGHT))
+                    .w_full()
+                    .flex_none()
+                    .pl(px(padding + TREE_INDENT))
+                    .pr(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::wash(0.055)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let cursor = this
+                            .tree
+                            .node(&directory)
+                            .and_then(|node| match &node.load {
+                                DirectoryLoadState::Error { cursor, .. } => cursor.clone(),
+                                _ => None,
+                            });
+                        this.load_directory(directory.clone(), cursor, cx);
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(theme.danger.opacity(0.82))
+                            .child(format!("{message} — Retry")),
+                    )
+                    .into_any_element()
+            }
+            VisibleRowKind::LoadMore { directory, cursor } => {
+                let directory = directory.clone();
+                let cursor = cursor.clone();
+                div()
+                    .id(("files-tree-more", index))
+                    .h(px(TREE_ROW_HEIGHT))
+                    .w_full()
+                    .flex_none()
+                    .pl(px(padding + TREE_INDENT))
+                    .pr(px(8.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::wash(0.055)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.load_directory(directory.clone(), Some(cursor.clone()), cx);
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted)
+                            .child("Load more…"),
+                    )
+                    .into_any_element()
+            }
         };
         self.track_tree_drop_row(
             drop_key,
             drop_target,
             TREE_ROW_HEIGHT,
-            with_indent_guides(content, row.depth, TREE_ROW_HEIGHT, &theme),
+            with_indent_guides(content, row.depth, TREE_ROW_HEIGHT, theme),
         )
     }
 

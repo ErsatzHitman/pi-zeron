@@ -6317,6 +6317,10 @@ pub struct Composer {
     /// delivery. The text buffer is kept until Finish receives an ACK.
     pub(crate) queue_edit_lease_id: Option<String>,
     pub(crate) queue_edit_base_text_hash: Option<String>,
+    /// Host paths of the attachments a queue edit loaded, keyed by staged
+    /// attachment id. Committing an edit reuses them instead of re-uploading
+    /// attachments the user never touched (audit #64).
+    pub(crate) queue_edit_loaded_paths: HashMap<String, String>,
     pub(crate) queue_edit_chat_id: Option<String>,
     pub(crate) queue_edit_host_device_id: Option<String>,
     pub(crate) queue_edit_instance_id: String,
@@ -6650,6 +6654,7 @@ impl Composer {
             key_warned: None,
             queue_edit_lease_id: None,
             queue_edit_base_text_hash: None,
+            queue_edit_loaded_paths: HashMap::new(),
             queue_edit_chat_id: None,
             queue_edit_host_device_id: None,
             queue_edit_instance_id: uuid::Uuid::new_v4().to_string(),
