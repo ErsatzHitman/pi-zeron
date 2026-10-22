@@ -32,6 +32,7 @@ pub mod shortcuts;
 pub mod pi;
 pub mod thread_naming;
 pub mod usage;
+pub mod usage_limits;
 pub mod wallpaper;
 pub mod wallpaper_colors;
 pub mod widgets;
@@ -2535,6 +2536,10 @@ mod tests {
             alias.settings_section.reopenable(),
             SettingsSection::Harnesses
         );
+        // The new Usage limits section round-trips through its own slug.
+        let limits: UiSettings =
+            serde_json::from_str(r#"{"settingsSection":"usage-limits"}"#).unwrap();
+        assert_eq!(limits.settings_section, SettingsSection::UsageLimits);
     }
 
     #[test]

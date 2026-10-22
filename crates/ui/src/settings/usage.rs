@@ -1081,7 +1081,20 @@ impl Render for UsagePage {
                                 ))
                                 .child(tabs)
                                 // Stale numbers dim while fresh ones load.
-                                .child(div().when(stale, |el| el.opacity(0.6)).children(body)),
+                                .child(div().when(stale, |el| el.opacity(0.6)).children(body))
+                                // Token accounting, not plan quotas: point at the
+                                // page that shows each subscription's windows.
+                                .child(
+                                    div()
+                                        .mt(px(16.0))
+                                        .px(px(8.0))
+                                        .text_size(crate::typography::ui_rems(11.0))
+                                        .line_height(crate::typography::ui_rems(15.0))
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from(
+                                            "Plan rate limits for each subscription live in Settings → Usage limits.",
+                                        )),
+                                ),
                         ),
                 )
                 .fade_overflow_y(&self.scroll.scroll),
