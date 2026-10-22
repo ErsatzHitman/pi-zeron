@@ -282,8 +282,10 @@ fn chat_copy_path(chat: &zeron_proto::Chat) -> Option<&str> {
 
 /// Absolute on the HOST, whatever the viewer's OS: a remote engine may hand a
 /// POSIX path to a Windows viewport (no drive, so `Path::is_absolute` says
-/// no) or a drive path to a POSIX one.
-fn is_host_absolute_path(path: &str) -> bool {
+/// no) or a drive path to a POSIX one. The file surface's outside checks use
+/// the same shape test, so an outside link a Windows host can open never
+/// reads as a workspace-relative document.
+pub(crate) fn is_host_absolute_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     path.starts_with('/')
         || path.starts_with("\\\\")
@@ -4255,7 +4257,10 @@ impl Shell {
                 None => (
                     chat_id.to_owned(),
                     crate::workspace_links::WorkspaceFileLink {
-                        path: roots[root].absolute(&link).to_string_lossy().into_owned(),
+                        // The wire spelling, not the host's: the read request
+                        // is classified by shape, so `C:\…` must arrive as
+                        // `C:/…`.
+                        path: roots[root].absolute_wire_path(&link),
                         outside: true,
                         ..link
                     },

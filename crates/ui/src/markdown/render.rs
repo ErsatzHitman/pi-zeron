@@ -173,9 +173,10 @@ impl LinkUi {
                 let absolute = root.absolute(&link);
                 // A project root past the linking chat's own opens by
                 // absolute path (see `Shell::open_workspace_file_link`), so
-                // its hover card shows that path too.
+                // its hover card shows that path too — in the same wire
+                // spelling the read request carries.
                 let path = if ix > 0 && root.chat.is_none() {
-                    absolute.to_string_lossy().into_owned()
+                    root.absolute_wire_path(&link)
                 } else {
                     link.path
                 };

@@ -103,6 +103,14 @@ impl FileLinkRoot {
     pub(crate) fn absolute(&self, link: &WorkspaceFileLink) -> PathBuf {
         Path::new(&self.root).join(&link.path)
     }
+
+    /// The same file in the wire spelling an absolute read request carries:
+    /// `/` separators, so a Windows checkout's `C:\dir\f.md` arrives as
+    /// `C:/dir/f.md`. The engine classifies that shape as absolute; the
+    /// relative grammar it would otherwise reach rejects ':' and '\'.
+    pub(crate) fn absolute_wire_path(&self, link: &WorkspaceFileLink) -> String {
+        format!("{}/{}", self.root.trim_end_matches(['\\', '/']), link.path).replace('\\', "/")
+    }
 }
 
 /// What one filesystem probe found at a candidate path.
@@ -1202,6 +1210,35 @@ mod tests {
         // file name unless the target is a `file://` URL.
         assert!(resolve_workspace_file_link("C:\\Users\\dev\\project\\", root).is_none());
         assert!(resolve_workspace_file_link("C:\\Users\\dev\\BASE", root).is_none());
+    }
+
+    /// A project root past the linking chat's own opens by absolute path (see
+    /// `Shell::open_workspace_file_link`), so that path must be the wire
+    /// spelling the engine classifies as absolute on every host.
+    #[test]
+    fn an_owned_root_outside_the_linking_checkout_spells_its_read_path_for_the_wire() {
+        let windows = FileLinkRoot {
+            chat: None,
+            root: "C:\\Users\\dev\\project\\".into(),
+            local: true,
+        };
+        assert_eq!(
+            windows.absolute_wire_path(&link("src/lib.rs", None, None)),
+            "C:/Users/dev/project/src/lib.rs"
+        );
+        assert_eq!(
+            windows.absolute_wire_path(&link("Makefile", None, None)),
+            "C:/Users/dev/project/Makefile"
+        );
+        let posix = FileLinkRoot {
+            chat: None,
+            root: "/home/dev/project".into(),
+            local: true,
+        };
+        assert_eq!(
+            posix.absolute_wire_path(&link("src/lib.rs", None, None)),
+            "/home/dev/project/src/lib.rs"
+        );
     }
 
     /// An inline-code span names the probed file, whatever the host spells

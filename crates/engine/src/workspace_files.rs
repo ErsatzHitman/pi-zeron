@@ -481,7 +481,7 @@ impl WorkspaceFiles {
         let workspace = self.resolve_target(&request.target).await?;
         // Only a chat target may read by absolute path; space targets keep
         // the workspace-relative grammar.
-        let absolute = request.target.chat_id.is_some() && request.path.starts_with('/');
+        let absolute = request.target.chat_id.is_some() && is_absolute_request_path(&request.path);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_on_drop = CancelOnDrop::new(cancel.clone());
         let result = tokio::task::spawn_blocking(move || {
@@ -504,7 +504,7 @@ impl WorkspaceFiles {
         request: zeron_proto::ReadWorkspaceImageRequest,
     ) -> Result<zeron_proto::WorkspaceImageChunk, WorkspaceFilesError> {
         let workspace = self.resolve_target(&request.target).await?;
-        let absolute = request.target.chat_id.is_some() && request.path.starts_with('/');
+        let absolute = request.target.chat_id.is_some() && is_absolute_request_path(&request.path);
         if !absolute
             && (request.expected_checkout_id.is_empty()
                 || request.expected_checkout_id != workspace.checkout_id)
@@ -1607,10 +1607,26 @@ enum AbsoluteRead {
     },
 }
 
+/// Absolute on the host, whatever shape the client sent — the mirror of the
+/// UI's `shell::is_host_absolute_path`: a POSIX path, a UNC share, or a
+/// Windows drive path (`C:/…`, the wire spelling of a drive path). An
+/// absolute request must never reach [`WorkspaceRelativePath::file`], whose
+/// grammar rejects ':' and '\' as a relative-path error.
+fn is_absolute_request_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
 /// Canonicalize an absolute request path and classify it against the
-/// workspace. The wire grammar mirrors the link side's safety envelope: one
-/// leading slash, never `//`, no trailing slash, no `?`, backslashes, NUL or
-/// `.`/`..` segments. A missing path is the same `NotFound` a relative read
+/// workspace. The wire grammar mirrors the link side's safety envelope: never
+/// `//`, no trailing slash, no `?`, backslashes, NUL or `.`/`..` segments (a
+/// drive path is `/`-spelled and carries its own drive, but is otherwise held
+/// to the same rules). A missing path is the same `NotFound` a relative read
 /// reports.
 fn resolve_absolute_read(
     workspace: &ResolvedWorkspace,
@@ -2946,8 +2962,6 @@ mod tests {
         );
     }
 
-    // Absolute reads take POSIX paths — the only shape a UI sends.
-    #[cfg(unix)]
     fn resolved_workspace(root: &Path) -> ResolvedWorkspace {
         ResolvedWorkspace {
             checkout_id: "checkout-test".into(),
@@ -2955,6 +2969,55 @@ mod tests {
         }
     }
 
+    /// Absolute reads take the host's own path shapes — a POSIX path, or a
+    /// Windows drive path in the wire spelling the file surface sends
+    /// (`C:/…`, never `C:\…`). The drive shape is what makes a Windows-hosted
+    /// outside link open instead of failing the relative grammar.
+    #[test]
+    fn absolute_request_paths_carry_every_host_shape() {
+        for path in [
+            "/work/comet/src/lib.rs",
+            "C:/Users/dev/project/src/lib.rs",
+            "c:/Users/dev/project/src/lib.rs",
+            "C:\\Users\\dev\\project\\src\\lib.rs",
+            "\\\\server\\share\\report.md",
+        ] {
+            assert!(is_absolute_request_path(path), "{path}");
+        }
+        // A bare drive, a drive-relative path and a plain relative path are
+        // not absolute, so they keep the workspace-relative grammar.
+        for path in ["", "C:", "C:dir/file.md", "src/lib.rs", "./src/lib.rs"] {
+            assert!(!is_absolute_request_path(path), "{path}");
+        }
+    }
+
+    /// The wire spelling is host-independent: a temp directory read by an
+    /// absolute path spelled with `/` separators reads here as it does on a
+    /// Windows host, which hands the same request `C:/…` instead of `/…`.
+    #[test]
+    fn absolute_read_takes_a_wire_spelled_drive_path() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("dir")).unwrap();
+        std::fs::write(root.path().join("dir/file.txt"), b"inside\n").unwrap();
+        let workspace = resolved_workspace(root.path());
+        // The temp directory's own spelling, not the canonicalized one: a
+        // Windows canonical path carries the `\\?\` prefix no UI sends.
+        let absolute = root
+            .path()
+            .join("dir/file.txt")
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        assert!(is_absolute_request_path(&absolute), "{absolute}");
+        let file = read_absolute_file_blocking(&workspace, &absolute, &no_cancel()).unwrap();
+        assert_eq!(file.text.as_deref(), Some("inside\n"));
+        assert_eq!(file.path, "dir/file.txt");
+        assert_eq!(file.checkout_id, "checkout-test");
+        assert!(file.read_only_reason.is_none());
+    }
+
+    // These reads spell their absolute path the POSIX way; the wire-spelled
+    // test above covers the drive shape a Windows host sends.
     #[cfg(unix)]
     #[test]
     fn absolute_read_inside_the_workspace_is_editable() {
