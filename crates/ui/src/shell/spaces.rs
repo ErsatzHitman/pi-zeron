@@ -14,7 +14,7 @@ use crate::pickers::{
     same_folder_path,
 };
 use gpui::{FocusHandle, Window};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use zeron_proto::{
     ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, HomeFolderMatch,
     HomeFolderSearchResult, SearchHomeFoldersRequest, Space,
@@ -5283,9 +5283,13 @@ impl Shell {
                 .into_iter()
                 .map(|(status, chat)| (status, chat.clone()))
                 .collect();
-            chats.sort_by(|left, right| {
-                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
-            });
+            // `sidebar_chats` already orders by recency, which is exactly
+            // what the LastUpdated sort asks for; only Created re-sorts.
+            if self.settings.sidebar_sort == SidebarSort::Created {
+                chats.sort_by(|left, right| {
+                    compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
+                });
+            }
             chats
                 .into_iter()
                 .map(|(status, chat)| self.sidebar_chat_data(status, chat, state))
@@ -5353,22 +5357,34 @@ impl Shell {
             })
             .collect();
         let mut regular_groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
+        // A row belongs to at most one custom section, and rows sharing a
+        // group key land in one group: look both up by id/key instead of
+        // scanning the sections and groups for every row.
+        let section_of: HashMap<&str, usize> = {
+            let mut map = HashMap::new();
+            for (ix, section) in custom_sections.iter().enumerate() {
+                for id in &section.session_ids {
+                    map.entry(id.as_str()).or_insert(ix);
+                }
+            }
+            map
+        };
+        let mut group_of: HashMap<Option<(String, String)>, usize> = HashMap::new();
         for row in regular_rows {
-            if let Some(index) = custom_sections
-                .iter()
-                .position(|section| section.session_ids.contains(&row.chat.id))
-            {
+            if let Some(&index) = section_of.get(row.chat.id.as_str()) {
                 custom_groups[index].1.push(row);
                 continue;
             }
-            if let Some((_, existing)) = regular_groups
-                .iter_mut()
-                .find(|(group, _)| group == &row.group)
-            {
-                existing.push(row);
-            } else {
-                regular_groups.push((row.group.clone(), vec![row]));
-            }
+            let index = match group_of.get(&row.group) {
+                Some(&index) => index,
+                None => {
+                    regular_groups.push((row.group.clone(), Vec::new()));
+                    let index = regular_groups.len() - 1;
+                    group_of.insert(row.group.clone(), index);
+                    index
+                }
+            };
+            regular_groups[index].1.push(row);
         }
         // Sections keep their placed order, as Pinned does, not activity order.
         for ((_, rows), section) in custom_groups.iter_mut().zip(&custom_sections) {
@@ -6010,17 +6026,16 @@ impl Shell {
     }
 
     /// The Archived shelf's chats under the project filter, in sidebar order.
-    fn archived_sidebar_chats(&self, cx: &App) -> Vec<zeron_proto::Chat> {
+    fn archived_sidebar_chats<'a>(&self, cx: &'a App) -> Vec<&'a zeron_proto::Chat> {
         let state = self.state.read(cx);
         let in_filter = state.project_filter(self.settings.space_filter.as_deref());
-        let mut rows: Vec<zeron_proto::Chat> = state
+        let mut rows: Vec<&zeron_proto::Chat> = state
             .chats
             .iter()
             // Spawned children stay out of the Archived section too — the
             // same top-level rule as `visible_chats`.
             .filter(|c| c.archived && c.is_top_level())
             .filter(|chat| in_filter(chat))
-            .cloned()
             .collect();
         rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
         rows
@@ -6036,23 +6051,31 @@ impl Shell {
         const INITIAL: usize = ARCHIVED_INITIAL_ROWS;
         const PAGE: usize = ARCHIVED_PAGE_ROWS;
         let now = Utc::now();
-        let rows = self.archived_sidebar_chats(cx);
-        if rows.is_empty() {
+        let archived = self.archived_sidebar_chats(cx);
+        let total = archived.len();
+        if total == 0 {
             return None;
         }
-        let rows: Vec<_> = {
-            let state = self.state.read(cx);
-            rows.into_iter()
-                .map(|chat| {
-                    self.sidebar_chat_data(state.display_status_for(&chat, now), chat, state)
-                })
-                .collect()
-        };
-        let total = rows.len();
         let open = self.archived_open;
         let shown = self.archived_shown.max(INITIAL);
         let visible_count = total.min(shown);
         let has_more = total > shown;
+        // Only the rows the shelf shows need their metadata built; the rest
+        // stay as ordered references until "Show more" pages them in.
+        let rows: Vec<_> = {
+            let state = self.state.read(cx);
+            archived
+                .into_iter()
+                .take(shown)
+                .map(|chat| {
+                    self.sidebar_chat_data(
+                        state.display_status_for(chat, now),
+                        chat.clone(),
+                        state,
+                    )
+                })
+                .collect()
+        };
         // "Show more" matches the row slot: compact rows are 29px, so the
         // button shrinks with them instead of towering over the list.
         let more_height = if self.settings.sidebar_compact {
@@ -7920,6 +7943,35 @@ mod tests {
         let beta = chat("beta");
         assert!(compare_sidebar_chats(SidebarSort::Created, &alpha, &beta).is_lt());
         assert!(compare_sidebar_chats(SidebarSort::LastUpdated, &alpha, &beta).is_lt());
+    }
+
+    #[test]
+    fn the_recency_sort_already_orders_rows_as_last_updated_would() {
+        // `render_active_rows` skips its own sort under LastUpdated because
+        // `sort_active` (in `sidebar_chats`) already orders rows that way.
+        let mut alpha = chat("alpha");
+        alpha.last_message_at = Some(Utc.timestamp_opt(30, 0).unwrap());
+        let mut beta = chat("beta");
+        beta.last_message_at = None;
+        beta.created_at = Utc.timestamp_opt(20, 0).unwrap();
+        let mut gamma = chat("gamma");
+        gamma.last_message_at = Some(Utc.timestamp_opt(30, 0).unwrap());
+        let chats = vec![alpha, beta, gamma];
+        let ids = |rows: &[(zeron_proto::ChatIndicator, &zeron_proto::Chat)]| {
+            rows.iter()
+                .map(|(_, chat)| chat.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut recency: Vec<(zeron_proto::ChatIndicator, &zeron_proto::Chat)> = chats
+            .iter()
+            .map(|chat| (zeron_proto::ChatIndicator::Idle, chat))
+            .collect();
+        zeron_proto::view::sort_active(&mut recency);
+        let mut expected = recency.clone();
+        expected.sort_by(|(_, left), (_, right)| {
+            compare_sidebar_chats(SidebarSort::LastUpdated, left, right)
+        });
+        assert_eq!(ids(&recency), ids(&expected));
     }
 
     #[test]
