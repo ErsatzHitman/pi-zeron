@@ -4505,17 +4505,28 @@ impl RpcService for EngineRpc {
             }
             methods::UPLOAD_CHUNK => {
                 let p: UploadChunkParams = parse_params(params)?;
-                self.uploads
-                    .append(&p.upload_id, &p.data, p.seq)
+                // Staging is disk IO (create the staging dir, list it, write the
+                // chunk, sweep stale uploads): one chunk per dot of a fast link
+                // must not run on the async worker, or a slow disk stalls the
+                // whole reactor. Same pool as READ_ATTACHMENT_CHUNK below.
+                let uploads = self.uploads.clone();
+                tokio::task::spawn_blocking(move || uploads.append(&p.upload_id, &p.data, p.seq))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::UPLOAD_COMMIT => {
                 let p: UploadCommitParams = parse_params(params)?;
-                let path = self
-                    .uploads
-                    .commit(&p.upload_id, &p.file_name)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Assembling and decoding up to 32MB of staged chunks is disk
+                // AND CPU work: keep it off the async worker.
+                let uploads = self.uploads.clone();
+                let path = tokio::task::spawn_blocking(move || {
+                    uploads.commit(&p.upload_id, &p.file_name)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 // Bytes just landed on this device: any command deferred on
                 // them (queued-attachment refs) is executable NOW.
                 self.doc_host.kick_drains();
