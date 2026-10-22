@@ -540,6 +540,91 @@ impl zeron_sync::registry::RegistryTransport for FlakyAckTransport {
     }
 }
 
+/// Pull-first HTTPS races the socket: the bootstrap pull (or a slow backoff
+/// pull) asks for `since=cursor`, a socket session then joins and its hello
+/// applies NEWER truth, and only afterwards does the old HTTP answer land.
+/// Applying it blind-inserted the answer's rows over fresher ones and dragged
+/// the cursor back to the older head.
+struct StalePullTransport {
+    doc: Arc<Mutex<RegistryDoc>>,
+    fetches: Arc<std::sync::atomic::AtomicU64>,
+}
+
+const STALE_CHAT_ROW: &str = r#"{"kind":"chats","id":"chat-old","seq":100,
+    "fields":{"id":"chat-old","deviceId":"dev-b","createdAt":2000,"title":"from-100"}}"#;
+const LIVE_CHAT_ROW: &str = r#"{"kind":"chats","id":"chat-new","seq":500,
+    "fields":{"id":"chat-new","deviceId":"dev-b","createdAt":3000,"title":"from-500"}}"#;
+
+impl zeron_sync::registry::RegistryTransport for StalePullTransport {
+    fn fetch(
+        &self,
+        since: u64,
+    ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+        let doc = self.doc.clone();
+        let fetches = self.fetches.clone();
+        Box::pin(async move {
+            if fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // The socket session wins the race: its hello applies the
+                // current head (seq 500) while this pull is in flight.
+                let rows: Vec<zeron_doc::RegistryRow> =
+                    serde_json::from_str(&format!("[{LIVE_CHAT_ROW}]")).expect("live row");
+                doc.lock().unwrap().apply_state(500, true, 0, rows);
+                // ...and the answer was snapshotted at the older head.
+                return Ok(format!(
+                    r#"{{"seq":100,"full":true,"gcFloor":0,"rows":[{STALE_CHAT_ROW}],"presence":{{}}}}"#
+                ));
+            }
+            let seq = doc.lock().unwrap().cursor();
+            let _ = since;
+            Ok(format!(
+                r#"{{"seq":{seq},"full":false,"gcFloor":0,"rows":[],"presence":{{}}}}"#
+            ))
+        })
+    }
+
+    fn push(
+        &self,
+        body: String,
+    ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+        Box::pin(async move {
+            let v: serde_json::Value = serde_json::from_str(&body).expect("push body is json");
+            let batch = v["batch"].as_str().expect("batch id").to_owned();
+            Ok(format!(r#"{{"batch":"{batch}","seq":1,"applied":1}}"#))
+        })
+    }
+}
+
+#[tokio::test]
+async fn stale_http_pull_never_regresses_rows_or_the_cursor() {
+    let fetches = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let doc = new_doc("dev-a");
+    // The WS side never connects (dead port): every sync runs over HTTPS.
+    let client = RegistryClient::connect_via_transport(
+        Arc::new(zeron_sync::StaticUrl("ws://127.0.0.1:1/ws".into())),
+        doc.clone(),
+        "dev-a",
+        zeron_sync::RegistryTuning::default(),
+        Arc::new(StalePullTransport {
+            doc: doc.clone(),
+            fetches: fetches.clone(),
+        }),
+    )
+    .await
+    .expect("transport clients construct immediately");
+
+    // A second fetch proves the first cycle finished (applied or discarded).
+    wait_until(|| fetches.load(std::sync::atomic::Ordering::SeqCst) >= 2).await;
+    let d = doc.lock().unwrap();
+    assert_eq!(d.cursor(), 500, "the newer WS cursor must survive the pull");
+    let chats = d.read_chats().unwrap();
+    assert_eq!(chats.len(), 1, "the stale full replace must not apply");
+    assert_eq!(chats[0].id, "chat-new");
+    assert_eq!(chats[0].title.as_deref(), Some("from-500"));
+    drop(d);
+
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn unreadable_http_ack_retries_instead_of_stranding_the_batch() {
     let push_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
