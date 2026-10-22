@@ -526,6 +526,38 @@ pub async fn upload_attachment(
     attachment: &StagedAttachment,
     progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<String, String> {
+    // Encoding a file (up to 24 MiB → ~32 MiB of base64) and copying each
+    // chunk into its request payload is CPU work. Callers await this from the
+    // foreground (`cx.spawn`) thread, so run it on the background pool and
+    // leave the UI thread only awaiting the result.
+    let engine = engine.clone();
+    let worker_executor = executor.clone();
+    let target_device_id = target_device_id.map(str::to_owned);
+    let upload_id = upload_id.to_owned();
+    let attachment = attachment.clone();
+    executor
+        .spawn(async move {
+            upload_attachment_on_worker(
+                &engine,
+                &worker_executor,
+                target_device_id.as_deref(),
+                &upload_id,
+                &attachment,
+                progress,
+            )
+            .await
+        })
+        .await
+}
+
+async fn upload_attachment_on_worker(
+    engine: &EngineHandle,
+    executor: &BackgroundExecutor,
+    target_device_id: Option<&str>,
+    upload_id: &str,
+    attachment: &StagedAttachment,
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
+) -> Result<String, String> {
     let b64 = BASE64.encode(attachment.bytes());
     let ranges = chunk_ranges(b64.len());
     let deadline = executor.timer(attachment_deadline(ranges.len()));
@@ -1881,6 +1913,55 @@ mod generated_image_tests {
                 "done": true,
             }))
         }
+    }
+
+    struct UploadRpc {
+        chunks: Arc<Mutex<Vec<(u64, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::RpcService for UploadRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+            match method {
+                methods::UPLOAD_CHUNK => {
+                    self.chunks.lock().unwrap().push((
+                        params["seq"].as_u64().unwrap(),
+                        params["data"].as_str().unwrap().to_string(),
+                    ));
+                    zeron_rpc::RpcReply::value(&serde_json::json!({}))
+                }
+                methods::UPLOAD_COMMIT => zeron_rpc::RpcReply::value(
+                    &serde_json::json!({"path": "/uploads/ab12cd34-notes.md"}),
+                ),
+                other => panic!("unexpected upload method {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_chunks_reassemble_to_the_encoded_file() {
+        let executor = gpui_platform::background_executor();
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let engine = EngineHandle::from_test_client(zeron_rpc::memory_client(Arc::new(UploadRpc {
+            chunks: chunks.clone(),
+        })));
+        // One full chunk plus a tail, so the plan spans two UploadChunk calls.
+        let bytes = vec![0x5au8; UPLOAD_CHUNK_B64_CHARS / 4 * 3 + 11];
+        let attachment = StagedAttachment::from_file("notes.md", bytes.clone());
+        let path = upload_attachment(&engine, &executor, None, "up-1", &attachment, None)
+            .await
+            .unwrap();
+        assert_eq!(path, "/uploads/ab12cd34-notes.md");
+        let encoded = BASE64.encode(&bytes);
+        let mut chunks = chunks.lock().unwrap().clone();
+        chunks.sort_by_key(|(seq, _)| *seq);
+        assert_eq!(chunks.len(), chunk_ranges(encoded.len()).len());
+        let reassembled: String = chunks.iter().map(|(_, data)| data.as_str()).collect();
+        assert_eq!(reassembled, encoded);
     }
 
     #[test]
