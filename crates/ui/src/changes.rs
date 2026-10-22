@@ -912,6 +912,14 @@ impl DiffScope {
             Self::Commit => "commit",
         }
     }
+
+    /// Whether a pane in this scope renders the live working-tree stream. A
+    /// pinned commit's diff is immutable and the history surface has its own
+    /// fetch, so neither needs the watch — and every subscription receives the
+    /// full diff stream, so not starting one is the point.
+    pub fn watches_working_tree(self) -> bool {
+        matches!(self, Self::WorkingTree | Self::Branch | Self::LatestTurn)
+    }
 }
 
 /// Header-strip label per scope.
@@ -2315,7 +2323,11 @@ impl Changes {
         self.discard_stale_draft(cx);
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
-        self.ensure_watch(cx);
+        // Only the scopes that render the working tree need it — see
+        // [`DiffScope::watches_working_tree`].
+        if self.scope.watches_working_tree() {
+            self.ensure_watch(cx);
+        }
         if self.scope == DiffScope::History {
             self.history_pane(cx)
                 .update(cx, |history, cx| history.ensure_loaded(cx));
@@ -6315,6 +6327,23 @@ rename to new_name.rs
             ]
         );
         assert!(!DiffScope::ALL.contains(&DiffScope::History));
+    }
+
+    #[test]
+    fn commit_and_history_panes_do_not_subscribe_to_the_working_tree_watch() {
+        for scope in [
+            DiffScope::WorkingTree,
+            DiffScope::Branch,
+            DiffScope::LatestTurn,
+        ] {
+            assert!(scope.watches_working_tree(), "{scope:?} renders the tree");
+        }
+        for scope in [DiffScope::Commit, DiffScope::History] {
+            assert!(
+                !scope.watches_working_tree(),
+                "{scope:?} must not hold a full diff-stream subscription"
+            );
+        }
     }
 
     /// A raw watch frame, decoded and folded in as the pane does.
