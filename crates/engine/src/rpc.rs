@@ -1929,6 +1929,9 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // queueing, verification, and the relayed response itself.
         methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // The host's own recap run is capped at 45s; leave headroom for
+        // queueing behind a concurrent run and the relayed response.
+        methods::RECAP_CHAT => Duration::from_secs(60),
         // Runtimes come down in parallel, each allowed a few seconds, and the
         // report waits (bounded) for them to be gone.
         methods::STOP_TREE => Duration::from_secs(60),
@@ -5669,6 +5672,12 @@ mod tests {
         assert_eq!(
             forward_deadline(methods::CREATE_WORKTREE),
             Duration::from_secs(120)
+        );
+        // Longer than the host's 45s recap run, so a forwarded generate is not
+        // cut off before the engine that owns the recap finishes it.
+        assert_eq!(
+            forward_deadline(methods::RECAP_CHAT),
+            Duration::from_secs(60)
         );
         assert_eq!(
             forward_deadline(methods::CLONE_REPO),

@@ -51,6 +51,13 @@ pub const HOME_FOLDER_MAX_RESULTS: usize = 50;
 const HOME_FOLDER_CANDIDATES: usize = 300;
 const HOME_FOLDER_PATH_CANDIDATES: usize = 2_000;
 const GITHUB_AVATAR_TIMEOUT: Duration = Duration::from_secs(6);
+/// Wall-clock ceiling for a local `git` command: a wedged network mount or a
+/// credential helper must fail the RPC, not wedge it.
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Ceiling for the two git commands that talk to a remote (`fetch`, `clone`).
+/// A large repository over a slow link may need minutes — not forever, and
+/// under the 15-minute forwarded-reply deadline both methods get.
+const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Stable prefix of the error `delete_worktree` returns when it refuses to
 /// discard unmerged commits or uncommitted changes (clients match on it).
 pub use zeron_rpc::WORKTREE_UNSAFE_PREFIX;
@@ -249,8 +256,11 @@ impl Repos {
 
     // ── git plumbing ────────────────────────────────────────────────────────
 
-    /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
-    async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
+    /// The common `git` subprocess: no console window on Windows, no stdin,
+    /// and never a credential prompt — a fetch or clone that needs one must
+    /// fail rather than block the RPC forever. `kill_on_drop` takes the child
+    /// down with a dropped (timed-out, cancelled) future.
+    fn git_command(args: &[&str], cwd: Option<&Path>) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("git");
         #[cfg(windows)]
         {
@@ -262,19 +272,49 @@ impl Repos {
             cmd.current_dir(cwd);
         }
         cmd.stdin(std::process::Stdio::null());
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cmd.env("GCM_INTERACTIVE", "never");
+        cmd.kill_on_drop(true);
+        cmd
+    }
+
+    /// Await a git command, killing it at `timeout` (`kill_on_drop` is set on
+    /// the command) so a wedged git never outlives the RPC.
+    async fn git_output(
+        mut cmd: tokio::process::Command,
+        timeout: Duration,
+        subcommand: &str,
+    ) -> Result<std::process::Output, EngineError> {
+        match tokio::time::timeout(timeout, cmd.output()).await {
+            Ok(output) => output.map_err(|e| EngineError::Other(format!("git spawn failed: {e}"))),
+            Err(_) => Err(EngineError::Other(format!(
+                "git {subcommand} timed out after {}s",
+                timeout.as_secs()
+            ))),
+        }
+    }
+
+    /// Run `git <args>` (optionally under `cwd`), returning trimmed stdout.
+    /// Bounded by [`GIT_TIMEOUT`]; the remote commands use [`Self::git_within`]
+    /// with [`GIT_NETWORK_TIMEOUT`].
+    async fn git(&self, args: &[&str], cwd: Option<&Path>) -> Result<String, EngineError> {
+        self.git_within(args, cwd, GIT_TIMEOUT).await
+    }
+
+    /// [`Self::git`] with an explicit wall-clock ceiling.
+    async fn git_within(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+        timeout: Duration,
+    ) -> Result<String, EngineError> {
+        let subcommand = args.first().copied().unwrap_or("?");
+        let output = Self::git_output(Self::git_command(args, cwd), timeout, subcommand).await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();
             return Err(EngineError::Other(if message.is_empty() {
-                format!(
-                    "git {} failed ({})",
-                    args.first().unwrap_or(&"?"),
-                    output.status
-                )
+                format!("git {subcommand} failed ({})", output.status)
             } else {
                 format!("git: {message}")
             }));
@@ -285,22 +325,14 @@ impl Repos {
     /// Like [`Self::git`], for commands that answer "no" with a silent exit
     /// status 1 (`rev-parse --verify --quiet`): `Ok(None)` then, `Err` for
     /// any other failure.
-    async fn git_probe(&self, args: &[&str], cwd: Option<&Path>) -> Result<Option<String>, EngineError> {
-        let mut cmd = tokio::process::Command::new("git");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.as_std_mut().creation_flags(0x08000000);
-        }
-        cmd.args(args);
-        if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
-        }
-        cmd.stdin(std::process::Stdio::null());
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+    async fn git_probe(
+        &self,
+        args: &[&str],
+        cwd: Option<&Path>,
+    ) -> Result<Option<String>, EngineError> {
+        let subcommand = args.first().copied().unwrap_or("?");
+        let output =
+            Self::git_output(Self::git_command(args, cwd), GIT_TIMEOUT, subcommand).await?;
         if output.status.success() {
             return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()));
         }
@@ -309,8 +341,7 @@ impl Repos {
             return Ok(None);
         }
         Err(EngineError::Other(format!(
-            "git {} failed ({}): {}",
-            args.first().unwrap_or(&"?"),
+            "git {subcommand} failed ({}): {}",
             output.status,
             stderr.trim()
         )))
@@ -324,21 +355,9 @@ impl Repos {
         args: &[&str],
         cwd: Option<&Path>,
     ) -> Result<(i32, String, String), EngineError> {
-        let mut cmd = tokio::process::Command::new("git");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.as_std_mut().creation_flags(0x08000000);
-        }
-        cmd.args(args);
-        if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
-        }
-        cmd.stdin(std::process::Stdio::null());
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+        let subcommand = args.first().copied().unwrap_or("?");
+        let output =
+            Self::git_output(Self::git_command(args, cwd), GIT_TIMEOUT, subcommand).await?;
         Ok((
             output.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -400,9 +419,13 @@ impl Repos {
     /// Fetch every configured remote without pruning or integrating anything
     /// into the active branch. This intentionally updates refs only.
     pub async fn fetch_all(&self, repo_path: &Path) -> Result<(), EngineError> {
-        self.git(&["fetch", "--all", "--quiet"], Some(repo_path))
-            .await
-            .map(drop)
+        self.git_within(
+            &["fetch", "--all", "--quiet"],
+            Some(repo_path),
+            GIT_NETWORK_TIMEOUT,
+        )
+        .await
+        .map(drop)
     }
 
     /// The absolute Git `HEAD` file for event-driven external branch reconciliation.
@@ -629,8 +652,13 @@ impl Repos {
             )));
         }
         std::fs::create_dir_all(&repos_dir)?;
-        self.git(&["clone", trimmed, &target.to_string_lossy()], None)
-            .await?;
+        // `--` keeps a URL that starts with `-` a repository, not an option.
+        self.git_within(
+            &["clone", "--", trimmed, &target.to_string_lossy()],
+            None,
+            GIT_NETWORK_TIMEOUT,
+        )
+        .await?;
         self.register(&target.to_string_lossy())?;
         self.to_repo(&target).await
     }
@@ -3435,6 +3463,52 @@ tmpfs /run tmpfs rw 0 0
         let mut paths: Vec<&String> = drives.iter().map(|d| &d.path).collect();
         paths.dedup();
         assert_eq!(paths.len(), drives.len());
+    }
+
+    /// A clone runs prompt-free and option-guarded: the child carries the
+    /// no-prompt env, and the URL sits behind `--` so one starting with `-`
+    /// can never be read as a git option.
+    #[tokio::test]
+    async fn clone_repo_runs_a_prompt_free_guarded_git() {
+        let data = tempfile::tempdir().unwrap();
+        let source = data.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&source)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@test")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@test")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(source.join("a.txt"), "hi\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "a"]);
+
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let cloned = repos.clone_repo(&source.to_string_lossy()).await.unwrap();
+        assert!(Path::new(&cloned.path).join("a.txt").exists());
+
+        let cmd = Repos::git_command(&["clone", "--", "x", "y"], None);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("GIT_TERMINAL_PROMPT"),
+            Some(std::ffi::OsStr::new("0"))
+        )));
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("GCM_INTERACTIVE"),
+            Some(std::ffi::OsStr::new("never"))
+        )));
     }
 
     #[test]
