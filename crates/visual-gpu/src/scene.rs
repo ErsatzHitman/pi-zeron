@@ -1119,8 +1119,8 @@ impl SceneState {
 
 /// Render `scene` on the GPU for a canvas `width` by `height` logical pixels
 /// at `pixel_scale`, reusing `state`'s targets (made or remade as needed).
-/// `None` without a GPU (or geometry), so the caller can fall back to the
-/// software renderer.
+/// `None` without a GPU, without geometry, or when the frame can't be read
+/// back, so the caller can fall back to the software renderer.
 pub fn render_scene(
     scene: &Scene,
     camera: Camera,
@@ -1580,7 +1580,15 @@ pub fn render_scene(
         &pipelines.composite,
         &post_bind(shaded, &strength, bloom_a),
     );
-    Some(gpu.read_back(encoder, output, staging))
+    // A readback that fails costs this frame's GPU path, not the visual: the
+    // caller draws it in software instead of a transparent blank.
+    match gpu.read_back(encoder, output, staging) {
+        Ok(frame) => Some(frame),
+        Err(error) => {
+            tracing::warn!(%error, "scene readback failed; drawing in software");
+            None
+        }
+    }
 }
 
 /// A 1×1 texture for bind slots a pass doesn't read (a texture can't be both

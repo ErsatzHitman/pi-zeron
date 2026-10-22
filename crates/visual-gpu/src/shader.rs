@@ -666,7 +666,7 @@ pub fn render_shader(
     );
     let frame = gpu.read_back(encoder, &state.output, &mut state.staging);
     state.latest = write;
-    Ok(frame)
+    frame
 }
 
 fn uniform_bytes(values: &[f32; 4]) -> &[u8] {
