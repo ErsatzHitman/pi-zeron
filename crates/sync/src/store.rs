@@ -2,8 +2,9 @@
 //! processed-command ledger (ARCHITECTURE §2 command plane: entries are marked
 //! processed BEFORE execution so a crash can never double-execute a command).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -107,7 +108,6 @@ pub const PRE_CHAT2_ROLLBACK_SUFFIX: &str = ".pre-chat2";
 /// that gives command execution mark-BEFORE-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
-    failed_publications: Mutex<HashSet<String>>,
     /// Chats purged in this process ([`Self::purge_doc`]). Writers that still
     /// hold the doc (a debounced snapshot flush, an outbox insert racing the
     /// delete) must not put its rows back; chat ids are never reused.
@@ -116,6 +116,12 @@ pub struct DocsStore {
     /// can tell "nothing new was queued" without a SQLite read per handle per
     /// tick. Bumped by every write that can add or advance queued work.
     job_clock: std::sync::atomic::AtomicI64,
+    /// Per-doc generation of the newest outbox-write failure whose replay
+    /// obligation has not yet been made durable. Process-unique values mean a
+    /// stale cleanup can never match a later failure.
+    failed_publications: Mutex<HashMap<String, u64>>,
+    /// Monotonic source of [`Self::failed_publications`] generations.
+    failure_generation: AtomicU64,
     /// Snapshot jobs wait here asynchronously before entering the blocking pool.
     pub snapshot_writer: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -146,9 +152,10 @@ impl DocsStore {
             .unwrap_or(0);
         Ok(Self {
             conn: Mutex::new(conn),
-            failed_publications: Mutex::new(HashSet::new()),
             purged: Mutex::new(HashSet::new()),
             job_clock: std::sync::atomic::AtomicI64::new(job_clock),
+            failed_publications: Mutex::new(HashMap::new()),
+            failure_generation: AtomicU64::new(0),
             snapshot_writer: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -190,10 +197,15 @@ impl DocsStore {
             params![doc_id, batch_id, bytes],
         );
         if result.is_err() {
+            // Bump a process-unique generation: a snapshot save records the
+            // generation it observed, so a failure arriving mid-save is never
+            // dropped by that save's cleanup, and a stale cleanup can never
+            // match a failure that arrived after it read.
+            let generation = self.failure_generation.fetch_add(1, Ordering::Relaxed) + 1;
             self.failed_publications
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(doc_id.to_string());
+                .insert(doc_id.to_string(), generation);
         }
         result?;
         Ok(())
@@ -303,16 +315,19 @@ impl DocsStore {
         doc_id: &str,
         updates: &[Vec<u8>],
     ) -> Result<(), StoreError> {
+        // Read before the transaction: a failure that lands during it bumps the
+        // generation and keeps its own invalidation obligation.
+        let observed = self.failed_publication_generation(doc_id);
         let mut conn = self.conn();
         if self.is_purged(doc_id) {
             return Ok(());
         }
         let tx = conn.transaction()?;
-        if tx.execute(
+        let reinitialized = tx.execute(
             "INSERT OR IGNORE INTO chat_outbox_initialized(doc_id) VALUES (?1)",
             params![doc_id],
-        )? != 0
-        {
+        )? != 0;
+        if reinitialized {
             for bytes in updates {
                 tx.execute(
                     "INSERT INTO chat_outbox(doc_id,batch_id,bytes) VALUES (?1,?2,?3)",
@@ -321,6 +336,11 @@ impl DocsStore {
             }
         }
         tx.commit()?;
+        // Re-seeding the outbox from full history fulfills the replay
+        // obligation a failed outbox write created.
+        if reinitialized {
+            self.clear_failed_publication(doc_id, observed);
+        }
         Ok(())
     }
 
@@ -357,8 +377,9 @@ impl DocsStore {
              ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at",
             params![doc_id, bytes, now_ms()],
         )?;
-        self.invalidate_failed_publication(&tx, doc_id)?;
+        let invalidation = self.invalidate_failed_publication(&tx, doc_id)?;
         tx.commit()?;
+        self.clear_failed_publication(doc_id, invalidation);
         Ok(())
     }
 
@@ -393,8 +414,9 @@ impl DocsStore {
                  cursor = excluded.cursor, epoch = excluded.epoch, cursor_verified = 0",
             params![doc_id, bytes, now_ms(), cursor as i64, epoch as i64],
         )?;
-        self.invalidate_failed_publication(&tx, doc_id)?;
+        let invalidation = self.invalidate_failed_publication(&tx, doc_id)?;
         tx.commit()?;
+        self.clear_failed_publication(doc_id, invalidation);
         Ok(())
     }
 
@@ -428,8 +450,9 @@ impl DocsStore {
                  cursor = excluded.cursor, epoch = excluded.epoch, cursor_verified = 1",
             params![doc_id, bytes, now_ms(), cursor as i64, epoch as i64],
         )?;
-        self.invalidate_failed_publication(&tx, doc_id)?;
+        let invalidation = self.invalidate_failed_publication(&tx, doc_id)?;
         tx.commit()?;
+        self.clear_failed_publication(doc_id, invalidation);
         Ok(())
     }
 
@@ -666,23 +689,45 @@ impl DocsStore {
     // Every snapshot path, including ACK/cursor persistence, must retain a
     // replay obligation for operations whose outbox write failed. Invalidate
     // the marker atomically with those operations becoming durable in a snapshot.
+    // Returns the failure generation observed, so the caller can clear the
+    // in-memory marker once the commit lands.
     fn invalidate_failed_publication(
         &self,
         tx: &rusqlite::Transaction<'_>,
         doc_id: &str,
-    ) -> Result<(), StoreError> {
-        if self
-            .failed_publications
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(doc_id)
-        {
+    ) -> Result<Option<u64>, StoreError> {
+        let observed = self.failed_publication_generation(doc_id);
+        if observed.is_some() {
             tx.execute(
                 "DELETE FROM chat_outbox_initialized WHERE doc_id=?1",
                 params![doc_id],
             )?;
         }
-        Ok(())
+        Ok(observed)
+    }
+
+    fn failed_publication_generation(&self, doc_id: &str) -> Option<u64> {
+        self.failed_publications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(doc_id)
+            .copied()
+    }
+
+    /// The obligation `observed` identified is now durable, so drop the marker.
+    /// A newer generation means another outbox write failed while the durable
+    /// step was in flight; that failure still needs its own invalidation.
+    fn clear_failed_publication(&self, doc_id: &str, observed: Option<u64>) {
+        let Some(observed) = observed else {
+            return;
+        };
+        let mut failed = self
+            .failed_publications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if failed.get(doc_id).copied() == Some(observed) {
+            failed.remove(doc_id);
+        }
     }
 
     /// Reclaim free space: WAL truncate, then a VACUUM only past the
@@ -1113,6 +1158,37 @@ mod publication_failure_tests {
                 (b"after".to_vec(), if cursor_save { 43 } else { 42 }, 2)
             );
         }
+    }
+
+    #[test]
+    fn replay_obligation_is_cleared_once_it_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.initialize_chat_outbox("chat", &[]).unwrap();
+        store.conn().execute_batch("CREATE TRIGGER fail_publication BEFORE INSERT ON chat_outbox BEGIN SELECT RAISE(FAIL, 'injected disk failure'); END;").unwrap();
+        assert!(store.enqueue_chat_update("chat", "batch", b"lost").is_err());
+
+        // The first snapshot save carries the obligation and retires the marker.
+        store.save_snapshot("chat", b"after").unwrap();
+        assert!(!store.chat_outbox_initialized("chat").unwrap());
+
+        // Reopening re-seeds full history once, which fulfills the obligation.
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER fail_publication")
+            .unwrap();
+        store
+            .initialize_chat_outbox("chat", &[b"replayed".to_vec()])
+            .unwrap();
+        assert!(store.chat_outbox_initialized("chat").unwrap());
+
+        // Later snapshot saves must not un-initialize the outbox again.
+        store.save_snapshot("chat", b"later").unwrap();
+        assert!(
+            store.chat_outbox_initialized("chat").unwrap(),
+            "a spent failure marker must not keep un-initializing the outbox"
+        );
+        assert_eq!(store.pending_chat_updates("chat").unwrap().len(), 1);
     }
 }
 
