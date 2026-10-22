@@ -18,7 +18,7 @@
 
 use chrono::{DateTime, Utc};
 use zeron_proto::extension_ui::{
-    ExtensionUiState, WorkflowAction, WorkflowState, WorkflowTask, WorkflowTaskState,
+    ExtensionUiState, WorkflowAction, WorkflowGate, WorkflowState, WorkflowTask, WorkflowTaskState,
 };
 
 /// How long a finished run stays up: long enough to see it end, and short
@@ -294,6 +294,17 @@ pub(super) struct Recovery {
     pub discard: Option<WorkflowAction>,
 }
 
+/// The host resource gate holding the run back, while it waits.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct GateRow {
+    /// The composed sentence the row draws.
+    pub reason: String,
+    /// When the wait began, for a live timer.
+    pub since: Option<DateTime<Utc>>,
+    /// Admissions blocked on the gate right now.
+    pub waiting: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct WorkflowView {
     pub run_id: String,
@@ -318,6 +329,8 @@ pub(super) struct WorkflowView {
     pub pause: Option<WorkflowAction>,
     pub stop: Option<WorkflowAction>,
     pub recovery: Option<Recovery>,
+    /// The host resource gate, while it holds admission (v3).
+    pub gate: Option<GateRow>,
     /// The payload groups by phase: draw `phases` instead of `lead`,
     /// `queued` and `finished`.
     pub grouped: bool,
@@ -365,6 +378,7 @@ impl WorkflowView {
                     resume: Some(resume),
                     discard: action("discard").filter(|a| a.run_id == latest.run_id),
                 }),
+                gate: None,
                 grouped: false,
                 phases: Vec::new(),
                 agents: 0,
@@ -442,6 +456,17 @@ impl WorkflowView {
             }),
             _ => None,
         };
+        // The gate is shown only while it actually waits: a cleared gate (or a
+        // paused or finished run) leaves the section exactly as it was.
+        let gate = run
+            .gate
+            .as_ref()
+            .filter(|g| run.status == "running" && g.state == "waiting")
+            .map(|g| GateRow {
+                reason: gate_text(g),
+                since: g.since.and_then(at),
+                waiting: g.waiting,
+            });
         let live = ended.is_none();
         let queued_more = state.progress.queued.saturating_sub(queued.len() as u32);
         Some(Self {
@@ -462,6 +487,7 @@ impl WorkflowView {
             pause: if live { action("pause") } else { None },
             stop: if live { action("stop") } else { None },
             recovery,
+            gate,
             grouped: state.grouped(),
             phases,
             agents: if state.grouped() {
@@ -750,6 +776,26 @@ fn clean_or(text: &str, fallback: &str) -> String {
     }
 }
 
+/// The one sentence the gate row draws: the gate's own reason, then how many
+/// agents are queued behind it. The reason names the metric and both values
+/// (the runtime composes it), so a reader can tell a busy host from a stuck run.
+fn gate_text(gate: &WorkflowGate) -> String {
+    let reason = clean(&gate.reason);
+    let mut text = if reason.is_empty() {
+        "Waiting for resources".to_string()
+    } else {
+        format!("Waiting for resources: {reason}")
+    };
+    if gate.waiting > 0 {
+        text.push_str(&format!(
+            " — {} agent{} queued",
+            gate.waiting,
+            if gate.waiting == 1 { "" } else { "s" }
+        ));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,6 +882,92 @@ mod tests {
         assert!(view.pause.is_some() && view.stop.is_some());
         assert!(view.recovery.is_none());
         assert!((view.fraction() - 2.0 / 6.0).abs() < 1e-6);
+    }
+
+    /// A running run the host resource gate is holding back.
+    fn gated() -> serde_json::Value {
+        let mut payload = running();
+        payload["v"] = json!(3);
+        payload["run"]["gate"] = json!({
+            "state": "waiting",
+            "reason": "free memory 2.1 GB is below the 4 GB floor",
+            "waiting": 3,
+            "since": T0 + 40_000,
+            "metrics": {"memAvailableGb": 2.1, "swapUsedPct": 12.5, "load1": 7.2, "diskFreeGb": 40.0}
+        });
+        payload
+    }
+
+    #[test]
+    fn a_waiting_gate_shows_why_the_run_is_held() {
+        let view = WorkflowView::of(&ui(gated()), now()).expect("shown");
+        let gate = view.gate.as_ref().expect("a gate row");
+        assert_eq!(
+            gate.reason,
+            "Waiting for resources: free memory 2.1 GB is below the 4 GB floor — 3 agents queued"
+        );
+        assert_eq!(gate.waiting, 3);
+        assert_eq!(
+            gate.since,
+            Some(DateTime::from_timestamp_millis(T0 + 40_000).unwrap())
+        );
+        // The rest of the run is unchanged by the gate.
+        assert_eq!(view.phase, RunPhase::Retrying);
+        assert!(view.stop.is_some());
+    }
+
+    #[test]
+    fn a_cleared_or_absent_gate_leaves_the_section_unchanged() {
+        let mut cleared = gated();
+        cleared["run"]["gate"]["state"] = json!("cleared");
+        assert_eq!(WorkflowView::of(&ui(cleared), now()).unwrap().gate, None);
+        // No gate at all (a v2 payload): also none.
+        let mut plain = running();
+        plain["v"] = json!(2);
+        assert_eq!(WorkflowView::of(&ui(plain), now()).unwrap().gate, None);
+    }
+
+    #[test]
+    fn a_paused_run_keeps_its_pill_and_shows_no_gate() {
+        let mut paused = gated();
+        paused["run"]["status"] = json!("paused");
+        let view = WorkflowView::of(&ui(paused), now()).expect("shown");
+        assert_eq!(view.phase, RunPhase::Paused);
+        assert!(
+            view.gate.is_none(),
+            "a paused run is not waiting on the host"
+        );
+        assert!(view.pause.is_some() && view.stop.is_some());
+    }
+
+    #[test]
+    fn a_gated_grouped_run_still_shows_its_phases_and_queued_agents() {
+        let mut payload = grouped();
+        payload["v"] = json!(3);
+        payload["run"]["gate"] = json!({
+            "state": "waiting",
+            "reason": "load average 9 is at or above the 8 ceiling",
+            "waiting": 2,
+            "since": T0 + 55_000
+        });
+        let view = WorkflowView::of(&ui(payload), now()).expect("shown");
+        assert!(view.grouped);
+        let gate = view.gate.as_ref().expect("a gate row");
+        assert_eq!(
+            gate.reason,
+            "Waiting for resources: load average 9 is at or above the 8 ceiling — 2 agents queued"
+        );
+        assert_eq!(view.phases.len(), 5);
+        let active = view
+            .phases
+            .iter()
+            .find(|p| p.state == PhaseState::Active)
+            .expect("the phase in progress");
+        assert_eq!(
+            active.rows.len(),
+            4,
+            "two running agents and two queued placeholders"
+        );
     }
 
     /// Every frame a real run published, then its resume: Pi on a Linux box,
