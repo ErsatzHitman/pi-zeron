@@ -303,10 +303,7 @@ impl FilesSurface {
             }
             return;
         };
-        let Some(chat) = state.chats.iter().find(|chat| chat.id == self.chat_id) else {
-            return;
-        };
-        let Some(space) = &chat.space_id else {
+        let Some(space) = self.chat_space_id.clone() else {
             let had_source = self.git_status.is_some();
             self.release_git_status();
             if had_source {
@@ -314,7 +311,9 @@ impl FilesSurface {
             }
             return;
         };
-        let device = chat.device_id.clone();
+        // Cached by `sync_target`; no `state.chats` scan on this path
+        // (audit #88).
+        let device = self.chat_device_id.clone();
         // A shared source must survive the first consuming chat disappearing.
         context.target = zeron_proto::WorkspaceTarget {
             chat_id: None,

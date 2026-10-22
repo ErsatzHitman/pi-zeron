@@ -255,6 +255,11 @@ pub struct FilesSurface {
     tree_delete: Option<rename::TreeDelete>,
     state: Entity<AppState>,
     chat_id: String,
+    /// The current chat's space and device, cached when the target syncs.
+    /// The render/notify path reads these instead of scanning `state.chats`
+    /// again for the git-status and projectless checks (audit #88).
+    chat_space_id: Option<String>,
+    chat_device_id: String,
     review_comment_flush_source: u64,
     presentation: FilesPresentation,
     editor_path: Option<String>,
@@ -345,24 +350,20 @@ impl FilesSurface {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        let projectless_root = {
+        let projectless_root = if self.chat_space_id.is_none() {
             let state = self.state.read(cx);
-            state
-                .chats
-                .iter()
-                .find(|chat| chat.id == self.chat_id && chat.space_id.is_none())
-                .map(|chat| {
-                    let device = state
-                        .device_name(&chat.device_id)
-                        .unwrap_or(&chat.device_id);
-                    // A projectless chat's folder is an implementation detail.
-                    match chat.cwd.as_deref() {
-                        Some(cwd) if !zeron_proto::projectless::is_projectless_cwd(Some(cwd)) => {
-                            format!("Files in {cwd} · {device}")
-                        }
-                        _ => format!("Files · {device}"),
-                    }
-                })
+            let device = state
+                .device_name(&self.chat_device_id)
+                .unwrap_or(&self.chat_device_id);
+            // A projectless chat's folder is an implementation detail.
+            match self.request_context.as_ref().map(|context| context.cwd.as_str()) {
+                Some(cwd) if !zeron_proto::projectless::is_projectless_cwd(Some(cwd)) => {
+                    Some(format!("Files in {cwd} · {device}"))
+                }
+                _ => Some(format!("Files · {device}")),
+            }
+        } else {
+            None
         };
         let phase = self.tree.node("").map(|root| root.load.clone());
         let content = if !self.search_state.query.is_empty() {
@@ -633,6 +634,8 @@ impl FilesSurface {
             tree_delete: None,
             state,
             chat_id,
+            chat_space_id: None,
+            chat_device_id: String::new(),
             review_comment_flush_source: NEXT_REVIEW_COMMENT_FLUSH_SOURCE
                 .fetch_add(1, Ordering::Relaxed),
             presentation,
@@ -835,13 +838,8 @@ impl FilesSurface {
         }
         // A projectless explorer may not have a resolvable home on its host.
         // Start its watcher only after the root listing succeeds.
-        let projectless_explorer = !self.presentation.is_editor()
-            && self
-                .state
-                .read(cx)
-                .chats
-                .iter()
-                .any(|chat| chat.id == self.chat_id && chat.space_id.is_none());
+        let projectless_explorer =
+            !self.presentation.is_editor() && self.chat_space_id.is_none();
         // An editor opened by absolute path beyond the workspace has nothing
         // the workspace watcher can report; outside files never register one.
         let outside_editor = self.presentation.is_editor()
@@ -1080,7 +1078,16 @@ impl FilesSurface {
     }
 
     fn sync_target(&mut self, cx: &mut Context<Self>) -> bool {
-        let next = FilesRequestContext::for_chat(self.state.read(cx), &self.chat_id);
+        let next = {
+            let state = self.state.read(cx);
+            let chat = state.chats.iter().find(|chat| chat.id == self.chat_id);
+            // One scan for the whole render/notify path: the facts the
+            // git-status and projectless checks need are kept here instead of
+            // re-scanning `state.chats` (audit #88).
+            self.chat_space_id = chat.and_then(|chat| chat.space_id.clone());
+            self.chat_device_id = chat.map(|chat| chat.device_id.clone()).unwrap_or_default();
+            chat.and_then(|chat| FilesRequestContext::for_chat_row(state, chat))
+        };
         if self.request_context == next {
             self.target_change_pending = false;
             self.pending_request_context = None;
