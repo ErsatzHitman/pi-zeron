@@ -183,6 +183,8 @@ impl ProjectIcon {
             };
             let _ = this.update(cx, |this, cx| {
                 this.media = media;
+                // Measure the miss TTL from the attempt, not from creation.
+                this.refreshed = std::time::Instant::now();
                 cx.notify();
             });
         });
@@ -251,6 +253,17 @@ impl Render for ProjectIconTooltip {
             );
         crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
     }
+}
+
+/// How long a project whose icon could not be read is remembered before it
+/// is looked up again, so a repository that gains artwork later is picked up.
+const ICON_MISS_TTL: Duration = Duration::from_secs(300);
+
+/// Whether a cached icon survives a prune: artwork, once loaded, stays for the
+/// shell's lifetime so it never flashes its monogram or re-reads the file;
+/// only a miss expires, so an icon added later is found.
+fn keep_icon(has_media: bool, since_read: Duration) -> bool {
+    has_media || since_read < ICON_MISS_TTL
 }
 
 fn project_icon_frame(
@@ -398,7 +411,10 @@ impl ProjectIcons {
             return monogram(&name, &seed, selected, Theme::of(cx));
         }
         let mut cache = self.entries.borrow_mut();
-        cache.retain(|_, entity| entity.read(cx).refreshed.elapsed() < Duration::from_secs(300));
+        cache.retain(|_, entity| {
+            let icon = entity.read(cx);
+            keep_icon(icon.media.is_some(), icon.refreshed.elapsed())
+        });
         let entity = cache
             .entry(key)
             .or_insert_with(|| {
@@ -444,6 +460,16 @@ mod tests {
         std::fs::write(temp.path().join("public/apple-touch-icon.png"), b"invalid").unwrap();
         assert!(load_local_icon(temp.path()).is_none());
     }
+    #[test]
+    fn loaded_artwork_is_kept_but_a_miss_expires() {
+        assert!(keep_icon(true, Duration::from_secs(3600)), "artwork stays");
+        assert!(keep_icon(false, Duration::from_secs(1)), "a fresh miss stays");
+        assert!(
+            !keep_icon(false, ICON_MISS_TTL + Duration::from_secs(1)),
+            "a stale miss is looked up again"
+        );
+    }
+
     #[test]
     fn sidebar_project_icons_support_svg_and_ico() {
         let temp = tempfile::tempdir().unwrap();

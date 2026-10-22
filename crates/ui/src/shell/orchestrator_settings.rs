@@ -110,12 +110,23 @@ fn policy_from_form(
     })
 }
 
+/// How long a project read is trusted: the Orchestrator tab re-reads it once
+/// this passes, so a tree paused or resumed elsewhere shows up on its own.
+const PROJECT_REFRESH: Duration = Duration::from_secs(30);
+/// How long to wait before re-reading a root whose read failed. A transient
+/// engine error must not read as an empty, unpaused project forever.
+const PROJECT_RETRY: Duration = Duration::from_secs(5);
+
 /// What the sidebar knows of each orchestrator's project, filled as the
 /// Orchestrator tab shows a root and whenever this window changes one.
 #[derive(Default)]
 pub(super) struct OrchestratorProjects {
-    pub known: HashMap<String, OrchestratorProject>,
+    known: HashMap<String, OrchestratorProject>,
     loading: HashSet<String>,
+    /// When each root may be read again: after the refresh interval once a
+    /// read lands, or after the retry pause once one fails. A root with no
+    /// entry has never been read.
+    next_read: HashMap<String, std::time::Instant>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -124,6 +135,37 @@ impl OrchestratorProjects {
         self.known
             .get(root_id)
             .is_some_and(|project| project.paused)
+    }
+
+    /// Whether `root`'s project is due to be read: not already in flight, and
+    /// either never read or past its refresh or retry time.
+    fn due(&self, root: &str, now: std::time::Instant) -> bool {
+        !self.loading.contains(root)
+            && self.next_read.get(root).is_none_or(|at| now >= *at)
+    }
+
+    /// Keep a project this window just read or changed, and hold off
+    /// re-reading it for the refresh interval.
+    fn remember(&mut self, root_id: String, project: OrchestratorProject) {
+        self.next_read.insert(
+            root_id.clone(),
+            std::time::Instant::now() + PROJECT_REFRESH,
+        );
+        self.known.insert(root_id, project);
+    }
+
+    /// Note that `root`'s read failed: cache nothing, and retry after the
+    /// pause so a stale read (if any) is not shown as current.
+    fn failed(&mut self, root: &str) {
+        self.next_read
+            .insert(root.to_owned(), std::time::Instant::now() + PROJECT_RETRY);
+    }
+
+    /// Mark `root`'s tree paused, as a stop report says it is held.
+    fn set_paused(&mut self, root_id: &str, paused: bool) {
+        if let Some(project) = self.known.get_mut(root_id) {
+            project.paused = paused;
+        }
     }
 }
 
@@ -144,12 +186,10 @@ impl Shell {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        let now = std::time::Instant::now();
         let missing: Vec<String> = roots
             .iter()
-            .filter(|root| {
-                !self.orchestrator_projects.known.contains_key(*root)
-                    && !self.orchestrator_projects.loading.contains(*root)
-            })
+            .filter(|root| self.orchestrator_projects.due(root, now))
             .cloned()
             .collect();
         if missing.is_empty() {
@@ -158,8 +198,11 @@ impl Shell {
         self.orchestrator_projects
             .loading
             .extend(missing.iter().cloned());
-        // Finished loads leave their tasks behind; drop them with each batch.
-        self.orchestrator_projects._tasks.clear();
+        // Finished loads leave their tasks behind; drop only those, so a load
+        // still in flight for another root is not cancelled.
+        self.orchestrator_projects
+            ._tasks
+            .retain(|task| !task.is_ready());
         self.orchestrator_projects
             ._tasks
             .push(cx.spawn(async move |this, cx| {
@@ -173,14 +216,14 @@ impl Shell {
                         .await;
                     this.update(cx, |shell, cx| {
                         shell.orchestrator_projects.loading.remove(&root);
-                        // An engine without projects reads as an empty one.
-                        let project = reply.map(|reply| reply.project).unwrap_or_else(|_| {
-                            OrchestratorProject {
-                                root_id: root.clone(),
-                                ..Default::default()
-                            }
-                        });
-                        shell.orchestrator_projects.known.insert(root, project);
+                        match reply {
+                            Ok(reply) => shell
+                                .orchestrator_projects
+                                .remember(root, reply.project),
+                            // A failed read caches nothing: the project stays
+                            // unknown (and unpaused) only until the retry.
+                            Err(_) => shell.orchestrator_projects.failed(&root),
+                        }
                         cx.notify();
                     })
                     .ok();
@@ -286,8 +329,7 @@ impl Shell {
                         dialog.loaded = true;
                         shell
                             .orchestrator_projects
-                            .known
-                            .insert(load_root, reply.project);
+                            .remember(load_root, reply.project);
                     }
                     Err(err) => dialog.error = Some(format!("Could not load the settings: {err}")),
                 }
@@ -405,8 +447,7 @@ impl Shell {
                     Ok(reply) => {
                         shell
                             .orchestrator_projects
-                            .known
-                            .insert(root_id, reply.project);
+                            .remember(root_id, reply.project);
                         shell.orchestrator_settings = None;
                     }
                     Err(err) => {
@@ -525,7 +566,9 @@ impl Shell {
                         if let Ok(project) =
                             serde_json::from_value::<OrchestratorProject>(reply["project"].clone())
                         {
-                            shell.orchestrator_projects.known.insert(root_id, project);
+                            shell
+                                .orchestrator_projects
+                                .remember(root_id, project);
                         }
                         let notice = match action {
                             "pause" => Some(match reply["stopped"].as_u64().unwrap_or(0) {
@@ -607,11 +650,8 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 match reply {
                     Ok(report) => {
-                        if report["held"] == true
-                            && let Some(project) =
-                                shell.orchestrator_projects.known.get_mut(&root_id)
-                        {
-                            project.paused = true;
+                        if report["held"] == true {
+                            shell.orchestrator_projects.set_paused(&root_id, true);
                         }
                         let kind = if report["remaining"]
                             .as_array()
@@ -1203,6 +1243,34 @@ mod tests {
         assert_eq!(
             stop_notice(&json!({"stopped": [], "remaining": []})),
             "Nothing was running"
+        );
+    }
+
+    #[test]
+    fn a_failed_project_read_is_retried_and_never_cached_as_empty() {
+        let mut projects = OrchestratorProjects::default();
+        let now = std::time::Instant::now();
+        assert!(projects.due("root", now), "a root never read is read at once");
+        projects.failed("root");
+        assert!(!projects.paused("root"), "a failed read is not an empty project");
+        assert!(!projects.due("root", now), "a failed read waits before retrying");
+        let failed_at = std::time::Instant::now();
+        assert!(
+            projects.due("root", failed_at + PROJECT_RETRY),
+            "and is retried once the pause passes"
+        );
+        let project = OrchestratorProject {
+            root_id: "root".into(),
+            paused: true,
+            ..Default::default()
+        };
+        projects.remember("root".into(), project);
+        assert!(projects.paused("root"));
+        assert!(!projects.due("root", now), "a fresh read is not read again");
+        let read_at = std::time::Instant::now();
+        assert!(
+            projects.due("root", read_at + PROJECT_REFRESH),
+            "and is refreshed once its read goes stale"
         );
     }
 
