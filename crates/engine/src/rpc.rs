@@ -2507,12 +2507,14 @@ impl RpcService for EngineRpc {
                         .map_err(RpcError::Failed)?;
                 } else if method == methods::SET_PI_SETTINGS {
                     let p: SetPiSettingsParams = parse_params(params)?;
-                    self.registry.set_pi_executable(
-                        p.executable
-                            .map(|path| path.trim().trim_matches('"').to_owned())
-                            .filter(|path| !path.is_empty())
-                            .map(std::path::PathBuf::from),
-                    );
+                    self.registry
+                        .set_pi_executable(
+                            p.executable
+                                .map(|path| path.trim().trim_matches('"').to_owned())
+                                .filter(|path| !path.is_empty())
+                                .map(std::path::PathBuf::from),
+                        )
+                        .map_err(RpcError::Failed)?;
                 }
                 let registry = self.registry.clone();
                 let settings = tokio::task::spawn_blocking(move || registry.pi_settings_blocking())

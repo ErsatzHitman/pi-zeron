@@ -270,6 +270,41 @@ async fn concurrent_recaps_for_one_chat_share_one_run() {
 }
 
 #[tokio::test]
+async fn a_dropped_caller_does_not_stall_the_shared_run() {
+    let fx = fixture(50);
+    chat_with(&fx.core, "main", &finished_turn());
+    let generate = RecapAction::Generate { force: false };
+    // A caller that goes away mid-run: a closed tab or a cancelled RPC.
+    let caller = tokio::spawn({
+        let recaps = fx.core.recaps.clone();
+        async move { recaps.handle("main", generate).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+
+    // The generator drives its own run: it finishes and stores the recap with
+    // nobody awaiting it, instead of holding a permit forever.
+    let mut stored = None;
+    for _ in 0..100 {
+        stored = fx
+            .core
+            .recaps
+            .handle("main", RecapAction::Get)
+            .await
+            .unwrap()
+            .recap;
+        if stored.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(stored.is_some(), "the abandoned run still finished");
+    assert_eq!(fx.calls.lock().unwrap().len(), 1);
+    fx.core.shutdown().await;
+}
+
+#[tokio::test]
 async fn recap_refuses_live_or_empty_chats_and_side_chats() {
     let fx = fixture(0);
     let generate = RecapAction::Generate { force: false };

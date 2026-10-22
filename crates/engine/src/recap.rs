@@ -672,10 +672,18 @@ impl RecapGenerator {
                     let this = self.clone();
                     let id = chat_id.to_owned();
                     let key = analysis.key;
-                    let flight: Flight = async move {
+                    // The run is driven by its own task, not by whoever is
+                    // awaiting it: a caller that drops (closed tab, cancelled
+                    // RPC) must not leave the permit held and the in-flight
+                    // entry stalled forever.
+                    let task = tokio::spawn(async move {
                         let outcome = this.run(&id, key, prompt, preferred).await;
                         lock(&this.inner.in_flight).remove(&id);
                         outcome
+                    });
+                    let flight: Flight = async move {
+                        task.await
+                            .unwrap_or_else(|err| Err(format!("recap task failed: {err}")))
                     }
                     .boxed()
                     .shared();

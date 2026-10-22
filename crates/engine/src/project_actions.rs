@@ -334,10 +334,12 @@ fn launch_project_action_with_environment(
     rows: u16,
     always_include_worktree: bool,
 ) -> Result<ProjectActionRun, EngineError> {
-    let mut environment =
-        HashMap::from([("ZERON_PROJECT_ROOT".to_string(), root_string(project_root))]);
+    let mut environment = HashMap::from([(
+        "ZERON_PROJECT_ROOT".to_string(),
+        environment_path(project_root),
+    )]);
     if always_include_worktree || cwd != project_root {
-        environment.insert("ZERON_WORKTREE_PATH".to_string(), root_string(cwd));
+        environment.insert("ZERON_WORKTREE_PATH".to_string(), environment_path(cwd));
     }
     let session = terminals.open_with_command(
         &root_string(cwd),
@@ -366,6 +368,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn root_string(project_root: &Path) -> String {
     project_root.to_string_lossy().to_string()
+}
+
+/// Reserved environment values are read by ordinary shells and tools, so a
+/// canonicalized Windows path must lose its verbatim `\\?\` prefix (kept when
+/// the path needs it for length or names). The reserved variables never carry
+/// device paths: they are the project root and the checkout being launched in.
+fn environment_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let path = dunce::simplified(path);
+    path.to_string_lossy().into_owned()
 }
 
 fn ensure_project_root(
@@ -641,6 +653,22 @@ mod tests {
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         (temp, store, project)
+    }
+
+    #[test]
+    fn reserved_environment_paths_are_not_verbatim() {
+        assert_eq!(environment_path(Path::new("/work/repo")), "/work/repo");
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                environment_path(Path::new(r"\\?\C:\work\repo")),
+                r"C:\work\repo"
+            );
+            assert_eq!(
+                environment_path(Path::new(r"\\?\UNC\server\share\repo")),
+                r"\\server\share\repo"
+            );
+        }
     }
 
     #[test]

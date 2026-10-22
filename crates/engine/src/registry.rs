@@ -423,12 +423,15 @@ impl HarnessRegistry {
         self.prefs().pi_executable.clone()
     }
 
-    /// Store (or clear, with `None`/empty) the device's Pi executable.
-    pub fn set_pi_executable(&self, path: Option<PathBuf>) {
+    /// Store (or clear, with `None`/empty) the device's Pi executable. A
+    /// failed save is an error: the harness would keep resolving the old
+    /// value while the field shows the new one.
+    pub fn set_pi_executable(&self, path: Option<PathBuf>) -> Result<(), String> {
         let path = path.filter(|path| !path.as_os_str().is_empty());
         self.prefs().pi_executable = path.clone();
         *self.pi_executable.lock().unwrap_or_else(PoisonError::into_inner) = path;
-        self.persist_prefs();
+        self.try_persist_prefs()
+            .map_err(|error| format!("Could not save the Pi executable: {error}"))
     }
 
     fn gate(&self, id: HarnessId) -> Arc<tokio::sync::RwLock<()>> {
@@ -632,8 +635,8 @@ impl HarnessRegistry {
             }
             _ => return Ok(()),
         }
-        self.persist_prefs();
-        Ok(())
+        self.try_persist_prefs()
+            .map_err(|error| format!("Could not save harness enablement: {error}"))
     }
 
     /// Best-effort atomic write (temp + rename, the ui-settings pattern).
@@ -673,8 +676,8 @@ impl HarnessRegistry {
         }
         settings.model = settings.model.filter(|model| !model.trim().is_empty());
         self.prefs().titles = settings;
-        self.persist_prefs();
-        Ok(())
+        self.try_persist_prefs()
+            .map_err(|error| format!("Could not save title settings: {error}"))
     }
 
     pub fn register(&self, harness: Arc<dyn Harness>) {
@@ -1230,13 +1233,13 @@ mod tests {
         let setting = registry.pi_executable_setting();
         assert_eq!(setting(), None);
         let exe = dir.path().join("pi-dev.cmd");
-        registry.set_pi_executable(Some(exe.clone()));
+        registry.set_pi_executable(Some(exe.clone())).unwrap();
         assert_eq!(setting(), Some(exe.clone()));
         let reloaded = HarnessRegistry::new();
         reloaded.load_prefs(dir.path());
         assert_eq!(reloaded.pi_executable(), Some(exe.clone()));
         assert_eq!(reloaded.pi_executable_setting()(), Some(exe));
-        reloaded.set_pi_executable(Some(PathBuf::new()));
+        reloaded.set_pi_executable(Some(PathBuf::new())).unwrap();
         assert_eq!(reloaded.pi_executable(), None);
         // A missing executable is reported, never silently replaced by PATH.
         let status = reloaded.pi_settings_blocking();
@@ -1274,7 +1277,7 @@ mod tests {
         assert_eq!(reloaded.block_deletes(), forced);
         assert_eq!(reloaded.pi_settings_blocking().block_deletes, forced);
         // Switching on again, and leaving the executable alone.
-        reloaded.set_pi_executable(Some(dir.path().join("pi-dev.cmd")));
+        reloaded.set_pi_executable(Some(dir.path().join("pi-dev.cmd"))).unwrap();
         reloaded.set_block_deletes(true).unwrap();
         assert!(reloaded.block_deletes());
         assert_eq!(
@@ -1290,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_block_deletes_save_is_an_error() {
+    fn a_failed_prefs_save_is_reported_by_every_settings_action() {
         let dir = tempfile::tempdir().unwrap();
         let registry = HarnessRegistry::new();
         // The prefs path is a directory: the rename over it fails.
@@ -1298,6 +1301,25 @@ mod tests {
         std::fs::create_dir_all(blocked.join("harness-prefs.json")).unwrap();
         registry.load_prefs(&blocked);
         assert!(registry.set_block_deletes(false).is_err());
+        assert!(registry.set_you_should_know(true).is_err());
+        assert!(
+            registry
+                .set_pi_executable(Some(PathBuf::from("pi-dev.cmd")))
+                .is_err()
+        );
+
+        // Enablement and titles only reach the save once their gate passes.
+        test_slot(&registry, HarnessId::Codex, true);
+        test_slot(&registry, HarnessId::ClaudeCode, true);
+        assert!(registry.set_enabled(HarnessId::Codex, false).is_err());
+        assert!(
+            registry
+                .set_title_settings(TitleSettings {
+                    harness: Some(HarnessId::ClaudeCode),
+                    model: Some("haiku-test".into()),
+                })
+                .is_err()
+        );
     }
 
     /// A registry slot for the tests below: installed probe fixed, factory
