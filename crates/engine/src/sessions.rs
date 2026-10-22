@@ -3826,6 +3826,12 @@ async fn drive_run(
     // either: the agent reports the drained set a moment before the turn the
     // completion wakes, and reaping in that gap lost the wake (issue #831).
     let mut held_for_background = false;
+    // The parked turn FAILED (a provider error on a runtime that outlives it).
+    // Stopping that runtime later is a clean resource decision — the turn
+    // itself did not recover — so every post-park end below keeps reporting
+    // Errored instead of stamping the row Idle (issue #118: the 10s finished
+    // TTL rewrote the failure the user was about to read).
+    let mut parked_errored = false;
     let steerable = harness.supports_steering();
     let stops_turn_in_place = steerable && harness.stops_turn_in_place();
     // The harness stream itself failed or ended: its Done is synthetic and
@@ -3958,7 +3964,11 @@ async fn drive_run(
                     {
                         token.cancel();
                     }
-                    break SessionStatus::Idle;
+                    break if parked_errored {
+                        SessionStatus::Errored
+                    } else {
+                        SessionStatus::Idle
+                    };
                 }
                 // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
                 // nobody returned to within its window releases its child. The turn
@@ -4018,7 +4028,14 @@ async fn drive_run(
                     {
                         token.cancel();
                     }
-                    break SessionStatus::Idle;
+                    // Reaping a runtime after a FAILED turn ends the process,
+                    // not the failure: the row must keep saying Errored until
+                    // the user's next message (issue #118).
+                    break if parked_errored {
+                        SessionStatus::Errored
+                    } else {
+                        SessionStatus::Idle
+                    };
                 }
                 Some(event) = engine_rx.recv() => event,
                 next = stream.next() => match next {
@@ -4049,7 +4066,11 @@ async fn drive_run(
                     Some(Err(err)) if idle_since.is_some() => {
                         let Some(held) = inner.lost_work(&chat_id, subagents.len(), turn.background_live()) else {
                             tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
-                            break SessionStatus::Idle;
+                            break if parked_errored {
+                                SessionStatus::Errored
+                            } else {
+                                SessionStatus::Idle
+                            };
                         };
                         // The runtime held jobs or sub-agents nobody has
                         // heard the end of: their results died with it, and
@@ -4105,7 +4126,11 @@ async fn drive_run(
                     // after its final Done — a clean end, not a crash (the turn
                     // was already finalized). Persistent adapters keep the
                     // stream open and never hit this.
-                    None if idle_since.is_some() => break SessionStatus::Idle,
+                    None if idle_since.is_some() => break if parked_errored {
+                        SessionStatus::Errored
+                    } else {
+                        SessionStatus::Idle
+                    },
                     None => {
                         stream_failed = true;
                         AgentEvent::Done {
@@ -4205,6 +4230,7 @@ async fn drive_run(
                     idle_since = Some(tokio::time::Instant::now());
                     reap_deferred_until = None;
                     self_continued_turn = false;
+                    parked_errored = false;
                     inner.set_status_with_completion(
                         &chat_id, SessionStatus::Idle, false, completed_turn,
                     );
@@ -4898,6 +4924,7 @@ async fn drive_run(
                 idle_since = Some(tokio::time::Instant::now());
                 reap_deferred_until = None;
                 self_continued_turn = false;
+                parked_errored = failed_in_place;
                 // Accepted steers still own this runtime. Publishing Idle
                 // here lets the ordinary queue overtake that continuation.
                 inner.set_status_with_completion(

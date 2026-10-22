@@ -138,7 +138,17 @@ impl Harness for ProcessHarness {
             })
             .await;
             let mut waiting = request.prompt.contains("wait");
-            if !waiting && !send(done(DoneStatus::Completed)).await {
+            // A prompt naming a failure ends its turn errored (a provider
+            // error on a runtime that outlives the turnaround).
+            let failed = request.prompt.contains("fail");
+            let done_status = || {
+                if failed {
+                    DoneStatus::Errored
+                } else {
+                    DoneStatus::Completed
+                }
+            };
+            if !waiting && !send(done(done_status())).await {
                 return;
             }
             loop {
@@ -471,6 +481,41 @@ async fn a_finished_pi_runtime_is_stopped_root_or_plain_and_resumes() {
     assert_eq!(
         resumes.last().unwrap(),
         &("work plain again".to_string(), Some("provider-session".into()))
+    );
+    set_env(&[]);
+}
+
+// The finished TTL stops a parked runtime after 10s by default. That reap is
+// about the process, not the turn: a turn that FAILED must keep saying
+// Errored instead of being rewritten to Idle (issue #118).
+#[tokio::test]
+async fn reaping_a_runtime_after_a_failed_turn_keeps_it_errored() {
+    let _env = ENV.lock().await;
+    set_env(&[
+        ("ZERON_MAX_RUNNING_TURNS", "0"),
+        ("ZERON_MEMBER_IDLE_MS", "0"),
+        ("ZERON_FINISHED_IDLE_MS", "300"),
+        ("ZERON_SESSION_IDLE_MS", "600000"),
+    ]);
+    let rig = rig(true);
+    rig.create_chat("failed", None);
+    rig.send("failed", "fail this turn").await;
+    wait_for(
+        || rig.status("failed") == Some(SessionStatus::Errored),
+        "the turn to fail and park",
+    )
+    .await;
+    wait_for(
+        || !rig.core.sessions.has_run("failed"),
+        "the failed runtime to be reaped",
+    )
+    .await;
+    // Well past several TTLs: the ended runtime must not overwrite the status.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        rig.status("failed"),
+        Some(SessionStatus::Errored),
+        "a failed turn stays Errored after its idle runtime stops"
     );
     set_env(&[]);
 }
