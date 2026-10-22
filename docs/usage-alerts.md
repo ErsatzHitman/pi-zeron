@@ -1,31 +1,37 @@
 # Subscription usage alerts
 
-When a signed-in (OAuth) subscription is almost used up, every session on that
-account is told to finish its current safe step, write a handoff and end, and
-no new work is started on it. Other accounts stay usable.
+When a subscription is almost used up — a signed-in (OAuth) login or an API
+key that carries a quota view, such as an OpenCode Go key — every session on
+that account is told to finish its current safe step, write a handoff and end,
+and no new work is started on it. Other accounts stay usable.
 
 ## One reader
 
 Zeron has one usage reader: `AgentAccounts::list` (`crates/engine/src/agent_accounts.rs`,
 probes in `agent_accounts/usage.rs`), the snapshot behind the composer footer
-("5h 98% · wk 90% left", `crates/ui/src/account_usage.rs`) and Settings →
-Accounts, with its cache (`agent-accounts/usage-cache.json`), throttle and
-backoff. `crates/engine/src/usage_alerts.rs` polls it every 5 minutes (forced,
-like the footer) and evaluates the result. Nothing else reads usage.
+("5h 98% · wk 90% left", `crates/ui/src/account_usage.rs`), Settings →
+Providers, and Settings → **Usage limits** (one list of every subscription's
+plan limits — the page is a view of this snapshot, and the coverage table
+below is the alerting contract over the same probes, see
+[docs/reference/usage-limits.md](reference/usage-limits.md)). All three share
+its cache (`agent-accounts/usage-cache.json`), throttle and backoff.
+`crates/engine/src/usage_alerts.rs` polls it every 5 minutes (forced, like the
+footer) and evaluates the result. Nothing else reads usage.
 
 ## Coverage
 
-| Pi `auth.json` login | Kind | Usage read | Monitored |
+| Login | Kind | Usage read | Monitored |
 |---|---|---|---|
-| `anthropic` | OAuth | Claude `/api/oauth/usage` (5h, week) | yes |
-| `openai-codex` | OAuth | Codex usage endpoint (5h, week) | yes |
-| `github-copilot` | OAuth | Copilot premium-request quota (month) | yes |
-| `openai` | OAuth | none | **no: unknown** |
-| `clinepass` | OAuth | none | **no: unknown** |
-| API keys (`opencode-go`, `openrouter`, `runinfra`, …) | API key | no plan windows | n/a |
+| Pi `anthropic` | OAuth | Claude `/api/oauth/usage` (5h, week) | yes |
+| Pi `openai-codex` | OAuth | Codex usage endpoint (5h, week) | yes |
+| Pi `github-copilot` | OAuth | Copilot premium-request quota (month) | yes |
+| Pi `clinepass` | OAuth | Cline `/api/v1/users/me/plan/usage-limits` (5h, week, month) | yes |
+| Pi `opencode-go` (one entry per key in `api-keys.json`) | API key | `opencode.ai/zen/go/v1/usage` (5h, week, month) | yes, one alert set per key |
+| Pi `openai` | OAuth | none | **no: unknown** |
+| other API keys (`openrouter`, `runinfra`, …) | API key | no plan windows | n/a |
 
-Unsupported OAuth logins are listed in the snapshot's `unsupported` field. They
-are unknown, not "fine": nothing warns before they run out.
+Unsupported OAuth logins are listed in the alerts file's `unsupported` field.
+They are unknown, not "fine": nothing warns before they run out.
 
 ## Semantics
 
@@ -34,15 +40,19 @@ are unknown, not "fine": nothing warns before they run out.
   `ZERON_USAGE_ALERT_THRESHOLD` on the engine (0–100, `0` disables). Exactly
   10% left does not alert; 9.99% does.
 - **Unknown never blocks.** No windows, a failed probe with no recent last-good
-  numbers, or a snapshot older than 6 hours: no alert, nothing blocked.
+  numbers, or a snapshot older than 6 hours: no alert, nothing blocked. An API
+  key with a quota view is a subscription like any other: an OpenCode Go key
+  that reports 5h/week/month windows alerts and is listed as coverage exactly
+  like an OAuth login. Only a key whose provider reports no windows
+  (`openrouter`, `runinfra`, …) stays unknown and never blocks.
 - **Reset.** A window whose `resets_at` has passed is over: it cannot alert.
   The guard also ignores a snapshot file older than `validForSecs` (15 min), so
   a stopped engine never blocks work.
 - **Scope.** Per active account per provider. A Pi session is affected only
   when its model's provider (`anthropic/…`, `openai-codex/…`,
-  `github-copilot/…`) is the provider of the low account; a session left on
-  Pi's own default model counts as the provider `defaultProvider` in Pi's
-  `settings.json` names. That is the account
+  `github-copilot/…`, `clinepass/…`, `opencode-go/…`) is the provider of the
+  low account; a session left on Pi's own default model counts as the provider
+  `defaultProvider` in Pi's `settings.json` names. That is the account
   Pi uses: Pi keeps one login per provider in `auth.json`, and the accounts
   snapshot marks that entry `active`. Saved, inactive slots never dispatch.
   Only this device's chats are told (another device has its own logins).
@@ -97,3 +107,7 @@ reset time.
 - The guard tells a session at depth 0 when its next turn starts and the engine
   tells it while it works, so one chat can see the note twice around a turn
   boundary.
+- A quota-bearing API key alerts like an OAuth login: a session whose model is
+  `opencode-go/…` is told to wrap up and refused new work near a window limit
+  instead of failing mid-run. Other providers and keys with no quota view are
+  unaffected.

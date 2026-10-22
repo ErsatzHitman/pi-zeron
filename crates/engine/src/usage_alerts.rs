@@ -1,13 +1,14 @@
-//! Subscription usage alerts: when a signed-in (OAuth) account's plan usage
-//! falls below a threshold, every session running on that account is told to
-//! finish its current safe step, write a handoff and end, and no new work is
-//! started on it.
+//! Subscription usage alerts: when a subscription's plan usage falls below a
+//! threshold — a signed-in (OAuth) account or an API key that carries a quota
+//! view, such as an OpenCode Go key — every session running on that account is
+//! told to finish its current safe step, write a handoff and end, and no new
+//! work is started on it.
 //!
 //! There is ONE usage reader: [`AgentAccounts::list`], the same snapshot the
-//! composer footer ("5h 98% · wk 90% left", `zeron-ui` `account_usage`) and
-//! Settings → Accounts render, with its cache, throttle and backoff. This
-//! module only polls it (forced, like the footer's 5-minute poll) and
-//! evaluates what it returns.
+//! composer footer ("5h 98% · wk 90% left", `zeron-ui` `account_usage`),
+//! Settings → Providers and Settings → Usage limits render, with its cache,
+//! throttle and backoff. This module only polls it (forced, like the footer's
+//! 5-minute poll) and evaluates what it returns.
 //!
 //! Semantics, all pure and tested below:
 //!
@@ -15,14 +16,18 @@
 //!   below `T` in ANY window the account reports (5h, week; Copilot's month).
 //!   Default `T = 10`; `ZERON_USAGE_ALERT_THRESHOLD` (0–100, `0` disables).
 //!   Exactly `T`% left does not alert.
-//! - **Unknown never alerts or blocks**: no windows, an API-key login, or a
-//!   snapshot older than [`MAX_SNAPSHOT_AGE`] (the engine serves the last
-//!   good probe through failures; past that age it is not trusted).
+//! - **Unknown never alerts or blocks**: no windows (an OAuth login whose
+//!   provider has no probe, or an API key with no quota view), or a snapshot
+//!   older than [`MAX_SNAPSHOT_AGE`] (the engine serves the last good probe
+//!   through failures; past that age it is not trusted). An API key that DOES
+//!   report windows is a subscription like any other and is evaluated the
+//!   same way.
 //! - **Reset**: a window whose `resets_at` has passed is reset — it cannot
 //!   alert on old numbers.
 //! - **Scope**: per active account per provider. A Pi session is affected
 //!   only when its model's provider (`anthropic/…`, `openai-codex/…`,
-//!   `github-copilot/…`) is that account's provider; a session on Pi's own
+//!   `github-copilot/…`, `clinepass/…`, `opencode-go/…`) is that account's
+//!   provider; a session on Pi's own
 //!   default model runs on the provider Pi's `settings.json` names. Saved,
 //!   inactive slots are listed, never dispatched.
 //! - **Dedup**: alert key = harness + provider + account + window + reset
@@ -107,7 +112,8 @@ fn harness_slug(harness: HarnessId) -> String {
 pub struct UsageAlert {
     pub key: String,
     pub harness: HarnessId,
-    /// Pi's auth store key (`anthropic`, `openai-codex`, `github-copilot`);
+    /// Pi's auth store (or API-key store) provider key — `anthropic`,
+    /// `openai-codex`, `github-copilot`, `clinepass`, `opencode-go`;
     /// `None` for single-login harnesses.
     pub provider: Option<String>,
     pub account_id: String,
@@ -165,7 +171,11 @@ pub fn evaluate(
 ) -> Evaluation {
     let mut out = Evaluation::default();
     for account in snapshot.accounts.iter().filter(|a| a.active) {
-        if account.auth_kind == Some(AgentAuthKind::ApiKey) {
+        // An API key with no quota view (openrouter, runinfra, Devin's bare
+        // key, …) is not a subscription: nothing to read, nothing to alert.
+        // A key that DOES report windows — an OpenCode Go key — is one, and is
+        // evaluated exactly like an OAuth login below.
+        if account.auth_kind == Some(AgentAuthKind::ApiKey) && account.usage_windows.is_empty() {
             continue;
         }
         let coverage = |status: &str, reason: Option<String>| Coverage {
@@ -339,9 +349,11 @@ pub fn alerts_file(
 }
 
 /// Pi `auth.json` OAuth providers the reader has no usage probe for. Reads
-/// entry names and `type` only.
+/// entry names and `type` only. Every provider `agent_accounts/usage.rs`
+/// probes must be listed here, or the file tells every Pi that a reader is
+/// missing where there is one (`openai` genuinely has none).
 pub fn unsupported_pi_oauth(auth_file: &Path) -> Vec<String> {
-    const SUPPORTED: [&str; 3] = ["anthropic", "openai-codex", "github-copilot"];
+    const SUPPORTED: [&str; 4] = ["anthropic", "openai-codex", "github-copilot", "clinepass"];
     let Ok(text) = std::fs::read_to_string(auth_file) else {
         return Vec::new();
     };
