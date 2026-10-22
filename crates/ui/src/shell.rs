@@ -840,6 +840,13 @@ impl SessionPanels {
         }
     }
 
+    /// Drop a chat's panel state with the chat: a deleted session has nothing
+    /// left to restore its open flags or tab order into.
+    fn forget_chat(&mut self, key: &str) {
+        self.map.remove(key);
+        self.right_tab_history.remove(key);
+    }
+
     /// Resolve against live surfaces so stale terminal/entity ids are skipped.
     /// The strip's first tab remains the fallback for surfaces never visited.
     fn right_surface_fallback(
@@ -2277,6 +2284,10 @@ pub struct Shell {
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
+    /// Sidebar mutations waiting behind the in-flight one. Batches keep a
+    /// call's own ops together (a project's rename spans its checkouts; the
+    /// first failure ends that batch only).
+    mutate_queue: std::collections::VecDeque<Vec<serde_json::Value>>,
     auth_task: Option<Task<()>>,
     runtime_change_task: Option<Task<()>>,
     runtime_change_error: Option<SharedString>,
@@ -2801,6 +2812,7 @@ impl Shell {
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
+            mutate_queue: std::collections::VecDeque::new(),
             auth_task: None,
             runtime_change_task: None,
             runtime_change_error: None,
@@ -3066,68 +3078,71 @@ impl Shell {
         // still ring immediately. Output settings do not affect the baseline.
         {
             let now = Utc::now();
-            type Ping = (
-                String,
-                crate::sound::SessionNotificationState,
-                bool,
-                Option<String>,
-                bool,
-            );
-            let (sessions, connectivity, connectivity_observed) = {
+            // Only a session that actually rings costs anything here: this
+            // observer runs on EVERY notify, so the common frame advances the
+            // baselines from the session rows alone and never walks the chat
+            // list or clones a title.
+            let mut pings: Vec<(String, String, crate::sound::Sound)> = Vec::new();
+            let (connectivity, connectivity_observed) = {
                 let state = state.read(cx);
-                let sessions: Vec<Ping> = state
-                    .sessions
-                    .iter()
-                    .map(|s| {
-                        let status = crate::sound::SessionNotificationState::new(s, now);
-                        let send_pending = state.send_pending(&s.chat_id, now);
-                        let chat = state.chats.iter().find(|c| c.id == s.chat_id);
-                        let title = chat.and_then(|c| c.title.clone());
-                        let notify = crate::sound::notifies(&state.chats, &s.chat_id);
-                        (s.chat_id.clone(), status, send_pending, title, notify)
-                    })
-                    .collect();
-                (
-                    sessions,
-                    state.connectivity.state,
-                    state.connectivity_observed,
-                )
+                for session in &state.sessions {
+                    let status = crate::sound::SessionNotificationState::new(session, now);
+                    let send_pending = state.send_pending(&session.chat_id, now);
+                    // Advance the baseline before anything can skip out: a
+                    // suppressed ping must never be replayed later.
+                    let sound = match self.sound_prev.get_mut(&session.chat_id) {
+                        Some(prev) => {
+                            let sound = status.sound_since(prev, send_pending);
+                            *prev = status;
+                            sound
+                        }
+                        None => {
+                            self.sound_prev.insert(session.chat_id.clone(), status);
+                            None
+                        }
+                    };
+                    let Some(sound) = sound else {
+                        continue;
+                    };
+                    let Some(chat) = state.chats.iter().find(|c| c.id == session.chat_id) else {
+                        continue;
+                    };
+                    // Keep side-chat baselines current, but never emit their
+                    // completion, input-request, or failure sounds/banners. An
+                    // orchestrator's sessions do ring: they are the user's work
+                    // (see `sound::notifies`).
+                    if !crate::sound::notifies(&state.chats, &session.chat_id) {
+                        continue;
+                    }
+                    let title = chat.title.clone().unwrap_or_else(|| "New session".into());
+                    pings.push((session.chat_id.clone(), title, sound));
+                }
+                (state.connectivity.state, state.connectivity_observed)
             };
             // Background-only banners: `active_window()` is app-level (any
             // Zeron window being key), so a ping for a *background chat* in a
             // focused app still stays a chime — you're already looking at
             // Zeron; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
-            for (chat_id, status, send_pending, title, notify) in sessions {
-                let prev = self.sound_prev.insert(chat_id.clone(), status.clone());
-                // Keep side-chat baselines current, but never emit their
-                // completion, input-request, or failure sounds/banners. An
-                // orchestrator's sessions do ring: they are the user's work
-                // (see `sound::notifies`).
-                if notify
-                    && let Some(prev) = prev
-                    && let Some(sound) = status.sound_since(&prev, send_pending)
+            for (chat_id, title, sound) in pings {
+                if self.settings.session_sound_enabled(sound) {
+                    let should_play = sound != crate::sound::Sound::Attention
+                        || self
+                            .attention_sound_gate
+                            .should_play(std::time::Instant::now());
+                    if should_play {
+                        crate::sound::play(sound);
+                    }
+                }
+                if self.settings.notifications_enabled
+                    && !(self.settings.notifications_background_only && app_focused)
                 {
-                    if self.settings.session_sound_enabled(sound) {
-                        let should_play = sound != crate::sound::Sound::Attention
-                            || self
-                                .attention_sound_gate
-                                .should_play(std::time::Instant::now());
-                        if should_play {
-                            crate::sound::play(sound);
-                        }
-                    }
-                    if self.settings.notifications_enabled
-                        && !(self.settings.notifications_background_only && app_focused)
-                    {
-                        let title = title.unwrap_or_else(|| "New session".into());
-                        let body = match sound {
-                            crate::sound::Sound::Done => "Run finished",
-                            crate::sound::Sound::Request => "Waiting on your input",
-                            crate::sound::Sound::Attention => "Run failed",
-                        };
-                        crate::notify::post(&title, body, Some(&chat_id));
-                    }
+                    let body = match sound {
+                        crate::sound::Sound::Done => "Run finished",
+                        crate::sound::Sound::Request => "Waiting on your input",
+                        crate::sound::Sound::Attention => "Run failed",
+                    };
+                    crate::notify::post(&title, body, Some(&chat_id));
                 }
             }
             if let Some(sound) = self.connectivity_notifications.update(
@@ -6142,10 +6157,12 @@ impl Shell {
         self.mutate_many(vec![params], cx);
     }
 
-    /// Fire Mutate ops in order on ONE task: a project's rename or removal
-    /// spans its checkouts, and a second `mutate` call would replace (and so
-    /// cancel) the first request. The first failure surfaces in the sidebar
-    /// notice strip, as for a single op.
+    /// Queue Mutate ops and drain them on ONE task, in order. A project's
+    /// rename or removal spans its checkouts, so one call's ops must not
+    /// interleave with another's; and replacing the running task on every
+    /// click cancelled the request already in flight and swallowed its error.
+    /// Each batch stops at its first failure, which surfaces in the sidebar
+    /// notice strip.
     fn mutate_many(&mut self, ops: Vec<serde_json::Value>, cx: &mut Context<Self>) {
         if ops.is_empty() {
             return;
@@ -6155,15 +6172,29 @@ impl Shell {
             cx.notify();
             return;
         };
+        self.mutate_queue.push_back(ops);
+        // A running drain picks up what was just queued.
+        if self.mutate_task.is_some() {
+            return;
+        }
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
-            for params in ops {
-                if let Err(err) = engine.client().call(methods::MUTATE, params).await {
-                    this.update(cx, |shell, cx| {
-                        shell.show_notice(crate::toast::ToastKind::Error, format!("{err}"), cx);
-                        cx.notify();
-                    })
+            loop {
+                let batch = this
+                    .update(cx, |shell, _| shell.mutate_queue.pop_front())
                     .ok();
+                let Some(batch) = batch.flatten() else {
+                    this.update(cx, |shell, _| shell.mutate_task = None).ok();
                     return;
+                };
+                for params in batch {
+                    if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                        this.update(cx, |shell, cx| {
+                            shell.show_notice(crate::toast::ToastKind::Error, format!("{err}"), cx);
+                            cx.notify();
+                        })
+                        .ok();
+                        break;
+                    }
                 }
             }
         }));
@@ -6383,6 +6414,16 @@ impl Shell {
         let state = self.state.read(cx);
         if state.workspace_scope == Some(WorkspaceScope::Local) {
             if !state.chats_synced {
+                return;
+            }
+            // Nothing pinned for this profile: skip the scan of every chat
+            // (and the cloned ids it collects) — this runs on every notify.
+            if self
+                .settings
+                .sidebar_pinned_session_ids_by_profile
+                .get(&profile_key)
+                .is_none_or(Vec::is_empty)
+            {
                 return;
             }
             let known = state.chats.iter().map(|chat| chat.id.clone()).collect();
@@ -6655,16 +6696,7 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
-        if let Some(tabs) = self.right_tabs.get(&chat_id) {
-            for surface in tabs {
-                if let RightSurface::Browser(id) = surface {
-                    if let Some(browser) = self.browsers.remove(id) {
-                        browser.update(cx, |browser, cx| browser.close(cx));
-                    }
-                    self.browser_subs.remove(id);
-                }
-            }
-        }
+        self.forget_chat_panels(&chat_id, cx);
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
@@ -6675,6 +6707,61 @@ impl Shell {
             cx,
         );
         cx.notify();
+    }
+
+    /// Tear down everything the deleted session's right pane owns: its surface
+    /// tabs, the entities behind them, the feeds they hold (file editors, diff
+    /// watches, subagent doc watches, browser previews, terminal PTYs) and its
+    /// per-session panel state. The row is going away, so nothing here can be
+    /// reopened — leaving the tabs up pinned subagent docs and kept engine
+    /// watches running for a session that no longer exists.
+    fn forget_chat_panels(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let surfaces = self.right_tabs.remove(chat_id).unwrap_or_default();
+        self.right_tab_drag = None;
+        for surface in surfaces {
+            self.pending_file_closes.remove(&surface);
+            self.panels.forget_right_surface(chat_id, surface);
+            match surface {
+                RightSurface::File(id) => {
+                    self.file_surfaces.remove(&id);
+                    self.file_surface_paths.remove(&id);
+                    self.file_surface_subs.remove(&id);
+                    self.file_surface_keys.retain(|_, value| *value != id);
+                }
+                RightSurface::Diff(id) => {
+                    // Dropping the entity tears down its diff watch.
+                    self.diffs.remove(&id);
+                    self.diff_subs.remove(&id);
+                }
+                RightSurface::Terminal(_) => {
+                    if let Some(panel) = self.right_terminal.clone() {
+                        panel.update(cx, |panel, cx| panel.close_chat_tabs(chat_id, cx));
+                    }
+                }
+                RightSurface::SideChat(id) => {
+                    self.side_chats.remove(&id);
+                }
+                RightSurface::Subagent(id) => {
+                    // Unwatch drops the watch task, the engine-side watch and
+                    // the doc's pin in the engine LRU.
+                    if let Some(tab) = self.subagent_tabs.remove(&id) {
+                        self.state
+                            .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
+                    }
+                }
+                RightSurface::Extension(id) => {
+                    self.extension_tabs.remove(&id);
+                }
+                RightSurface::Browser(id) => {
+                    if let Some(browser) = self.browsers.remove(&id) {
+                        browser.update(cx, |browser, cx| browser.close(cx));
+                    }
+                    self.browser_subs.remove(&id);
+                }
+                RightSurface::Picker => {}
+            }
+        }
+        self.panels.forget_chat(chat_id);
     }
 
     fn confirm_discard_working_tree(&mut self, cx: &mut Context<Self>) {
@@ -8423,6 +8510,9 @@ impl Shell {
     fn render_chat_row(
         &self,
         id: String,
+        // The row's host device, from the caller's own chat row: looking the
+        // chat up again here cost one scan of every chat per row.
+        device_id: Option<String>,
         title: SharedString,
         time_ago: SharedString,
         space_name: SharedString,
@@ -8464,24 +8554,12 @@ impl Shell {
         } else {
             format!("chat-{id}")
         };
-        let pr_device = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .map(|chat| chat.device_id.clone());
+        let remote = device_id
+            .as_deref()
+            .is_some_and(|device| self.state.read(cx).local_device_id.as_deref() != Some(device));
+        let pr_device = device_id;
         let compact = child_row || (search_query.is_none() && self.settings.sidebar_compact);
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
-        let remote = self
-            .state
-            .read(cx)
-            .chats
-            .iter()
-            .find(|chat| chat.id == id)
-            .is_some_and(|chat| {
-                self.state.read(cx).local_device_id.as_deref() != Some(chat.device_id.as_str())
-            });
         let project_icon = (project_icon && search_query.is_none())
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
@@ -18886,6 +18964,36 @@ mod right_tab_mouse_regressions {
                     RightSurface::Subagent(_) | RightSurface::Extension(_)
                 )),
                 "a detached tab stayed in the strip"
+            );
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Picker);
+        });
+    }
+
+    /// Deleting a session takes its whole right pane with it. The row is gone,
+    /// so nothing in it can be reopened: leaving the tabs up stranded live
+    /// entities (and their diff/subagent/browser feeds) on a chat that no
+    /// longer exists.
+    #[gpui::test]
+    fn deleting_a_chat_takes_its_surface_tabs(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.subagent_tabs.len(), 2, "setup opens two tabs");
+        });
+        shell.update(cx, |shell, cx| shell.delete_chat("parent".into(), cx));
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, cx| {
+            assert!(
+                shell.subagent_tabs.is_empty(),
+                "a deleted chat's tabs outlived it"
+            );
+            assert!(
+                shell.right_tabs.get("parent").is_none(),
+                "the panel kept a strip for a deleted chat"
+            );
+            assert_eq!(
+                shell.panels.get("parent"),
+                ChatPanels::default(),
+                "per-session panel state outlived its chat"
             );
             assert_eq!(shell.resolved_right_active(cx), RightSurface::Picker);
         });

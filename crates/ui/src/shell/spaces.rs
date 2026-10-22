@@ -5595,6 +5595,7 @@ impl Shell {
                 };
                 let element = self.render_chat_row(
                     chat.id.clone(),
+                    Some(chat.device_id.clone()),
                     transcript::single_line(
                         &chat.title.clone().unwrap_or_else(|| "New session".into()),
                     )
@@ -6117,6 +6118,7 @@ impl Shell {
                 list = list.child(
                     self.render_chat_row(
                         chat.id.clone(),
+                        Some(chat.device_id.clone()),
                         transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
                         )

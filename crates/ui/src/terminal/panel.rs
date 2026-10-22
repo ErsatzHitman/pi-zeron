@@ -1376,7 +1376,6 @@ impl TerminalPanel {
             return;
         };
         let tab = tabs.tabs.remove(ix);
-        let target = tab.target_device_id.clone();
         tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
         let now_empty = tabs.tabs.is_empty();
         self.drag = None;
@@ -1387,19 +1386,42 @@ impl TerminalPanel {
         if now_empty && self.open && !self.embedded {
             window.dispatch_action(Box::new(ToggleTerminal), cx);
         }
-        if let (Some(engine), Some(id)) = (engine, tab.terminal_id.clone()) {
-            cx.spawn(async move |_, _| {
-                let _ = engine
-                    .client()
-                    .call(
-                        methods::CLOSE_TERMINAL,
-                        with_target(serde_json::json!({ "terminalId": id }), &target),
-                    )
-                    .await;
-            })
-            .detach();
+        Self::retire_tab(engine, tab, cx);
+        cx.notify();
+    }
+
+    /// Close every tab `chat` owns, PTYs included — a deleted session's
+    /// terminals have no tab left to reach them from. `close_tab`'s drawer
+    /// dispatch is the only window-bound part of closing, and emptiness here
+    /// is the shell's to own, so this needs no window.
+    pub fn close_chat_tabs(&mut self, chat: &str, cx: &mut Context<Self>) {
+        let engine = self.engine(cx);
+        let Some(tabs) = self.chats.remove(chat) else {
+            return;
+        };
+        self.drag = None;
+        for tab in tabs.tabs {
+            Self::retire_tab(engine.clone(), tab, cx);
         }
         cx.notify();
+    }
+
+    /// Tell the engine to drop `tab`'s PTY. Shared by close and purge.
+    fn retire_tab(engine: Option<EngineHandle>, tab: TerminalTab, cx: &mut Context<Self>) {
+        let (Some(engine), Some(id)) = (engine, tab.terminal_id) else {
+            return;
+        };
+        let target = tab.target_device_id;
+        cx.spawn(async move |_, _| {
+            let _ = engine
+                .client()
+                .call(
+                    methods::CLOSE_TERMINAL,
+                    with_target(serde_json::json!({ "terminalId": id }), &target),
+                )
+                .await;
+        })
+        .detach();
     }
 
     fn commit_reorder(&mut self, chat: &str, from: usize, to: usize, cx: &mut Context<Self>) {
@@ -1909,6 +1931,40 @@ mod tests {
         panel.read_with(cx, |panel, cx| {
             assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 0);
             assert_eq!(panel.active_tab(cx).unwrap().scroll_remainder, 0.75);
+        });
+    }
+
+    /// Deleting a session purges its terminals (PTYs included) and leaves
+    /// another chat's tabs alone.
+    #[gpui::test]
+    fn purging_a_chat_closes_only_its_tabs(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("chat".into());
+                state
+            });
+            let mut panel = TerminalPanel::new(state, cx);
+            for (chat, title) in [("chat", "First"), ("chat", "Second"), ("other", "Third")] {
+                panel.reserve_tab_for_chat(chat.into(), title, cx);
+            }
+            panel
+        });
+        panel.update(cx, |panel, cx| panel.close_chat_tabs("chat", cx));
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.chats.get("chat").is_none(),
+                "a deleted chat kept its terminal tabs"
+            );
+            assert_eq!(
+                panel.chats.get("other").map(|tabs| tabs.tabs.len()),
+                Some(1),
+                "another chat's terminal went with it"
+            );
         });
     }
 
