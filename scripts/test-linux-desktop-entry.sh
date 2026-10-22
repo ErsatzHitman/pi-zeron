@@ -13,16 +13,18 @@ trap 'rm -rf "$WORK"' EXIT
 VERSION=9.9.9
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# A fake release: the tarball layout package-linux.sh produces, minus the real
-# binary. `uname` is shimmed so the curl installer also runs on a macOS dev box.
+# A fake release feed: the tarball layout package-linux.sh produces, minus the
+# real binary, published the way the curl installer reads it (manifest.json at
+# the feed root, artifacts beside it). `uname` is shimmed so the curl installer
+# also runs on a macOS dev box.
 PKG="zeron-$VERSION-linux-x86_64"
-mkdir -p "$WORK/site/releases" "$WORK/pkg/$PKG" "$WORK/shim"
+mkdir -p "$WORK/site" "$WORK/pkg/$PKG" "$WORK/shim"
 printf '#!/bin/sh\nexit 0\n' >"$WORK/pkg/$PKG/zeron"
 chmod 755 "$WORK/pkg/$PKG/zeron"
 cp "$ROOT/dist/zeron.desktop" "$WORK/pkg/$PKG/zeron.desktop"
 printf 'not-really-a-png' >"$WORK/pkg/$PKG/zeron.png"
-echo "$VERSION" >"$WORK/site/releases/latest.txt"
-tar -czf "$WORK/site/releases/$PKG.tar.gz" -C "$WORK/pkg" "$PKG"
+printf '{\n  "version": "%s",\n  "files": {}\n}\n' "$VERSION" >"$WORK/site/manifest.json"
+tar -czf "$WORK/site/$PKG.tar.gz" -C "$WORK/pkg" "$PKG"
 printf '#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) exec /usr/bin/uname "$@" ;; esac\n' >"$WORK/shim/uname"
 chmod 755 "$WORK/shim/uname"
 
@@ -44,7 +46,7 @@ mkdir -p "$WORK/tmp"
 run_curl() {
   local home="$1"; shift
   env -i HOME="$home" USER=tester PATH="$WORK/shim:/usr/bin:/bin" TMPDIR="$WORK/tmp" "$@" \
-    ZERON_BASE_URL="file://$WORK/site" sh "$ROOT/edge/src/install.sh" >"$WORK/out.log" 2>&1 \
+    ZERON_RELEASES_URL="file://$WORK/site" sh "$ROOT/edge/src/install.sh" >"$WORK/out.log" 2>&1 \
     || { cat "$WORK/out.log" >&2; fail "curl installer exited non-zero"; }
   [ -z "$(ls -A "$WORK/tmp")" ] || fail "curl installer left files in TMPDIR: $(ls -A "$WORK/tmp")"
 }

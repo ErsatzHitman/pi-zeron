@@ -1,7 +1,10 @@
 #!/bin/sh
-# Zeron (native) headless installer.
+# Zeron for Pi (native) headless installer.
 #
-#   curl -fsSL https://zeron.sh/install.sh | sh
+# Run from this fork's Linux release tarball, or serve it as the
+# `curl -fsSL <install-host>/install.sh | sh` one-liner. Artifacts come from
+# this fork's GitHub releases; upstream Zeron's feed serves upstream builds
+# and would replace this fork.
 #
 # Installs the native binary (requires the system ALSA runtime) to
 # ~/.zeron/app, puts `zeron` on PATH, adds a launcher entry and icon under
@@ -14,7 +17,10 @@
 # client-id configuration needed. Overrides (if any) go in ~/.zeron/env.
 set -eu
 
-BASE="${ZERON_BASE_URL:-https://zeron.sh}"
+# Release feed: the newest assets of this fork's GitHub release. Never
+# upstream Zeron's `{edge}/releases`. ZERON_RELEASES_URL (the same override the
+# updater reads) or the legacy ZERON_BASE_URL selects another feed.
+FEED="${ZERON_RELEASES_URL:-${ZERON_BASE_URL:-https://github.com/ErsatzHitman/pi-zeron/releases/latest/download}}"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"
@@ -23,7 +29,7 @@ case "$os" in
   Linux) plat=linux ;;
   Darwin)
     echo "zeron install: on macOS, download the desktop app instead:" >&2
-    echo "  $BASE/releases/latest.txt → $BASE/releases/zeron-<version>-macos-arm64.dmg" >&2
+    echo "  $FEED/manifest.json → $FEED/zeron-<version>-macos-arm64.dmg" >&2
     exit 1
     ;;
   *)
@@ -41,7 +47,11 @@ case "$arch" in
 esac
 
 # --- download ----------------------------------------------------------------
-ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
+# manifest.json carries the version (and the per-artifact sha256); latest.txt
+# remains as the fallback for releases published before the manifest existed.
+ver="$(curl -fsSL "$FEED/manifest.json" 2>/dev/null \
+  | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+[ -n "$ver" ] || ver="$(curl -fsSL "$FEED/latest.txt" 2>/dev/null | tr -d '[:space:]')"
 [ -n "$ver" ] || { echo "zeron install: could not resolve latest version" >&2; exit 1; }
 file="zeron-$ver-$plat-$arch.tar.gz"
 data_root="$HOME/.zeron"
@@ -54,7 +64,7 @@ else
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   echo "downloading zeron $ver ($plat-$arch)…"
-  curl -fSL --progress-bar "$BASE/releases/$file" -o "$tmp/$file"
+  curl -fSL --progress-bar "$FEED/$file" -o "$tmp/$file"
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
 fi
