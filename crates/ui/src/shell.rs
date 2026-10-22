@@ -49,6 +49,7 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::usage::UsagePage;
+use crate::settings::usage_limits::UsageLimitsPage;
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, FILES_PANEL_MIN, JUMP_SLOTS, KeymapConfig,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
@@ -568,13 +569,15 @@ pub enum SettingsSection {
     Archived,
     /// Tokens and spend per Pi provider and model on this machine.
     Usage,
+    /// Plan rate limits for every connected subscription on this machine.
+    UsageLimits,
     /// Every provider API key Zeron and its Pi use.
     ApiKeys,
 }
 
 impl SettingsSection {
     /// Sections shown in Settings. `Agents` is a legacy Accounts route alias.
-    pub const ALL: [SettingsSection; 12] = [
+    pub const ALL: [SettingsSection; 13] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
@@ -583,6 +586,7 @@ impl SettingsSection {
         SettingsSection::Harnesses,
         SettingsSection::ApiKeys,
         SettingsSection::Usage,
+        SettingsSection::UsageLimits,
         SettingsSection::Devices,
         SettingsSection::Files,
         SettingsSection::Appshots,
@@ -630,6 +634,7 @@ impl SettingsSection {
             SettingsSection::Appshots => "appshots",
             SettingsSection::Archived => "archived",
             SettingsSection::Usage => "usage",
+            SettingsSection::UsageLimits => "usage-limits",
             SettingsSection::ApiKeys => "api-keys",
         }
     }
@@ -649,6 +654,7 @@ impl SettingsSection {
             "appshots" => SettingsSection::Appshots,
             "archived" => SettingsSection::Archived,
             "usage" => SettingsSection::Usage,
+            "usage-limits" | "limits" => SettingsSection::UsageLimits,
             "api-keys" | "keys" => SettingsSection::ApiKeys,
             _ => return None,
         })
@@ -676,6 +682,7 @@ impl SettingsSection {
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Usage => "Usage",
+            SettingsSection::UsageLimits => "Usage limits",
             SettingsSection::ApiKeys => "API keys",
         }
     }
@@ -2152,6 +2159,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     usage_page: Option<Entity<UsagePage>>,
+    usage_limits_page: Option<Entity<UsageLimitsPage>>,
     api_keys_page: Option<Entity<crate::settings::api_keys::ApiKeysPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
@@ -2729,6 +2737,7 @@ impl Shell {
             devices_page: None,
             archived_page: None,
             usage_page: None,
+            usage_limits_page: None,
             api_keys_page: None,
             appearance_page: None,
             files_settings_page: None,
@@ -5647,6 +5656,10 @@ impl Shell {
         if section == SettingsSection::Usage {
             self.usage_page = None;
         }
+        // Each visit re-probes every subscription's plan windows.
+        if section == SettingsSection::UsageLimits {
+            self.usage_limits_page = None;
+        }
         // Each visit shows the key router's latest health.
         if section == SettingsSection::ApiKeys
             && let Some(page) = &self.api_keys_page
@@ -6148,6 +6161,16 @@ impl Shell {
                     self.usage_page = Some(cx.new(|cx| UsagePage::new(state, cx)));
                 }
                 match &self.usage_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::UsageLimits => {
+                if self.usage_limits_page.is_none() {
+                    let state = self.state.clone();
+                    self.usage_limits_page = Some(cx.new(|cx| UsageLimitsPage::new(state, cx)));
+                }
+                match &self.usage_limits_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -8402,6 +8425,7 @@ impl Shell {
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Usage => icons::CHART,
+            SettingsSection::UsageLimits => icons::CHART,
             SettingsSection::ApiKeys => icons::KEY_MINIMALISTIC,
         };
         settings::widgets::scroll_faded(
@@ -19421,6 +19445,14 @@ mod settings_modal_regressions {
             assert!(section.reopenable().visible_in_nav(), "{section:?}");
             assert_eq!(SettingsSection::from_slug(section.slug()), Some(section));
         }
+        assert_eq!(
+            SettingsSection::from_slug("usage-limits"),
+            Some(SettingsSection::UsageLimits)
+        );
+        assert_eq!(
+            SettingsSection::from_slug("limits"),
+            Some(SettingsSection::UsageLimits)
+        );
     }
 
     #[test]
@@ -19446,6 +19478,8 @@ mod settings_modal_regressions {
             ("settings/appshots", SettingsSection::Appshots),
             ("settings/archived", SettingsSection::Archived),
             ("settings/usage", SettingsSection::Usage),
+            ("settings/usage-limits", SettingsSection::UsageLimits),
+            ("settings/limits", SettingsSection::UsageLimits),
             ("settings/api-keys", SettingsSection::ApiKeys),
         ] {
             assert_eq!(
@@ -19565,6 +19599,37 @@ mod settings_modal_regressions {
         assert_eq!(
             settings::UiSettings::load(dir.path()).settings_section,
             SettingsSection::Harnesses
+        );
+    }
+
+    /// Usage limits is a first-class settings route: it opens, is remembered
+    /// as itself (unlike the legacy Accounts alias), and reopens there.
+    #[gpui::test]
+    fn usage_limits_is_a_route_and_reopens(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let window = cx.add_window(|_, cx| test_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.open_settings(SettingsSection::UsageLimits, cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::UsageLimits));
+                assert_eq!(
+                    shell.settings.settings_section,
+                    SettingsSection::UsageLimits
+                );
+                assert_eq!(
+                    settings::current(cx).settings_section,
+                    SettingsSection::UsageLimits
+                );
+                shell.close_settings(cx);
+                shell.toggle_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::UsageLimits));
+                settings::flush(cx);
+            })
+            .unwrap();
+        assert_eq!(
+            settings::UiSettings::load(dir.path()).settings_section,
+            SettingsSection::UsageLimits
         );
     }
 
