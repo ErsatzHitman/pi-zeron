@@ -497,7 +497,11 @@ impl WorkflowView {
         (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
     }
 
-    /// Rows the section draws before its first measurement.
+    /// Rows the section draws before its first measurement: title, totals
+    /// and "Phases", then each phase's header (its two lines) and, for the
+    /// phase in progress, its table header and every agent row it lists.
+    /// Only an estimate: it holds `section_frame`'s height until the painted
+    /// probe lands, and the table itself is not capped (the card scrolls).
     pub fn estimated_rows(&self, queued_open: bool, finished_open: bool) -> usize {
         if self.grouped {
             // Title, totals and "Phases", then each header (two lines) and
@@ -508,7 +512,7 @@ impl WorkflowView {
                     .iter()
                     .map(|p| {
                         2 + if p.opens_by_default() {
-                            1 + p.rows.len().min(GROUP_ROWS)
+                            1 + p.rows.len()
                         } else {
                             0
                         }
@@ -1117,6 +1121,45 @@ mod tests {
         assert_eq!(trace.dots, [Dot::Done; 4]);
         assert!(view.stop.is_some());
         assert_eq!(view.took(), None, "a live run has no frozen time");
+    }
+
+    #[test]
+    fn a_grouped_runs_estimate_counts_every_row_of_an_open_phase() {
+        // Twenty agents in the phase in progress: the table lists them all, so
+        // the section's pre-measure estimate has to count them all.
+        let mut payload = grouped();
+        payload["tasks"] = json!((0..20)
+            .map(|n| json!({"id": format!("w{n}"), "label": format!("check {n}"),
+                            "state": "running", "phaseIndex": 3,
+                            "startedAt": T0 + 50_000}))
+            .collect::<Vec<_>>());
+        payload["phases"][3]["agents"] = json!(20);
+        payload["phases"][3]["running"] = json!(20);
+        payload["phases"][3]["queued"] = json!(0);
+        let view = WorkflowView::of(&ui(payload), now()).expect("shown");
+        assert_eq!(view.phases[3].rows.len(), 20);
+        // Title, totals and "Phases", then each of the five phase headers (two
+        // lines) and, for the one open phase, its table header and its rows.
+        let rows = 4 + 5 * 2 + 1 + 20;
+        assert_eq!(view.estimated_rows(false, false), rows);
+        assert!(
+            view.estimated_rows(false, false) > 4 + 5 * 2 + 1 + GROUP_ROWS,
+            "the estimate no longer stops at GROUP_ROWS rows"
+        );
+
+        // The v1 layout keeps its caps: Queued and Finished list GROUP_ROWS
+        // rows before "+N more".
+        let mut v1 = running();
+        v1["tasks"] = json!((0..20)
+            .map(|n| json!({"id": format!("q{n}"), "label": format!("queued {n}"),
+                            "state": "queued"}))
+            .collect::<Vec<_>>());
+        let view = WorkflowView::of(&ui(v1), now()).expect("shown");
+        assert!(!view.grouped);
+        assert_eq!(view.queued.len(), 20);
+        // Title and status, then the Queued fold, closed and open.
+        assert_eq!(view.estimated_rows(false, false), 3);
+        assert_eq!(view.estimated_rows(true, false), 3 + GROUP_ROWS);
     }
 
     #[test]
