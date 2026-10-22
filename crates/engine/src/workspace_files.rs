@@ -26,6 +26,7 @@ use zeron_proto::{
 };
 use zeron_rpc::RpcError;
 
+use crate::fs_watch::{FsWatch, FsWatchHub};
 use crate::workspace_search::{IndexState, NameKinds, normalize_name_query};
 use crate::{Repos, WorkspaceHost, WorkspaceSearch};
 
@@ -80,7 +81,9 @@ struct CheckoutWatch {
     subscribers: AtomicUsize,
     changes_tx: broadcast::Sender<WorkspaceFileChanges>,
     cancel: CancellationToken,
-    watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// Keeps the recursive watch alive on the shared [`FsWatchHub`], so a
+    /// checkout costs OS watches but no thread of its own. Dropped on cancel.
+    watcher: Mutex<Option<FsWatch>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -612,18 +615,20 @@ impl WorkspaceFiles {
             }
         }
 
+        let cancel = self.inner.cancel.child_token();
+        let checkout_id = workspace.checkout_id.clone();
         let root = workspace.root.clone();
-        let over_budget = tokio::task::spawn_blocking(move || exceeds_watch_budget(&root))
-            .await
-            .map_err(|error| {
-                WorkspaceFilesError::Io(format!("watch budget worker failed: {error}"))
-            })?;
-        let candidate = CheckoutWatch::start(
-            workspace.checkout_id.clone(),
-            workspace.root,
-            over_budget,
-            self.inner.cancel.child_token(),
-        );
+        // Budget walk and hub registration are both blocking (the walk reads up
+        // to MAX_WATCH_DIRS entries, the hub canonicalizes and installs OS
+        // watches), so they run off the runtime.
+        let candidate = tokio::task::spawn_blocking(move || {
+            let over_budget = exceeds_watch_budget(&root);
+            CheckoutWatch::start(checkout_id, root, over_budget, cancel)
+        })
+        .await
+        .map_err(|error| {
+            WorkspaceFilesError::Io(format!("watch setup worker failed: {error}"))
+        })?;
         let subscription = {
             let mut watches = lock(&self.inner.watches);
             if let Some(existing) = watches.get(&workspace.checkout_id) {
@@ -678,34 +683,32 @@ impl CheckoutWatch {
         } else {
             let callback_overflow = overflow.clone();
             let callback_notify = overflow_notify.clone();
-            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-                if event
-                    .as_ref()
-                    .is_ok_and(|event| matches!(event.kind, notify::EventKind::Access(_)))
-                {
-                    return;
-                }
-                let event = TimedWatchEvent {
-                    received_at: Instant::now(),
-                    event,
-                };
-                match event_tx.try_send(event) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        callback_overflow.store(true, Ordering::Release);
-                        callback_notify.notify_one();
+            // Registered on the shared hub: one watcher thread for every
+            // checkout (and diff-sync's own watch on the same root), not one
+            // per checkout. The hub's rescan events (watch went live, events
+            // may have been lost) reach the callback as pathless rescan events
+            // and become a full resync in `normalize_watch_events`.
+            Some(FsWatchHub::global().watch(
+                &root,
+                notify::RecursiveMode::Recursive,
+                move |event: &notify::Event| {
+                    if matches!(event.kind, notify::EventKind::Access(_)) {
+                        return;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {}
-                }
-            })
-            .ok()
-            .and_then(|mut watcher| {
-                use notify::Watcher as _;
-                watcher
-                    .watch(&root, notify::RecursiveMode::Recursive)
-                    .ok()
-                    .map(|()| watcher)
-            })
+                    let event = TimedWatchEvent {
+                        received_at: Instant::now(),
+                        event: Ok(event.clone()),
+                    };
+                    match event_tx.try_send(event) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            callback_overflow.store(true, Ordering::Release);
+                            callback_notify.notify_one();
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                },
+            ))
         };
         let repair_only = over_budget || watcher.is_none();
         let watch = Arc::new(Self {
@@ -932,6 +935,13 @@ fn normalize_watch_events(
                 continue;
             }
         };
+        // The hub's synthetic "anything may have changed" signal: the watch
+        // went live (anything before it was unobserved) or events may have
+        // been lost. Same handling as a watcher error.
+        if event.need_rescan() {
+            resync_required = true;
+            continue;
+        }
         if matches!(
             event.kind,
             EventKind::Modify(ModifyKind::Name(RenameMode::Both))
@@ -3376,6 +3386,20 @@ mod tests {
         assert_eq!(changes[0].kind, WorkspaceFileChangeKind::Removed);
     }
 
+    #[test]
+    fn watch_treats_hub_rescans_as_a_full_resync() {
+        use notify::EventKind;
+        use notify::event::Flag;
+
+        let root = Path::new("/workspace");
+        let events = vec![Ok(
+            notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
+        )];
+        let (resync, changes) = normalize_watch_events(root, events);
+        assert!(resync);
+        assert!(changes.is_empty());
+    }
+
     #[tokio::test]
     async fn new_subscribers_do_not_create_sequence_gaps_for_existing_subscribers() {
         let root = tempfile::tempdir().unwrap();
@@ -3453,6 +3477,24 @@ mod tests {
         assert!(watch.cancel.is_cancelled());
     }
 
+    /// The shared hub installs watches on its batch worker, so a registration
+    /// is not live when `CheckoutWatch::start` returns. Tests that inject
+    /// native changes wait for it first; production relies on the hub's rescan
+    /// (a full resync) to cover the capture→attach gap.
+    async fn wait_until_live(watch: &Arc<CheckoutWatch>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if lock(&watch.watcher).as_ref().is_some_and(FsWatch::is_live) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "checkout watch never went live"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn watch_streams_native_file_changes_and_stops_on_cancel() {
         let root = tempfile::tempdir().unwrap();
@@ -3465,6 +3507,7 @@ mod tests {
         );
         let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
         subscription.recv().await.unwrap();
+        wait_until_live(&watch).await;
         std::fs::write(canonical.join("created.txt"), b"hello").unwrap();
         let batch = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
             .await
@@ -3494,6 +3537,7 @@ mod tests {
         );
         let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
         subscription.recv().await.unwrap();
+        wait_until_live(&watch).await;
 
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"after").unwrap();
@@ -3535,6 +3579,7 @@ mod tests {
         );
         let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
         subscription.recv().await.unwrap();
+        wait_until_live(&watch).await;
 
         std::fs::write(&replacement, b"after").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
@@ -3573,6 +3618,7 @@ mod tests {
         );
         let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
         subscription.recv().await.unwrap();
+        wait_until_live(&watch).await;
 
         let producer = tokio::spawn(async move {
             for value in 1..=50 {
