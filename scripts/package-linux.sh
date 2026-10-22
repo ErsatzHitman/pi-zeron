@@ -41,7 +41,7 @@ cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
 # Install Zeron for this user (no root needed), in the layout the in-app
 # updater manages: ~/.zeron/app/<version> behind a `current` symlink — the
-# same layout `curl -fsSL https://zeron.sh/install.sh | sh` uses — with
+# same layout the curl installer (`edge/src/install.sh`) uses — with
 # ~/.local/bin/zeron and the desktop entry pointing through it.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -280,12 +280,11 @@ impl SessionDoc {
     /// Drop a row. `false` when it was already gone (another device took it).
     pub fn remove_queued(&self, id: &str) -> Result<bool, DocError> {
         let queue = self.doc().get_movable_list("queue");
-        let Some(index) = index_of(&queue, id) else {
-            return Ok(false);
-        };
-        queue.delete(index, 1)?;
-        self.doc().commit();
-        Ok(true)
+        let removed = remove_queued_row(&queue, id, index_of(&queue, id), |_| false)?;
+        if removed.removed {
+            self.doc().commit();
+        }
+        Ok(removed.removed)
     }
 
     /// Remove a row and hand it back — the host's "send this one" path.
@@ -293,22 +292,17 @@ impl SessionDoc {
     /// popping the same row means exactly one of them gets it.
     pub fn take_queued(&self, id: &str) -> Result<Option<QueuedMessage>, DocError> {
         let queue = self.doc().get_movable_list("queue");
-        let Some(index) = index_of(&queue, id) else {
-            return Ok(None);
-        };
-        let item = self.read_queue()?.into_iter().find(|item| item.id == id);
         // Delivery gates are a model invariant, not merely a UI/engine
         // convention. This keeps future take call sites from accidentally
-        // sending a row that is being edited or awaiting review.
-        if item
-            .as_ref()
-            .is_some_and(|item| item.delivery_gate.is_some())
-        {
-            return Ok(None);
+        // sending a row that is being edited or awaiting review: a gated row
+        // is refused without being removed.
+        let removed = remove_queued_row(&queue, id, index_of(&queue, id), |item| {
+            item.is_some_and(|row| row.delivery_gate.is_some())
+        })?;
+        if removed.removed {
+            self.doc().commit();
         }
-        queue.delete(index, 1)?;
-        self.doc().commit();
-        Ok(item)
+        Ok(removed.item)
     }
 
     /// Remove and return the head — the host's turn-end flush.
@@ -317,6 +311,77 @@ impl SessionDoc {
             return Ok(None);
         };
         self.take_queued(&head.id)
+    }
+}
+
+/// The row [`remove_queued_row`] located, and whether it left the queue.
+struct RemovedQueuedRow {
+    /// False when no row carried the id, or `keep` refused it.
+    removed: bool,
+    /// The row's contents. `None` for a malformed row that was removed anyway:
+    /// it can never be rendered or dispatched, but it still matched `id`.
+    item: Option<QueuedMessage>,
+}
+
+/// Locate the row `id`, read it, and delete it in one pass.
+///
+/// A position is only meaningful for the instant it is read. The doc is shared
+/// (`Arc<SessionDoc>`) and chat2 rows are imported on the sync task, so a
+/// remote reorder or delete landing between an earlier lookup and the mutation
+/// shifts every later position — deleting `hint` outright would then drop a
+/// neighbour. `hint` is therefore only a starting point: the row there is
+/// matched against `id` first, and a miss (the row moved, or the position now
+/// holds someone else) falls back to a full scan. The whole locate → read →
+/// delete runs against one freshly resolved position, with no queue-wide read
+/// in between to widen the window. `keep` refuses a matched row without
+/// touching the queue.
+fn remove_queued_row(
+    queue: &loro::LoroMovableList,
+    id: &str,
+    hint: Option<usize>,
+    keep: impl Fn(Option<&QueuedMessage>) -> bool,
+) -> Result<RemovedQueuedRow, DocError> {
+    let mut candidate = hint;
+    loop {
+        let index = match candidate.take() {
+            Some(index) if index < queue.len() => index,
+            _ => match index_of(queue, id) {
+                Some(index) => index,
+                None => {
+                    return Ok(RemovedQueuedRow {
+                        removed: false,
+                        item: None,
+                    });
+                }
+            },
+        };
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = queue.get(index)
+        else {
+            continue;
+        };
+        // `get` returns a container handle, so this reads the row that sat at
+        // `index` when it was fetched. Match the id again: a reorder between
+        // the scan above and this read can have put a neighbour there.
+        let matches_target = matches!(
+            map.get("id"),
+            Some(loro::ValueOrContainer::Value(loro::LoroValue::String(s)))
+                if s.as_str() == id
+        );
+        if !matches_target {
+            continue;
+        }
+        let item = queued_from_json(map.get_deep_value().to_json_value());
+        if keep(item.as_ref()) {
+            return Ok(RemovedQueuedRow {
+                removed: false,
+                item: None,
+            });
+        }
+        queue.delete(index, 1)?;
+        return Ok(RemovedQueuedRow {
+            removed: true,
+            item,
+        });
     }
 }
 
@@ -649,6 +714,44 @@ mod tests {
         assert!(doc.take_queued("q1").unwrap().is_none());
         assert!(doc.take_queue_head().unwrap().is_none());
         assert_eq!(texts(&doc), vec!["still editing"]);
+    }
+
+    /// A position resolved by an earlier read is only a hint: the row is
+    /// matched by id again at the delete site, so a concurrent reorder that
+    /// shifted it can never make the delete drop a neighbour.
+    #[test]
+    fn a_stale_position_never_deletes_a_neighbour() {
+        let doc = doc();
+        for (id, text) in [("q1", "a"), ("q2", "b"), ("q3", "c")] {
+            doc.push_queued(&item(id, text)).unwrap();
+        }
+        let queue = doc.doc().get_movable_list("queue");
+        // "q2" sits at 1; hand the helper the position a remote reorder left
+        // stale (2, now "q3") and it must still remove exactly "q2".
+        let removed = remove_queued_row(&queue, "q2", Some(2), |_| false).unwrap();
+        assert!(removed.removed);
+        assert_eq!(removed.item.unwrap().text, "b");
+        assert_eq!(texts(&doc), vec!["a", "c"]);
+    }
+
+    /// A row still carrying an edit gate is refused by a take, and the refusal
+    /// leaves it in the queue rather than removing it.
+    #[test]
+    fn a_gated_take_refuses_without_removing_the_row() {
+        let doc = doc();
+        let mut row = item("q1", "still editing");
+        row.delivery_gate = Some(QueueDeliveryGate::ReviewRequired {
+            previous_lease_id: "lease-1".into(),
+            owner_device_id: "phone".into(),
+            since_ms: 2_000,
+            base_text_hash: "hash".into(),
+        });
+        doc.push_queued(&row).unwrap();
+        assert!(doc.take_queued("q1").unwrap().is_none());
+        assert_eq!(texts(&doc), vec!["still editing"]);
+        // The delete gesture still removes it regardless of the gate.
+        assert!(doc.remove_queued("q1").unwrap());
+        assert!(texts(&doc).is_empty());
     }
 
     #[test]
