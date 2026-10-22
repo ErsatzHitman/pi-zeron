@@ -62,8 +62,52 @@ fn save(path: &Path, context: &ModelContext, models: &[Model]) -> std::io::Resul
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(staging);
+    } else {
+        prune_stale(path);
     }
     result
+}
+
+/// The context hash in the file name changes whenever the credentials, the
+/// environment or the binary do, so old names would otherwise accumulate under
+/// one harness forever. Other live contexts share this directory (a second
+/// agent dir, a different env-var set), so the sweep is bounded rather than
+/// "everything but the file just written": the newest catalogs survive.
+const KEPT_CATALOGS: usize = 8;
+
+/// Reclaim all but the newest [`KEPT_CATALOGS`] catalogs of one harness. Runs
+/// only after a successful `save` published the new file, and only ever
+/// removes whole `*.json` catalogs: a concurrent save's `<hash>.<uuid>.partial`
+/// staging file is not ours to touch.
+fn prune_stale(keep: &Path) {
+    let Some(dir) = keep.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut catalogs: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| path != keep && path.extension().is_some_and(|ext| ext == "json"))
+        .map(|path| (fetched_at(&path), path))
+        .collect();
+    catalogs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, stale) in catalogs.into_iter().skip(KEPT_CATALOGS.saturating_sub(1)) {
+        if let Err(error) = std::fs::remove_file(&stale) {
+            tracing::warn!(%error, path = %stale.display(), "Could not prune stale model catalog");
+        }
+    }
+}
+
+/// The save time recorded in a catalog, or 0 for one that cannot be read (a
+/// corrupt file is reclaimed before a valid older one).
+fn fetched_at(path: &Path) -> u64 {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
+        .map_or(0, |saved| saved.fetched_at)
 }
 fn unchanged(harness: &dyn Harness, context: &ModelContext) -> bool {
     harness
@@ -464,6 +508,27 @@ mod tests {
         let (result, _) = tokio::join!(list(dir.path(), probe.clone(), false), swap);
         assert!(result.is_err());
         assert!(!dir.path().join("model-catalogs").exists());
+    }
+
+    #[tokio::test]
+    async fn catalogs_stay_bounded_and_the_newest_survives_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Probe::new();
+        for account in 1..=KEPT_CATALOGS + 3 {
+            probe.account.store(account, SeqCst);
+            list_with_lease(dir.path(), probe.clone(), true, true, None)
+                .await
+                .unwrap();
+        }
+        let current = probe.model_context().unwrap().unwrap();
+        let path = location(dir.path(), probe.as_ref(), &current);
+        assert_eq!(read(&path, &current), Some(models()));
+        let files: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files.len(), KEPT_CATALOGS, "bounded: {files:?}");
+        assert!(files.contains(&format!("{}.json", current.hash).into()));
     }
 
     #[test]

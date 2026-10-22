@@ -18,8 +18,11 @@
 //!   A stopped root is not restarted; the note waits for the user.
 //! - A paused tree, an archived parent, or a shutting-down engine: dropped.
 //! - A child that ended its turn with background work still running (tests,
-//!   a CI watch, sub-agents), or a btw aside: no note. The work's result
-//!   starts the child's next turn, and that settle notifies.
+//!   a CI watch, sub-agents): the note waits [`BACKGROUND_GRACE`] for the
+//!   work's result to wake the child — its next settle notifies, and the
+//!   waiting note reads as stale. A job that outlives the grace (a dev
+//!   server, a watch) never wakes it, so the parent is told the turn ended
+//!   with that work still running. A btw aside: no note.
 //!
 //! Delivery is at-least-once. A turn counts as announced only after the
 //! hand-off succeeded; a failed one is retried with a backoff
@@ -48,6 +51,11 @@ use super::*;
 /// the first note (not sliding), so a steady stream cannot starve delivery.
 const BATCH_DELAY: Duration = Duration::from_secs(2);
 const BATCH_MS: i64 = BATCH_DELAY.as_millis() as i64;
+/// A settle that left background work running waits this long before its
+/// parent hears: the job's result normally wakes the child first (and the
+/// note then reads as stale), but a job that outlives this — a dev server, a
+/// watch — never will, and the parent must not wait on it forever.
+const BACKGROUND_GRACE: Duration = Duration::from_secs(5 * 60);
 /// Longest reply tail quoted per child, in characters.
 const EXCERPT_MAX_CHARS: usize = 4000;
 /// Shortest tail kept when many children share one note.
@@ -89,6 +97,10 @@ pub(super) struct ChildNote {
     /// stopped under it), when that rather than the turn's own error is the
     /// outcome.
     pub lost: Option<String>,
+    /// The settle left background work running (a dev server, a watch): the
+    /// turn is done, the child is not free. Such a note waits out
+    /// [`BACKGROUND_GRACE`] so the job's own wake can supersede it.
+    pub background: bool,
 }
 
 impl ChildNote {
@@ -315,15 +327,21 @@ impl Inner {
         }
         // A child that ended its turn with background work running (tests,
         // a CI watch, sub-agents) is waiting, not done: that work's result
-        // starts its next turn, whose settle notifies. Errors and questions
-        // still go at once.
-        if status == SessionStatus::Idle
+        // starts its next turn, whose settle notifies. A job that runs for
+        // hours (a dev server, a watch) never delivers that result, so the
+        // note is deferred rather than dropped: after [`BACKGROUND_GRACE`]
+        // the parent hears, and the note says the child is not free. Errors
+        // and questions still go at once.
+        let background = status == SessionStatus::Idle
             && completed_turn.is_some()
-            && self.holds_background(chat_id)
-        {
-            return;
-        }
-        self.queue_child_note(chat_id, status, completed_turn.map(str::to_owned), None);
+            && self.holds_background(chat_id);
+        self.queue_child_note(
+            chat_id,
+            status,
+            completed_turn.map(str::to_owned),
+            None,
+            background,
+        );
     }
 
     /// A child whose runtime was lost while it sat parked: its status goes
@@ -344,6 +362,7 @@ impl Inner {
             SessionStatus::Errored,
             None,
             Some(cause.to_owned()),
+            false,
         );
     }
 
@@ -354,6 +373,7 @@ impl Inner {
         status: SessionStatus,
         completed_turn: Option<String>,
         lost: Option<String>,
+        background: bool,
     ) {
         let Some(ws) = self.workspace() else {
             return;
@@ -382,6 +402,7 @@ impl Inner {
             turn_key,
             settled_at: now_ms(),
             lost,
+            background,
         };
         match self.parent_notifier.queue(&parent, note.clone()) {
             Some(true) => {}
@@ -486,6 +507,17 @@ impl Inner {
         // the next outcome of a restarted child notifies on its own.
         let (notes, stale) = self.partition_stale_children(&ws, notes);
         self.parent_notifier.discard(&stale);
+        // A settle that left background work running is not a note yet; only
+        // one whose job outlives the grace leaves the child parked for good.
+        let (notes, waiting, wait) = partition_deferred(notes, now_ms());
+        if !waiting.is_empty() {
+            // Re-arm the waiting note at the ordinary cadence, not its whole
+            // remaining grace: the next flush re-checks the deadline, and a
+            // sibling that settles meanwhile is not stuck behind it. A
+            // deferral is not a failed hand-off, so it spends no retry.
+            let delay = wait.min(self.parent_notifier.delay);
+            self.requeue_parent_notes(parent, waiting, failures, delay);
+        }
         if notes.is_empty() {
             return;
         }
@@ -587,17 +619,10 @@ fn child_report(host: &DocHost, note: &ChildNote) -> ChildReport {
         .and_then(|handle| Ok(handle.doc().read_entries()?))
         .unwrap_or_default();
     let (reply, error, question) = read_turn(&entries, note.settled_at.saturating_add(BATCH_MS));
-    let outcome = match (note.status, note.completed) {
-        (SessionStatus::Errored, _) if note.lost.is_some() => "failed (process lost)",
-        (SessionStatus::Errored, _) => "failed",
-        (SessionStatus::AwaitingInput, _) => "awaiting input",
-        (_, true) => "completed",
-        (_, false) => "stopped",
-    };
     ChildReport {
         child_id: note.child_id.clone(),
         title,
-        outcome,
+        outcome: outcome_of(note),
         reply,
         error: (note.status == SessionStatus::Errored)
             .then(|| note.lost.clone().or(error))
@@ -606,6 +631,39 @@ fn child_report(host: &DocHost, note: &ChildNote) -> ChildReport {
             .then_some(question)
             .flatten(),
     }
+}
+
+/// What the note says the child's turn did. A settle that still holds
+/// background work says so: the parent must not read it as "free".
+fn outcome_of(note: &ChildNote) -> &'static str {
+    match (note.status, note.completed) {
+        (SessionStatus::Errored, _) if note.lost.is_some() => "failed (process lost)",
+        (SessionStatus::Errored, _) => "failed",
+        (SessionStatus::AwaitingInput, _) => "awaiting input",
+        (_, true) if note.background => "completed (background work still running)",
+        (_, true) => "completed",
+        (_, false) => "stopped",
+    }
+}
+
+/// Split `notes` into the ones due now and the settles still inside
+/// [`BACKGROUND_GRACE`] of their background work, plus how long until the
+/// earliest waiting note is due.
+fn partition_deferred(
+    notes: Vec<ChildNote>,
+    now: i64,
+) -> (Vec<ChildNote>, Vec<ChildNote>, Duration) {
+    let grace = BACKGROUND_GRACE.as_millis() as i64;
+    let (due, waiting): (Vec<_>, Vec<_>) = notes
+        .into_iter()
+        .partition(|note| !note.background || now.saturating_sub(note.settled_at) >= grace);
+    let wait = waiting
+        .iter()
+        .map(|note| grace.saturating_sub(now.saturating_sub(note.settled_at)))
+        .min()
+        .unwrap_or(0)
+        .max(1) as u64;
+    (due, waiting, Duration::from_millis(wait))
 }
 
 /// From the entries after the last user message: the assistant text, the last
@@ -928,7 +986,69 @@ mod tests {
             turn_key: turn.into(),
             settled_at: 0,
             lost: None,
+            background: false,
         }
+    }
+
+    #[test]
+    fn a_settle_that_holds_background_work_says_so() {
+        let mut held = note("c", "t1");
+        assert_eq!(outcome_of(&held), "completed");
+        held.background = true;
+        assert_eq!(
+            outcome_of(&held),
+            "completed (background work still running)"
+        );
+        // The other outcomes are unchanged.
+        held.status = SessionStatus::Errored;
+        held.completed = false;
+        held.lost = Some("gone".into());
+        assert_eq!(outcome_of(&held), "failed (process lost)");
+    }
+
+    #[test]
+    fn a_background_settle_waits_out_the_grace_and_then_goes() {
+        let mut held = note("c", "t1");
+        held.background = true;
+        held.settled_at = 1_000;
+        let mut plain = note("d", "t1");
+        plain.settled_at = 1_000;
+        let grace = BACKGROUND_GRACE.as_millis() as i64;
+        let (due, waiting, wait) =
+            partition_deferred(vec![held.clone(), plain.clone()], 1_000 + grace - 5_000);
+        assert_eq!(due.len(), 1, "the ordinary settle goes now");
+        assert_eq!(due[0].child_id, "d");
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(wait, Duration::from_millis(5_000));
+        let (due, waiting, _) = partition_deferred(vec![held], 1_000 + grace);
+        assert_eq!(due.len(), 1, "the parent hears once the grace passes");
+        assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn a_deferred_background_note_keeps_its_place_without_spending_a_retry() {
+        let notifier = ParentNotifier::new();
+        let mut held = note("c", "t1");
+        held.background = true;
+        assert_eq!(notifier.queue("p", held.clone()), Some(true));
+        // An ordinary flush takes the whole batch and puts the waiting note
+        // back: a deferral is not a failed hand-off, so it spends no retry.
+        let batch = notifier.take("p");
+        let (due, waiting, _) = partition_deferred(batch.notes, 1_000);
+        assert!(due.is_empty());
+        assert_eq!(waiting.len(), 1);
+        assert!(notifier.retry("p", waiting, batch.failures));
+        let back = notifier.take("p");
+        assert_eq!(back.failures, 0, "the retry budget is untouched");
+        assert_eq!(back.notes.len(), 1);
+        assert!(back.notes[0].background);
+        // A newer settle of the same child replaces the waiting note.
+        assert!(notifier.retry("p", back.notes, back.failures));
+        assert_eq!(notifier.queue("p", note("c", "t2")), Some(false));
+        let now = notifier.take("p").notes;
+        assert_eq!(now.len(), 1, "one note per child");
+        assert_eq!(now[0].turn_key, "t2");
+        assert!(!now[0].background);
     }
 
     #[test]
