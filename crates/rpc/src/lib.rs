@@ -354,7 +354,8 @@ pub mod methods {
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";
     /// Download + apply the newest release on the target device (symlink-managed
-    /// installs; the service restart is scheduled after the reply flushes).
+    /// installs; when the engine IS the installed service, its restart is
+    /// scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
     /// Device-local agent CLI update lifecycle. The stream emits the complete
     /// ordered status list initially and after every transition.

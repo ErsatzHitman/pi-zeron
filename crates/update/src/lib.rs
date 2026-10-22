@@ -7,7 +7,8 @@
 //! are the assets of its GitHub releases, read through [`RELEASE_FEED`].
 //! `manifest.json` carries the latest version plus a sha256 per artifact;
 //! `latest.txt` (version only) remains as the fallback for releases published
-//! before the manifest existed.
+//! before the manifest existed. Such a release can still be reported, but not
+//! installed: a download without a checksum is refused, never done unverified.
 //!
 //! Install kinds and their update paths:
 //! - **Managed** (`~/.zeron/app/<ver>` + `current` symlink — the curl|sh
@@ -87,7 +88,8 @@ const RELEASE_METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Manifest {
     pub version: String,
     /// Artifact file name → metadata. Empty for pre-manifest releases resolved
-    /// via `latest.txt` — downloads then skip checksum verification (with a log).
+    /// via `latest.txt` — those are report-only: [`download_release_file`]
+    /// refuses to fetch an artifact without a checksum.
     #[serde(default)]
     pub files: BTreeMap<String, FileMeta>,
 }
@@ -166,7 +168,8 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 }
 
 /// Fetch the newest release metadata: `manifest.json`, falling back to
-/// `latest.txt` (version only, no checksums) for pre-manifest releases.
+/// `latest.txt` (version only) for pre-manifest releases. A fallback manifest
+/// has no checksums, so it can report a version but never install one.
 pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
     let base = release_base(edge_url)?;
     let client = http_client()?;
@@ -602,9 +605,13 @@ fn bundle_short_version(plist: &str) -> Option<String> {
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream `{edge}/releases/<file>` to `dest`, verifying the manifest sha256 when
-/// present. Writes through a `.partial` sidecar so an interrupted download never
+/// Stream `{edge}/releases/<file>` to `dest`, verifying it against the manifest
+/// sha256. Writes through a `.partial` sidecar so an interrupted download never
 /// leaves a plausible-looking artifact behind.
+///
+/// A file the manifest gives no checksum for (a pre-manifest release resolved
+/// through `latest.txt`, or a manifest that omits this platform's artifact) is
+/// refused: an update that cannot be verified is never installed.
 pub async fn download_release_file(
     edge_url: &str,
     manifest: &Manifest,
@@ -612,13 +619,9 @@ pub async fn download_release_file(
     dest: &Path,
 ) -> anyhow::Result<()> {
     let url = format!("{}/{file}", release_base(edge_url)?);
-    let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
-    if expected.is_none() {
-        tracing::warn!(
-            file,
-            "no checksum in release metadata; skipping verification"
-        );
-    }
+    let Some(expected) = manifest.files.get(file).and_then(|m| m.sha256.as_deref()) else {
+        bail!("release metadata has no sha256 for {file}; refusing an unverified download");
+    };
     let partial = dest.with_extension("partial");
     let resp = http_client()?
         .get(&url)
@@ -639,12 +642,10 @@ pub async fn download_release_file(
     }
     out.flush().await.context("flushing download")?;
     drop(out);
-    if let Some(expected) = expected {
-        let actual = format!("{:x}", hasher.finalize());
-        if !actual.eq_ignore_ascii_case(expected.trim()) {
-            tokio::fs::remove_file(&partial).await.ok();
-            bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
-        }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected.trim()) {
+        tokio::fs::remove_file(&partial).await.ok();
+        bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
     }
     tokio::fs::rename(&partial, dest)
         .await
@@ -1233,7 +1234,7 @@ impl Updater {
             // symlink swap: work can begin while that network/disk I/O runs.
             match self.apply_inner(true).await {
                 Ok(Some(version)) => {
-                    tracing::info!(%version, "auto-update applied; service restarting");
+                    tracing::info!(%version, "auto-update applied");
                     return;
                 }
                 Ok(None) => {
@@ -1287,8 +1288,9 @@ impl Updater {
     }
 
     /// Stage + apply the newest release on THIS device (managed installs only),
-    /// then restart the service after a short delay so the caller's RPC reply
-    /// flushes before systemd/launchd kills this process.
+    /// then restart the installed service after a short delay so the caller's
+    /// RPC reply flushes before systemd/launchd kills this process — but only
+    /// when this process IS that service (see `apply_inner`).
     pub async fn apply(&self) -> anyhow::Result<String> {
         self.apply_inner(false)
             .await?
@@ -1314,12 +1316,25 @@ impl Updater {
             return Ok(None);
         }
         apply_headless(&app_root, &manifest.version)?;
-        tokio::spawn(async {
-            tokio::time::sleep(Duration::from_millis(800)).await;
-            if let Err(err) = restart_service() {
-                tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
-            }
-        });
+        // Only the installed service may restart the unit: a hand-started
+        // `zeron headless` or the desktop app's in-process engine is not that
+        // service, and restarting would have systemd or launchd start a second
+        // engine beside this one. Those keep running the current binary and
+        // pick the new one up at their next start.
+        if running_as_installed_service() {
+            tracing::info!(version = %manifest.version, "update applied; restarting the zeron service");
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                if let Err(err) = restart_service() {
+                    tracing::warn!(error = %err, "service restart failed — restart the engine to finish the update");
+                }
+            });
+        } else {
+            tracing::info!(
+                version = %manifest.version,
+                "update applied; this process is not the installed service, so no restart was scheduled"
+            );
+        }
         Ok(Some(manifest.version))
     }
 }
@@ -2049,5 +2064,31 @@ mod tests {
         server.abort();
         assert_eq!(staged, app_root.join("9.9.9"));
         assert!(staged.join("zeron").is_file());
+    }
+
+    /// A manifest without a checksum for the artifact — the `latest.txt`
+    /// fallback, or a manifest that omits this platform — may be reported, but
+    /// never installed: the download is refused before a byte is fetched.
+    #[tokio::test]
+    async fn a_release_without_a_checksum_is_never_downloaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = headless_artifact("9.9.9");
+        let dest = tmp.path().join(&file);
+        let manifest = Manifest {
+            version: "9.9.9".into(),
+            files: BTreeMap::new(),
+        };
+        // An unroutable feed: the refusal must come before any request.
+        let error = download_release_file("http://127.0.0.1:1", &manifest, &file, &dest)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing an unverified download"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 }

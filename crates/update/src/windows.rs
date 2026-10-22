@@ -24,6 +24,9 @@ const INCOMING: &str = ".zeron-update-incoming.exe";
 /// The installer's uninstall entry (`AppId` in `dist/windows/zeron.iss`, plus
 /// Inno Setup's `_is1` suffix). Settings → Apps reads `DisplayVersion` here.
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{AD5DEC34-E254-467B-8F24-8127EBAF4DA6}_is1";
+/// Prefix of the staging directories `stage` creates in the installation
+/// directory; also what marks an earlier attempt's leftovers.
+const STAGE_PREFIX: &str = ".zeron-update-";
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -74,8 +77,15 @@ pub async fn stage(
         expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid SHA-256 checksum"
     );
+    // A staged update is a whole executable, and `apply` is the only thing
+    // that removes its directory. A stage nobody ever applied (the app was
+    // never restarted, or a swap crashed) would otherwise pin that much disk
+    // forever, so clear the leftovers of earlier attempts first. Only this
+    // process's own stage can be live: the app is single-instance, and a
+    // stage is applied before another one is made.
+    prune_stale_stages(directory);
     let temporary = tempfile::Builder::new()
-        .prefix(".zeron-update-")
+        .prefix(STAGE_PREFIX)
         .tempdir_in(directory)?;
     let staged = temporary.path().join("zeron.exe");
     super::download_release_file(edge_url, manifest, &file, &staged).await?;
@@ -100,6 +110,26 @@ pub async fn stage(
     );
     let _ = temporary.keep();
     Ok(staged)
+}
+
+/// Drop the staging directories earlier update attempts left in the
+/// installation directory. Only directories with the staging prefix are
+/// touched: the backup and incoming images are files, and a user's own files
+/// are left alone.
+fn prune_stale_stages(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGE_PREFIX)
+            && entry.path().is_dir()
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn verify(staged: &Path) -> anyhow::Result<()> {
@@ -353,6 +383,25 @@ mod tests {
         std::fs::write(&staged, bytes).unwrap();
         std::fs::write(dir.join("sha256"), format!("{:x}", Sha256::digest(bytes))).unwrap();
         staged
+    }
+
+    #[test]
+    fn stale_staging_directories_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(format!("{STAGE_PREFIX}1234"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("zeron.exe"), b"stale staged image").unwrap();
+        // The leftovers of a crashed swap and the user's own files survive.
+        std::fs::write(dir.path().join(INCOMING), b"incoming").unwrap();
+        std::fs::write(dir.path().join(BACKUP), b"backup").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"mine").unwrap();
+
+        prune_stale_stages(dir.path());
+
+        assert!(!stale.exists());
+        for kept in [INCOMING, BACKUP, "notes.txt"] {
+            assert!(dir.path().join(kept).is_file(), "{kept} was removed");
+        }
     }
 
     #[test]
