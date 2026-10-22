@@ -187,7 +187,19 @@ impl UsageTracker {
         if first && let Some(mut rx) = scan {
             let _ = tokio::time::timeout(FIRST_SCAN_WAIT, rx.wait_for(|done| *done)).await;
         }
-        self.current(&query)
+        // Building the answer walks EVERY record in the index (dedup, pricing,
+        // bucketing, sorting) and the tree spend rail asks for one on every
+        // guarded tool call. That is CPU work: keep it off the async worker so
+        // a hot, long history cannot hold a worker thread per request.
+        let tracker = self.clone();
+        let build = query.clone();
+        match tokio::task::spawn_blocking(move || tracker.current(&build)).await {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(%error, "usage report build aborted; building inline");
+                self.current(&query)
+            }
+        }
     }
 
     fn current(&self, query: &UsageQuery) -> UsageReport {
