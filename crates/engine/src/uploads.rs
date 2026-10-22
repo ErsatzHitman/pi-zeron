@@ -164,18 +164,27 @@ impl Uploads {
         let dir = self.staging_dir(upload_id)?;
         self.sweep();
         std::fs::create_dir_all(&dir)?;
+        // ONE listing per chunk serves both the next free slot and the staged
+        // byte total. This used to scan the staging dir twice per chunk (and
+        // the sweep walks it too), so a chunk's own cost grew with the number
+        // of chunks already staged.
+        let staged_chunks = chunk_files(&dir)?;
         let at = match seq {
             Some(seq) => seq,
-            None => next_free_seq(&dir)?,
+            None => staged_chunks
+                .iter()
+                .map(|(seq, _, _)| seq + 1)
+                .max()
+                .unwrap_or(0),
         };
         if at > 1_000_000 {
             return Err(EngineError::Other("Invalid chunk index".into()));
         }
         // Base64 inflates by ~4/3; bound the staged payload against the file cap.
-        let staged: u64 = chunk_files(&dir)?
+        let staged: u64 = staged_chunks
             .iter()
-            .filter(|(seq, _)| *seq != at)
-            .map(|(_, path)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+            .filter(|(seq, _, _)| *seq != at)
+            .map(|(_, _, len)| *len)
             .sum();
         if (staged + data.len() as u64) * 3 / 4 > MAX_BYTES {
             let _ = std::fs::remove_dir_all(&dir);
@@ -193,11 +202,11 @@ impl Uploads {
         if parts.is_empty() {
             return Err(EngineError::Other("Unknown or expired upload".into()));
         }
-        parts.sort_by_key(|(seq, _)| *seq);
+        parts.sort_by_key(|(seq, _, _)| *seq);
         // Positional appends may leave holes if a chunk never arrived — joining
         // around them would silently corrupt the file.
         let mut joined = String::new();
-        for (i, (seq, path)) in parts.iter().enumerate() {
+        for (i, (seq, path, _)) in parts.iter().enumerate() {
             if *seq != i as u64 {
                 return Err(EngineError::Other("Upload is missing a chunk".into()));
             }
@@ -451,7 +460,8 @@ fn lexical_components(path: &Path) -> Option<Vec<std::ffi::OsString>> {
     Some(out)
 }
 
-fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, EngineError> {
+/// The staged chunks of one upload: `(seq, path, bytes)`.
+fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf, u64)>, EngineError> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
     };
@@ -465,18 +475,11 @@ fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, EngineError> {
         if let Some(seq) = seq
             && path.extension().and_then(|e| e.to_str()) == Some("b64")
         {
-            files.push((seq, path));
+            let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push((seq, path, len));
         }
     }
     Ok(files)
-}
-
-fn next_free_seq(dir: &Path) -> Result<u64, EngineError> {
-    Ok(chunk_files(dir)?
-        .iter()
-        .map(|(seq, _)| seq + 1)
-        .max()
-        .unwrap_or(0))
 }
 
 fn sanitize(file_name: &str) -> String {
