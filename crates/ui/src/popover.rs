@@ -1280,6 +1280,14 @@ pub fn menu_section() -> gpui::Div {
 
 /// Centered dialog with the shared popover surface. A filled drop shadow
 /// would show through the translucent card, so only opaque cards use it.
+///
+/// A card is content-sized by default, and [`modal`] does not clip or scroll:
+/// a caller whose card can outgrow the window must cap it with
+/// `.max_h(dialog_max_height(viewport))`, give it an internally scrolling body
+/// (see [`dialog_body_height`]) and keep its footer outside that scroller, so
+/// the buttons never scroll away. `render_orchestrator_settings_overlay`
+/// (`shell/orchestrator_settings.rs`) and `render_import_dialog`
+/// (`settings/appearance.rs`) are the two worked examples.
 pub fn dialog_card(theme: &Theme) -> gpui::Div {
     div()
         .w(px(360.0))
@@ -1325,6 +1333,43 @@ pub fn dialog_field(input: AnyElement) -> gpui::Div {
         .bg(ink(0.04))
         .text_size(crate::typography::ui_rems(14.0))
         .child(input)
+}
+
+// ---------------------------------------------------------------------------
+// Dialog geometry: how big a centered dialog may be, per window size
+// ---------------------------------------------------------------------------
+
+/// Margin a centered dialog keeps from the window edges, top and bottom.
+pub const DIALOG_VIEWPORT_MARGIN: f32 = 16.0;
+/// A card never grows past this, however tall the window is (the ceiling
+/// the theme dialogs already use: 720-760px).
+pub const DIALOG_MAX_HEIGHT: f32 = 720.0;
+/// A card never shrinks below this; the app's own minimum window is
+/// 900x600 (`lib.rs:413`), so this floor is never reached in practice.
+pub const DIALOG_MIN_HEIGHT: f32 = 200.0;
+/// Floor for a scrolling dialog body under [`dialog_body_height`].
+pub const DIALOG_MIN_BODY_HEIGHT: f32 = 120.0;
+
+/// The tallest a centered dialog card may be in `viewport`: the window minus
+/// [`DIALOG_VIEWPORT_MARGIN`] top and bottom, capped at [`DIALOG_MAX_HEIGHT`]
+/// and floored at [`DIALOG_MIN_HEIGHT`]. A card at this height must scroll its
+/// own body.
+pub fn dialog_max_height(viewport: gpui::Size<Pixels>) -> Pixels {
+    px((f32::from(viewport.height) - 2.0 * DIALOG_VIEWPORT_MARGIN)
+        .min(DIALOG_MAX_HEIGHT)
+        .max(DIALOG_MIN_HEIGHT))
+}
+
+/// The width a centered dialog card may take: `preferred`, or the window
+/// minus the same margins when that is narrower.
+pub fn dialog_max_width(viewport: gpui::Size<Pixels>, preferred: f32) -> Pixels {
+    px(preferred.min((f32::from(viewport.width) - 2.0 * DIALOG_VIEWPORT_MARGIN).max(1.0)))
+}
+
+/// The height left for a dialog's scrolling body under a card of
+/// `card_height`, after `chrome_height` of fixed header and footer.
+pub fn dialog_body_height(card_height: Pixels, chrome_height: f32) -> Pixels {
+    px((f32::from(card_height) - chrome_height).max(DIALOG_MIN_BODY_HEIGHT))
 }
 
 /// Ghost button (`btnGhost`): quiet text, hover wash fading over
@@ -2664,5 +2709,52 @@ mod adaptive_menu_tests {
             }
         );
         assert_eq!(menu_geometry(900.0, 920.0, 1000.0).height, 640.0);
+    }
+}
+
+#[cfg(test)]
+mod dialog_geometry_tests {
+    use super::{dialog_body_height, dialog_max_height, dialog_max_width};
+    use gpui::{px, size};
+
+    #[test]
+    fn a_tall_window_caps_the_card_at_the_theme_dialogs_ceiling() {
+        assert_eq!(
+            dialog_max_height(size(px(900.0), px(1080.0))),
+            px(720.0),
+            "a 1080-tall window caps at DIALOG_MAX_HEIGHT"
+        );
+    }
+
+    #[test]
+    fn a_short_window_keeps_two_margins_off_the_card() {
+        assert_eq!(dialog_max_height(size(px(900.0), px(600.0))), px(568.0));
+        assert_eq!(dialog_max_height(size(px(900.0), px(300.0))), px(268.0));
+    }
+
+    #[test]
+    fn a_tiny_window_floors_the_card_so_it_stays_usable() {
+        assert_eq!(dialog_max_height(size(px(900.0), px(150.0))), px(200.0));
+    }
+
+    #[test]
+    fn a_narrow_window_clamps_the_preferred_width() {
+        assert_eq!(
+            dialog_max_width(size(px(900.0), px(600.0)), 460.0),
+            px(460.0),
+            "a window wider than the preferred width keeps it"
+        );
+        assert_eq!(dialog_max_width(size(px(420.0), px(600.0)), 460.0), px(388.0));
+        assert_eq!(
+            dialog_max_width(size(px(10.0), px(600.0)), 460.0),
+            px(1.0),
+            "never zero or negative"
+        );
+    }
+
+    #[test]
+    fn a_body_is_the_card_less_its_chrome_and_floored() {
+        assert_eq!(dialog_body_height(px(568.0), 200.0), px(368.0));
+        assert_eq!(dialog_body_height(px(180.0), 200.0), px(120.0));
     }
 }

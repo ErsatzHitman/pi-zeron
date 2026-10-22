@@ -18,6 +18,28 @@ use zeron_proto::orchestrator_project::{
 /// its list scrolls for the rest.
 const PICKER_ROWS: usize = 60;
 
+/// The dialog's preferred width, before the window clamps it.
+const SETTINGS_CARD_WIDTH: f32 = 460.0;
+/// Budget for the fixed header (title + copy) and footer (the action row):
+/// deliberately generous, so header + body + footer always fit the card's cap
+/// even before the body shrinks, and a wrapped footer is never the part a
+/// short window clips.
+const SETTINGS_CHROME_HEIGHT: f32 = 200.0;
+/// Share of the scrolling body the instructions box may take.
+const INSTRUCTIONS_SHARE: f32 = 0.30;
+/// Share of the scrolling body the model picker's list may take.
+const PICKER_SHARE: f32 = 0.30;
+/// Share of the scrolling body the memory list may take.
+const MEMORY_SHARE: f32 = 0.25;
+
+/// A nested scroller's cap inside a dialog body `body_height` tall: `share` of
+/// it, never below `min`, never above the familiar `max`, so a short window
+/// shrinks the instructions box, the model picker and the memory list instead
+/// of stacking three scrollbars inside the body's own.
+fn nested_scroll_height(body_height: f32, share: f32, min: f32, max: f32) -> f32 {
+    (body_height * share).clamp(min, max)
+}
+
 /// The allow-list with `model` added once: ids compare case-insensitively, as
 /// the policy's own check does, and it stops at the policy's cap.
 fn with_model(mut models: Vec<String>, model: &str) -> Vec<String> {
@@ -683,6 +705,15 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).for_popup();
+        // The card is capped to the viewport and the field column scrolls
+        // inside it, so the header and the action row stay on screen whatever
+        // the window height: at the app's own 600px minimum the whole form
+        // would otherwise overflow by a few hundred pixels.
+        let card_max_height = popover::dialog_max_height(viewport);
+        let body_height = f32::from(popover::dialog_body_height(
+            card_max_height,
+            SETTINGS_CHROME_HEIGHT,
+        ));
         let dialog = self.orchestrator_settings.as_mut()?;
         if std::mem::take(&mut dialog.focus_pending) {
             window.focus(&dialog.goal.focus_handle(cx), cx);
@@ -950,7 +981,13 @@ impl Shell {
                         .child(
                             div()
                                 .id("orchestrator-model-list")
-                                .max_h(px(160.0))
+                                .flex_none()
+                                .max_h(px(nested_scroll_height(
+                                    body_height,
+                                    PICKER_SHARE,
+                                    96.0,
+                                    160.0,
+                                )))
                                 .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
@@ -973,7 +1010,13 @@ impl Shell {
         } else {
             div()
                 .id("orchestrator-memory")
-                .max_h(px(140.0))
+                .flex_none()
+                .max_h(px(nested_scroll_height(
+                    body_height,
+                    MEMORY_SHARE,
+                    72.0,
+                    140.0,
+                )))
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
@@ -1015,7 +1058,14 @@ impl Shell {
         let archive_root = root_id.clone();
         let stop_root = root_id.clone();
         let card = popover::dialog_card(&theme)
-            .w(px(460.0))
+            .w(popover::dialog_max_width(viewport, SETTINGS_CARD_WIDTH))
+            .max_h(card_max_height)
+            .p(px(0.0))
+            .overflow_hidden()
+            .id("orchestrator-settings-card")
+            .debug_selector(|| "orchestrator-settings-card".into())
+            .role(gpui::Role::Dialog)
+            .aria_label("Orchestrator settings")
             .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
                 if ev.keystroke.key == "escape" {
                     this.orchestrator_settings = None;
@@ -1023,52 +1073,82 @@ impl Shell {
                     cx.stop_propagation();
                 }
             }))
-            .child(popover::dialog_title(&theme, "Orchestrator settings"))
-            .child(popover::dialog_body(
-                &theme,
-                "Every session this orchestrator starts gets its goal and instructions.",
-            ))
-            .child(label("Name"))
-            .child(popover::dialog_field(name.into_any_element()))
-            .child(label("Goal"))
-            .child(popover::dialog_field(goal.into_any_element()))
-            .child(label("Instructions"))
-            .child(popover::dialog_field(
-                div()
-                    .id("orchestrator-instructions")
-                    .min_h(px(72.0))
-                    .max_h(px(180.0))
-                    .overflow_y_scroll()
-                    .child(instructions)
-                    .into_any_element(),
-            ))
-            .child(label("Rules for every session"))
-            .child(github_switch)
-            .child(preflight_switch)
-            .child(label("Heavy commands at once (1-8)"))
-            .child(popover::dialog_field(heavy.into_any_element()))
-            .child(label("Writing sessions at once (1-16)"))
-            .child(popover::dialog_field(writers.into_any_element()))
-            .child(label("Allowed models"))
-            .child(allowed_models)
-            .child(label("Spending cap in dollars, all sessions together"))
-            .child(popover::dialog_field(cap.into_any_element()))
-            .child(label("Memory"))
-            .child(memory)
-            .when_some(error, |el, error| {
-                el.child(
-                    div()
-                        .mt(px(12.0))
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.danger)
-                        .child(SharedString::from(error)),
-                )
-            })
             .child(
                 div()
-                    .mt(px(18.0))
+                    .flex_none()
+                    .px(px(20.0))
+                    .pt(px(20.0))
+                    .child(popover::dialog_title(&theme, "Orchestrator settings"))
+                    .child(popover::dialog_body(
+                        &theme,
+                        "Every session this orchestrator starts gets its goal and instructions.",
+                    )),
+            )
+            .child(widgets::scroll_faded(
+                "orchestrator-settings-fade",
+                div()
+                    .id("orchestrator-settings-body")
+                    .debug_selector(|| "orchestrator-settings-body".into())
+                    .min_h_0()
+                    .flex_shrink_1()
+                    .max_h(px(body_height))
+                    .overflow_y_scroll()
+                    .px(px(20.0))
+                    .pt(px(4.0))
+                    .pb(px(4.0))
+                    .flex()
+                    .flex_col()
+                    .child(label("Name"))
+                    .child(popover::dialog_field(name.into_any_element()))
+                    .child(label("Goal"))
+                    .child(popover::dialog_field(goal.into_any_element()))
+                    .child(label("Instructions"))
+                    .child(popover::dialog_field(
+                        div()
+                            .id("orchestrator-instructions")
+                            .flex_none()
+                            .min_h(px(72.0))
+                            .max_h(px(nested_scroll_height(
+                                body_height,
+                                INSTRUCTIONS_SHARE,
+                                72.0,
+                                180.0,
+                            )))
+                            .overflow_y_scroll()
+                            .child(instructions)
+                            .into_any_element(),
+                    ))
+                    .child(label("Rules for every session"))
+                    .child(github_switch)
+                    .child(preflight_switch)
+                    .child(label("Heavy commands at once (1-8)"))
+                    .child(popover::dialog_field(heavy.into_any_element()))
+                    .child(label("Writing sessions at once (1-16)"))
+                    .child(popover::dialog_field(writers.into_any_element()))
+                    .child(label("Allowed models"))
+                    .child(allowed_models)
+                    .child(label("Spending cap in dollars, all sessions together"))
+                    .child(popover::dialog_field(cap.into_any_element()))
+                    .child(label("Memory"))
+                    .child(memory)
+                    .when_some(error, |el, error| {
+                        el.child(
+                            div()
+                                .mt(px(12.0))
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.danger)
+                                .child(SharedString::from(error)),
+                        )
+                    }),
+            ))
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(20.0))
+                    .py(px(16.0))
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.0))
                     .child(
@@ -1078,6 +1158,7 @@ impl Shell {
                             "orchestrator-pause",
                         )
                         .id("orchestrator-pause")
+                        .debug_selector(|| "orchestrator-pause".into())
                         .tooltip(crate::settings::widgets::text_tooltip(if paused {
                             "Let its sessions start and message work again"
                         } else {
@@ -1094,6 +1175,7 @@ impl Shell {
                     .child(
                         popover::btn_danger(&theme, "Stop all")
                             .id("orchestrator-stop-all")
+                            .debug_selector(|| "orchestrator-stop-all".into())
                             .tooltip(crate::settings::widgets::text_tooltip(
                                 "Stop every session, background job and queued message, and hold the tree",
                             ))
@@ -1104,6 +1186,7 @@ impl Shell {
                     .child(
                         popover::btn_danger(&theme, "Archive all")
                             .id("orchestrator-archive")
+                            .debug_selector(|| "orchestrator-archive".into())
                             .tooltip(crate::settings::widgets::text_tooltip(
                                 "Stop and archive the orchestrator and every session it started",
                             ))
@@ -1115,6 +1198,7 @@ impl Shell {
                     .child(
                         popover::btn_ghost(&theme, "Cancel", "orchestrator-settings-cancel")
                             .id("orchestrator-settings-cancel")
+                            .debug_selector(|| "orchestrator-settings-cancel".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.orchestrator_settings = None;
                                 cx.notify();
@@ -1123,6 +1207,7 @@ impl Shell {
                     .child(
                         popover::btn_primary(&theme, if saving { "Saving…" } else { "Save" })
                             .id("orchestrator-settings-save")
+                            .debug_selector(|| "orchestrator-settings-save".into())
                             .when(!loaded || saving, |el| el.opacity(0.5))
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.submit_orchestrator_settings(cx)),
@@ -1272,6 +1357,216 @@ mod tests {
             projects.due("root", read_at + PROJECT_REFRESH),
             "and is refreshed once its read goes stale"
         );
+    }
+
+    #[test]
+    fn nested_scrollers_shrink_with_the_dialog_body() {
+        // Room to spare: each box takes its share of the body.
+        assert_eq!(nested_scroll_height(520.0, INSTRUCTIONS_SHARE, 72.0, 180.0), 156.0);
+        assert_eq!(nested_scroll_height(520.0, PICKER_SHARE, 96.0, 160.0), 156.0);
+        assert_eq!(nested_scroll_height(520.0, MEMORY_SHARE, 72.0, 140.0), 130.0);
+        // A short window: the floor keeps each box usable.
+        assert_eq!(nested_scroll_height(120.0, INSTRUCTIONS_SHARE, 72.0, 180.0), 72.0);
+        assert_eq!(nested_scroll_height(120.0, PICKER_SHARE, 96.0, 160.0), 96.0);
+        assert_eq!(nested_scroll_height(120.0, MEMORY_SHARE, 72.0, 140.0), 72.0);
+        // A tall one: the familiar cap, so no box becomes a second page.
+        assert_eq!(nested_scroll_height(900.0, INSTRUCTIONS_SHARE, 72.0, 180.0), 180.0);
+        assert_eq!(nested_scroll_height(900.0, PICKER_SHARE, 96.0, 160.0), 160.0);
+        assert_eq!(nested_scroll_height(900.0, MEMORY_SHARE, 72.0, 140.0), 140.0);
+    }
+
+    mod dialog_fit {
+        //! The dialog on a window smaller than the form: it must stay inside
+        //! the viewport, scroll its own body, and keep every control on screen.
+        use super::*;
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        use gpui::{AppContext, TestAppContext, VisualTestContext, size};
+        use zeron_rpc::{RpcReply, methods};
+
+        struct DialogHost(Entity<Shell>);
+
+        impl Render for DialogHost {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    let overlays = shell.render_overlays(window.viewport_size(), window, cx);
+                    div().size_full().children(overlays)
+                })
+            }
+        }
+
+        fn redraw(cx: &mut VisualTestContext) {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        }
+
+        /// A long form over a scripted engine, in a window too small for it.
+        #[gpui::test]
+        fn the_dialog_fits_a_small_window_and_scrolls_its_body(cx: &mut TestAppContext) {
+            let runtime = fixture::runtime();
+            let _guard = runtime.enter();
+            let rpc = ScriptedRpc::new(|method, _params| async move {
+                match method.as_str() {
+                    methods::GET_ORCHESTRATOR_PROJECT => RpcReply::value(&json!({
+                        "project": {
+                            "rootId": "orchestrator-1",
+                            "goal": "Ship the release notes for every crate.",
+                            "instructions": "Line one of the standing instructions.\n\
+                                Line two, long enough that the instructions box scrolls rather than \
+                                growing with the text it holds.\nLine three.\nLine four.\nLine five.\n\
+                                Line six.\nLine seven.\nLine eight.",
+                            "paused": false,
+                            "pauseReason": "",
+                            "policy": {
+                                "githubOnlyTests": true,
+                                "requirePreflight": true,
+                                "allowedModels": ["anthropic/claude-sonnet-5"],
+                                "spendCapCents": 2500,
+                            },
+                            "updatedAt": 0,
+                        },
+                        "memory": (0..12)
+                            .map(|ix| json!({
+                                "id": format!("note-{ix:02}"),
+                                "rootId": "orchestrator-1",
+                                "text": format!("A fact the orchestrator saved for later turns ({ix})."),
+                                "at": ix,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })),
+                    methods::LIST_MODELS => RpcReply::value(&json!([])),
+                    // Nothing else is expected; a neutral reply keeps an
+                    // incidental overlay render from panicking.
+                    other => {
+                        eprintln!("unscripted request: {other}");
+                        RpcReply::value(&json!(null))
+                    }
+                }
+            });
+            let dir = tempfile::tempdir().unwrap();
+            cx.update(|cx| {
+                gpui_base::init(cx);
+                cx.set_global(Theme::default());
+                crate::app_menus::init(cx);
+                settings::init(UiSettings::default(), dir.path(), cx);
+                crate::history::init(
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    cx,
+                );
+                apply_keymap(cx, &KeymapConfig::default(), ComposerSendBehavior::default());
+                // The dialog's entrance is a 180ms fade + 2px rise: snap it
+                // to its end state so the bounds below are the settled ones.
+                crate::motion::set_reduced_motion(cx, true);
+            });
+            let (host, cx) = cx.add_window_view(|_, cx| {
+                DialogHost(cx.new(|cx| {
+                    let state = fixture::state(cx, Some(rpc.client()));
+                    let mut shell = Shell::new(
+                        state.clone(),
+                        EngineBootConfig {
+                            data_dir: dir.path().into(),
+                            ipc_port: 0,
+                            edge_url: "http://127.0.0.1:1".into(),
+                            edge_token: None,
+                            org_id: None,
+                            workos_client_id: None,
+                            default_harness: zeron_proto::HarnessId::Mock,
+                        },
+                        cx,
+                    );
+                    shell.reduced_motion = true;
+                    state.update(cx, |state, _| {
+                        state.workspace_scope = Some(WorkspaceScope::Local);
+                        state.local_device_id = Some("local".into());
+                        state.no_project = true;
+                        state.chats = vec![
+                            serde_json::from_value(json!({
+                                "id": "orchestrator-1",
+                                "title": "Release notes",
+                                "deviceId": "local",
+                                "archived": false,
+                                "createdAt": Utc::now(),
+                            }))
+                            .unwrap(),
+                        ];
+                        state.selected_chat = Some("orchestrator-1".into());
+                    });
+                    shell
+                }))
+            });
+            let shell = host.read_with(cx, |host, _| host.0.clone());
+            cx.update(|window, cx| {
+                window.activate_window();
+            });
+            redraw(cx);
+            cx.simulate_resize(size(px(420.0), px(520.0)));
+            shell.update(cx, |shell, cx| {
+                shell.open_orchestrator_settings("orchestrator-1".into(), cx)
+            });
+            rpc.settle(cx, &runtime, |cx| {
+                shell.read_with(cx, |shell, _| {
+                    shell
+                        .orchestrator_settings
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.loaded)
+                })
+            });
+            redraw(cx);
+
+            let viewport = size(px(420.0), px(520.0));
+            let card = cx
+                .debug_bounds("orchestrator-settings-card")
+                .expect("the settings card draws");
+            assert!(
+                card.top() >= px(popover::DIALOG_VIEWPORT_MARGIN - 0.5),
+                "the card keeps its top margin: {card:?}"
+            );
+            assert!(
+                card.bottom() <= viewport.height - px(popover::DIALOG_VIEWPORT_MARGIN - 0.5),
+                "the card keeps its bottom margin: {card:?}"
+            );
+            assert!(
+                card.size.width <= viewport.width - px(2.0 * popover::DIALOG_VIEWPORT_MARGIN),
+                "the card is clamped to the window's width: {card:?}"
+            );
+            assert!(
+                card.size.height <= popover::dialog_max_height(viewport),
+                "the card is clamped to the window's height: {card:?}"
+            );
+
+            let body = cx
+                .debug_bounds("orchestrator-settings-body")
+                .expect("the scrolling body draws");
+            assert!(
+                body.size.height < card.size.height,
+                "the body, not the card, absorbs the overflow: body {body:?} card {card:?}"
+            );
+            assert!(
+                body.top() >= card.top() && body.bottom() <= card.bottom(),
+                "the body sits inside the card: body {body:?} card {card:?}"
+            );
+
+            // The regression: at this window size these used to be off screen.
+            for selector in [
+                "orchestrator-settings-save",
+                "orchestrator-settings-cancel",
+                "orchestrator-pause",
+                "orchestrator-stop-all",
+                "orchestrator-archive",
+            ] {
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} draws"));
+                assert!(
+                    bounds.top() >= card.top() && bounds.bottom() <= card.bottom(),
+                    "{selector} stays on the card: {bounds:?} card {card:?}"
+                );
+            }
+        }
     }
 
     #[test]

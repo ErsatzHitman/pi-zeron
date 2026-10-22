@@ -1657,6 +1657,19 @@ fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
         .into_any_element()
 }
 
+/// The theme import dialog's header strip plus its footer (its scrolling main
+/// is everything else). Generous, so the cap never clips the two fixed rows.
+const IMPORT_CHROME_HEIGHT: f32 = 150.0;
+
+/// The import dialog's caps in `viewport`: the card's height, then the height
+/// left for its scrolling main. Absolute caps (760/520) overflowed a 600px-tall
+/// window, which is the app's own minimum.
+fn import_dialog_caps(viewport: gpui::Size<Pixels>) -> (Pixels, Pixels) {
+    let card_max = popover::dialog_max_height(viewport);
+    let main_max = popover::dialog_body_height(card_max, IMPORT_CHROME_HEIGHT);
+    (card_max, main_max)
+}
+
 fn report_panel(theme: &Theme, report: &ImportReport) -> impl IntoElement {
     let summary = format!(
         "{} mapped · {} adjusted · {} inferred/fallback · {} unsupported · {} warnings · {} validation",
@@ -2152,9 +2165,10 @@ impl AppearancePage {
                 .child(label)
         };
 
+        let (_, main_max_height) = import_dialog_caps(viewport);
         let mut main = div()
             .id("theme-import-main")
-            .max_h(px(520.0))
+            .max_h(main_max_height)
             .overflow_y_scroll()
             .px(px(20.0))
             .pb(px(18.0))
@@ -2543,10 +2557,11 @@ impl AppearancePage {
                 }),
             );
 
+        let (card_max_height, _) = import_dialog_caps(viewport);
         let card = popover::dialog_card(theme)
             .id("theme-import-card")
             .w(px(600.0))
-            .max_h(px(760.0))
+            .max_h(card_max_height)
             .p(px(0.0))
             .overflow_hidden()
             .track_focus(&focus)
@@ -3117,7 +3132,7 @@ impl AppearancePage {
         let mut card = popover::dialog_card(theme)
             .id("theme-review-card")
             .w(px(660.0))
-            .max_h(px(720.0))
+            .max_h(popover::dialog_max_height(viewport))
             .overflow_y_scroll()
             .child(popover::dialog_title(theme, "Theme mapping"))
             .child(
@@ -4076,6 +4091,25 @@ impl Render for AppearancePage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_import_dialog_caps_follow_the_window() {
+        // A 768-tall window would allow 736, but the shared ceiling is 720.
+        let (card, main) = import_dialog_caps(gpui::size(px(1365.0), px(768.0)));
+        assert_eq!((card, main), (px(720.0), px(570.0)));
+        // The app's own minimum window: the old 760px card overflowed it.
+        let (card, main) = import_dialog_caps(gpui::size(px(900.0), px(600.0)));
+        assert_eq!((card, main), (px(568.0), px(418.0)));
+        // Never taller than the window, at any height.
+        for height in [600.0_f32, 768.0, 1080.0, 420.0] {
+            let viewport = gpui::size(px(900.0), px(height));
+            let (card, _) = import_dialog_caps(viewport);
+            assert!(
+                card <= viewport.height - px(32.0),
+                "a {height}px window keeps a {card:?} card inside itself"
+            );
+        }
+    }
 
     fn background_settings() -> crate::settings::UiSettings {
         crate::settings::UiSettings {
