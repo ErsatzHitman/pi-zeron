@@ -245,10 +245,14 @@ fn main() {
                 response(&v, json!({"levels":["off","low","medium","high"]}))
             }
             "set_model" => {
-                // A model that disappeared from the provider's catalog.
-                if std::path::Path::new("refuse-model").exists() {
+                // A model that disappeared from the provider's catalog. The
+                // file names one model to refuse, or (empty) refuses any.
+                let refused = std::fs::read_to_string("refuse-model").ok();
+                let refused = refused.as_deref().map(str::trim);
+                let wanted = v["modelId"].as_str().unwrap_or("");
+                if refused.is_some_and(|id| id.is_empty() || id == wanted) {
                     emit(
-                        json!({"type":"response","id":v["id"],"command":"set_model","success":false,"error":format!("Model {} is not available", v["modelId"].as_str().unwrap_or(""))}),
+                        json!({"type":"response","id":v["id"],"command":"set_model","success":false,"error":format!("Model {wanted} is not available")}),
                     );
                     continue;
                 }
