@@ -459,6 +459,42 @@ async fn revoked_refresh_token_signs_out() {
 }
 
 #[tokio::test]
+async fn infrastructure_4xx_does_not_sign_the_user_out() {
+    let edge = StubEdge::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("session.json"),
+        r#"{"refreshToken":"live","user":{"id":"user_1","email":"w@example.com"},"orgId":"org_1"}"#,
+    )
+    .expect("seed session");
+    // 404 is an edge/proxy that never reached the refresh logic (version skew),
+    // not a rejected credential: the session must survive and retry.
+    edge.state.refresh_status.store(404, Ordering::SeqCst);
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+    assert!(
+        auth.state().is_signed_in(),
+        "boots from the persisted session"
+    );
+
+    assert!(
+        matches!(
+            auth.access_token().await,
+            Err(TokenError::TemporarilyUnavailable(_))
+        ),
+        "infrastructure 4xx must be retryable, not a revocation"
+    );
+    assert!(
+        auth.state().is_signed_in(),
+        "a 404 must not sign the user out"
+    );
+    assert!(
+        dir.path().join("session.json").exists(),
+        "a 404 must not delete the persisted session"
+    );
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn offline_refresh_loop_backs_off_without_revoking_session() {
     let edge = StubEdge::start().await;
     edge.state.drop_refresh.store(true, Ordering::SeqCst);

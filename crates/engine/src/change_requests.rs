@@ -160,11 +160,29 @@ impl CheckoutChangeRequests {
             requested_branch,
             lease: None,
             last_emitted: None,
+            refresh_at: None,
         };
         futures::stream::unfold(state, |mut state| async move {
             loop {
                 if state.service.inner.shutdown.is_cancelled() {
                     return None;
+                }
+                // A pinned conversation branch cannot change under this
+                // subscription, so a fresh cache entry needs no re-inspection:
+                // sleep until it expires instead of re-running
+                // `inspect_checkout`'s 6-9 Git subprocesses on every context
+                // poll. (A live branch still polls so a checkout switch is
+                // noticed between refreshes.)
+                let pinned_fresh = state.requested_branch.is_some()
+                    && state.refresh_at.is_some_and(|at| Instant::now() < at);
+                if pinned_fresh {
+                    let refresh_at = state.refresh_at.expect("checked above");
+                    if !state
+                        .sleep(refresh_at.saturating_duration_since(Instant::now()))
+                        .await
+                    {
+                        return None;
+                    }
                 }
                 let mut source = match state
                     .service
@@ -200,6 +218,7 @@ impl CheckoutChangeRequests {
                     state.lease = Some(state.service.acquire(key.clone()));
                 }
                 let (snapshot, next_refresh) = state.service.refresh(&key, &source).await;
+                state.refresh_at = Some(next_refresh);
                 if let Some(snapshot) = snapshot {
                     let semantic = SemanticStatus::from(&snapshot);
                     if state.last_emitted.as_ref() != Some(&semantic) {
@@ -345,6 +364,9 @@ struct SubscriptionState {
     requested_branch: Option<String>,
     lease: Option<DemandLease>,
     last_emitted: Option<SemanticStatus>,
+    /// When the cache entry this subscription last served goes stale. Set after
+    /// every refresh so a pinned branch can skip re-inspection while fresh.
+    refresh_at: Option<Instant>,
 }
 
 impl SubscriptionState {
@@ -420,6 +442,7 @@ mod tests {
     struct FakeLookup {
         source: Mutex<CheckoutSourceContext>,
         results: Mutex<VecDeque<Result<Option<ChangeRequestSummary>, ChangeRequestError>>>,
+        inspects: AtomicUsize,
         resolves: AtomicUsize,
     }
 
@@ -431,12 +454,17 @@ mod tests {
             Arc::new(Self {
                 source: Mutex::new(source),
                 results: Mutex::new(results.into_iter().collect()),
+                inspects: AtomicUsize::new(0),
                 resolves: AtomicUsize::new(0),
             })
         }
 
         fn set_source(&self, source: CheckoutSourceContext) {
             *self.source.lock().unwrap() = source;
+        }
+
+        fn inspect_count(&self) -> usize {
+            self.inspects.load(Ordering::Acquire)
         }
 
         fn resolve_count(&self) -> usize {
@@ -450,6 +478,7 @@ mod tests {
             &self,
             _cwd: &Path,
         ) -> Result<CheckoutSourceContext, ChangeRequestError> {
+            self.inspects.fetch_add(1, Ordering::AcqRel);
             Ok(self.source.lock().unwrap().clone())
         }
 
@@ -530,6 +559,41 @@ mod tests {
         );
         let snapshot = stream.next().await.expect("opening snapshot");
         assert_eq!(snapshot.branch, "feature/sidebar");
+    }
+
+    #[tokio::test]
+    async fn pinned_branch_does_not_reinspect_a_fresh_cache() {
+        let lookup = FakeLookup::new(source("feature/status"), [Ok(Some(pull_request(90)))]);
+        // A long TTL with a short context poll: without the freshness guard the
+        // loop would re-inspect the checkout on every poll (~12 times here).
+        let timing = Timing {
+            with_change_request_ttl: Duration::from_millis(200),
+            without_change_request_ttl: Duration::from_millis(200),
+            failure_initial_backoff: Duration::from_secs(1),
+            failure_max_backoff: Duration::from_secs(2),
+            context_poll_interval: Duration::from_millis(5),
+        };
+        let service = service(lookup.clone(), timing);
+        let mut stream = service.watch_checkout_for_branch(
+            PathBuf::from("/checkout"),
+            identity(),
+            Some("feature/sidebar".into()),
+        );
+        stream.next().await.unwrap();
+        assert_eq!(lookup.inspect_count(), 1);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), stream.next())
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            lookup.inspect_count(),
+            1,
+            "a fresh pinned-branch cache must not re-run checkout inspection"
+        );
+        assert_eq!(lookup.resolve_count(), 1);
     }
 
     #[tokio::test]
