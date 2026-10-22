@@ -437,6 +437,47 @@ fn workflow_more_row(key: impl Into<String>, hidden: usize, theme: &Theme) -> Op
     })
 }
 
+/// The host resource gate, while it holds the run back: the gate's own reason
+/// (which metric is short, and both values) and how long the wait has run.
+fn workflow_gate_row(gate: &workflow::GateRow, theme: &Theme) -> AnyElement {
+    let elapsed = gate.since.map(|since| {
+        elapsed_label(
+            "session-info-workflow-gate-elapsed".into(),
+            since,
+            theme.warning.opacity(0.8),
+        )
+    });
+    div()
+        .id("session-info-workflow-gate")
+        .debug_selector(|| "session-info-workflow-gate".into())
+        .px(px(9.0))
+        .pb(px(2.0))
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(6.0))
+        .child(
+            icon(icons::CLOCK_CIRCLE)
+                .size(px(11.5))
+                .flex_none()
+                .mt(px(2.0))
+                .text_color(theme.warning),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .line_clamp(2)
+                .text_size(crate::typography::ui_rems(11.5))
+                .line_height(px(15.0))
+                .text_color(theme.warning)
+                .child(gate.reason.clone()),
+        )
+        .children(elapsed)
+        .into_any_element()
+}
+
 /// One agent row of a workflow phase's table.
 const WORKFLOW_AGENT_ROW_HEIGHT: f32 = 24.0;
 
@@ -2370,6 +2411,11 @@ impl Shell {
                 })
                 .into_any_element(),
         );
+
+        // ── Why it is not moving: the host resource gate, while it waits.
+        if let Some(gate) = &view.gate {
+            rows.push(workflow_gate_row(gate, theme));
+        }
 
         if view.grouped {
             self.render_workflow_phases(view, &mut rows, theme, cx);

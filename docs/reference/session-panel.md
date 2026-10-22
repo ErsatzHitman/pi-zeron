@@ -65,6 +65,7 @@ Pi chats only, from the `workflows` extension's `workflow:state` channel. Shown 
 - **Queued (N)** and **Finished (N)** fold, closed until opened, and list up to 12 tasks each, then "+N more". Finished includes results reused from an earlier run (cached), skipped and aborted tasks.
 - **Notes:** how many results a resume reused or found no longer matching, and how many tasks the payload left out.
 - **Recovery:** for a run that stopped early, why it stopped and **Resume** (picks up where it left off; finished work is reused) and **Discard** (stops offering it; asks first). With no run tracked, the newest interrupted run is offered the same way.
+- **Waiting on the host:** while the workflows extension's resource gate holds new agents back (the machine is short of memory, swap, load or disk), a warning line under the run's name says why: which reading is short, both the measured and the threshold value, how many agents are queued behind it, and how long the wait has run. It is host state, not a failure — the run resumes on its own once the machine recovers, and Stop is always available.
 
 A run from a workflows extension that groups by phase (`workflow:state` v2) is drawn the way Claude Code draws a workflow instead of the bar and the Queued and Finished folds:
 
@@ -106,7 +107,7 @@ Fork chat is gone. The Files panel no longer has Subagents or Chats sections; th
 
 `session_info/compact.rs` decides when Compaction shows and what it says, from the Pi harness's `zeron:compact` host channel (`CompactStatus`: on or off, the threshold, a running compaction) and the chat's context usage.
 
-`session_info/context.rs` (pure) builds the Context rows from the chat's `ContextUsage`, the `zeron:compact` status and the `context:window` payload (`ContextBreakdown` in `zeron_proto::extension_ui`); `Shell::render_context` draws it. `session_info/workflow.rs` (pure) decides when Workflow shows and builds its rows from the `workflow:state` payload (`WorkflowState` in `zeron_proto::extension_ui`); `Shell::render_workflow` draws it, and its actions are sent with `WorkflowState::send`.
+`session_info/context.rs` (pure) builds the Context rows from the chat's `ContextUsage`, the `zeron:compact` status and the `context:window` payload (`ContextBreakdown` in `zeron_proto::extension_ui`); `Shell::render_context` draws it. `session_info/workflow.rs` (pure) decides when Workflow shows and builds its rows from the `workflow:state` payload (`WorkflowState` in `zeron_proto::extension_ui`), the host resource gate (`run.gate`, v3) included; `Shell::render_workflow` draws it, and its actions are sent with `WorkflowState::send`.
 
 `session_info/agents.rs` builds the Sub-agents rows from `AppState`, and decides when Sub-agents and Background are active:
 

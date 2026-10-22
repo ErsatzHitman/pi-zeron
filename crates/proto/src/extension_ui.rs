@@ -201,6 +201,8 @@ pub const WORKFLOW_STATE_ELEMENT: &str = "workflows:state";
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WorkflowState {
+    /// Payload version: v2 groups by phase, v3 adds [`WorkflowRun::gate`].
+    /// Additive, so a reader that knows only v2 parses a v3 payload.
     pub v: u32,
     /// Extension clock, unix ms; strictly increasing per Pi process.
     pub updated_at: u64,
@@ -233,6 +235,39 @@ pub struct WorkflowRun {
     pub agents: u32,
     /// Tokens over every agent, retries included (v2).
     pub tokens: u64,
+    /// The host resource gate holding admission, only while it waits (v3).
+    pub gate: Option<WorkflowGate>,
+}
+
+/// Why the run's resource gate is holding admission (v3).
+///
+/// `reason` is the gate's own verdict, so it names the metric and both the
+/// measured and the threshold value; the panel prints it as it is rather than
+/// composing a second explanation that could disagree with the runtime.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowGate {
+    /// `waiting` or `cleared`; an unknown value passes through.
+    pub state: String,
+    /// The gate's verdict: which reading is short, and by how much.
+    pub reason: String,
+    /// Admissions blocked on the gate right now, this one included.
+    pub waiting: u32,
+    /// Extension clock, unix ms, the wait began (the first poll, across
+    /// repeated ones).
+    pub since: Option<u64>,
+    pub metrics: Option<WorkflowGateMetrics>,
+}
+
+/// The gate's readings in the units a panel prints: GB and percent, already
+/// rounded by the extension.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkflowGateMetrics {
+    pub mem_available_gb: f64,
+    pub swap_used_pct: f64,
+    pub load1: f64,
+    pub disk_free_gb: f64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1250,6 +1285,64 @@ mod tests {
         assert!(!state.grouped());
         assert_eq!(state.tasks[0].phase_index, None);
         assert_eq!(state.phases[0].agents, 0);
+    }
+
+    #[test]
+    fn workflow_state_v3_carries_the_resource_gate_and_v2_without_it_still_parses() {
+        let mut ui = ExtensionUiState::default();
+        ui.channels.insert(
+            WORKFLOW_STATE_CHANNEL.into(),
+            json!({
+                "v": 3,
+                "run": {"id": "wf-1", "status": "running", "gate": {
+                    "state": "waiting",
+                    "reason": "free memory 2.1 GB is below the 4 GB floor",
+                    "waiting": 3,
+                    "since": 1_760_000_000_000u64,
+                    "metrics": {"memAvailableGb": 2.1, "swapUsedPct": 12.5, "load1": 7.2, "diskFreeGb": 40.0}
+                }},
+                "tasks": [{"id": "0", "state": "queued"}]
+            }),
+        );
+        let state = WorkflowState::of(&ui).expect("parses");
+        let gate = state.run.as_ref().unwrap().gate.as_ref().expect("gate");
+        assert_eq!(gate.state, "waiting");
+        assert_eq!(gate.reason, "free memory 2.1 GB is below the 4 GB floor");
+        assert_eq!(gate.waiting, 3);
+        assert_eq!(gate.since, Some(1_760_000_000_000));
+        let metrics = gate.metrics.as_ref().expect("metrics");
+        assert_eq!(
+            (
+                metrics.mem_available_gb,
+                metrics.swap_used_pct,
+                metrics.load1,
+                metrics.disk_free_gb,
+            ),
+            (2.1, 12.5, 7.2, 40.0)
+        );
+        // Round trip keeps the gate.
+        let back: WorkflowState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(back, state);
+        // A gate state a future extension adds is kept verbatim, not an error.
+        ui.channels.insert(
+            WORKFLOW_STATE_CHANNEL.into(),
+            json!({"v": 3, "run": {"id": "wf-1", "status": "running",
+                   "gate": {"state": "paused-for-disk", "reason": "r"}}}),
+        );
+        let state = WorkflowState::of(&ui).expect("parses");
+        assert_eq!(
+            state.run.as_ref().unwrap().gate.as_ref().unwrap().state,
+            "paused-for-disk"
+        );
+        // A v2 payload (no gate) still parses, and reads as no gate.
+        ui.channels.insert(
+            WORKFLOW_STATE_CHANNEL.into(),
+            json!({"v": 2, "run": {"id": "wf-1", "status": "running", "agents": 4}}),
+        );
+        let state = WorkflowState::of(&ui).expect("parses");
+        assert_eq!(state.run.as_ref().unwrap().gate, None);
+        assert!(state.grouped());
     }
 
     #[test]
