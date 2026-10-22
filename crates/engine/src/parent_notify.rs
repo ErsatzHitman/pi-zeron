@@ -511,7 +511,12 @@ impl Inner {
         // one whose job outlives the grace leaves the child parked for good.
         let (notes, waiting, wait) = partition_deferred(notes, now_ms());
         if !waiting.is_empty() {
-            self.requeue_parent_notes(parent, waiting, failures, wait);
+            // Re-arm the waiting note at the ordinary cadence, not its whole
+            // remaining grace: the next flush re-checks the deadline, and a
+            // sibling that settles meanwhile is not stuck behind it. A
+            // deferral is not a failed hand-off, so it spends no retry.
+            let delay = wait.min(self.parent_notifier.delay);
+            self.requeue_parent_notes(parent, waiting, failures, delay);
         }
         if notes.is_empty() {
             return;
@@ -1018,6 +1023,32 @@ mod tests {
         let (due, waiting, _) = partition_deferred(vec![held], 1_000 + grace);
         assert_eq!(due.len(), 1, "the parent hears once the grace passes");
         assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn a_deferred_background_note_keeps_its_place_without_spending_a_retry() {
+        let notifier = ParentNotifier::new();
+        let mut held = note("c", "t1");
+        held.background = true;
+        assert_eq!(notifier.queue("p", held.clone()), Some(true));
+        // An ordinary flush takes the whole batch and puts the waiting note
+        // back: a deferral is not a failed hand-off, so it spends no retry.
+        let batch = notifier.take("p");
+        let (due, waiting, _) = partition_deferred(batch.notes, 1_000);
+        assert!(due.is_empty());
+        assert_eq!(waiting.len(), 1);
+        assert!(notifier.retry("p", waiting, batch.failures));
+        let back = notifier.take("p");
+        assert_eq!(back.failures, 0, "the retry budget is untouched");
+        assert_eq!(back.notes.len(), 1);
+        assert!(back.notes[0].background);
+        // A newer settle of the same child replaces the waiting note.
+        assert!(notifier.retry("p", back.notes, back.failures));
+        assert_eq!(notifier.queue("p", note("c", "t2")), Some(false));
+        let now = notifier.take("p").notes;
+        assert_eq!(now.len(), 1, "one note per child");
+        assert_eq!(now[0].turn_key, "t2");
+        assert!(!now[0].background);
     }
 
     #[test]

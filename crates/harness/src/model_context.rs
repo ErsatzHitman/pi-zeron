@@ -201,11 +201,12 @@ fn hash_files<'a>(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => hash.update([0]),
             // A credential file another process is rewriting (a Windows
             // sharing violation, a lock) must not hide the whole model list:
-            // hash it as unreadable, which a later successful read changes.
+            // hash it as one stable "unreadable" marker, distinct from
+            // "missing", so the same state hashes the same on every poll
+            // instead of churning the catalog on each error variant.
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "model context file unreadable");
                 hash.update([2]);
-                field(hash, format!("{:?}", e.kind()).as_bytes());
             }
         }
     }
@@ -271,5 +272,42 @@ mod tests {
         let keyed = key();
         std::fs::write(&file, api("sk-two")).unwrap();
         assert_ne!(keyed, key(), "a replaced API key invalidates");
+    }
+
+    #[test]
+    fn a_rotated_token_keeps_the_whole_pi_context_while_an_account_change_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        // The binary does not exist, so it contributes only its path; the temp
+        // `auth.json` rides the `extra` files, so no environment is touched.
+        let binary = dir.path().join("pi");
+        let context_hash = || {
+            context(
+                zeron_proto::HarnessId::Pi,
+                &binary,
+                std::slice::from_ref(&auth),
+            )
+            .unwrap()
+            .hash
+        };
+        // `access`, `accessToken`, `refresh` and `expires` rotate together on
+        // refresh and are all masked; `email` is the account.
+        let entry = |token: &str, email: &str| {
+            format!(
+                r#"{{"anthropic":{{"type":"oauth","access":"{token}","accessToken":"{token}","refresh":"r-{token}","expires":1}},"email":"{email}"}}"#
+            )
+        };
+        std::fs::write(&auth, entry("tok-1", "a@example.com")).unwrap();
+        let first = context_hash();
+        std::fs::write(&auth, entry("tok-2", "a@example.com")).unwrap();
+        assert_eq!(first, context_hash(), "a refreshed token is the same account");
+        std::fs::write(&auth, entry("tok-2", "other@example.com")).unwrap();
+        assert_ne!(first, context_hash(), "a different account invalidates");
+        // A non-JSON credential file falls back to raw bytes, never to a
+        // shared empty hash.
+        std::fs::write(&auth, "not json").unwrap();
+        let raw = context_hash();
+        std::fs::write(&auth, "not json either").unwrap();
+        assert_ne!(raw, context_hash(), "a non-JSON file is hashed whole");
     }
 }
