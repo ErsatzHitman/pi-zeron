@@ -19,6 +19,10 @@ const REFRESH_SOURCE: &str = include_str!("catalog-refresh.mjs");
 const REFRESH_COMMAND: &str = "pi_ui_refresh_models";
 /// Above the extension's own 20 s, so its timeout answers first.
 const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+/// How long one model's thinking-level probe may take. Pi answers these
+/// locally; a stuck one must not spend the whole discovery budget and take
+/// every other model down with it.
+const MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Installed beside the delete guard, content-addressed the same way.
 pub(super) fn install_refresh(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     super::guard::install_file(dir, "zeron-catalog-refresh", REFRESH_SOURCE)
@@ -101,18 +105,36 @@ pub(super) async fn models(
     for model in data["models"].as_array().into_iter().flatten() {
         let provider = string(model, "provider");
         let id = string(model, "id");
-        process
-            .query(
-                json!({"type":"set_model","provider":provider,"modelId":id}),
-                &mut backlog,
-            )
-            .await?;
-        let supported = process
-            .query(
-                json!({"type":"get_available_thinking_levels"}),
-                &mut backlog,
-            )
-            .await?;
+        // Selecting a model is how Pi reports its thinking levels, but one
+        // model Pi will not select (a provider that vanished, a wedged
+        // process) must not discard the whole catalog: the model stays in
+        // the list, just without reasoning levels.
+        let supported = match tokio::time::timeout(MODEL_PROBE_TIMEOUT, async {
+            process
+                .query(
+                    json!({"type":"set_model","provider":provider,"modelId":id}),
+                    &mut backlog,
+                )
+                .await?;
+            process
+                .query(
+                    json!({"type":"get_available_thinking_levels"}),
+                    &mut backlog,
+                )
+                .await
+        })
+        .await
+        {
+            Ok(Ok(supported)) => Some(supported),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, provider, id, "Pi would not select a model");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(provider, id, "Pi's model probe timed out");
+                None
+            }
+        };
         result.push(Model {
             id: format!("{provider}/{id}"),
             label: model["name"].as_str().unwrap_or(id).into(),
@@ -123,8 +145,8 @@ pub(super) async fn models(
                     .cloned()
                     .unwrap_or_else(|| zeron_proto::model_provider::display_name(provider)),
             ),
-            reasoning_levels: levels(&supported),
-            options: thinking_option(&supported),
+            reasoning_levels: supported.as_ref().map(levels).unwrap_or_default(),
+            options: supported.as_ref().map(thinking_option).unwrap_or_default(),
         });
         backlog.clear();
     }

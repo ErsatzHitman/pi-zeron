@@ -269,6 +269,12 @@ async fn workspace_file_rpcs_list_search_read_write_and_watch() {
         {
             break;
         }
+        if item.resync_required {
+            // The recursive watch attaches on the shared hub's batch worker,
+            // so the first write can land before it exists; its "watch is
+            // live" resync means the write was unobserved. Write again now.
+            std::fs::write(repo.join("created.txt"), "created\n").expect("external create");
+        }
     }
 
     assert!(

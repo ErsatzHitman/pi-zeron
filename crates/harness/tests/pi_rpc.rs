@@ -683,6 +683,39 @@ async fn discovers_model_specific_thinking_and_extension_commands() {
     let skills = h.skills(dir.path()).await.unwrap().unwrap();
     assert!(skills.iter().any(|s| s.name == "probe"));
 }
+/// One model Pi refuses to select must not discard the catalog: that model
+/// stays listed (without reasoning levels) and the others keep theirs.
+#[tokio::test]
+async fn a_refused_model_selection_keeps_the_rest_of_the_catalog() {
+    if std::env::var_os("ZERON_PI_REFUSED_MODEL_CHILD").is_none() {
+        // The probe reads `refuse-model` from its cwd, so the assertion runs
+        // in a child process started from a scratch directory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("refuse-model"), "mock-2").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_refused_model_selection_keeps_the_rest_of_the_catalog",
+            ])
+            .current_dir(dir.path())
+            .env("ZERON_PI_REFUSED_MODEL_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
+    let models = harness().models().await.unwrap();
+    assert_eq!(models.len(), 2, "{models:?}");
+    assert_eq!(models[0].id, "mock/mock");
+    assert!(!models[0].reasoning_levels.is_empty());
+    assert_eq!(models[1].id, "mock/mock-2");
+    assert!(models[1].reasoning_levels.is_empty());
+    assert!(models[1].options.is_empty());
+}
 #[tokio::test]
 async fn rpc_control_commands_finish_without_waiting_for_agent_settled() {
     for command in [
