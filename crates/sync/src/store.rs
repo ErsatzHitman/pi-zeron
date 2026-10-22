@@ -2,7 +2,7 @@
 //! processed-command ledger (ARCHITECTURE §2 command plane: entries are marked
 //! processed BEFORE execution so a crash can never double-execute a command).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
