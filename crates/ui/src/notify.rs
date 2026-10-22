@@ -17,8 +17,10 @@
 //!   `osascript`, attributed to Script Editor (cosmetics only).
 //! - Linux: `notify-send` (libnotify's CLI, present on every mainstream
 //!   desktop).
-//! - Windows: no-op for now — toasts require a registered AppUserModelID
-//!   (an installer concern); the chime still covers it.
+//! - Windows: no banner path — toasts require a registered AppUserModelID (an
+//!   installer concern), so [`is_supported`] is false there and Settings shows
+//!   the banner switches as unavailable instead of offering ones that would
+//!   silently do nothing; the chime still covers it.
 //! - `ZERON_DISABLE_NOTIFICATIONS` env kill-switch + the
 //!   `notificationsEnabled` ui-setting (checked by the caller);
 //! - failures are logged and swallowed — a missing notifier must never
@@ -30,6 +32,13 @@ const DISABLE_ENV: &str = "ZERON_DISABLE_NOTIFICATIONS";
 /// conversation. Session ids are generated UUIDs, so this cannot collide
 /// with a real chat.
 pub(crate) const AGENT_UPDATES_TARGET: &str = "__zeron_agent_updates__";
+
+/// Whether this platform can deliver a banner at all. Settings must not offer
+/// the banner preference where it cannot: Windows toasts need a registered
+/// AppUserModelID, which is an installer concern, so [`post`] is a no-op there.
+pub const fn is_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
+}
 
 /// Post a desktop banner, optionally linked to `chat_id`'s session. Call from the main thread
 /// (the macOS native path talks to AppKit); slow paths (spawning a CLI) hop to

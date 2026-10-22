@@ -275,9 +275,101 @@ impl Render for NotificationsPage {
                         }),
                     ),
             );
-        let desktop_card = widgets::section_card(&theme)
-            .mt_0()
-            .child(
+        // The banner switches exist only where a banner can be delivered:
+        // Windows toasts need a registered AppUserModelID (an installer
+        // concern), so the card explains the gap instead of offering toggles
+        // that would silently do nothing.
+        let desktop_card = if crate::notify::is_supported() {
+            widgets::section_card(&theme)
+                .mt_0()
+                .child(
+                    widgets::card_row(&theme, true)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(160.0))
+                                .flex()
+                                .flex_col()
+                                .child(widgets::row_title(&theme, "Desktop notifications")),
+                        )
+                        .child(interactive_switch(
+                            toggle(
+                                "notifications-desktop-toggle",
+                                "Desktop notifications",
+                                desktop,
+                                true,
+                            ),
+                            accent,
+                            NotificationPreference::Desktop,
+                            cx,
+                        )),
+                )
+                .child(
+                    widgets::card_row(&theme, false)
+                        .when(!desktop, |el| el.opacity(0.55))
+                        .child(widgets::row_tile(&theme, icons::REFRESH))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(widgets::row_title(&theme, "Agent updates"))
+                                .child(widgets::meta_line(
+                                    &theme,
+                                    vec![
+                                        div()
+                                            .child(SharedString::from(
+                                                "Show a banner when monitored agent CLIs have updates.",
+                                            ))
+                                            .into_any_element(),
+                                    ],
+                                )),
+                        )
+                        .child(
+                            toggle(
+                                "notifications-agent-updates-toggle",
+                                "Agent update notifications",
+                                agent_updates,
+                                desktop,
+                            )
+                            .when(desktop, |el| {
+                                interactive_switch(el, accent, NotificationPreference::AgentUpdates, cx)
+                            }),
+                        ),
+                )
+                .child(
+                    // Sub-option of the banner row: dimmed + inert while banners
+                    // are off (the harnesses not-installed treatment).
+                    widgets::card_row(&theme, false)
+                        .when(!desktop, |el| el.opacity(0.55))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(160.0))
+                                .flex()
+                                .flex_col()
+                                .child(widgets::row_title(&theme, "Only when in the background")),
+                        )
+                        .child(
+                            toggle(
+                                "notifications-background-toggle",
+                                "Only notify when Zeron is in the background",
+                                background_only,
+                                desktop,
+                            )
+                            .when(desktop, |el| {
+                                interactive_switch(
+                                    el,
+                                    accent,
+                                    NotificationPreference::BackgroundOnly,
+                                    cx,
+                                )
+                            }),
+                        ),
+                )
+        } else {
+            widgets::section_card(&theme).mt_0().child(
                 widgets::card_row(&theme, true)
                     .child(
                         div()
@@ -285,84 +377,22 @@ impl Render for NotificationsPage {
                             .min_w(px(160.0))
                             .flex()
                             .flex_col()
-                            .child(widgets::row_title(&theme, "Desktop notifications")),
-                    )
-                    .child(interactive_switch(
-                        toggle(
-                            "notifications-desktop-toggle",
-                            "Desktop notifications",
-                            desktop,
-                            true,
-                        ),
-                        accent,
-                        NotificationPreference::Desktop,
-                        cx,
-                    )),
-            )
-            .child(
-                widgets::card_row(&theme, false)
-                    .when(!desktop, |el| el.opacity(0.55))
-                    .child(widgets::row_tile(&theme, icons::REFRESH))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(widgets::row_title(&theme, "Agent updates"))
+                            .child(widgets::row_title(&theme, "Desktop notifications"))
                             .child(widgets::meta_line(
                                 &theme,
                                 vec![
                                     div()
                                         .child(SharedString::from(
-                                            "Show a banner when monitored agent CLIs have updates.",
+                                            "Desktop banners aren't available on this platform. \
+                                             Session sounds still play.",
                                         ))
                                         .into_any_element(),
                                 ],
                             )),
                     )
-                    .child(
-                        toggle(
-                            "notifications-agent-updates-toggle",
-                            "Agent update notifications",
-                            agent_updates,
-                            desktop,
-                        )
-                        .when(desktop, |el| {
-                            interactive_switch(el, accent, NotificationPreference::AgentUpdates, cx)
-                        }),
-                    ),
+                    .child(widgets::badge(&theme, "Unavailable")),
             )
-            .child(
-                // Sub-option of the banner row: dimmed + inert while banners
-                // are off (the harnesses not-installed treatment).
-                widgets::card_row(&theme, false)
-                    .when(!desktop, |el| el.opacity(0.55))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.0))
-                            .flex()
-                            .flex_col()
-                            .child(widgets::row_title(&theme, "Only when in the background")),
-                    )
-                    .child(
-                        toggle(
-                            "notifications-background-toggle",
-                            "Only notify when Zeron is in the background",
-                            background_only,
-                            desktop,
-                        )
-                        .when(desktop, |el| {
-                            interactive_switch(
-                                el,
-                                accent,
-                                NotificationPreference::BackgroundOnly,
-                                cx,
-                            )
-                        }),
-                    ),
-            );
+        };
 
         let scrollbar = popover::rail(self, "notifications-page-scrollbar", &theme, cx);
         div()
