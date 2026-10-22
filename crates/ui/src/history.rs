@@ -1328,6 +1328,10 @@ pub struct GitHistory {
     search_scroll_anchor: Option<HistoryScrollAnchor>,
     search_task: Option<Task<()>>,
     loading: bool,
+    /// Whether a fetch has been started for the current target key. An empty
+    /// commit list is then a real empty repository, not a load that never
+    /// happened, so the observe path stops refetching it (audit #95).
+    first_page_fetched: bool,
     error: Option<SharedString>,
     graph: GraphLayout,
     graph_lane_capacity: usize,
@@ -1977,6 +1981,7 @@ impl GitHistory {
             search_scroll_anchor: None,
             search_task: None,
             loading: false,
+            first_page_fetched: false,
             error: None,
             graph: GraphLayout::default(),
             graph_lane_capacity: 0,
@@ -2051,10 +2056,11 @@ impl GitHistory {
             self.graph_hover_clear_task = None;
             self.avatar_images.clear();
             self.loading = false;
+            self.first_page_fetched = false;
             return;
         };
         if self.target_key.as_deref() == Some(key.as_str()) {
-            if !self.loading && self.commits.is_empty() && self.error.is_none() {
+            if self.needs_first_page_fetch() {
                 self.fetch_page(key, cwd, target, 0, true, cx);
             }
             return;
@@ -2065,6 +2071,7 @@ impl GitHistory {
         self.fetch_for = None;
         self.fetch_error = None;
         self.loading = false;
+        self.first_page_fetched = false;
         self.target_key = Some(key.clone());
         self.commits.clear();
         self.visible_commits.clear();
@@ -2096,6 +2103,14 @@ impl GitHistory {
         self.graph_hover_clear_task = None;
         self.avatar_images.clear();
         self.fetch_page(key, cwd, target, 0, true, cx);
+    }
+
+    /// Whether the observe path should retry the first page. Only a target
+    /// whose fetch never started needs the retry; once a fetch has been
+    /// attempted, an empty list is a real empty repository and must not be
+    /// refetched on every notify (audit #95).
+    fn needs_first_page_fetch(&self) -> bool {
+        !self.loading && self.commits.is_empty() && self.error.is_none() && !self.first_page_fetched
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -2661,6 +2676,9 @@ impl GitHistory {
             return;
         };
         self.loading = true;
+        // A fetch has been attempted for this key: an empty page from here on
+        // is a final answer, not a missing load (audit #95).
+        self.first_page_fetched = true;
         self.error = None;
         cx.notify();
         self.request_task = Some(cx.spawn(async move |this, cx| {
@@ -4589,6 +4607,30 @@ mod tests {
         assert!(git_history_matches("plsh grph", &candidate));
         assert!(git_history_matches("A1B2", &candidate));
         assert!(!git_history_matches("terminal", &candidate));
+    }
+
+    #[test]
+    fn empty_repository_does_not_refetch_the_first_page_on_every_notify() {
+        let mut app = gpui::TestApp::new();
+        app.update(|cx| {
+            let state = cx.new(|_| AppState::new());
+            let history = cx.new(|cx| GitHistory::new(state, cx));
+            history.update(cx, |history, _cx| {
+                history.target_key = Some("local|/work".into());
+                // No fetch has started for this target yet: retry.
+                assert!(history.needs_first_page_fetch());
+                // A fetch that returned an empty page is final.
+                history.first_page_fetched = true;
+                assert!(!history.needs_first_page_fetch());
+                // An in-flight fetch or a surfaced error also suppresses it.
+                history.first_page_fetched = false;
+                history.loading = true;
+                assert!(!history.needs_first_page_fetch());
+                history.loading = false;
+                history.error = Some("offline".into());
+                assert!(!history.needs_first_page_fetch());
+            });
+        });
     }
 
     #[test]
