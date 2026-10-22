@@ -2042,8 +2042,13 @@ impl UiSettings {
     }
 
     /// Load from `{data_dir}/ui-settings.json`; defaults on any failure.
+    ///
+    /// A file that cannot be read or parsed is moved aside to
+    /// `ui-settings.json.bak` first: the next save would otherwise replace it
+    /// with defaults, leaving nothing of the user's settings to recover.
     pub fn load(data_dir: &Path) -> Self {
-        match std::fs::read_to_string(Self::path(data_dir)) {
+        let path = Self::path(data_dir);
+        match std::fs::read_to_string(&path) {
             Ok(text) => {
                 match serde_json::from_str::<serde_json::Value>(&text).and_then(|mut value| {
                     if let Some(settings) = value.as_object_mut() {
@@ -2140,11 +2145,31 @@ impl UiSettings {
                     Ok(settings) => settings.migrated().clamped(),
                     Err(err) => {
                         tracing::warn!(error = %err, "ui-settings corrupt; using defaults");
+                        Self::keep_unreadable(&path);
                         Self::default()
                     }
                 }
             }
-            Err(_) => Self::default(),
+            Err(err) => {
+                // Only a missing file is normal. Anything else (permissions,
+                // invalid UTF-8) holds settings that must survive the save
+                // this load leads to.
+                if err.kind() != io::ErrorKind::NotFound {
+                    tracing::warn!(error = %err, "ui-settings unreadable; using defaults");
+                    Self::keep_unreadable(&path);
+                }
+                Self::default()
+            }
+        }
+    }
+
+    /// Move a settings file we could not read aside, so the defaults that
+    /// replace it in memory never destroy what the user had.
+    fn keep_unreadable(path: &Path) {
+        let backup = path.with_extension("json.bak");
+        match std::fs::rename(path, &backup) {
+            Ok(()) => tracing::warn!(backup = %backup.display(), "kept the unreadable ui-settings as a backup"),
+            Err(err) => tracing::warn!(error = %err, "couldn't keep a backup of the unreadable ui-settings"),
         }
     }
 
@@ -2275,6 +2300,32 @@ mod tests {
                 .separate_from_slash
         );
         assert!(legacy.skill_completion(HarnessId::Codex).dollar);
+    }
+
+    /// A file we cannot parse is moved aside before its defaults take over:
+    /// the next save would otherwise replace the user's settings with nothing
+    /// left to recover.
+    #[test]
+    fn a_corrupt_settings_file_is_kept_as_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = UiSettings::path(dir.path());
+        let backup = path.with_extension("json.bak");
+        let corrupt = "{\"sidebarWidth\": 300, oops";
+        std::fs::write(&path, corrupt).unwrap();
+        assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), corrupt);
+        assert!(!path.exists());
+        // The save this load leads to leaves the original readable.
+        UiSettings::default().save(dir.path()).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn a_missing_settings_file_is_not_backed_up() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
+        assert!(!UiSettings::path(dir.path()).with_extension("json.bak").exists());
     }
 
     #[test]

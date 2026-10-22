@@ -52,6 +52,23 @@ fn queue_mutation_acknowledged(method: &str, reply: &serde_json::Value) -> bool 
     reply.get(field).and_then(serde_json::Value::as_bool) == Some(true)
 }
 
+/// What a cancel says when the host never confirmed it: the row stays queued
+/// (and may need review once its lease lapses), but the composer is free again.
+const CANCELLED_WITHOUT_CONFIRMATION: &str =
+    "Couldn't confirm the cancelled edit; the queued message may need review before it sends";
+
+/// Whether a finished edit resolves without the host's blessing. Cancelling
+/// saves nothing, so a lost, contested or unreachable lease must still give the
+/// composer back — otherwise the draft stays trapped in edit mode. Committing
+/// keeps the text in the editor until the host has taken it.
+fn queue_edit_cancels_locally(action: &str, outcome: Option<&str>) -> bool {
+    action == "cancel"
+        && !matches!(
+            outcome,
+            Some("committed" | "cancelled" | "discarded" | "released")
+        )
+}
+
 struct QueueActionTooltip {
     label: SharedString,
 }
@@ -1298,8 +1315,7 @@ impl Composer {
             (chat_id, host_device_id, supported)
         };
         if !supported {
-            self.failure = Some("The chat host does not support safe queue removal".into());
-            cx.notify();
+            self.show_error("The chat host does not support safe queue removal", cx);
             return;
         }
         if self.editing_queued.as_deref() == Some(id.as_str()) {
@@ -1340,8 +1356,11 @@ impl Composer {
                             "queued message had already left the queue before removal"
                         );
                         if selected_matches {
-                            composer.failure =
-                                Some("That message had already left the queue".into());
+                            composer.show_error_for(
+                                chat_id.clone(),
+                                "That message had already left the queue",
+                                cx,
+                            );
                             composer
                                 .state
                                 .update(cx, |state, cx| state.refresh_selected_queue(cx));
@@ -1350,7 +1369,11 @@ impl Composer {
                     Err(err) => {
                         tracing::warn!(error = %err, "host-authoritative queue removal failed");
                         if selected_matches {
-                            composer.failure = Some("Couldn't remove the message".into());
+                            composer.show_error_for(
+                                chat_id.clone(),
+                                "Couldn't remove the message",
+                                cx,
+                            );
                             composer
                                 .state
                                 .update(cx, |state, cx| state.refresh_selected_queue(cx));
@@ -1461,8 +1484,7 @@ impl Composer {
             (chat_id, host_device_id, supported)
         };
         if !supported {
-            self.failure = Some("Update the chat host to edit queued messages safely".into());
-            cx.notify();
+            self.show_error("Update the chat host to edit queued messages safely", cx);
             return;
         }
         if !self.state.read(cx).queue.iter().any(|item| item.id == id) {
@@ -1531,7 +1553,11 @@ impl Composer {
                     })).await;
                     this.update(cx, |composer, cx| {
                         composer.queue_edit_pending_id = None;
-                        composer.failure = Some("Couldn't load the queued attachments or Appshot context. Check the connection and update the chat host.".into());
+                        composer.show_error_for(
+                            chat_id.clone(),
+                            "Couldn't load the queued attachments or Appshot context. Check the connection and update the chat host.",
+                            cx,
+                        );
                         cx.notify();
                     }).ok();
                     return;
@@ -1544,17 +1570,21 @@ impl Composer {
                         if reply.get("outcome").and_then(|v| v.as_str()) == Some("acquired") =>
                     {
                         let Some(lease_id) = reply.get("leaseId").and_then(|v| v.as_str()) else {
-                            composer.failure =
-                                Some("The chat host returned an invalid edit lease".into());
-                            cx.notify();
+                            composer.show_error_for(
+                                chat_id.clone(),
+                                "The chat host returned an invalid edit lease",
+                                cx,
+                            );
                             return;
                         };
                         let Some(base_text_hash) =
                             reply.get("baseTextHash").and_then(|v| v.as_str())
                         else {
-                            composer.failure =
-                                Some("The chat host returned an invalid edit lease".into());
-                            cx.notify();
+                            composer.show_error_for(
+                                chat_id.clone(),
+                                "The chat host returned an invalid edit lease",
+                                cx,
+                            );
                             return;
                         };
                         let raw_text = reply
@@ -1605,17 +1635,26 @@ impl Composer {
                     Ok(reply)
                         if reply.get("outcome").and_then(|v| v.as_str()) == Some("locked") =>
                     {
-                        composer.failure =
-                            Some("That queued message is being edited on another device".into());
+                        composer.show_error_for(
+                            chat_id.clone(),
+                            "That queued message is being edited on another device",
+                            cx,
+                        );
                     }
                     Ok(_) => {
-                        composer.failure =
-                            Some("That queued message is no longer available".into());
+                        composer.show_error_for(
+                            chat_id.clone(),
+                            "That queued message is no longer available",
+                            cx,
+                        );
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "begin queue edit failed");
-                        composer.failure =
-                            Some("Connect to the chat host to edit this message".into());
+                        composer.show_error_for(
+                            chat_id.clone(),
+                            "Connect to the chat host to edit this message",
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -1742,8 +1781,23 @@ impl Composer {
             self.queue_edit_host_device_id.clone(),
             self.state.read(cx).engine().cloned(),
         ) else {
-            self.failure = Some("The edit lease was lost; your text is still in the editor".into());
-            cx.notify();
+            // A lease that is already gone cannot be finished at its host.
+            // Cancelling still gives the composer back — nothing was saved, and
+            // the row keeps its queued text until the host lapses the lease.
+            let key = self
+                .queue_edit_chat_id
+                .clone()
+                .unwrap_or_else(|| self.current_key.clone());
+            if queue_edit_cancels_locally(action, None) {
+                self.clear_queue_edit_local(cx);
+                self.show_error_for(key, CANCELLED_WITHOUT_CONFIRMATION, cx);
+            } else {
+                self.show_error_for(
+                    key,
+                    "The edit lease was lost; your text is still in the editor",
+                    cx,
+                );
+            }
             return;
         };
         let expected = self.queue_edit_base_text_hash.clone();
@@ -1795,6 +1849,19 @@ impl Composer {
             this.update(cx, |composer, cx| {
                 composer.queue_edit_finishing = false;
                 composer.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); });
+                let outcome = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|reply| reply.get("outcome"))
+                    .and_then(|outcome| outcome.as_str());
+                // A cancel saves nothing, so it must never wait on the host's
+                // answer: a lost, missing or unreachable lease would otherwise
+                // trap the draft in edit mode with no way out.
+                if queue_edit_cancels_locally(action, outcome) {
+                    composer.clear_queue_edit_local(cx);
+                    composer.show_error_for(chat_id.clone(), CANCELLED_WITHOUT_CONFIRMATION, cx);
+                    return;
+                }
                 match result {
                     Ok(reply) => match reply.get("outcome").and_then(|v| v.as_str()) {
                         Some("committed" | "cancelled" | "discarded" | "released") => {
@@ -1802,25 +1869,33 @@ impl Composer {
                             return;
                         }
                         Some("conflict") => {
-                            composer.failure = Some(
-                                "This message changed on another device; your edit was kept locally".into(),
+                            composer.show_error_for(
+                                chat_id.clone(),
+                                "This message changed on another device; your edit was kept locally",
+                                cx,
                             );
                         }
                         Some("missing") => {
-                            composer.failure = Some(
-                                "The queued message was removed; your edit was kept locally".into(),
+                            composer.show_error_for(
+                                chat_id.clone(),
+                                "The queued message was removed; your edit was kept locally",
+                                cx,
                             );
                         }
                         _ => {
-                            composer.failure = Some(
-                                "The edit lease changed; your text is still in the editor".into(),
+                            composer.show_error_for(
+                                chat_id.clone(),
+                                "The edit lease changed; your text is still in the editor",
+                                cx,
                             );
                         }
                     },
                     Err(err) => {
                         tracing::warn!(error = %err, "finish queue edit failed");
-                        composer.failure = Some(
-                            "Couldn't reach the chat host; your edit is still in the editor".into(),
+                        composer.show_error_for(
+                            chat_id.clone(),
+                            "Couldn't reach the chat host; your edit is still in the editor",
+                            cx,
                         );
                     }
                 }
@@ -1863,11 +1938,11 @@ impl Composer {
                         if reply.get("outcome").and_then(|v| v.as_str()) == Some("renewed") => {}
                     Ok(_) => {
                         this.update(cx, |composer, cx| {
-                            composer.failure = Some(
-                                "Edit protection expired; review this message before sending"
-                                    .into(),
+                            composer.show_error_for(
+                                chat_id.clone(),
+                                "Edit protection expired; review this message before sending",
+                                cx,
                             );
-                            cx.notify();
                         })
                         .ok();
                         break;
@@ -1935,8 +2010,7 @@ impl Composer {
             (chat_id, host, supported)
         };
         if !host_supports_action {
-            self.failure = Some("The chat host does not support queue actions".into());
-            cx.notify();
+            self.show_error("The chat host does not support queue actions", cx);
             return;
         }
         let pending_message = matches!(
@@ -2010,7 +2084,7 @@ impl Composer {
                                 cx.notify();
                             });
                         }
-                        composer.failure = Some(failure.into());
+                        composer.show_error_for(chat_id.clone(), failure, cx);
                         composer
                             .state
                             .update(cx, |state, cx| state.refresh_selected_queue(cx));
@@ -2542,6 +2616,96 @@ mod appshot_edit_tests {
             assert_eq!(composer.staged_appshots().len(), 2);
             assert_eq!(composer.staged_appshots()[1].id, "during-save");
             assert!(composer.editing_queued.is_none());
+        });
+    }
+}
+
+#[cfg(test)]
+mod edit_recovery_tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    /// #61: a cancel saves nothing, so it resolves locally whatever the host
+    /// says; a commit or discard keeps the text until the host has taken it.
+    #[test]
+    fn only_a_cancel_resolves_without_the_host() {
+        for outcome in [None, Some("conflict"), Some("missing"), Some("lost")] {
+            assert!(queue_edit_cancels_locally("cancel", outcome));
+        }
+        for outcome in [
+            Some("committed"),
+            Some("cancelled"),
+            Some("discarded"),
+            Some("released"),
+        ] {
+            assert!(!queue_edit_cancels_locally("cancel", outcome));
+        }
+        for action in ["commit", "discard"] {
+            for outcome in [None, Some("conflict"), Some("missing"), Some("lost")] {
+                assert!(!queue_edit_cancels_locally(action, outcome), "{action}");
+            }
+        }
+    }
+
+    /// #61: with the lease already gone (or no engine to release it), Escape
+    /// still hands the composer back instead of trapping the draft in edit
+    /// mode for good.
+    #[gpui::test]
+    fn cancelling_an_edit_without_a_lease_returns_the_composer(cx: &mut TestAppContext) {
+        let state = cx.new(|_| crate::state::AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            composer.current_key = "chat-a".into();
+            composer.queue_edit_draft = Some(("draft".into(), vec![], vec![]));
+            composer.editing_queued = Some("row".into());
+            composer.queue_edit_chat_id = Some("chat-a".into());
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("edited", cx));
+            assert!(composer.cancel_queue_edit(cx));
+            assert!(composer.editing_queued.is_none());
+            assert_eq!(composer.input.read(cx).text(), "draft");
+            assert_eq!(
+                composer.visible_failure().as_deref(),
+                Some(CANCELLED_WITHOUT_CONFIRMATION)
+            );
+        });
+    }
+
+    /// #62: a queue failure is keyed to the chat that asked for it. A key left
+    /// behind by another draft used to hide the banner on the chat it belongs
+    /// to, so the failure was silently swallowed.
+    #[gpui::test]
+    fn queue_failures_are_keyed_to_the_chat_that_asked(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let (out, _server_in) = tokio::sync::mpsc::channel::<String>(16);
+        let (_server_out, inbound) = tokio::sync::mpsc::channel::<String>(16);
+        let state = cx.new(|_| crate::state::AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.selected_chat = Some("chat-a".into());
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            // A notice left behind by another draft keeps its own key: the
+            // user was looking at chat b when it landed.
+            composer.current_key = "chat-b".into();
+            composer.show_error("older", cx);
+            composer.current_key = "chat-a".into();
+            assert!(composer.visible_failure().is_none());
+            composer.queue_rpc(
+                methods::REMOVE_QUEUED_MESSAGE,
+                serde_json::json!({ "id": "row" }),
+                "Couldn't remove the message",
+                cx,
+            );
+            assert_eq!(
+                composer.visible_failure().as_deref(),
+                Some("The chat host does not support queue actions")
+            );
         });
     }
 }

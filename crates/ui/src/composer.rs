@@ -6973,8 +6973,20 @@ impl Composer {
 
     /// Show a dismissable failure chip for the current draft's session.
     pub(crate) fn show_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.show_error_for(self.current_key.clone(), message, cx);
+    }
+
+    /// Show a failure chip under `key`'s draft — for work that can finish after
+    /// the user navigated away, so the notice waits on the chat it belongs to
+    /// instead of landing on whatever draft happens to be visible.
+    pub(crate) fn show_error_for(
+        &mut self,
+        key: impl Into<String>,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         self.failure = Some(message.into());
-        self.failure_key = Some(self.current_key.clone());
+        self.failure_key = Some(key.into());
         cx.notify();
     }
 
@@ -9066,8 +9078,10 @@ impl Composer {
             self.clear_queue_edit(cx);
         } else if !edited_row_exists && self.editing_queued.is_some() && !self.queue_edit_finishing
         {
-            self.failure =
-                Some("The queued message was removed; your edit remains in the composer".into());
+            self.show_error(
+                "The queued message was removed; your edit remains in the composer",
+                cx,
+            );
             // Recover both drafts when another device removes the reserved row.
             if let Some((draft, mut attachments, mut appshots)) = self.queue_edit_draft.take() {
                 appshots.extend(self.appshots.remove(&self.current_key).unwrap_or_default());
@@ -9612,9 +9626,10 @@ impl Composer {
             if !engine.engine_info().supports(capability)
                 || !self.state.read(cx).chat_host_supports(&chat_id, capability)
             {
-                self.failure =
-                    Some("Update the chat's engine to queue messages during a response.".into());
-                cx.notify();
+                self.show_error(
+                    "Update the chat's engine to queue messages during a response.",
+                    cx,
+                );
                 return;
             }
         }
