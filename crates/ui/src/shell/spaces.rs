@@ -2412,7 +2412,9 @@ pub(super) struct AddSpaceFlow {
     focus_pending: bool,
     load_task: Option<Task<()>>,
     drives_task: Option<Task<()>>,
-    submit_task: Option<Task<()>>,
+    /// The space id of the `createSpace` this flow is waiting on. The reply
+    /// outlives the flow (the request is detached), so it is matched by id.
+    submit_id: Option<String>,
     /// Folders matching the query anywhere under the device's home (Home
     /// location only).
     home_search: HomeFolderSearch,
@@ -6019,6 +6021,14 @@ impl Shell {
             // Spawned children stay out of the Archived section too — the
             // same top-level rule as `visible_chats`.
             .filter(|c| c.archived && c.is_top_level())
+            // And the same live-project rule as `overview_chats`: a chat whose
+            // project is gone has no row on the active list, so it must not
+            // reappear here as "?".
+            .filter(|c| {
+                c.space_id
+                    .as_deref()
+                    .is_none_or(|id| state.space_row(id).is_some())
+            })
             .filter(|chat| in_filter(chat))
             .cloned()
             .collect();
@@ -6242,7 +6252,7 @@ impl Shell {
             focus_pending: true,
             load_task: None,
             drives_task: None,
-            submit_task: None,
+            submit_id: None,
             home_search: HomeFolderSearch::default(),
             _search_events: search_events,
         });
@@ -6832,12 +6842,13 @@ impl Shell {
             self.land_in_space(existing, cx);
             return;
         }
+        let space_id = uuid::Uuid::new_v4().to_string();
         let Some(flow) = self.add_space.as_mut() else {
             return;
         };
         flow.submit_busy = true;
         flow.error = None;
-        let space_id = uuid::Uuid::new_v4().to_string();
+        flow.submit_id = Some(space_id.clone());
         // Optimistic echo: the watch frame carrying the real row replaces it
         // by id (apply_spaces re-sorts; same-id upsert is idempotent).
         let space = Space {
@@ -6868,20 +6879,40 @@ impl Shell {
         let task = cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::MUTATE, params).await;
             this.update(cx, |shell, cx| {
+                // The picker may have been closed (or replaced) while the
+                // create was in flight: only the flow still waiting on THIS
+                // submit may take the reply, but the optimistic row is
+                // rolled back either way.
+                let pending = shell
+                    .add_space
+                    .as_ref()
+                    .is_some_and(|flow| flow.submit_id.as_deref() == Some(submit_id.as_str()));
                 match result {
                     Ok(_) => {
-                        shell.close_add_space(cx);
-                        shell.land_in_space(submit_id.clone(), cx);
+                        if pending {
+                            shell.close_add_space(cx);
+                            shell.land_in_space(submit_id.clone(), cx);
+                        }
                     }
                     Err(err) => {
-                        // Roll the optimistic row back; surface the error inline.
                         shell.state.update(cx, |s, cx| {
                             s.spaces.retain(|space| space.id != submit_id);
                             cx.notify();
                         });
-                        if let Some(flow) = shell.add_space.as_mut() {
-                            flow.submit_busy = false;
-                            flow.error = Some(format!("{err}").into());
+                        if pending {
+                            if let Some(flow) = shell.add_space.as_mut() {
+                                flow.submit_busy = false;
+                                flow.submit_id = None;
+                                flow.error = Some(format!("{err}").into());
+                            }
+                        } else {
+                            // No flow is left to show it inline; the failure
+                            // would otherwise be swallowed with the picker.
+                            shell.show_notice(
+                                crate::toast::ToastKind::Error,
+                                format!("{err}"),
+                                cx,
+                            );
                         }
                     }
                 }
@@ -6889,9 +6920,10 @@ impl Shell {
             })
             .ok();
         });
-        if let Some(flow) = self.add_space.as_mut() {
-            flow.submit_task = Some(task);
-        }
+        // Detached on purpose: the palette may close (or reopen) while the
+        // create is in flight, and cancelling here would strand the
+        // optimistic row and swallow the failure.
+        task.detach();
         cx.notify();
     }
 
@@ -8699,6 +8731,86 @@ mod home_folder_search_tests {
                 .is_empty()
         );
     }
+
+    /// Bring the picker to the Home folder listing, ready to create.
+    fn browse_home_ready(
+        window: gpui::WindowHandle<Shell>,
+        engine: &mut FakeEngine,
+        cx: &mut TestAppContext,
+    ) {
+        go_home(window, cx);
+        let browse = engine.take(methods::LIST_FOLDERS, cx);
+        assert_eq!(browse.len(), 1);
+        let listing = engine.listing.clone();
+        engine.reply(&browse[0], listing);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn closing_the_picker_mid_create_rolls_the_ghost_back_and_reports_the_failure(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _dir, mut engine) = picker(cx, "local");
+        browse_home_ready(window, &mut engine, cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.submit_add_space(cx);
+                assert_eq!(shell.state.read(cx).spaces.len(), 1);
+            })
+            .unwrap();
+        let mutate = engine.take(methods::MUTATE, cx);
+        assert_eq!(mutate.len(), 1);
+        // Dismissing the picker must not cancel the create: the host's
+        // failure still has to roll the optimistic row back and be seen.
+        window
+            .update(cx, |shell, _, cx| shell.close_add_space(cx))
+            .unwrap();
+        engine.fail(&mutate[0], "that folder cannot be added");
+        cx.run_until_parked();
+        window
+            .read_with(cx, |shell, cx| {
+                assert!(
+                    shell.state.read(cx).spaces.is_empty(),
+                    "the optimistic row is rolled back"
+                );
+                assert_eq!(
+                    shell.sidebar_notice.as_deref(),
+                    Some("that folder cannot be added")
+                );
+                assert!(shell.add_space.is_none());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn closing_the_picker_mid_create_keeps_the_project_without_navigating(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _dir, mut engine) = picker(cx, "local");
+        browse_home_ready(window, &mut engine, cx);
+        window
+            .update(cx, |shell, _, cx| shell.submit_add_space(cx))
+            .unwrap();
+        let mutate = engine.take(methods::MUTATE, cx);
+        assert_eq!(mutate.len(), 1);
+        window
+            .update(cx, |shell, _, cx| shell.close_add_space(cx))
+            .unwrap();
+        engine.reply(&mutate[0], serde_json::json!({}));
+        cx.run_until_parked();
+        window
+            .read_with(cx, |shell, cx| {
+                let state = shell.state.read(cx);
+                // The project really was created; the dismissed picker just
+                // must not reopen or move the canvas.
+                assert_eq!(state.spaces.len(), 1);
+                assert_eq!(state.spaces[0].id, mutate[0]["params"]["spaceId"]);
+                assert!(state.selected_space.is_none());
+                assert!(shell.settings.last_space_id.is_none());
+                assert!(shell.add_space.is_none());
+            })
+            .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -8858,6 +8970,82 @@ mod project_menu_tests {
                 shell.filter_project_target("sp-gone", cx),
                 target("", &["sp-gone"], &[], 0)
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod archived_shelf_tests {
+    //! The Archived shelf draws the same rows the active list would: a chat
+    //! whose project no longer exists is not one of them.
+    use super::*;
+
+    #[gpui::test]
+    fn archived_rows_skip_chats_whose_project_is_gone(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let shell = cx.new(|cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: String::new(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, _| {
+                state.spaces = serde_json::from_value(serde_json::json!([{
+                    "id": "live",
+                    "deviceId": "local",
+                    "path": "/repo/live",
+                    "gitDetected": true,
+                    "createdAt": "2026-09-01T00:00:00Z",
+                }]))
+                .unwrap();
+                state.chats = serde_json::from_value(serde_json::json!([
+                    {
+                        "id": "orphan",
+                        "deviceId": "local",
+                        "archived": true,
+                        "spaceId": "gone",
+                        "createdAt": "2026-09-01T00:00:00Z",
+                        "lastMessageAt": "2026-09-03T00:00:00Z",
+                    },
+                    {
+                        "id": "archived-live",
+                        "deviceId": "local",
+                        "archived": true,
+                        "spaceId": "live",
+                        "createdAt": "2026-09-01T00:00:00Z",
+                        "lastMessageAt": "2026-09-02T00:00:00Z",
+                    },
+                    {
+                        "id": "archived-home",
+                        "deviceId": "local",
+                        "archived": true,
+                        "createdAt": "2026-09-01T00:00:00Z",
+                        "lastMessageAt": "2026-09-01T12:00:00Z",
+                    },
+                ]))
+                .unwrap();
+            });
+            let rows = shell.archived_sidebar_chats(cx);
+            let ids: Vec<&str> = rows.iter().map(|chat| chat.id.as_str()).collect();
+            // The orphan sorts first by recency, so passing here is the filter
+            // at work — not just an empty list.
+            assert_eq!(ids, ["archived-live", "archived-home"]);
         });
     }
 }
