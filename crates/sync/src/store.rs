@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -103,7 +104,12 @@ const MAINTENANCE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 /// that gives command execution mark-BEFORE-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
+    /// Per-doc generation of the newest outbox-write failure whose replay
+    /// obligation has not yet been made durable. Process-unique values mean a
+    /// stale cleanup can never match a later failure.
     failed_publications: Mutex<HashMap<String, u64>>,
+    /// Monotonic source of [`Self::failed_publications`] generations.
+    failure_generation: AtomicU64,
     /// Snapshot jobs wait here asynchronously before entering the blocking pool.
     pub snapshot_writer: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -130,6 +136,7 @@ impl DocsStore {
         Ok(Self {
             conn: Mutex::new(conn),
             failed_publications: Mutex::new(HashMap::new()),
+            failure_generation: AtomicU64::new(0),
             snapshot_writer: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -155,15 +162,15 @@ impl DocsStore {
             params![doc_id, batch_id, bytes],
         );
         if result.is_err() {
-            // Bump a per-doc generation: a snapshot save records the generation
-            // it observed, so a failure arriving mid-save is never dropped by
-            // that save's cleanup.
-            let mut failed = self
-                .failed_publications
+            // Bump a process-unique generation: a snapshot save records the
+            // generation it observed, so a failure arriving mid-save is never
+            // dropped by that save's cleanup, and a stale cleanup can never
+            // match a failure that arrived after it read.
+            let generation = self.failure_generation.fetch_add(1, Ordering::Relaxed) + 1;
+            self.failed_publications
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let entry = failed.entry(doc_id.to_string()).or_insert(0);
-            *entry = entry.wrapping_add(1);
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(doc_id.to_string(), generation);
         }
         result?;
         Ok(())
