@@ -658,21 +658,21 @@ pub fn resolve_space_in(spaces: &[Space], key: &str) -> anyhow::Result<Space> {
     if let Some(space) = spaces.iter().find(|s| s.id == key) {
         return Ok(space.clone());
     }
-    let normalized = key.trim_end_matches(['/', '\\']);
+    let normalized = key.trim();
     let by_path: Vec<&Space> = spaces
         .iter()
-        .filter(|s| s.path.trim_end_matches(['/', '\\']) == normalized)
+        .filter(|s| same_path(&s.path, normalized))
         .collect();
     let by_name: Vec<&Space> = spaces
         .iter()
         .filter(|s| s.display_name().eq_ignore_ascii_case(normalized))
         .collect();
+    // The key names the tail of a path (`codebase/t3code`), compared one
+    // folder at a time: a raw substring picks `/code/t3code-old` for "t3code"
+    // and misses `C:/Code/T3Code` on a case-insensitive host.
     let by_suffix: Vec<&Space> = spaces
         .iter()
-        .filter(|s| {
-            let path = s.path.trim_end_matches(['/', '\\']);
-            path.ends_with(normalized) || path.contains(normalized)
-        })
+        .filter(|s| path_ends_with(&s.path, normalized))
         .collect();
     let candidates = if !by_path.is_empty() {
         &by_path
@@ -698,6 +698,58 @@ pub fn resolve_space_in(spaces: &[Space], key: &str) -> anyhow::Result<Space> {
     bail!(
         "{NO_PROJECT} {key:?} (id, path, or name); try list_projects, or register_project to add an existing folder"
     )
+}
+
+/// One path spelled the way every host spells it: separators unified, trailing
+/// ones dropped, and Windows paths (drive letter or UNC) folded to lower case,
+/// where the file system is case-insensitive.
+fn path_key(path: &str) -> String {
+    let path = path.trim().replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    if is_windows_path(path) {
+        path.to_lowercase()
+    } else {
+        path.to_owned()
+    }
+}
+
+fn is_windows_path(path: &str) -> bool {
+    path.as_bytes().get(1) == Some(&b':') || path.starts_with("//")
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    let (a, b) = (path_key(a), path_key(b));
+    if is_windows_path(&a) || is_windows_path(&b) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
+}
+
+/// Whether `suffix` names the tail of `path` on a folder boundary.
+fn path_ends_with(path: &str, suffix: &str) -> bool {
+    let (path, suffix) = (path_key(path), path_key(suffix));
+    let fold = is_windows_path(&path) || is_windows_path(&suffix);
+    let parts = |path: &str| -> Vec<String> {
+        path.split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let (path, suffix) = (parts(&path), parts(&suffix));
+    if suffix.is_empty() || path.len() < suffix.len() {
+        return false;
+    }
+    path[path.len() - suffix.len()..]
+        .iter()
+        .zip(&suffix)
+        .all(|(a, b)| {
+            if fold {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        })
 }
 
 /// How the error of an unknown project starts.
@@ -863,5 +915,27 @@ mod tests {
         // substring of s2's path.
         assert_eq!(resolve_space_in(&spaces, "comet").unwrap().id, "s1");
         assert!(resolve_space_in(&spaces, "GitHub").is_err());
+    }
+
+    #[test]
+    fn space_resolution_folds_windows_paths_and_needs_a_folder_boundary() {
+        // Windows hosts spell the same folder with either separator and any
+        // case; a middle-of-the-path fragment is not a project name.
+        let spaces = vec![
+            space("win", r"C:\Users\Me\Codebase\T3Code", None),
+            space("old", r"C:\Users\Me\t3code-old", None),
+        ];
+        for key in [
+            "C:/Users/me/Codebase/T3Code",
+            r"c:\users\ME\codebase\t3code\",
+            "codebase/t3code",
+        ] {
+            assert_eq!(resolve_space_in(&spaces, key).unwrap().id, "win", "{key}");
+        }
+        assert!(resolve_space_in(&spaces, "Users").is_err());
+        // A twin folder that merely starts the same way is not a match.
+        let spaces = vec![space("old", "/code/t3code-old", None)];
+        let err = resolve_space_in(&spaces, "t3code").unwrap_err().to_string();
+        assert!(err.starts_with(NO_PROJECT), "{err}");
     }
 }
