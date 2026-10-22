@@ -140,13 +140,15 @@ impl Gpu {
     }
 
     /// Read a rendered texture back as straight-alpha BGRA, through a
-    /// staging buffer kept in `staging` between frames.
+    /// staging buffer kept in `staging` between frames. A readback that cannot
+    /// complete is an error, never a blank frame: callers fall back to (or
+    /// report) the failure instead of painting transparency.
     pub(crate) fn read_back(
         &self,
         mut encoder: wgpu::CommandEncoder,
         texture: &wgpu::Texture,
         staging: &mut Option<wgpu::Buffer>,
-    ) -> Frame {
+    ) -> Result<Frame, String> {
         let (width, height) = (texture.width(), texture.height());
         let row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -179,9 +181,18 @@ impl Gpu {
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
             });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        // Poll first: on its error the callback may never run, so waiting on
+        // the channel afterwards could block forever.
+        let mapped = match self.device.poll(wgpu::PollType::wait_indefinitely()) {
+            Err(error) => Err(format!("the GPU never finished reading back: {error}")),
+            Ok(_) => match rx.recv() {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(format!("the GPU readback could not be read: {error}")),
+                Err(error) => Err(format!("the GPU readback never reported: {error}")),
+            },
+        };
         let mut bgra = vec![0u8; (width * height * 4) as usize];
-        if let Ok(Ok(())) = rx.recv() {
+        let frame = mapped.map(|()| {
             let mapped = buffer.slice(..).get_mapped_range();
             for y in 0..height as usize {
                 let src = &mapped[y * row as usize..][..width as usize * 4];
@@ -194,13 +205,16 @@ impl Gpu {
                 }
             }
             drop(mapped);
-            buffer.unmap();
-        }
-        Frame {
-            width,
-            height,
-            bgra,
-        }
+            Frame {
+                width,
+                height,
+                bgra,
+            }
+        });
+        // Unconditionally, so a failed readback leaves the staging buffer
+        // reusable: mapping an already mapped buffer panics.
+        buffer.unmap();
+        frame
     }
 
     pub(crate) fn target(&self, width: u32, height: u32, label: &str) -> wgpu::Texture {
