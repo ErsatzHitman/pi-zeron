@@ -27,6 +27,7 @@ impl DocsStore {
                 params![doc, kind],
             )?;
             tx.commit()?;
+            self.bump_job_clock();
             Ok(())
         })
     }
@@ -55,6 +56,7 @@ impl DocsStore {
             if current != Some(version) {
                 return Ok(());
             }
+            let mut bumped = false;
             if let Some(last) = ids.last() {
                 tx.execute("UPDATE sync_job_clock SET value=value+1 WHERE id=1", [])?;
                 for id in ids {
@@ -64,6 +66,7 @@ impl DocsStore {
                     "UPDATE chat_sync_jobs SET cursor=?1 WHERE doc_id='*' AND kind='reconcile'",
                     params![last],
                 )?;
+                bumped = true;
             } else {
                 tx.execute(
                     "DELETE FROM chat_sync_jobs WHERE doc_id='*' AND kind='reconcile'",
@@ -71,6 +74,9 @@ impl DocsStore {
                 )?;
             }
             tx.commit()?;
+            if bumped {
+                self.bump_job_clock();
+            }
             Ok(())
         })
     }

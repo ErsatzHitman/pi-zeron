@@ -540,10 +540,20 @@ impl Room {
             .subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
                 let batch_id = crate::new_id();
                 let mut slot = lock(&publish_slot);
-                if let Err(err) = store.enqueue_chat_update(&publish_chat, &batch_id, bytes) {
-                    tracing::warn!(chat = %publish_chat, error = %err, "outbox enqueue failed");
-                }
+                // One durable insert per commit: a persisted row goes to the
+                // client without the second outbox write, and a failed one
+                // hands over unpersisted so the client retries it.
+                let persisted = match store.enqueue_chat_update(&publish_chat, &batch_id, bytes) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::warn!(chat = %publish_chat, error = %err, "outbox enqueue failed");
+                        false
+                    }
+                };
                 match &slot.client {
+                    Some(client) if persisted => {
+                        client.enqueue_persisted_batch(batch_id, bytes.clone())
+                    }
                     Some(client) => client.enqueue_batch(batch_id, bytes.clone()),
                     None => slot.unsent.push((batch_id, bytes.clone())),
                 }

@@ -96,6 +96,10 @@ const VACUUM_MIN_FREE_DENOMINATOR: i64 = 4;
 /// connection holds a lock.
 const MAINTENANCE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Chat deletion must take the pre-cutover lineage's rollback copy with it: the
+/// chat2 adopt path keeps that copy under `<chat_id>.pre-chat2`.
+pub const PRE_CHAT2_ROLLBACK_SUFFIX: &str = ".pre-chat2";
+
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
 ///
 /// Holds warm-open doc snapshots (the DO room is authoritative; these make
@@ -104,6 +108,14 @@ const MAINTENANCE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 pub struct DocsStore {
     conn: Mutex<Connection>,
     failed_publications: Mutex<HashSet<String>>,
+    /// Chats purged in this process ([`Self::purge_doc`]). Writers that still
+    /// hold the doc (a debounced snapshot flush, an outbox insert racing the
+    /// delete) must not put its rows back; chat ids are never reused.
+    purged: Mutex<HashSet<String>>,
+    /// In-memory mirror of the durable `sync_job_clock`, so the sync scheduler
+    /// can tell "nothing new was queued" without a SQLite read per handle per
+    /// tick. Bumped by every write that can add or advance queued work.
+    job_clock: std::sync::atomic::AtomicI64,
     /// Snapshot jobs wait here asynchronously before entering the blocking pool.
     pub snapshot_writer: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -127,11 +139,30 @@ impl DocsStore {
         // live size. Callers run `reclaim_free_space` off those paths.
         checkpoint_truncate(&conn, &path, "open");
         conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
+        let job_clock = conn
+            .query_row("SELECT value FROM sync_job_clock WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
         Ok(Self {
             conn: Mutex::new(conn),
             failed_publications: Mutex::new(HashSet::new()),
+            purged: Mutex::new(HashSet::new()),
+            job_clock: std::sync::atomic::AtomicI64::new(job_clock),
             snapshot_writer: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
+    }
+
+    /// Cheap "did any queued sync work change" probe for the scheduler poll.
+    /// The value is monotonic within a process and only ever grows.
+    pub fn job_clock(&self) -> i64 {
+        self.job_clock.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mirror a durable `sync_job_clock` bump made inside `tx`'s transaction.
+    pub(crate) fn bump_job_clock(&self) {
+        self.job_clock
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Insert before sending. Stable IDs make crash-after-ACK replay idempotent.
@@ -150,7 +181,11 @@ impl DocsStore {
         batch_id: &str,
         bytes: &[u8],
     ) -> Result<(), StoreError> {
-        let result = self.conn().execute(
+        let conn = self.conn();
+        if self.is_purged(doc_id) {
+            return Ok(());
+        }
+        let result = conn.execute(
             "INSERT OR IGNORE INTO chat_outbox(doc_id,batch_id,bytes) VALUES (?1,?2,?3)",
             params![doc_id, batch_id, bytes],
         );
@@ -269,6 +304,9 @@ impl DocsStore {
         updates: &[Vec<u8>],
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
+        if self.is_purged(doc_id) {
+            return Ok(());
+        }
         let tx = conn.transaction()?;
         if tx.execute(
             "INSERT OR IGNORE INTO chat_outbox_initialized(doc_id) VALUES (?1)",
@@ -310,6 +348,9 @@ impl DocsStore {
 
     fn save_snapshot_blocking(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
         let mut conn = self.conn();
+        if self.is_purged(doc_id) {
+            return Ok(());
+        }
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO snapshots (doc_id, bytes, saved_at) VALUES (?1, ?2, ?3)
@@ -342,6 +383,9 @@ impl DocsStore {
         epoch: u32,
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
+        if self.is_purged(doc_id) {
+            return Ok(());
+        }
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO snapshots (doc_id, bytes, saved_at, cursor, epoch) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -374,6 +418,9 @@ impl DocsStore {
         epoch: u32,
     ) -> Result<(), StoreError> {
         let mut conn = self.conn();
+        if self.is_purged(doc_id) {
+            return Ok(());
+        }
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO snapshots (doc_id, bytes, saved_at, cursor, epoch, cursor_verified) VALUES (?1, ?2, ?3, ?4, ?5, 1)
@@ -482,6 +529,53 @@ impl DocsStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The `pre-chat2` rollback copy a snapshot id owns, as a purge base id:
+    /// deleting a chat has to take that derived row with it.
+    fn purge_root(doc_id: &str) -> &str {
+        doc_id
+            .strip_suffix(PRE_CHAT2_ROLLBACK_SUFFIX)
+            .unwrap_or(doc_id)
+    }
+
+    /// Caller holds the connection: that serializes this against
+    /// [`Self::purge_doc`]'s delete.
+    fn is_purged(&self, doc_id: &str) -> bool {
+        self.purged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(Self::purge_root(doc_id))
+    }
+
+    /// Chat deletion (DeleteChat / the DeleteSpace cascade): drop every local
+    /// row for `doc_id` — snapshot, the `.pre-chat2` rollback copy, outbox,
+    /// sync jobs — and tombstone the id, so a writer that still holds the doc
+    /// (a debounced snapshot flush, an outbox insert racing the delete)
+    /// cannot put its rows back. Chat ids are never reused.
+    pub fn purge_doc(&self, doc_id: &str) -> Result<(), StoreError> {
+        store_blocking(|| {
+            let rollback = format!("{doc_id}{PRE_CHAT2_ROLLBACK_SUFFIX}");
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            for id in [doc_id, rollback.as_str()] {
+                tx.execute("DELETE FROM snapshots WHERE doc_id = ?1", params![id])?;
+                tx.execute("DELETE FROM chat_outbox WHERE doc_id = ?1", params![id])?;
+                tx.execute("DELETE FROM chat_sync_jobs WHERE doc_id = ?1", params![id])?;
+                tx.execute(
+                    "DELETE FROM chat_outbox_initialized WHERE doc_id = ?1",
+                    params![id],
+                )?;
+            }
+            tx.commit()?;
+            // Tombstone under the same connection lock the guarded writers
+            // take, so no insert can slip between the delete and the mark.
+            self.purged
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(Self::purge_root(doc_id).to_string());
+            Ok(())
+        })
     }
 
     /// Whether a snapshot row exists for `doc_id` — presence only, no blob read.
@@ -935,6 +1029,54 @@ mod publication_tests {
         store.delete_snapshot("chat").unwrap();
         assert!(store.pending_chat_updates("chat").unwrap().is_empty());
         assert!(!store.chat_outbox_initialized("chat").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+
+    fn rollback(doc_id: &str) -> String {
+        format!("{doc_id}{PRE_CHAT2_ROLLBACK_SUFFIX}")
+    }
+
+    /// A deleted chat takes its adopt-era rollback copy with it, and a writer
+    /// still holding the doc (a debounced snapshot flush, an outbox insert
+    /// that raced the delete) cannot put the rows back.
+    #[test]
+    fn purge_drops_rollback_copy_and_refuses_resurrection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        store
+            .save_verified_snapshot_with_cursor("chat", b"thin", 9, 2)
+            .unwrap();
+        store.save_snapshot(&rollback("chat"), b"fat").unwrap();
+        store.initialize_chat_outbox("chat", &[]).unwrap();
+        store
+            .enqueue_chat_update("chat", "pending", b"row")
+            .unwrap();
+
+        store.purge_doc("chat").unwrap();
+
+        assert!(store.load_snapshot("chat").unwrap().is_none());
+        assert!(store.load_snapshot(&rollback("chat")).unwrap().is_none());
+        assert!(store.pending_chat_updates("chat").unwrap().is_empty());
+        assert!(!store.chat_outbox_initialized("chat").unwrap());
+        assert!(!store.has_snapshot("chat").unwrap());
+
+        // The racing writers land after the delete.
+        store
+            .save_verified_snapshot_with_cursor("chat", b"late", 10, 2)
+            .unwrap();
+        store.save_snapshot(&rollback("chat"), b"late-fat").unwrap();
+        store.enqueue_chat_update("chat", "late", b"row").unwrap();
+        store
+            .initialize_chat_outbox("chat", &[b"replay".to_vec()])
+            .unwrap();
+
+        assert!(store.load_snapshot("chat").unwrap().is_none());
+        assert!(store.load_snapshot(&rollback("chat")).unwrap().is_none());
+        assert!(store.pending_chat_updates("chat").unwrap().is_empty());
     }
 }
 
