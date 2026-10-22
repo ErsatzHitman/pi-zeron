@@ -479,8 +479,57 @@ pub fn compact_model_picker(cx: &App) -> bool {
 
 /// Copy a selected image into Zeron's device-local data directory and make it
 /// the new-thread canvas background. A unique file name avoids stale image
-/// caches when the background is replaced.
+/// caches when the background is replaced. Reads, decodes and writes on the
+/// calling thread; [`install_new_thread_composer_background_async`] keeps that
+/// work off the UI thread.
 pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Result<(), String> {
+    let data_dir = background_data_dir(cx)?;
+    let (staged, color) = stage_new_thread_background(source)?;
+    commit_background(
+        source,
+        prepare_background_file(staged, &data_dir)?,
+        color,
+        cx,
+    )
+}
+
+/// The same install with the read, decode, thumbnail and managed-file write on
+/// the background executor: only the settings commit touches the UI thread.
+/// Choosing a large image must not stall the frame the picker returns to.
+pub fn install_new_thread_composer_background_async(
+    source: PathBuf,
+    cx: &mut App,
+) -> Task<Result<(), String>> {
+    let data_dir = cx
+        .try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone());
+    let worker = {
+        let source = source.clone();
+        cx.background_executor().spawn(async move {
+            let data_dir = data_dir.ok_or_else(|| {
+                "Unable to save the image. Restart Zeron and try again.".to_string()
+            })?;
+            let (staged, color) = stage_new_thread_background(&source)?;
+            Ok::<_, String>((prepare_background_file(staged, &data_dir)?, color))
+        })
+    };
+    cx.spawn(async move |cx| {
+        let (prepared, color) = worker.await?;
+        cx.update(|cx| commit_background(&source, prepared, color, cx))
+    })
+}
+
+fn background_data_dir(cx: &App) -> Result<PathBuf, String> {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone())
+        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())
+}
+
+/// Read and decode a candidate image and measure its dominant colour. No
+/// settings or UI access, so it is safe on the background executor.
+fn stage_new_thread_background(
+    source: &Path,
+) -> Result<(crate::attachments::StagedAttachment, Option<zeron_theme::Color>), String> {
     let staged = crate::attachments::stage_file_verbatim(source)?;
     // Do not persist the candidate or retire the old managed file until the
     // renderer's decoder has accepted the exact bytes we are about to save.
@@ -489,21 +538,7 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
     })?;
     let proxy = image.thumbnail(64, 64).to_rgba8();
     let color = wallpaper_colors::extract(proxy.pixels().map(|pixel| pixel.0));
-    install_staged_background(source, staged, color, cx)
-}
-
-fn install_staged_background(
-    source: &Path,
-    staged: crate::attachments::StagedAttachment,
-    color: Option<zeron_theme::Color>,
-    cx: &mut App,
-) -> Result<(), String> {
-    let data_dir = cx
-        .try_global::<SettingsStore>()
-        .map(|store| store.data_dir.clone())
-        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
-    let prepared = prepare_background_file(staged, &data_dir)?;
-    commit_background(source, prepared, color, cx)
+    Ok((staged, color))
 }
 
 /// Owns a prewritten managed file until it is committed; dropped queue entries
@@ -2927,6 +2962,33 @@ mod tests {
                     .count(),
                 1
             );
+        });
+    }
+
+    /// The picker installs on the background executor: the decode and the
+    /// managed-file write must land exactly as the synchronous path's do.
+    #[gpui::test]
+    fn async_background_install_commits_the_same_settings(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("chosen.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([20, 100, 200, 255]))
+            .save(&source)
+            .unwrap();
+        let task = cx.update(|cx| {
+            init(UiSettings::default(), dir.path(), cx);
+            install_new_thread_composer_background_async(source.clone(), cx)
+        });
+        cx.run_until_parked();
+        assert!(task.is_ready(), "the install task must finish");
+        cx.update(|cx| {
+            let settings = current(cx);
+            let background = settings.new_thread_composer_background.as_ref().unwrap();
+            assert_eq!(
+                std::fs::read(&background.path).unwrap(),
+                std::fs::read(&source).unwrap()
+            );
+            assert_eq!(background.name, "chosen.png");
+            assert_eq!(UiSettings::load(dir.path()), settings);
         });
     }
 
