@@ -577,12 +577,7 @@ async fn install_into(
     if output.is_empty() {
         output = out.trim().to_owned();
     }
-    let tail: String = if output.len() > 1200 {
-        // npm front-loads "npm ERR!" lines; keep the tail where the cause lands.
-        format!("…{}", &output[output.len() - 1200..])
-    } else {
-        output
-    };
+    let tail = npm_failure_tail(output);
     let exit = describe_npm_exit(Some(status));
     Err(HarnessError::Install(if tail.is_empty() {
         format!(
@@ -597,6 +592,22 @@ async fn install_into(
             pin.spec()
         )
     }))
+}
+
+/// The tail of npm's failure output. npm front-loads "npm ERR!" lines, so the
+/// cause lands at the end; cut on a char boundary because npm output can
+/// contain non-ASCII (paths, localized errors) and a mid-character slice
+/// panics.
+fn npm_failure_tail(output: String) -> String {
+    const TAIL_BYTES: usize = 1200;
+    if output.len() <= TAIL_BYTES {
+        return output;
+    }
+    let mut start = output.len() - TAIL_BYTES;
+    while start > 0 && !output.is_char_boundary(start) {
+        start -= 1;
+    }
+    format!("…{}", &output[start..])
 }
 
 #[cfg(test)]
@@ -642,6 +653,20 @@ mod tests {
         assert!(describe_npm_exit(status(243)).contains("EACCES"));
         assert!(describe_npm_exit(status(226)).contains("EROFS"));
         assert_eq!(describe_npm_exit(status(1)), "exit code 1");
+    }
+
+    #[test]
+    fn npm_failure_tail_slices_on_a_char_boundary() {
+        // The naive cut (len - 1200) lands inside a multi-byte character here.
+        let output = format!("{}ab", "€".repeat(400));
+        let tail = npm_failure_tail(output);
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with("ab"));
+        assert!(tail.contains('€'));
+
+        // Short output is returned untouched.
+        let short = "npm ERR! boom".to_owned();
+        assert_eq!(npm_failure_tail(short.clone()), short);
     }
 
     #[test]
