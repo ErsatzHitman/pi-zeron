@@ -285,10 +285,17 @@ pub async fn run(
         let heartbeat_failure = failure.clone();
         let heartbeat_media = media.clone();
         let heartbeat_mute = muted.clone();
+        // What the host itself declares: how often it wants a report, and how
+        // long it keeps a lease that stops reporting.
+        let beat = Duration::from_secs(prepared.heartbeat_seconds.max(1));
+        let window = Duration::from_secs(prepared.lease_seconds.max(1));
         scope.tasks.push(tokio::spawn(async move {
             let mut sequence = 0;
-            let mut interval = tokio::time::interval(Duration::from_secs(wire::HEARTBEAT_SECS));
+            let mut interval = tokio::time::interval(beat);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The last report the host acknowledged. A single failed or slow
+            // beat must not cost the call; only a lease about to run out does.
+            let mut reported = tokio::time::Instant::now();
             loop {
                 interval.tick().await;
                 sequence += 1;
@@ -302,15 +309,31 @@ pub async fn run(
                         muted: muted_now,
                         state: wire::MediaState::Ready,
                     },
-                    10,
+                    beat.as_secs() * 2,
                 )
                 .await;
-                if !matches!(result,Ok(wire::Ack{sequence:s}) if s==sequence) {
-                    *heartbeat_failure.lock().unwrap() = Some(VoiceRejection::Protocol);
-                    heartbeat_media.close();
-                    heartbeat_cancel.cancel();
-                    return;
+                let failed = match result {
+                    Ok(wire::Ack { sequence: acked }) if acked == sequence => {
+                        reported = tokio::time::Instant::now();
+                        continue;
+                    }
+                    Ok(wire::Ack { sequence: acked }) => {
+                        tracing::warn!(acked, sequence, "voice heartbeat acked the wrong report");
+                        VoiceRejection::Protocol
+                    }
+                    // Whatever actually failed, not a blanket protocol error.
+                    Err(error) => error,
+                };
+                // Retry while a report sent on the next beat could still land
+                // before the host drops the lease.
+                if reported.elapsed() + beat < window {
+                    tracing::warn!(?failed, sequence, "voice heartbeat failed; reporting again");
+                    continue;
                 }
+                *heartbeat_failure.lock().unwrap() = Some(failed);
+                heartbeat_media.close();
+                heartbeat_cancel.cancel();
+                return;
             }
         }));
         tracing::info!(
@@ -442,6 +465,8 @@ mod tests {
     struct Control {
         supported: bool,
         half_open: bool,
+        /// Reports to fail (and then ack again) before the host behaves.
+        failed_reports: Mutex<u64>,
         calls: Mutex<Vec<String>>,
         lease: wire::Lease,
     }
@@ -452,6 +477,13 @@ mod tests {
             if self.half_open && method == methods::REPORT_VOICE_MEDIA_V2 {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 return Err(VoiceRejection::Protocol);
+            }
+            if method == methods::REPORT_VOICE_MEDIA_V2 {
+                let mut failed = self.failed_reports.lock().unwrap();
+                if *failed > 0 {
+                    *failed -= 1;
+                    return Err(VoiceRejection::DeviceUnavailable);
+                }
             }
             Ok(match method {
                 methods::VOICE_CAPABILITIES_V2 => json!(wire::Capabilities {
@@ -498,6 +530,7 @@ mod tests {
         Arc::new(Control {
             supported,
             half_open: false,
+            failed_reports: Mutex::new(0),
             calls: Default::default(),
             lease: wire::Lease {
                 host_device_id: "host".into(),
@@ -508,6 +541,16 @@ mod tests {
                 },
             },
         })
+    }
+    impl Control {
+        fn reports(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == methods::REPORT_VOICE_MEDIA_V2)
+                .count()
+        }
     }
     fn config() -> zeron_proto::ChatConfig {
         serde_json::from_value(json!({"harness":"codex","sandbox":"danger-full-access"})).unwrap()
@@ -634,5 +677,71 @@ mod tests {
         assert_eq!(result.unwrap_err(), VoiceRejection::Protocol);
         assert!(media.closed.load(Ordering::SeqCst));
         assert!(started.elapsed() <= Duration::from_secs(wire::LEASE_SECS));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn one_failed_heartbeat_does_not_cost_the_call() {
+        let media = Arc::new(Media {
+            prepared: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            block: false,
+        });
+        let mut control = control(true);
+        *Arc::get_mut(&mut control)
+            .unwrap()
+            .failed_reports
+            .lock()
+            .unwrap() = 1;
+        let (tx, _rx) = mpsc::channel(8);
+        let (_mute, muted) = watch::channel(false);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run(
+            control.clone(),
+            media.clone(),
+            config(),
+            None,
+            cancel.clone(),
+            tx,
+            muted,
+        ));
+        // The first beat fails on the spot; the call survives it and the next
+        // beat lands, well inside the lease the host keeps.
+        tokio::time::sleep(Duration::from_secs(wire::HEARTBEAT_SECS + 1)).await;
+        assert!(!media.closed.load(Ordering::SeqCst));
+        assert!(control.reports() >= 2);
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_that_never_lands_reports_its_real_reason() {
+        let media = Arc::new(Media {
+            prepared: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            block: false,
+        });
+        let mut control = control(true);
+        *Arc::get_mut(&mut control)
+            .unwrap()
+            .failed_reports
+            .lock()
+            .unwrap() = 100;
+        let (tx, _rx) = mpsc::channel(8);
+        let (_mute, muted) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let result = run(
+            control.clone(),
+            media.clone(),
+            config(),
+            None,
+            CancellationToken::new(),
+            tx,
+            muted,
+        )
+        .await;
+        // What the host said, not the heartbeat's own bookkeeping.
+        assert_eq!(result.unwrap_err(), VoiceRejection::DeviceUnavailable);
+        assert!(media.closed.load(Ordering::SeqCst));
+        // Retried before giving up, and still ahead of the lease running out.
+        assert!(control.reports() > 1);
+        assert!(started.elapsed() < Duration::from_secs(wire::LEASE_SECS));
     }
 }
