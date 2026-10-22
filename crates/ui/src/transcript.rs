@@ -415,6 +415,21 @@ fn tool_group_collapses(tools: &[ToolItem]) -> bool {
     tools.iter().any(|t| !is_agent_tool(t))
 }
 
+/// Does a tool group's header shimmer as "working"? A live tail group does;
+/// in compact mode a still-streaming turn's unresolved work does too — the
+/// work header has no tail of its own. Only a LIVE turn qualifies: an
+/// interrupted or crashed run leaves its calls unresolved with nothing left
+/// to resolve them, and the shimmer must not outlive the run.
+fn tool_group_shimmering(
+    collapses: bool,
+    auto_open: bool,
+    compact_mode: bool,
+    live: bool,
+    tools: &[ToolItem],
+) -> bool {
+    collapses && (auto_open || (compact_mode && live && tools.iter().any(|t| !t.resolved)))
+}
+
 /// Column budget for soft-wrapping thought text into detail lines. The
 /// detail body is preformatted (no element wrapping), so the wrap happens
 /// here — conservative enough to fit the card at typical transcript widths.
@@ -1238,6 +1253,11 @@ pub enum RowKind {
         /// Compact-mode work header. Expanded content is sibling rows tagged
         /// [`Row::compact_fold`], not chips.
         compact_shell: bool,
+        /// The owning entry still streams — the only state in which an
+        /// unresolved chip means "work in progress". An interrupted or
+        /// crashed turn leaves its calls unresolved forever, so the header
+        /// shimmer keys on this, not on `resolved` alone.
+        live: bool,
     },
     InputChip {
         /// First question's header (chat-view.tsx `InputChip`: the resolved
@@ -1682,6 +1702,7 @@ pub fn rows_for_entry(
                     auto_open,
                     worked_secs: None,
                     compact_shell: false,
+                    live: streaming,
                 },
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
@@ -2062,6 +2083,7 @@ pub fn rows_for_entry(
                         })
                         .flatten(),
                     compact_shell: true,
+                    live: streaming,
                 },
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
@@ -8720,6 +8742,7 @@ impl Transcript {
                 summary,
                 worked_secs,
                 compact_shell,
+                live,
             } => self.render_tool_group(
                 &row.id,
                 tools,
@@ -8727,6 +8750,7 @@ impl Transcript {
                 *auto_open,
                 *worked_secs,
                 *compact_shell,
+                *live,
                 &theme,
                 cx,
             ),
@@ -9445,6 +9469,7 @@ impl Transcript {
         auto_open: bool,
         worked_secs: Option<i64>,
         compact_shell: bool,
+        live: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -9489,8 +9514,7 @@ impl Transcript {
         // fold — any unresolved chip (a running tool, a live thought) keeps it
         // pulsing until the turn's work settles. Compute this before the
         // collapsed-body skip, which may empty `tools`.
-        let active =
-            collapses && (auto_open || (self.compact_mode && tools.iter().any(|t| !t.resolved)));
+        let active = tool_group_shimmering(collapses, auto_open, self.compact_mode, live, tools);
         if self.compact_mode && active {
             self.compact_live_entries.insert(row_id.clone());
         }
@@ -12352,6 +12376,7 @@ mod tests {
                 tools,
                 auto_open,
                 summary,
+                live,
                 ..
             } = &row.kind
             else {
@@ -12365,6 +12390,7 @@ mod tests {
                 *auto_open,
                 None,
                 false,
+                *live,
                 &Theme::dark(),
                 cx,
             );
@@ -13268,6 +13294,7 @@ mod tests {
                     tools,
                     auto_open,
                     summary,
+                    live,
                     ..
                 } = &row.kind
                 else {
@@ -13280,6 +13307,7 @@ mod tests {
                     *auto_open,
                     None,
                     false,
+                    *live,
                     &Theme::dark(),
                     cx,
                 );
@@ -13307,6 +13335,7 @@ mod tests {
                     tools,
                     auto_open,
                     summary,
+                    live,
                     ..
                 } = &row.kind
                 else {
@@ -13320,6 +13349,7 @@ mod tests {
                     *auto_open,
                     None,
                     false,
+                    *live,
                     &Theme::dark(),
                     cx,
                 );
@@ -14774,6 +14804,47 @@ mod tests {
         assert_eq!(visible.len(), 2);
         assert!(matches!(visible[0].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(visible[1].kind, RowKind::Markdown { .. }));
+    }
+
+    #[test]
+    fn compact_work_header_shimmers_only_while_the_turn_is_live() {
+        // An interrupted or crashed run leaves its tool calls unresolved with
+        // nothing left to resolve them, so the work header's shimmer must key
+        // on the turn still streaming, not on `resolved` alone.
+        let mut dangling = tool_part("t0", "sleep 60");
+        let MessagePart::Tool { resolved, .. } = &mut dangling else {
+            panic!("expected a tool part");
+        };
+        *resolved = false;
+        let header = |entry: &SessionMessageEntry| {
+            let rows = rows_for_entry(entry, false, true, &mut parse);
+            let row = compact_visible(&rows)
+                .into_iter()
+                .find(|row| {
+                    matches!(
+                        row.kind,
+                        RowKind::ToolGroup {
+                            compact_shell: true,
+                            ..
+                        }
+                    )
+                })
+                .expect("compact split has a work header");
+            let RowKind::ToolGroup { tools, live, .. } = &row.kind else {
+                unreachable!()
+            };
+            let shimmer = tool_group_shimmering(true, false, true, *live, tools);
+            (tools.iter().any(|tool| !tool.resolved), *live, shimmer)
+        };
+
+        let live = assistant("a1", MessageStatus::Streaming, vec![dangling.clone()]);
+        assert_eq!(header(&live), (true, true, true), "live work shimmers");
+        let dead = assistant("a2", MessageStatus::Complete, vec![dangling]);
+        assert_eq!(
+            header(&dead),
+            (true, false, false),
+            "a settled turn's dangling chips never keep working"
+        );
     }
 
     #[test]

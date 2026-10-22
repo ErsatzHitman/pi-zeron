@@ -58,9 +58,10 @@ use crate::surface_chrome::{
 
 /// A file document opened by absolute path beyond the workspace root — a
 /// link-opened host file. It has no tree entry and no watch, and the owning
-/// device serves it read-only.
+/// device serves it read-only. The test is the host-absolute shape, not a
+/// leading `/`: a Windows checkout's outside link is `C:/…`.
 pub(super) fn path_is_outside(path: &str) -> bool {
-    path.starts_with('/')
+    crate::shell::is_host_absolute_path(path)
 }
 
 pub(super) fn toolbar_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
@@ -1294,6 +1295,25 @@ mod explorer_tests {
     use super::*;
     use gpui::{AppContext, TestAppContext};
     use std::{cell::RefCell, rc::Rc};
+
+    /// An outside document is any host-absolute path, not just a `/` one: a
+    /// Windows checkout's link-opened host file is `C:/…`, and the outside
+    /// branches (no watch, absolute image read, plain local links) key on it.
+    #[test]
+    fn an_outside_document_is_any_host_absolute_path() {
+        for path in [
+            "/home/dev/notes.md",
+            "C:/Users/dev/notes.md",
+            "c:/Users/dev/notes.md",
+            "C:\\Users\\dev\\notes.md",
+            "\\\\server\\share\\notes.md",
+        ] {
+            assert!(path_is_outside(path), "{path}");
+        }
+        for path in ["notes.md", "src/notes.md", "C:", "C:notes.md", ""] {
+            assert!(!path_is_outside(path), "{path}");
+        }
+    }
 
     #[gpui::test]
     fn explorer_header_search_and_visibility_toggle(cx: &mut TestAppContext) {

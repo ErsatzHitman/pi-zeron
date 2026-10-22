@@ -237,7 +237,7 @@ impl WorkspaceFilesClient {
         use zeron_proto::{MAX_WORKSPACE_IMAGE_BYTES, WORKSPACE_IMAGE_CHUNK_BYTES};
         // Outside files carry no checkout identity — the device resolves
         // them by absolute path.
-        if checkout_id.is_empty() && !path.starts_with('/') {
+        if checkout_id.is_empty() && !super::path_is_outside(&path) {
             return Err(FilesClientError::Decode(
                 "Workspace checkout identity unavailable".into(),
             ));
