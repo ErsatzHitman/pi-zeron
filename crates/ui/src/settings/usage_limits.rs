@@ -1005,7 +1005,9 @@ mod tests {
         });
         let first = cx.add_window(|_, cx| UsageLimitsPage::new(state.clone(), cx));
         assert_eq!(drain_lists(cx, &runtime, &mut engine), [false, true]);
-        drop(first);
+        first
+            .update(cx, |page, _, _| assert!(matches!(page.snapshot, Loadable::Ready(_))))
+            .unwrap();
         // A second visit paints from the shared cache, so it only forces the
         // one probe that keeps the numbers fresh.
         let second = cx.add_window(|_, cx| UsageLimitsPage::new(state.clone(), cx));
