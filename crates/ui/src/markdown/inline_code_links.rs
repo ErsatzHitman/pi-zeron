@@ -437,7 +437,8 @@ mod tests {
         out
     }
 
-    // File links are POSIX paths; Windows spans keep their code look.
+    // These expectations spell the paths POSIX-style, so they hold on the
+    // hosts whose checkouts are POSIX paths.
     #[cfg(unix)]
     #[test]
     fn a_context_directory_resolves_bare_names_that_follow_it() {
