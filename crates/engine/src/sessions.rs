@@ -1575,7 +1575,16 @@ impl SessionsEngine {
             if lock(&self.inner.runs).contains_key(&chat_id) {
                 continue; // a live run owns this journal
             }
-            let handle = self.doc_handle(&chat_id)?;
+            // One unreadable doc must not cost every other crashed session
+            // its recovery: log it and move on.
+            let handle = match self.doc_handle(&chat_id) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err,
+                        "recovery skipped: the chat doc could not be opened");
+                    continue;
+                }
+            };
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
@@ -1645,7 +1654,18 @@ impl SessionsEngine {
                 class: None,
             };
             self.inner.publish(&chat_id, &done);
-            let stamped = handle.mark_abandoned_streams(&note)?.len();
+            let stamped = match handle.mark_abandoned_streams(&note) {
+                Ok(stamped) => stamped.len(),
+                Err(err) => {
+                    // The journal is closed above, so this session is over; it
+                    // just could not be stamped. Leave it Idle and let the
+                    // remaining stale sessions recover.
+                    tracing::warn!(chat = %chat_id, error = %err,
+                        "recovery skipped: abandoned streams could not be stamped");
+                    self.set_status(&chat_id, SessionStatus::Idle, false);
+                    continue;
+                }
+            };
             // A tree member whose recent turn will not be continued failed as
             // far as its parent is concerned: Errored, and the parent is told.
             let member_lost = fresh && !will_resume && !held && self.inner.in_tree(&chat_id);

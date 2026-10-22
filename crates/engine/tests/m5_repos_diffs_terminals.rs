@@ -1282,6 +1282,8 @@ async fn diff_capture_against_merge_base_shows_branch_changes() {
 
     // Unknown ref errors instead of silently falling back.
     assert!(merge_base(&repo_dir, "no-such-ref").await.is_err());
+    // A client-supplied ref must never reach git as an option.
+    assert!(merge_base(&repo_dir, "--output=injected.patch").await.is_err());
 }
 
 #[tokio::test]
@@ -1354,6 +1356,13 @@ async fn commit_diff_captures_one_commit_and_roots_diff_the_empty_tree() {
         .await
         .expect("root capture");
     assert!(root_snapshot.files.iter().any(|f| f.path == "a.txt"));
+
+    // A client-supplied sha must never reach git as an option.
+    assert!(
+        capture_commit_diff(&repos, &repo_dir, "--output=injected.patch")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1531,6 +1540,61 @@ async fn delete_space_cascades_chats_and_sessions() {
     assert_eq!(deleted.chat_ids, vec!["chat-1".to_string()]);
     assert!(core.workspace.chat("chat-1").expect("read").is_none());
     assert!(core.workspace.read_spaces().expect("spaces").is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_diff_rpc_serves_only_known_checkouts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    let stranger = tmp.path().join("stranger");
+    init_repo(&repo_dir).await;
+    init_repo(&stranger).await;
+    // A chat opened in a subfolder of the repository: the diff watch publishes
+    // the checkout's toplevel, so that is the cwd the pane sends.
+    let sub = repo_dir.join("sub");
+    std::fs::create_dir_all(&sub).expect("subfolder");
+
+    let core = assemble(&tmp.path().join("data"));
+    core.workspace
+        .create_space(
+            "space-sub",
+            &core.device_id,
+            &sub.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("space row");
+    core.workspace
+        .create_chat("chat-sub", Some("space-sub"), None, None, None)
+        .expect("chat row");
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    // An unregistered checkout on this device is not a path probe.
+    let rejected = client
+        .call(
+            methods::GET_CHECKOUT_DIFF,
+            serde_json::json!({ "cwd": stranger, "mode": "working" }),
+        )
+        .await
+        .expect_err("unregistered checkout must be rejected");
+    assert!(rejected.to_string().contains("not a known checkout"));
+
+    // The chat's own folder is served, and so is the toplevel the diff watch
+    // publishes for it.
+    let canonical_repo = std::fs::canonicalize(&repo_dir).expect("canonical repo");
+    for cwd in [&sub, &repo_dir] {
+        let response = client
+            .call(
+                methods::GET_CHECKOUT_DIFF,
+                serde_json::json!({ "cwd": cwd, "mode": "working" }),
+            )
+            .await
+            .expect("GetCheckoutDiff");
+        let diff: zeron_proto::CheckoutDiff = serde_json::from_value(response).expect("typed diff");
+        assert_eq!(diff.cwd, canonical_repo.to_string_lossy());
+    }
+
     core.shutdown().await;
 }
 

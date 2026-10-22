@@ -1639,9 +1639,31 @@ pub(crate) async fn read_diff_file_text_at(
     })
 }
 
+/// Guard a client-supplied committish before it reaches a `git` argv. git
+/// parses options anywhere ahead of a `--`, so a value like
+/// `--output=/tmp/x` would be read as a flag rather than a revision; refs
+/// never carry whitespace or control bytes either.
+fn checked_revision(revision: &str) -> Result<&str, EngineError> {
+    let bad_char = revision
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control());
+    let ok =
+        !revision.is_empty() && revision.len() <= 256 && !revision.starts_with('-') && !bad_char;
+    if ok {
+        Ok(revision)
+    } else {
+        Err(EngineError::Other(format!(
+            "not a valid revision: {revision:?}"
+        )))
+    }
+}
+
 /// Resolve the parent used as a commit diff's old side. Root commits compare
 /// against Git's canonical empty tree.
 pub(crate) async fn commit_diff_base(root: &Path, sha: &str) -> String {
+    let Ok(sha) = checked_revision(sha) else {
+        return EMPTY_TREE_SHA.to_string();
+    };
     let parent_spec = format!("{sha}^");
     let parent = capture_git(root, &["rev-parse", "--verify", &parent_spec], 256)
         .await
@@ -2116,6 +2138,7 @@ pub async fn capture_commit_diff(
     root: &Path,
     sha: &str,
 ) -> Result<DiffSnapshot, EngineError> {
+    let sha = checked_revision(sha)?;
     let base = commit_diff_base(root, sha).await;
     let branch = repos
         .current_branch(root)
@@ -2203,6 +2226,7 @@ pub async fn capture_commit_diff(
 /// `git merge-base <base_ref> HEAD` — the diff base for "Branch changes".
 /// Errors when the ref is unknown or the histories are unrelated.
 pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineError> {
+    let base_ref = checked_revision(base_ref)?;
     let capture = capture_git(root, &["merge-base", base_ref, "HEAD"], 256).await?;
     let sha = String::from_utf8_lossy(&capture.stdout).trim().to_string();
     if sha.is_empty() {
