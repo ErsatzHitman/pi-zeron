@@ -896,7 +896,26 @@ impl Actor {
                     match serde_json::from_str::<PullBody>(&body) {
                         Ok(pull) => {
                             let mut d = lock(&doc);
-                            d.apply_state(pull.seq, pull.full, pull.gc_floor, pull.rows);
+                            // A socket session can land while this pull is in
+                            // flight (the bootstrap pull races the first
+                            // hello; a slow backoff pull races the
+                            // reconnect). Its state/broadcasts are NEWER
+                            // truth, so applying this older answer — a
+                            // `full` one especially — would blind-insert
+                            // stale rows over fresher ones and drag the
+                            // cursor back. Only answers below `since` are
+                            // not stale: that is the server-regressed
+                            // (reset/wipe) shape, whose reseed must apply.
+                            let stale = pull.seq >= since && pull.seq < d.cursor();
+                            if stale {
+                                tracing::debug!(
+                                    seq = pull.seq,
+                                    cursor = d.cursor(),
+                                    "registry: discarding stale http pull"
+                                );
+                            } else {
+                                d.apply_state(pull.seq, pull.full, pull.gc_floor, pull.rows);
+                            }
                             drop(d);
                             let now = tokio::time::Instant::now();
                             let mut map = lock(&presence);
@@ -906,7 +925,9 @@ impl Actor {
                             drop(map);
                             stats.synced.store(true, Relaxed);
                             stats.last_pushed_ms.store(epoch_ms(), Relaxed);
-                            let _ = events.send(RegistryEvent::Applied);
+                            if !stale {
+                                let _ = events.send(RegistryEvent::Applied);
+                            }
                         }
                         Err(err) => {
                             tracing::warn!(error = %err, "registry: http pull body unparseable");

@@ -593,6 +593,71 @@ impl SessionDoc {
             .collect())
     }
 
+    /// Cheap "is there work to do" probe for the drains.
+    ///
+    /// The drains run on EVERY doc change — from two watchers (the main drain
+    /// and the controls-only one) — and materialising the whole ledger as
+    /// JSON each time was the cost, paid whether or not anything was pending.
+    /// This walks the containers reading only each entry's `status`.
+    pub fn has_pending_commands(&self) -> bool {
+        let commands = self.doc.get_list("commands");
+        let pending = command_status_str(SessionCommandStatus::Pending);
+        for index in 0..commands.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                commands.get(index)
+            else {
+                continue;
+            };
+            if matches!(
+                map.get("status"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s)))
+                    if s.as_str() == pending
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Compact resolved history out of the commands ledger: keep every
+    /// unresolved entry plus the newest `keep_terminal` resolved ones.
+    ///
+    /// Writers never retract a command they issued (rule 1) and a Pending
+    /// entry is never touched here, but a RESOLVED entry is inert — replay
+    /// dedupe is the host's processed-command ledger, and the epoch rebuild
+    /// already drops resolved history. Unbounded retention only bought O(n)
+    /// reads (and O(n) snapshots) on every doc change for the life of the
+    /// chat. Returns how many entries were removed.
+    pub fn prune_resolved_commands(&self, keep_terminal: usize) -> Result<usize, DocError> {
+        let commands = self.doc.get_list("commands");
+        let pending = command_status_str(SessionCommandStatus::Pending);
+        let mut resolved: Vec<usize> = Vec::new();
+        for index in 0..commands.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                commands.get(index)
+            else {
+                continue;
+            };
+            let Some(loro::ValueOrContainer::Value(LoroValue::String(status))) = map.get("status")
+            else {
+                continue;
+            };
+            if status.as_str() != pending {
+                resolved.push(index);
+            }
+        }
+        let excess = resolved.len().saturating_sub(keep_terminal);
+        if excess == 0 {
+            return Ok(0);
+        }
+        // Oldest are the excess; delete back-to-front so indices stay valid.
+        for index in resolved[..excess].iter().rev() {
+            commands.delete(*index, 1)?;
+        }
+        self.doc.commit();
+        Ok(excess)
+    }
+
     /// Append a command entry (rule 1: own entries only, append-only).
     pub fn queue_command(&self, entry: &SessionCommandEntry) -> Result<(), DocError> {
         let commands = self.doc.get_list("commands");
@@ -619,12 +684,7 @@ impl SessionDoc {
         if let Some(expires_at) = entry.expires_at {
             map.insert("expiresAt", expires_at)?;
         }
-        map.insert(
-            "status",
-            serde_json::to_value(entry.status)?
-                .as_str()
-                .ok_or_else(|| DocError::Schema("status not a string".into()))?,
-        )?;
+        map.insert("status", command_status_str(entry.status))?;
         self.doc.commit();
         Ok(())
     }
@@ -646,12 +706,7 @@ impl SessionDoc {
                     Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == command_id
                 );
                 if id_matches {
-                    map.insert(
-                        "status",
-                        serde_json::to_value(status)?
-                            .as_str()
-                            .ok_or_else(|| DocError::Schema("status not a string".into()))?,
-                    )?;
+                    map.insert("status", command_status_str(status))?;
                     if let Some(r) = resolution {
                         map.insert("resolution", r)?;
                     }
@@ -981,6 +1036,20 @@ fn status_str(status: MessageStatus) -> &'static str {
         MessageStatus::Streaming => "streaming",
         MessageStatus::Complete => "complete",
         MessageStatus::Aborted => "aborted",
+    }
+}
+
+/// The stored wire name of a command status (`set_command_status`'s camelCase
+/// serde name). One definition so the cheap ledger probes can compare against
+/// it without serialising a value per entry.
+fn command_status_str(status: SessionCommandStatus) -> &'static str {
+    match status {
+        SessionCommandStatus::Pending => "pending",
+        SessionCommandStatus::Applied => "applied",
+        SessionCommandStatus::Rejected => "rejected",
+        SessionCommandStatus::Expired => "expired",
+        SessionCommandStatus::Superseded => "superseded",
+        SessionCommandStatus::Cancelled => "cancelled",
     }
 }
 
@@ -2408,6 +2477,78 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].status, SessionCommandStatus::Applied);
         assert_eq!(commands[0].payload, entry.payload);
+    }
+
+    #[test]
+    fn command_status_strings_match_the_stored_wire_form() {
+        use crate::commands::SessionCommandStatus;
+        for status in [
+            SessionCommandStatus::Pending,
+            SessionCommandStatus::Applied,
+            SessionCommandStatus::Rejected,
+            SessionCommandStatus::Expired,
+            SessionCommandStatus::Superseded,
+            SessionCommandStatus::Cancelled,
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::json!(command_status_str(status)),
+                "the ledger probes compare against the stored name"
+            );
+        }
+    }
+
+    #[test]
+    fn commands_ledger_probe_and_prune_bound_growth() {
+        use crate::commands::{SessionCommandPayload, SessionCommandStatus};
+        let entry = |id: &str| SessionCommandEntry {
+            id: id.into(),
+            payload: SessionCommandPayload::Steer {
+                prompt: "focus".into(),
+                message_id: None,
+            },
+            issued_by: "dev-b".into(),
+            issued_at: 10,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Pending,
+            resolution: None,
+        };
+        let doc = SessionDoc::init("chat-1").unwrap();
+
+        // The probe the drains gate on: container walk, no materialisation.
+        assert!(!doc.has_pending_commands());
+        doc.queue_command(&entry("c1")).unwrap();
+        assert!(doc.has_pending_commands());
+        doc.set_command_status("c1", SessionCommandStatus::Applied, None)
+            .unwrap();
+        assert!(!doc.has_pending_commands());
+
+        for i in 0..10 {
+            let id = format!("r{i}");
+            doc.queue_command(&entry(&id)).unwrap();
+            doc.set_command_status(&id, SessionCommandStatus::Applied, None)
+                .unwrap();
+        }
+        // c1 + r0..=r9 = 11 resolved; keep the newest 3.
+        assert_eq!(doc.prune_resolved_commands(3).unwrap(), 8);
+        let kept: Vec<String> = doc
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(kept, vec!["r7", "r8", "r9"]);
+
+        // Pending entries are never compacted, whatever the budget.
+        doc.queue_command(&entry("p1")).unwrap();
+        assert!(doc.has_pending_commands());
+        assert_eq!(doc.prune_resolved_commands(0).unwrap(), 3);
+        let commands = doc.read_commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].id, "p1");
+        assert_eq!(commands[0].status, SessionCommandStatus::Pending);
+        assert_eq!(doc.prune_resolved_commands(0).unwrap(), 0);
     }
 
     #[test]
