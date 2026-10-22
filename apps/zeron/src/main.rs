@@ -151,10 +151,19 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     attach_parent_console();
     let cli = Cli::parse();
+    // A relaunch (`--wait-for-exit`, passed by the updater) waits for the
+    // previous instance so its renamed-away image can be deleted. That wait
+    // must never take the updated app down with it: an old instance that is
+    // slow (or stuck) to exit would otherwise abort startup before logging is
+    // even initialized, and a GUI launch with nulled stderr exits silently.
+    // The failure is reported once logging is up and the app starts anyway;
+    // the leftover image is removed by the next launch instead.
     #[cfg(windows)]
-    if let Some(pid) = cli.wait_for_exit {
-        zeron_update::windows::wait_for_exit(pid)?;
-    } else if matches!(&cli.command, None | Some(Command::Headless)) {
+    let wait_for_exit_error = cli
+        .wait_for_exit
+        .and_then(|pid| zeron_update::windows::wait_for_exit(pid).err());
+    #[cfg(windows)]
+    if cli.wait_for_exit.is_none() && matches!(&cli.command, None | Some(Command::Headless)) {
         zeron_update::windows::cleanup_previous_image();
     }
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
@@ -215,6 +224,13 @@ fn main() -> anyhow::Result<()> {
                 None => registry.init(),
             }
         }
+    }
+
+    // Reported after the subscriber exists so it reaches the log file, not
+    // only a stderr a GUI launch does not have.
+    #[cfg(windows)]
+    if let Some(error) = wait_for_exit_error {
+        tracing::warn!(%error, "previous instance did not exit before this launch; continuing");
     }
 
     // Finder launches have no visible stderr. Mirror the panic location and
