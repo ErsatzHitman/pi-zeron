@@ -667,6 +667,17 @@ impl ChatClient {
                 false
             }
         };
+        self.queue_batch(batch_id, bytes, durable);
+    }
+
+    /// Queue a batch whose outbox row the caller already committed (the
+    /// engine's local-update feed writes it before handing the bytes over).
+    /// Skips the second SQLite insert on the committing thread.
+    pub fn enqueue_persisted_batch(&self, batch_id: String, bytes: Vec<u8>) {
+        self.queue_batch(batch_id, bytes, true);
+    }
+
+    fn queue_batch(&self, batch_id: String, bytes: Vec<u8>, durable: bool) {
         if bytes.len() > MAX_PUSH_BYTES {
             use std::sync::atomic::Ordering::Relaxed;
             tracing::error!(

@@ -53,12 +53,19 @@ struct RecordingSink {
     frontier_contained: std::sync::atomic::AtomicBool,
     verified_cursor: std::sync::atomic::AtomicBool,
     pending_until_checkpoint: std::sync::atomic::AtomicBool,
+    /// How many times the client asked the sink to journal a batch.
+    persists: std::sync::atomic::AtomicUsize,
     /// Global apply order across rows and checkpoints — the overlap test
     /// pins "checkpoint imports before any row that buffered during it".
     ops: Mutex<Vec<String>>,
 }
 
 impl ChatDocSink for RecordingSink {
+    fn persist_update(&self, _batch_id: &str, _bytes: &[u8]) -> Result<(), String> {
+        self.persists
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
     fn cursor_is_verified(&self) -> bool {
         self.verified_cursor
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1824,6 +1831,47 @@ async fn blocked_websockets_deliver_reopened_outbox_over_http_despite_lost_ack()
         "HTTP seam: all WS refused, reopened SQLite outbox, 1.2s/request, first ACK lost; attempts=2, unique batches=1, cursor=2, pending=0, convergence={:?}",
         started.elapsed()
     );
+    client.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn persisted_batch_skips_the_outbox_insert_on_the_committing_thread() {
+    let sink = Arc::new(RecordingSink::default());
+    let (pipe, mut end) = pipe_pair();
+    let (fetch, _) = fetcher(b"");
+    let server = tokio::spawn(async move {
+        serve_join(&mut end, empty_state_json(), &[], vec![], false).await;
+        end
+    });
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink.clone(),
+        fetch,
+        "sender",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .unwrap();
+    let mut end = server.await.unwrap();
+
+    // The engine's local-update feed already wrote the outbox row: the client
+    // must queue the batch without a second SQLite insert on that thread.
+    client.enqueue_persisted_batch("already-durable".into(), vec![1]);
+    let push = expect_kind(&mut end, frame_type::PUSH).await;
+    assert_eq!(push.header["batchId"], "already-durable");
+    assert_eq!(push.payload, vec![1]);
+    assert_eq!(
+        sink.persists.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a persisted batch is not journaled twice"
+    );
+
+    // Callers that have not journaled yet still get the durable insert.
+    client.enqueue_batch("needs-journal".into(), vec![2]);
+    let push = expect_kind(&mut end, frame_type::PUSH).await;
+    assert_eq!(push.header["batchId"], "needs-journal");
+    assert_eq!(sink.persists.load(std::sync::atomic::Ordering::Relaxed), 1);
     client.shutdown().await;
 }
 

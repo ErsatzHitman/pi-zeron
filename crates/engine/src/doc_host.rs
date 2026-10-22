@@ -75,6 +75,17 @@ const SYNC_QUANTUM_MS: i64 = 30_000;
 const ACTIVE_SYNC_CAP: usize = 28;
 const SYNC_ADMISSION_BATCH: usize = 4;
 const SYNC_CATCH_UP_QUANTUM_MS: i64 = 300_000;
+/// How often an idle, caught-up client re-checks its outbox before the grace
+/// path may retire it. The dispatcher ticks every 100 ms; a durable-outbox
+/// read per tick per client is the cost this caps.
+const OUTBOX_PROBE_MS: i64 = 1_000;
+/// Overflow reconciliation walks the registry; one pass a second is plenty
+/// and keeps the idle tick free of SQLite reads.
+const RECONCILE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Dispatcher cadence while there is work to place, and the backed-off cadence
+/// for a host with nothing resident and nothing queued.
+const SYNC_POLL_ACTIVE: std::time::Duration = std::time::Duration::from_millis(100);
+const SYNC_POLL_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 // All live-transport scenarios share the process budget, including tests in
 // sibling modules. Hold through shutdown so one fixture cannot rotate another.
@@ -643,6 +654,11 @@ pub struct ChatDocHandle {
     sync_service_until: AtomicI64,
     sync_wake_version: AtomicI64,
     sync_wake_ticket: AtomicU64,
+    /// Last durable-outbox probe for the idle grace path, and its verdict.
+    /// The dispatcher ticks every 100 ms; probing per tick per client is
+    /// needless SQLite work on a quiet host.
+    outbox_probe_at: AtomicI64,
+    outbox_pending: AtomicBool,
     sync_cancel: Mutex<CancellationToken>,
     writers: Arc<AtomicUsize>,
     pub(crate) persistence: Option<Arc<crate::chat_persistence::ChatPersistence>>,
@@ -1521,7 +1537,7 @@ impl DocHost {
                     // is the self-repair path: no user action, ever.
                     tracing::info!(chat = %chat_id, old_epoch = epoch,
                         "chat2 adopt: discarding pre-chat2 local doc (rollback copy kept)");
-                    let rollback_id = format!("{chat_id}.pre-chat2");
+                    let rollback_id = format!("{chat_id}{}", zeron_sync::PRE_CHAT2_ROLLBACK_SUFFIX);
                     // A re-adopt after a mid-catch-up crash reruns this path
                     // with a near-empty doc under `chat_id` — the FIRST
                     // rollback copy is the real transcript; never overwrite
@@ -1664,6 +1680,8 @@ impl DocHost {
             sync_service_until: AtomicI64::new(0),
             sync_wake_version: AtomicI64::new(0),
             sync_wake_ticket: AtomicU64::new(0),
+            outbox_probe_at: AtomicI64::new(0),
+            outbox_pending: AtomicBool::new(false),
             sync_cancel: Mutex::new(CancellationToken::new()),
             writers: Arc::new(AtomicUsize::new(0)),
             persistence,
@@ -1707,19 +1725,41 @@ impl DocHost {
                     .doc()
                     .subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
                         if let Some(handle) = weak_push.upgrade() {
-                            // The buffer push happens WHILE HOLDING the client
-                            // lock (verify pass: releasing it between the None
-                            // check and the push let the join's store+drain
-                            // slip between, orphaning the update forever).
-                            let batch_id = uuid::Uuid::new_v4().to_string();
-                            let client_guard = lock(&handle.chat2);
-                            if let Err(err) = publication_store.enqueue_chat_update(&publication_chat, &batch_id, bytes) {
-                                handle.publication_failed.store(true, Ordering::Release);
-                                lock(&handle.chat2_pending_local).push((batch_id.clone(), bytes.clone()));
-                                tracing::error!(chat = %publication_chat, %err, "chat2: durable outbox write failed");
+                            if handle.retired.load(Ordering::Acquire) {
+                                return true; // purged/adopted lineage: no outbox row
                             }
+                            // One durable insert per commit, on the committing
+                            // thread but OUTSIDE the client lock: the join
+                            // drains this outbox under that same lock, so a
+                            // row written before the dial is always picked up.
+                            let batch_id = uuid::Uuid::new_v4().to_string();
+                            let persisted = match publication_store.enqueue_chat_update(
+                                &publication_chat,
+                                &batch_id,
+                                bytes,
+                            ) {
+                                Ok(()) => true,
+                                Err(err) => {
+                                    handle.publication_failed.store(true, Ordering::Release);
+                                    lock(&handle.chat2_pending_local)
+                                        .push((batch_id.clone(), bytes.clone()));
+                                    tracing::error!(chat = %publication_chat, %err, "chat2: durable outbox write failed");
+                                    false
+                                }
+                            };
+                            // The buffer push stays under the client lock (verify
+                            // pass): releasing it between the None check and the
+                            // push let the join's store+drain slip between, orphaning
+                            // the update forever.
+                            let client_guard = lock(&handle.chat2);
                             if let Some(client) = &*client_guard {
-                                client.enqueue_batch(batch_id, bytes.clone());
+                                if persisted {
+                                    // The outbox row is already committed: hand it
+                                    // over without a second insert on this thread.
+                                    client.enqueue_persisted_batch(batch_id, bytes.clone());
+                                } else {
+                                    client.enqueue_batch(batch_id, bytes.clone());
+                                }
                             }
                         }
                         true
@@ -1858,9 +1898,18 @@ impl DocHost {
             // host shutdown must join these actors before its final snapshot.
             let mut stopping = FuturesUnordered::<tokio::task::JoinHandle<String>>::new();
             let mut stopping_ids = HashSet::new();
+            // Durable wake/queue discovery is invisible without a read: the
+            // store's job clock (bumped whenever work is queued) tells an idle
+            // tick there is nothing new to look for, so a quiet host costs
+            // atomics instead of a SQLite query per handle every 100 ms.
+            let mut seen_clock = i64::MIN;
+            // The overflow scan itself is a read, so it gets its own (slow)
+            // cadence instead of one per tick.
+            let mut last_reconcile = std::time::Instant::now() - RECONCILE_POLL;
+            let mut poll = SYNC_POLL_ACTIVE;
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    _ = tokio::time::sleep(poll) => {}
                     Some(result) = stopping.next(), if !stopping.is_empty() => {
                         match result {
                             Ok(id) => { stopping_ids.remove(&id); }
@@ -1871,32 +1920,47 @@ impl DocHost {
                 }
                 let Some(inner) = weak.upgrade() else { return };
                 let host = Self { inner };
-                host.evict_over_budget();
+                poll = SYNC_POLL_ACTIVE;
+                let job_clock = host.inner.store.job_clock();
+                let work_changed = job_clock != seen_clock;
+                seen_clock = job_clock;
+                // Blocking work (snapshot exports, cold doc opens) belongs on
+                // the blocking pool: the dispatcher worker must stay free to
+                // keep admitting and rotating transports.
+                {
+                    let evict = host.clone();
+                    let _ = tokio::task::spawn_blocking(move || evict.evict_over_budget()).await;
+                }
                 if host.inner.edge_disconnected.load(Ordering::Acquire) {
+                    poll = SYNC_POLL_IDLE;
                     continue;
                 }
                 let Some(edge) = host.inner.config.edge.clone() else {
+                    poll = SYNC_POLL_IDLE;
                     continue;
                 };
                 // Overflow reconciliation is metadata-only and resumable. Wait
                 // for registry truth before deciding the hosted set is complete.
-                if let Some(ws) = host.workspace() {
-                    if ws.sync_status().is_some_and(|s| s.synced) {
-                        if let Ok(Some((version, cursor))) =
-                            host.inner.store.reconciliation_progress()
-                        {
-                            let mut ids: Vec<_> = ws
-                                .watch_chats()
-                                .borrow()
-                                .iter()
-                                .filter(|c| {
-                                    c.device_id == host.inner.config.device_id && c.id > cursor
-                                })
-                                .map(|c| c.id.clone())
-                                .collect();
-                            ids.sort();
-                            ids.truncate(32);
-                            let _ = host.inner.store.reconcile_page(version, &ids);
+                if work_changed || last_reconcile.elapsed() >= RECONCILE_POLL {
+                    last_reconcile = std::time::Instant::now();
+                    if let Some(ws) = host.workspace() {
+                        if ws.sync_status().is_some_and(|s| s.synced) {
+                            if let Ok(Some((version, cursor))) =
+                                host.inner.store.reconciliation_progress()
+                            {
+                                let mut ids: Vec<_> = ws
+                                    .watch_chats()
+                                    .borrow()
+                                    .iter()
+                                    .filter(|c| {
+                                        c.device_id == host.inner.config.device_id && c.id > cursor
+                                    })
+                                    .map(|c| c.id.clone())
+                                    .collect();
+                                ids.sort();
+                                ids.truncate(32);
+                                let _ = host.inner.store.reconcile_page(version, &ids);
+                            }
                         }
                     }
                 }
@@ -1918,6 +1982,10 @@ impl DocHost {
                     }
                 }
 
+                // Durable discovery is one bounded page read per tick: cold
+                // jobs stay visible while every slot is busy, so a released
+                // slot is never wasted. The per-handle reads below are what
+                // the job clock gates.
                 let durable = host
                     .inner
                     .store
@@ -1983,50 +2051,95 @@ impl DocHost {
                     {
                         continue;
                     }
+                    let now = now_ms();
                     // A focus during teardown remains unserved and can
                     // reclaim a slot. Only resident, non-closing clients
                     // acknowledge focus here.
                     handle.sync_focus_served.fetch_max(handle.last_focus.load(Ordering::Acquire), Ordering::AcqRel);
                     let mut captured = handle.sync_wake_version.load(Ordering::Acquire);
-                    let pending_wake = host
-                        .inner
-                        .store
-                        .sync_job_version(&handle.chat_id, "wake")
-                        .ok()
-                        .flatten();
-                    if let Some(version) = pending_wake.filter(|v| *v != captured) {
-                        // Keep the healthy transport. Retirement of this wake
-                        // requires a read started after its version was seen.
-                        if let Some(client) = lock(&handle.chat2).as_ref() {
-                            let ticket = client.request_catch_up();
-                            handle.sync_wake_ticket.store(ticket, Ordering::Release);
-                            handle.sync_wake_version.store(version, Ordering::Release);
-                            captured = version;
+                    // The durable wake row is the only reason to read here. A
+                    // new wake bumps the job clock; an outstanding read ticket
+                    // still needs settling even when nothing new was queued.
+                    let wake_ticket = handle.sync_wake_ticket.load(Ordering::Acquire);
+                    if work_changed || wake_ticket != 0 || captured != 0 {
+                        let pending_wake = host
+                            .inner
+                            .store
+                            .sync_job_version(&handle.chat_id, "wake")
+                            .ok()
+                            .flatten();
+                        match pending_wake {
+                            // Keep the healthy transport. Retirement of this
+                            // wake requires a read started after its version
+                            // was seen.
+                            Some(version) if version != captured => {
+                                if let Some(client) = lock(&handle.chat2).as_ref() {
+                                    let ticket = client.request_catch_up();
+                                    handle.sync_wake_ticket.store(ticket, Ordering::Release);
+                                    handle.sync_wake_version.store(version, Ordering::Release);
+                                    captured = version;
+                                }
+                            }
+                            // No receipt left to settle (retired here or
+                            // consumed at admission): stop polling for it, or
+                            // this handle would read SQLite every tick forever.
+                            None => {
+                                handle.sync_wake_version.store(0, Ordering::Release);
+                                handle.sync_wake_ticket.store(0, Ordering::Release);
+                                captured = 0;
+                            }
+                            Some(_) => {}
                         }
-                    }
-                    let wake_read_complete = captured != 0
-                        && lock(&handle.chat2).as_ref().is_some_and(|c|
-                            c.catch_up_completed(handle.sync_wake_ticket.load(Ordering::Acquire)));
-                    if wake_read_complete && host.wakeup_is_durable(handle)
-                    {
-                        let _ =
-                            host.inner
-                                .store
-                                .complete_sync_job(&handle.chat_id, "wake", captured);
+                        let wake_read_complete = captured != 0
+                            && lock(&handle.chat2).as_ref().is_some_and(|c|
+                                c.catch_up_completed(handle.sync_wake_ticket.load(Ordering::Acquire)));
+                        if wake_read_complete {
+                            // Flush + ledger reads + snapshot export are
+                            // blocking work; keep them off this worker.
+                            let probe = host.clone();
+                            let probe_handle = handle.clone();
+                            let durable = tokio::task::spawn_blocking(move ||
+                                probe.wakeup_is_durable(&probe_handle))
+                                .await
+                                .unwrap_or(false);
+                            if durable {
+                                let _ = host
+                                    .inner
+                                    .store
+                                    .complete_sync_job(&handle.chat_id, "wake", captured);
+                                // The receipt is settled: close the poll gate so
+                                // this handle costs no further reads until a new
+                                // wake bumps the clock.
+                                handle.sync_wake_version.store(0, Ordering::Release);
+                                handle.sync_wake_ticket.store(0, Ordering::Release);
+                                captured = 0;
+                            }
+                        }
                     }
                     let caught_up = lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up());
                     // A quiet document can still be receiving its checkpoint
                     // or commands. Incomplete catch-up only yields via rotate's
                     // explicit service deadline, never the short reuse grace.
-                    let idle = caught_up
-                        && !handle.sync_protected()
-                        && (now_ms() - handle.last_access.load(Ordering::Relaxed) >= SYNC_IDLE_MS
-                            || (handle.sync_background.load(Ordering::Acquire) && caught_up))
-                        && !host
-                            .inner
-                            .store
-                            .has_pending_chat_updates(&handle.chat_id)
-                            .unwrap_or(true);
+                    // The outbox read that guards retirement is throttled and
+                    // retirement is decided only on a fresh one.
+                    let idle_grace = now - handle.last_access.load(Ordering::Relaxed) >= SYNC_IDLE_MS
+                        || (handle.sync_background.load(Ordering::Acquire) && caught_up);
+                    let mut outbox_checked = false;
+                    if caught_up && !handle.sync_protected() && idle_grace {
+                        let probed = handle.outbox_probe_at.load(Ordering::Acquire);
+                        if work_changed || now - probed >= OUTBOX_PROBE_MS {
+                            handle.outbox_probe_at.store(now, Ordering::Release);
+                            handle.outbox_pending.store(
+                                host.inner
+                                    .store
+                                    .has_pending_chat_updates(&handle.chat_id)
+                                    .unwrap_or(true),
+                                Ordering::Release,
+                            );
+                            outbox_checked = true;
+                        }
+                    }
+                    let idle = outbox_checked && !handle.outbox_pending.load(Ordering::Acquire);
                     if idle {
                         handle.sync_requested.store(false, Ordering::Release);
                         stopping_ids.insert(handle.chat_id.clone());
@@ -2141,17 +2254,29 @@ impl DocHost {
                     let (id, cached, wake_version) = waiting.remove(0);
                     let handle = match cached {
                         Some(h) => h,
-                        None => match host.open_local(&id) {
-                            Ok(h) => {
-                                h.sync_background.store(true, Ordering::Release);
-                                h.sync_requested.store(true, Ordering::Release);
-                                h
+                        // A cold open decodes a whole snapshot and writes it
+                        // back: blocking work belongs on the blocking pool.
+                        None => {
+                            let opener = host.clone();
+                            let open_id = id.clone();
+                            match tokio::task::spawn_blocking(move || opener.open_local(&open_id))
+                                .await
+                            {
+                                Ok(Ok(h)) => {
+                                    h.sync_background.store(true, Ordering::Release);
+                                    h.sync_requested.store(true, Ordering::Release);
+                                    h
+                                }
+                                Ok(Err(error)) => {
+                                    tracing::warn!(chat = %id, %error, "durable sync work deferred");
+                                    continue;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(chat = %id, %error, "cold open task failed");
+                                    continue;
+                                }
                             }
-                            Err(error) => {
-                                tracing::warn!(chat = %id, %error, "durable sync work deferred");
-                                continue;
-                            }
-                        },
+                        }
                     };
                     // Opening may observe a newer registry/lineage. Recheck
                     // ownership before admission, retaining the captured wake.
@@ -2188,7 +2313,8 @@ impl DocHost {
                     }
                 }
                 drop(waiting);
-                host.evict_over_budget();
+                let evict = host.clone();
+                let _ = tokio::task::spawn_blocking(move || evict.evict_over_budget()).await;
             }
         });
     }
@@ -2335,7 +2461,9 @@ impl DocHost {
                             // load but before installation. The same lock is
                             // held by the local-update subscription.
                             for (id, bytes) in host.inner.store.pending_chat_updates(&chat).unwrap_or_default() {
-                                client.enqueue_batch(id, bytes);
+                                // Rows read back from the outbox are already
+                                // durable; do not insert them again.
+                                client.enqueue_persisted_batch(id, bytes);
                             }
                             let pending: Vec<(String, Vec<u8>)> =
                                 lock(&handle.chat2_pending_local).clone();
@@ -2652,7 +2780,7 @@ impl DocHost {
         }
         // Rollback copy of the fat lineage BEFORE the thin one replaces it —
         // never overwriting an existing copy (review B5).
-        let rollback_id = format!("{chat_id}.pre-chat2");
+        let rollback_id = format!("{chat_id}{}", zeron_sync::PRE_CHAT2_ROLLBACK_SUFFIX);
         if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None))
             && let Ok(Some(old)) = self.inner.store.load_snapshot(chat_id)
         {
@@ -2797,7 +2925,7 @@ impl DocHost {
                 }
             }
         }
-        let rollback_id = format!("{chat_id}.pre-chat2");
+        let rollback_id = format!("{chat_id}{}", zeron_sync::PRE_CHAT2_ROLLBACK_SUFFIX);
         let source = self
             .inner
             .store
@@ -3438,13 +3566,25 @@ impl DocHost {
         rows
     }
 
-    /// Drop a chat's doc unconditionally and delete its local snapshot — the
+    /// Drop a chat's doc unconditionally and delete its local rows — the
     /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
-    /// stream end; a racing writer keeps its orphaned doc until the run ends.
+    /// stream end; a racing writer keeps its orphaned doc until the run ends,
+    /// but cannot put its snapshot or outbox rows back.
     pub fn purge_chat(&self, chat_id: &str) {
         let removed = lock(&self.inner.handles).remove(chat_id);
+        if let Some(handle) = &removed {
+            // Stop this doc's publications before the rows go: a retired
+            // handle writes no outbox row, and the client must not keep
+            // pushing into a deleted room.
+            handle.retired.store(true, Ordering::Release);
+            *lock(&handle.chat2_local_sub) = None;
+            let _client = lock(&handle.chat2).take();
+        }
         drop(removed);
-        if let Err(err) = self.inner.store.delete_snapshot(chat_id) {
+        // Deletes the snapshot, its `.pre-chat2` rollback copy, the outbox and
+        // the sync jobs, and tombstones the id so a debounced snapshot flush
+        // or an in-flight outbox insert cannot resurrect the chat.
+        if let Err(err) = self.inner.store.purge_doc(chat_id) {
             tracing::warn!(chat = %chat_id, error = %err, "snapshot delete failed");
         }
     }
@@ -6777,6 +6917,54 @@ mod publication_eviction_tests {
             "must survive a failed write"
         );
         reopened.shutdown_workers().await;
+    }
+
+    #[tokio::test]
+    async fn purge_chat_takes_the_rollback_copy_and_refuses_late_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let rollback = format!("gone{}", zeron_sync::PRE_CHAT2_ROLLBACK_SUFFIX);
+        // The M3 adopt left the pre-cutover lineage behind under a suffixed id.
+        store.save_snapshot(&rollback, b"fat").unwrap();
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "host".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let writer = host.open_local("gone").unwrap();
+        writer
+            .doc
+            .doc()
+            .get_text("body")
+            .insert(0, "before delete")
+            .unwrap();
+        writer.doc.doc().commit();
+        assert!(host.wakeup_is_durable(&writer));
+
+        host.purge_chat("gone");
+        assert!(!lock(&host.inner.handles).contains_key("gone"));
+        assert!(writer.retired.load(Ordering::Acquire));
+        assert!(store.load_snapshot("gone").unwrap().is_none());
+        assert!(store.load_snapshot(&rollback).unwrap().is_none());
+
+        // A writer still holding the doc must not put its rows back.
+        writer
+            .doc
+            .doc()
+            .get_text("body")
+            .insert(0, "after delete")
+            .unwrap();
+        writer.doc.doc().commit();
+        let _ = host.wakeup_is_durable(&writer);
+        store.enqueue_chat_update("gone", "late", b"row").unwrap();
+        store.save_snapshot(&rollback, b"late-fat").unwrap();
+        assert!(store.load_snapshot("gone").unwrap().is_none());
+        assert!(store.load_snapshot(&rollback).unwrap().is_none());
+        assert!(store.pending_chat_updates("gone").unwrap().is_empty());
+        host.shutdown_workers().await;
     }
 
     #[tokio::test]
