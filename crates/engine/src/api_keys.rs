@@ -594,6 +594,10 @@ impl ApiKeys {
     /// the change retires: Pi's entry is removed only if it still holds one.
     /// The key that was current before the change is retired too, so
     /// disabling the last enabled key takes it out of Pi as well.
+    ///
+    /// The store is the source of truth and Pi's `auth.json` is its
+    /// projection, so the two must never disagree: a projection that fails
+    /// puts the store back and fails the whole write.
     fn write(
         &self,
         provider: &str,
@@ -605,6 +609,7 @@ impl ApiKeys {
             let path = self.store_path();
             let mut store = Store::load(&path)?;
             let before = store.key(provider).map(str::to_owned);
+            let mut rollback = store.clone();
             let keys = store.providers.entry(provider.to_owned()).or_default();
             change(keys)?;
             if keys.keys.is_empty() {
@@ -618,7 +623,19 @@ impl ApiKeys {
             {
                 retired.push(old.to_owned());
             }
-            self.project(provider, after, &retired)?;
+            if let Err(err) = self.project(provider, after, &retired) {
+                // Saved-but-not-projected left a key in the store Pi never
+                // received (or one Pi still holds after removal). Restore the
+                // snapshot so both agree on the state the user had.
+                if let Err(restore) = rollback.save(&path) {
+                    tracing::error!(
+                        provider,
+                        error = %restore,
+                        "api key store rollback failed after a projection error"
+                    );
+                }
+                return Err(err);
+            }
         }
         Ok(self.list())
     }
@@ -633,10 +650,23 @@ impl ApiKeys {
         if Known::of(provider).is_some_and(|k| !k.pi) {
             return Ok(());
         }
-        let current = std::fs::read(self.auth_file())
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v.get(provider).cloned());
+        let auth_file = self.auth_file();
+        let current = match std::fs::read(&auth_file) {
+            Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(value) => value.get(provider).cloned(),
+                // Never rewrite a file we cannot parse (that would wipe the
+                // user's other logins) — and never report a projection as
+                // done when its current state is unknowable.
+                Err(err) => {
+                    return Err(EngineError::Other(format!(
+                        "{} exists but could not be parsed ({err}); fix or remove it to manage keys here.",
+                        auth_file.display()
+                    )));
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
         let entry_type = current.as_ref().and_then(|e| e["type"].as_str());
         if entry_type == Some("oauth") {
             // Signed in with OAuth: that login wins in Pi; leave it.
@@ -994,6 +1024,50 @@ mod tests {
         })
         .unwrap();
         assert_eq!(auth(dir.path())["openrouter"]["key"], "!op read key");
+    }
+
+    #[test]
+    fn a_failed_pi_projection_does_not_apply_the_store_change() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file Zeron must never rewrite (it does not parse): the projection
+        // cannot complete, so the add must not be half-applied to the store.
+        std::fs::write(dir.path().join("auth.json"), b"{not json").unwrap();
+        let k = keys(dir.path());
+        let err = k
+            .add(AddParams {
+                provider: "openrouter".into(),
+                label: "Personal".into(),
+                secret: "sk-or-aaaa1111".into(),
+                activate: false,
+            })
+            .expect_err("the projection must fail");
+        assert!(err.to_string().contains("could not be parsed"), "{err}");
+        let store = Store::load(&k.store_path()).unwrap();
+        assert_eq!(store.key("openrouter"), None, "no key Pi never received");
+        assert!(!store.providers.contains_key("openrouter"));
+        assert_eq!(
+            std::fs::read(dir.path().join("auth.json")).unwrap(),
+            b"{not json",
+            "the unparseable file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_failed_projection_on_remove_keeps_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = keys(dir.path());
+        let view = add(&k, "openrouter", "x", "sk-or-3333cccc");
+        let id = provider(&view, "openrouter").keys[0].id.clone();
+        // Pi's file becomes unreadable: the removal cannot be projected, so
+        // the store must keep the key instead of dropping one Pi still holds.
+        std::fs::write(dir.path().join("auth.json"), b"{not json").unwrap();
+        k.remove(KeyRef {
+            provider: "openrouter".into(),
+            id,
+        })
+        .expect_err("the projection must fail");
+        let store = Store::load(&k.store_path()).unwrap();
+        assert_eq!(store.key("openrouter"), Some("sk-or-3333cccc"));
     }
 
     #[test]
