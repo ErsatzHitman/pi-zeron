@@ -1038,11 +1038,18 @@ impl AppearancePage {
             let Some(path) = path else {
                 return;
             };
+            // The read, decode, thumbnail and managed-file write stay on the
+            // background executor; the picker's frame is not held up by them.
+            let install = this.update(cx, |page, cx| {
+                page.background_error = None;
+                crate::settings::install_new_thread_composer_background_async(path, cx)
+            });
+            let Ok(install) = install else {
+                return;
+            };
+            let result = install.await;
             let _ = this.update(cx, |page, cx| {
-                page.background_error =
-                    crate::settings::install_new_thread_composer_background(&path, cx)
-                        .err()
-                        .map(SharedString::from);
+                page.background_error = result.err().map(SharedString::from);
                 cx.notify();
             });
         })
