@@ -1090,6 +1090,27 @@ impl EngineRpc {
     /// Accept only a checkout already named by a local chat or contained in a
     /// local space. Remote clients must not turn this RPC into an arbitrary path probe.
     async fn change_request_root(&self, cwd: &str) -> Result<std::path::PathBuf, RpcError> {
+        self.known_checkout_root(cwd, false).await
+    }
+
+    /// [`Self::change_request_root`] for the Changes pane, which addresses a
+    /// checkout by the *toplevel* the diff watch publishes — one level above
+    /// the chat's own cwd when that chat was opened in a subfolder of the
+    /// repository — so a chat cwd inside the same tree authorizes it too.
+    async fn diff_checkout_root(&self, cwd: &str) -> Result<std::path::PathBuf, RpcError> {
+        self.known_checkout_root(cwd, true).await
+    }
+
+    /// The allow-list behind [`Self::change_request_root`] and
+    /// [`Self::diff_checkout_root`]: the requested folder must be a local
+    /// chat's own cwd, the same checkout tree as one, or a local space's
+    /// checkout. `same_tree` widens the chat match to the whole checkout, as
+    /// the diff pane names a checkout's toplevel rather than the chat cwd.
+    async fn known_checkout_root(
+        &self,
+        cwd: &str,
+        same_tree: bool,
+    ) -> Result<std::path::PathBuf, RpcError> {
         let requested = std::path::PathBuf::from(cwd);
         let local_device = self.doc_host.device_id();
         let mut chats_rx = self.workspace.watch_chats();
@@ -1099,7 +1120,11 @@ impl EngineRpc {
             let chats = chats_rx.borrow_and_update().clone();
             if chats.iter().any(|chat| {
                 chat.device_id == local_device
-                    && chat.cwd.as_deref().map(std::path::Path::new) == Some(requested.as_path())
+                    && chat.cwd.as_deref().is_some_and(|chat_cwd| {
+                        let chat_cwd = std::path::Path::new(chat_cwd);
+                        chat_cwd == requested
+                            || (same_tree && same_checkout_tree(chat_cwd, &requested))
+                    })
             }) {
                 return Ok(requested);
             }
@@ -1802,6 +1827,17 @@ impl EngineRpc {
             }
         }
     }
+}
+
+/// Whether two paths name the same checkout: equal, or one contains the
+/// other. The diff pane names a checkout's toplevel, while a chat opened in a
+/// subfolder of the repository names a path below it — either may be the
+/// request, and both stay inside one repository.
+fn same_checkout_tree(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let (Ok(a), Ok(b)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) else {
+        return false;
+    };
+    a == b || a.starts_with(&b) || b.starts_with(&a)
 }
 
 /// An RPC rejection is scoped to the requested capability. Only a broken
@@ -3588,9 +3624,13 @@ impl RpcService for EngineRpc {
                         commit_sha: Option<String>,
                     }
                     let p: P = parse_params(params)?;
+                    // Only a checkout this device already knows about: the
+                    // cwd is client-supplied and must not become an arbitrary
+                    // path probe (the diff watch publishes the toplevel).
+                    let cwd = self.diff_checkout_root(&p.cwd).await?;
                     let identity = self
                         .repos
-                        .checkout_identity(std::path::Path::new(&p.cwd))
+                        .checkout_identity(&cwd)
                         .await
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                     let root = identity.root.as_path();
@@ -4552,17 +4592,24 @@ impl RpcService for EngineRpc {
             }
             methods::UPLOAD_CHUNK => {
                 let p: UploadChunkParams = parse_params(params)?;
-                self.uploads
-                    .append(&p.upload_id, &p.data, p.seq)
+                // Staging is blocking filesystem work (and an O(chunks)
+                // directory scan per chunk) — keep it off the async runtime,
+                // like ReadAttachmentChunk below.
+                let uploads = self.uploads.clone();
+                tokio::task::spawn_blocking(move || uploads.append(&p.upload_id, &p.data, p.seq))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::UPLOAD_COMMIT => {
                 let p: UploadCommitParams = parse_params(params)?;
-                let path = self
-                    .uploads
-                    .commit(&p.upload_id, &p.file_name)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let uploads = self.uploads.clone();
+                let path =
+                    tokio::task::spawn_blocking(move || uploads.commit(&p.upload_id, &p.file_name))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
                 // Bytes just landed on this device: any command deferred on
                 // them (queued-attachment refs) is executable NOW.
                 self.doc_host.kick_drains();
