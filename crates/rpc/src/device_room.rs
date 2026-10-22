@@ -336,9 +336,9 @@ impl HostRelay {
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
             // away, client dials bounce with "readiness check failed" (user
-            // report) — so a session that ENDED CLEANLY after a healthy
-            // stretch rejoins near-instantly, and only rapid consecutive
-            // failures walk the backoff.
+            // report) — so a session that ENDED after a healthy stretch rejoins
+            // near-instantly, and only a session that connects and then dies
+            // (cleanly or not) walks the backoff.
             let mut delay = HOST_REJOIN_MIN;
             loop {
                 match config.token.token().await {
@@ -376,15 +376,11 @@ impl HostRelay {
                         match outcome {
                             Ok(()) => {
                                 tracing::info!("device-room: host session ended; reconnecting");
-                                delay = HOST_REJOIN_MIN;
+                                delay = rejoin_delay(healthy, delay, config.retry);
                             }
                             Err(err) => {
                                 tracing::warn!(error = %err, "device-room: host session failed");
-                                delay = if healthy {
-                                    HOST_REJOIN_MIN
-                                } else {
-                                    (delay * 2).min(config.retry)
-                                };
+                                delay = rejoin_delay(healthy, delay, config.retry);
                             }
                         }
                     }
@@ -400,7 +396,7 @@ impl HostRelay {
                 // only wakes/successes DURING this wait cut it short.
                 while online.try_recv().is_ok() {}
                 tokio::select! {
-                    _ = tokio::time::sleep(delay + jitter()) => {}
+                    _ = tokio::time::sleep(delay + jitter(delay)) => {}
                     // Wake = redial NOW (the old socket died with the suspend).
                     _ = wake.recv() => { delay = HOST_REJOIN_MIN; }
                     // A sibling dial succeeded = the network is back.
@@ -419,25 +415,41 @@ impl Drop for HostRelay {
     }
 }
 
-/// Floor for host-relay rejoins after a clean/healthy session end — the DO
-/// evicting an idle host must not leave a multi-second unreachable window.
+/// Floor for host-relay rejoins: the DO evicting an idle host must not leave a
+/// multi-second unreachable window, and a healthy session's end resets to it.
 const HOST_REJOIN_MIN: Duration = Duration::from_millis(250);
+/// A session that lasted at least this long counts as healthy: its end is the
+/// DO's lifecycle, not our failure, so the rejoin does not escalate.
+const HOST_HEALTHY_SESSION: Duration = Duration::from_secs(30);
+
+/// How long to wait before the next dial. A healthy session ended on the DO's
+/// schedule (hibernation, deploy), so the rejoin stays near-instant; one that
+/// connects and then dies — cleanly or not — walks the backoff up to `retry`,
+/// so a host crash-looping on every dial cannot hammer the edge.
+fn rejoin_delay(healthy: bool, delay: Duration, retry: Duration) -> Duration {
+    if healthy {
+        HOST_REJOIN_MIN
+    } else {
+        (delay * 2).min(retry)
+    }
+}
+
 /// In-call dial retries (see [`LinkCache::client`]): total attempts, and the
 /// spacing multiplier between them (1.5s, then 3s — ~4.5s of cover, several
 /// times the host's post-eviction rejoin window).
 const DIAL_ATTEMPTS: u32 = 3;
 const DIAL_RETRY_SPACING: Duration = Duration::from_millis(1500);
-/// A session that lasted at least this long counts as healthy: its end is the
-/// DO's lifecycle, not our failure, so the rejoin does not escalate.
-const HOST_HEALTHY_SESSION: Duration = Duration::from_secs(30);
 
-fn jitter() -> Duration {
-    // Cheap decorrelation without a rand dependency.
+fn jitter(delay: Duration) -> Duration {
+    // Cheap decorrelation without a rand dependency: a slice of the wait, so
+    // the near-instant rejoin after an eviction stays near-instant instead of
+    // sliding up to two seconds later.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    Duration::from_millis(u64::from(nanos) % 2_000)
+    let spread = (delay.as_millis() / 8) as u32;
+    Duration::from_millis(u64::from(if spread == 0 { 0 } else { nanos % spread }))
 }
 
 /// One per-client virtual connection: `in_tx` feeds the ndjson dispatch loop
@@ -1336,5 +1348,36 @@ mod tests {
         );
         let host = device_room_ws_url("http://localhost:26640", "d", "host", None, "t");
         assert_eq!(host, "ws://localhost:26640/device/d/ws?role=host&token=t");
+    }
+
+    #[test]
+    fn a_session_that_dies_quickly_walks_the_rejoin_backoff() {
+        let retry = Duration::from_secs(5);
+        // A short session is our failure whether it ended cleanly or not, so
+        // each rejoin doubles up to the configured retry.
+        let mut delay = HOST_REJOIN_MIN;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            delay = rejoin_delay(false, delay, retry);
+            seen.push(delay);
+        }
+        assert_eq!(
+            seen,
+            [500, 1000, 2000, 4000, 5000, 5000]
+                .map(Duration::from_millis)
+                .to_vec()
+        );
+        // A healthy session ended on the DO's schedule: rejoin at once.
+        assert_eq!(rejoin_delay(true, retry, retry), HOST_REJOIN_MIN);
+    }
+
+    #[test]
+    fn rejoin_jitter_stays_a_slice_of_the_wait() {
+        for delay in [HOST_REJOIN_MIN, Duration::from_secs(5)] {
+            for _ in 0..32 {
+                assert!(jitter(delay) <= delay / 8, "{delay:?}");
+            }
+        }
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
     }
 }

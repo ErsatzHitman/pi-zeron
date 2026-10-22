@@ -1902,7 +1902,11 @@ impl Tools {
         // A writing session in a git project gets its own worktree, made by
         // the host on its first run; the branch names where it starts.
         let worktree = isolation(sandbox, space.as_ref(), cwd.as_deref(), branch);
-        if let Some(branch) = branch.filter(|_| worktree.is_none()) {
+        // The branch rides the row either way, as the composer's pick does: a
+        // chat created without a prompt must remember the base its first send
+        // starts its worktree from, and the host stamps the real zeron/<name>
+        // branch over it once the worktree exists.
+        if let Some(branch) = branch {
             mutate["branch"] = json!(branch);
         }
         // A projectless chat runs in its own scratch folder on a host that
@@ -1980,7 +1984,7 @@ impl Tools {
                 title: args.title.clone(),
                 archived: false,
                 cwd: cwd.clone(),
-                branch: branch.filter(|_| worktree.is_none()).map(str::to_owned),
+                branch: branch.map(str::to_owned),
                 checkout_id: None,
                 source_context: None,
                 config: Some(config),
@@ -2109,12 +2113,18 @@ impl Tools {
             "chatId": chat.id,
             "title": chat.title,
         });
-        // A delegated writing session still in the project folder (created
-        // without a prompt) gets its worktree on this first run.
+        // A writing session still in the project folder gets its worktree on
+        // this first run: a delegated child, or a standalone chat that
+        // `create_chat` made without a prompt (its base is on the row). A chat
+        // that already ran there is someone's pick to work in the main
+        // checkout, so it is left where it is.
+        let first_run = chat.last_message_at.is_none()
+            && chat.harness_session_id.is_none()
+            && baseline.is_none();
         let worktree = chat
-            .parent_chat_id
+            .config
             .as_ref()
-            .and_then(|_| chat.config.as_ref())
+            .filter(|_| chat.parent_chat_id.is_some() || first_run)
             .and_then(|config| {
                 isolation(
                     config.sandbox,
@@ -4589,11 +4599,62 @@ mod tests {
             .filter(|(_, params)| params["op"] == "createChat")
             .map(|(_, params)| params)
             .collect();
-        assert!(
-            created[0].get("branch").is_none(),
-            "the host stamps zeron/<name>"
-        );
+        // The base rides the row so a chat created without a prompt still
+        // knows it: the host stamps the real zeron/<name> over it.
+        assert_eq!(created[0]["branch"], "main");
         assert_eq!(created[1]["config"]["sandbox"], "read-only");
+    }
+
+    #[tokio::test]
+    async fn a_writer_created_without_a_prompt_gets_its_worktree_on_the_first_send() {
+        // A standalone chat `create_chat` made with no prompt is still in the
+        // project folder: its first send must start the worktree from the base
+        // the create named, not from HEAD and not in the main checkout.
+        let world = Arc::new(World {
+            extra_chats: vec![
+                json!({
+                    "id": "chat-writer-1", "deviceId": "dev-local", "title": "Writer",
+                    "archived": false, "spaceId": "space-1", "cwd": "/repo/comet",
+                    "branch": "release/2.0",
+                    "config": { "harness": "claude-code", "model": "opus", "reasoning": null, "sandbox": "workspace-write" },
+                    "createdAt": "2026-09-03T00:00:00Z"
+                }),
+                json!({
+                    "id": "chat-incheckout-2", "deviceId": "dev-local", "title": "In checkout",
+                    "archived": false, "spaceId": "space-1", "cwd": "/repo/comet",
+                    "branch": "main", "lastMessageAt": "2026-09-03T01:00:00Z",
+                    "config": { "harness": "claude-code", "model": "opus", "reasoning": null, "sandbox": "workspace-write" },
+                    "createdAt": "2026-09-03T00:00:00Z"
+                }),
+            ],
+            ..Default::default()
+        });
+        let tools = tools(world.clone(), Origin::default());
+        tools
+            .call(
+                "send_message",
+                json!({ "chat": "chat-writer-1", "text": "go" }),
+            )
+            .await
+            .unwrap();
+        tools
+            .call(
+                "send_message",
+                json!({ "chat": "chat-incheckout-2", "text": "go" }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        let runs: Vec<&Value> = writes
+            .iter()
+            .filter(|(method, _)| method == methods::QUEUE_COMMAND)
+            .map(|(_, params)| &params["command"]["request"])
+            .collect();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["worktree"]["repoPath"], "/repo/comet");
+        assert_eq!(runs[0]["worktree"]["base"], "release/2.0");
+        // A chat that already ran in the main checkout keeps running there.
+        assert!(runs[1].get("worktree").is_none());
     }
 
     #[test]
