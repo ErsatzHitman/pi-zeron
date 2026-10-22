@@ -403,6 +403,11 @@ impl HarnessesPage {
         }
         self.installing = None;
         self.install_task = None;
+        // A toggle or load aimed at the old device must not paint its reply
+        // onto the new device's rows; a switch is a different world.
+        self.pending_toggle = None;
+        self.toggle_task = None;
+        self.load_task = None;
         self.policy_selects.clear();
         self.target_device = target;
         if let Some(accounts) = &self.accounts_page {
@@ -587,6 +592,7 @@ impl HarnessesPage {
             "harness": harness,
             "enabled": enabled,
         }));
+        let target = self.target_device.clone();
         self.error = None;
         self.pending_toggle = Some((harness, enabled));
         cx.notify();
@@ -596,6 +602,9 @@ impl HarnessesPage {
                 .call(methods::SET_HARNESS_ENABLED, params)
                 .await;
             this.update(cx, |page, cx| {
+                if page.target_device != target {
+                    return;
+                }
                 if page.pending_toggle == Some((harness, enabled)) {
                     page.pending_toggle = None;
                 }
@@ -1382,6 +1391,93 @@ mod tests {
             .unwrap();
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
+    }
+
+    /// A device switch replaces the page's install world: a toggle aimed at the
+    /// device the user just left must not repaint the new device's rows.
+    #[gpui::test]
+    fn a_toggle_for_the_previous_device_never_lands(cx: &mut gpui::TestAppContext) {
+        use crate::pull_request_test_support::{self as fixture, ScriptedRpc};
+        use gpui::AppContext;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use zeron_rpc::methods;
+
+        fn descriptor(
+            id: zeron_proto::HarnessId,
+            name: &str,
+        ) -> zeron_engine::registry::HarnessDescriptor {
+            zeron_engine::registry::HarnessDescriptor {
+                id,
+                name: name.into(),
+                supports_steering: false,
+                steering_mode: zeron_proto::SteeringMode::TurnBoundary,
+                reasoning_levels: Vec::new(),
+                installed: true,
+                can_install: false,
+                enabled: Some(true),
+            }
+        }
+
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, Default::default());
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let rpc = ScriptedRpc::new({
+            let started = started.clone();
+            let release = release.clone();
+            move |method, _| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    match method.as_str() {
+                        methods::LIST_HARNESSES => {
+                            zeron_rpc::RpcReply::value(&vec![descriptor(
+                                zeron_proto::HarnessId::Pi,
+                                "Pi",
+                            )])
+                        }
+                        methods::SET_HARNESS_ENABLED => {
+                            started.store(true, Ordering::SeqCst);
+                            release.notified().await;
+                            zeron_rpc::RpcReply::value(&vec![descriptor(
+                                zeron_proto::HarnessId::Mock,
+                                "Mock",
+                            )])
+                        }
+                        other => panic!("unexpected RPC: {other}"),
+                    }
+                }
+            }
+        });
+        let state = cx.update(|cx| fixture::state(cx, Some(rpc.client())));
+        let page = cx.new(|cx| super::HarnessesPage::new(state, cx));
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| {
+                matches!(&page.harnesses, super::Loadable::Ready(list) if !list.is_empty())
+            })
+        });
+        page.update(cx, |page, cx| {
+            page.set_enabled(zeron_proto::HarnessId::Pi, false, cx)
+        });
+        rpc.settle(cx, &runtime, |_| started.load(Ordering::SeqCst));
+        page.update(cx, |page, cx| {
+            page.set_target_device(Some("other-device".into()), cx)
+        });
+        // The new device's list lands while the old device's toggle is still in
+        // flight; its reply must not land on top of it.
+        rpc.settle(cx, &runtime, |_| rpc.completed() >= 2);
+        release.notify_one();
+        rpc.settle(cx, &runtime, |_| rpc.completed() >= 3);
+        page.read_with(cx, |page, _| {
+            assert!(page.pending_toggle.is_none());
+            assert!(
+                matches!(&page.harnesses, super::Loadable::Ready(list)
+                    if list.iter().all(|d| d.id == zeron_proto::HarnessId::Pi)),
+                "the previous device's toggle reply must be dropped"
+            );
+        });
     }
 }
 
