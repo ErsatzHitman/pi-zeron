@@ -183,6 +183,30 @@ fn delete_guard_forced() -> bool {
     forced_by(std::env::var("ZERON_BLOCK_DELETES").ok().as_deref())
 }
 
+/// The contents of `harness-prefs.json`. A UTF-8 BOM (Notepad, PowerShell's
+/// `>` redirection) is not JSON to serde, so strip it first. A file that still
+/// does not parse is moved aside: keeping the bytes as evidence beats silently
+/// replacing a hand edit with defaults on the next save (the local-import
+/// marker's pattern).
+fn read_prefs(path: &Path) -> HarnessPrefsFile {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return HarnessPrefsFile::default();
+    };
+    let text = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    match serde_json::from_str(text) {
+        Ok(prefs) => prefs,
+        Err(err) => {
+            let aside = path.with_extension("json.corrupt");
+            tracing::warn!(error = %err, aside = %aside.display(),
+                "harness-prefs is not valid JSON; moving it aside");
+            if let Err(err) = std::fs::rename(path, &aside) {
+                tracing::warn!(error = %err, "harness-prefs aside failed");
+            }
+            HarnessPrefsFile::default()
+        }
+    }
+}
+
 impl HarnessRegistry {
     /// The saved setting plus a live check of what it resolves to. Probes
     /// `--version`, so call it off the async runtime.
@@ -528,13 +552,11 @@ impl HarnessRegistry {
     }
 
     /// Load `harness-prefs.json` from the engine data dir and remember the
-    /// path for writes. Corrupt/missing files fall back to the default set.
+    /// path for writes. A missing file falls back to the default set; a file
+    /// that does not parse is kept aside first (see [`read_prefs`]).
     pub fn load_prefs(&self, data_dir: &Path) {
         let path = data_dir.join("harness-prefs.json");
-        let loaded = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<HarnessPrefsFile>(&text).ok())
-            .unwrap_or_default();
+        let loaded = read_prefs(&path);
         *self.pi_executable.lock().unwrap_or_else(PoisonError::into_inner) =
             loaded.pi_executable.clone();
         *self.prefs() = loaded;
@@ -1290,6 +1312,36 @@ mod tests {
         let corrupt = HarnessRegistry::new();
         corrupt.load_prefs(dir.path());
         assert!(corrupt.block_deletes());
+    }
+
+    /// A hand-edited file is read, not silently replaced: a UTF-8 BOM loads
+    /// (Notepad, PowerShell `>`), and a file that still does not parse is
+    /// moved aside rather than clobbered by the next save.
+    #[test]
+    fn prefs_read_a_bom_and_keep_a_hand_edit_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("harness-prefs.json");
+        std::fs::write(&path, "\u{feff}{ \"memberIdleSecs\": 120 }").unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        assert_eq!(registry.capacity_prefs().member_idle_secs, Some(120));
+        // A save keeps the loaded value and writes no BOM back.
+        registry.set_block_deletes(true).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.starts_with('\u{feff}'), "{text}");
+        let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["memberIdleSecs"], 120);
+
+        // A genuinely broken file is kept as evidence, not overwritten.
+        std::fs::write(&path, "{ hand-edited").unwrap();
+        let broken = HarnessRegistry::new();
+        broken.load_prefs(dir.path());
+        assert_eq!(broken.capacity_prefs().member_idle_secs, None);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.corrupt")).unwrap(),
+            "{ hand-edited"
+        );
+        assert!(!path.exists());
     }
 
     #[test]
