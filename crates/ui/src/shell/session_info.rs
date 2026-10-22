@@ -79,6 +79,9 @@ pub(super) struct SessionPanel {
     /// A grouped run's phases the user opened or closed, by run and phase
     /// index; the rest follow their default (the phase in progress open).
     workflow_phase_open: std::collections::HashMap<(String, usize), bool>,
+    /// The run and phase in progress last revealed, so the panel scrolls to
+    /// the phase a run moves on to.
+    workflow_phase_seen: Option<(String, usize)>,
     /// Every checkout's working-tree totals (`WatchCheckoutDiffs`, patches
     /// dropped), and the device the watch follows.
     diffs: Vec<CheckoutDiff>,
@@ -329,6 +332,11 @@ impl Shell {
     pub(super) fn session_panel_armed_stop(&self) -> Option<String> {
         self.session_panel.armed_stop.clone()
     }
+
+    /// The card body's scroller, for tests that check it has room to scroll.
+    pub(super) fn session_panel_body_scroll(&self) -> gpui::ScrollHandle {
+        self.session_panel.body_scroll.clone()
+    }
 }
 
 impl SessionPanel {
@@ -357,23 +365,31 @@ impl SessionPanel {
     }
 }
 
-/// A row's small trailing text.
 /// The agents table's columns, right of the agent's name.
-const WORKFLOW_MODEL_COL: f32 = 70.0;
-const WORKFLOW_TOKENS_COL: f32 = 42.0;
-const WORKFLOW_TIME_COL: f32 = 40.0;
+/// `Model` is fixed and ellipsizes; `Tokens` and `Time` are minimums, so a
+/// value wider than its column widens the cell instead of being clipped.
+/// In default-size pixels; scaled with the UI font via `ui_rems` (as
+/// `COMPACT_JUMP_HINT_WIDTH` in `shell.rs` is).
+const WORKFLOW_MODEL_COL: f32 = 60.0; // was 70.0
+const WORKFLOW_TOKENS_COL: f32 = 46.0; // was 42.0 (fits `170.8k`, `999.9k`)
+const WORKFLOW_TIME_COL: f32 = 58.0; // was 40.0 (fits `21m 56s`, `100h 59m`)
+
+/// One trailing column of the agents table, shared by the header and the
+/// rows so they line up. A `fixed` column keeps its width and truncates its
+/// text (Model); the others take at least `width` and grow rather than clip
+/// a value (Tokens, Time).
+fn workflow_table_column(width: f32, fixed: bool) -> gpui::Div {
+    div()
+        .flex_none()
+        .when(fixed, |el| el.w(crate::typography::ui_rems(width)))
+        .when(!fixed, |el| el.min_w(crate::typography::ui_rems(width)))
+        .flex()
+        .flex_row()
+        .items_center()
+}
 
 /// The muted header over an open phase's agents.
 fn workflow_table_header(phase: usize, theme: &Theme) -> AnyElement {
-    let col = |width: f32, text: &'static str| {
-        div()
-            .w(px(width))
-            .flex_none()
-            .flex()
-            .flex_row()
-            .justify_end()
-            .child(text)
-    };
     div()
         .debug_selector(move || format!("session-info-workflow-phase-{phase}-table"))
         .flex()
@@ -386,9 +402,21 @@ fn workflow_table_header(phase: usize, theme: &Theme) -> AnyElement {
         .text_color(theme.text_muted.opacity(0.7))
         .child(div().w(px(14.0)).flex_none())
         .child(div().flex_1().child("Agent"))
-        .child(col(WORKFLOW_MODEL_COL, "Model").justify_start())
-        .child(col(WORKFLOW_TOKENS_COL, "Tokens"))
-        .child(col(WORKFLOW_TIME_COL, "Time"))
+        .child(
+            workflow_table_column(WORKFLOW_MODEL_COL, true)
+                .justify_start()
+                .child("Model"),
+        )
+        .child(
+            workflow_table_column(WORKFLOW_TOKENS_COL, false)
+                .justify_end()
+                .child("Tokens"),
+        )
+        .child(
+            workflow_table_column(WORKFLOW_TIME_COL, false)
+                .justify_end()
+                .child("Time"),
+        )
         .into_any_element()
 }
 
@@ -409,8 +437,6 @@ fn workflow_more_row(key: impl Into<String>, hidden: usize, theme: &Theme) -> Op
     })
 }
 
-/// Agent rows a phase's table shows before it scrolls.
-const PHASE_TABLE_ROWS: usize = 10;
 /// One agent row of a workflow phase's table.
 const WORKFLOW_AGENT_ROW_HEIGHT: f32 = 24.0;
 
@@ -1012,6 +1038,9 @@ impl Shell {
                 .of(&chat.id)
                 .and_then(|ui| WorkflowView::of(ui, now))
         };
+        // The phase a run has moved on to, revealed by scrolling the card to
+        // it (see `follow_until` below).
+        let mut reveal_phase: Option<(String, usize)> = None;
         if let Some(view) = workflow {
             // An idle chat repaints once a minute: wake for the moment a
             // finished run clears, so it goes within five seconds.
@@ -1022,6 +1051,25 @@ impl Shell {
                     |shell: &mut Self| &mut shell.clock,
                     cx,
                 );
+            }
+            // The phase in progress, unless the user folded it (or the whole
+            // section): its table is the part of a run worth seeing.
+            if !self.session_panel.folded.contains(WORKFLOW)
+                && let Some(index) = view
+                    .phases
+                    .iter()
+                    .position(|phase| phase.state == workflow::PhaseState::Active)
+            {
+                let key = (view.run_id.clone(), index);
+                let open = self
+                    .session_panel
+                    .workflow_phase_open
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_else(|| view.phases[index].opens_by_default());
+                if open {
+                    reveal_phase = Some(key);
+                }
             }
             active.push((
                 SectionKey::Workflow,
@@ -1061,6 +1109,16 @@ impl Shell {
         }
         if pulse.entered {
             self.session_panel.follow_until = Some(frame_time + crate::motion::PANEL_ENTER.total());
+        }
+        // A run that moves on to its next phase brings that phase's table
+        // into view over the same window as a newcomer section.
+        if self.session_panel.workflow_phase_seen != reveal_phase {
+            self.session_panel.workflow_phase_seen = reveal_phase;
+            if self.session_panel.workflow_phase_seen.is_some() {
+                self.session_panel.follow_until =
+                    Some(frame_time + crate::motion::PANEL_ENTER.total());
+                self.motion_active.set(true);
+            }
         }
         self.session_panel.arrivals.begin(&chat.id);
         let entries = self.session_panel.sections.take();
@@ -1115,7 +1173,9 @@ impl Shell {
                 // The body's gap already spaces the column and each section
                 // carries its own top gap, so cancel one. The column bleeds
                 // through the body's inset so dividers still reach the
-                // card's edges.
+                // card's edges. The body's own height cap is what scrolls it:
+                // an open phase's whole table is drawn into this column, so
+                // the panel scrolls rather than clipping a nested list.
                 body.child(
                     div()
                         .flex()
@@ -2889,28 +2949,13 @@ impl Shell {
                 continue;
             }
             rows.push(workflow_table_header(phase.index, theme));
-            // Every agent of the phase, in a box that scrolls past
-            // `PHASE_TABLE_ROWS` rows instead of hiding the rest.
-            let agents: Vec<AnyElement> = phase
-                .rows
-                .iter()
-                .map(|row| {
-                    let element = self.render_workflow_agent(row, theme, cx);
-                    self.arriving(WORKFLOW, &row.id, element)
-                })
-                .collect();
-            let scroll_id = format!("session-info-workflow-phase-{}-rows", phase.index);
-            rows.push(
-                div()
-                    .id(SharedString::from(scroll_id.clone()))
-                    .debug_selector(move || scroll_id.clone())
-                    .max_h(px(WORKFLOW_AGENT_ROW_HEIGHT * PHASE_TABLE_ROWS as f32))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .children(agents)
-                    .into_any_element(),
-            );
+            // Every agent of the phase, straight into the section's rows: the
+            // card's body is the scroller, so a long phase is read by
+            // scrolling the panel rather than a nested list.
+            for row in &phase.rows {
+                let element = self.render_workflow_agent(row, theme, cx);
+                rows.push(self.arriving(WORKFLOW, &row.id, element));
+            }
             // Rows the payload itself left out; Pi sends every row it can.
             let hidden = phase.hidden as usize;
             if hidden > 0 {
@@ -3097,17 +3142,12 @@ impl Shell {
                 _ => None,
             }
         };
-        let cell = |width: f32| {
-            div()
-                .w(px(width))
-                .flex_none()
-                .flex()
-                .flex_row()
-                .justify_end()
-                .overflow_hidden()
-                .text_size(crate::typography::ui_rems(11.0))
-                .text_color(muted)
-        };
+        let model_id = format!("{id}-model");
+        let model_text_id = format!("{id}-model-text");
+        let tokens_id = format!("{id}-tokens");
+        let tokens_text_id = format!("{id}-tokens-text");
+        let time_id = format!("{id}-time");
+        let time_text_id = format!("{id}-time-text");
         let mut element = div()
             .id(id.clone())
             .debug_selector({
@@ -3133,15 +3173,70 @@ impl Shell {
                     .child(glyph),
             )
             .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+            // Model: fixed and ellipsized, so a long id never pushes the
+            // values right of it off the card.
             .child(
-                cell(WORKFLOW_MODEL_COL).justify_start().child(
-                    div()
-                        .truncate()
-                        .children(row.model.as_deref().map(workflow::short_model)),
-                ),
+                workflow_table_column(WORKFLOW_MODEL_COL, true)
+                    .debug_selector({
+                        let id = model_id.clone();
+                        move || id.clone()
+                    })
+                    .justify_start()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(muted)
+                    .child(
+                        div()
+                            .debug_selector({
+                                let id = model_text_id.clone();
+                                move || id.clone()
+                            })
+                            .min_w_0()
+                            .truncate()
+                            .children(row.model.as_deref().map(workflow::short_model)),
+                    ),
             )
-            .child(cell(WORKFLOW_TOKENS_COL).children(row.tokens.map(workflow::compact_tokens)))
-            .child(cell(WORKFLOW_TIME_COL).children(time));
+            // Tokens and Time keep their whole value: their column is a
+            // minimum that grows with it.
+            .child(
+                workflow_table_column(WORKFLOW_TOKENS_COL, false)
+                    .debug_selector({
+                        let id = tokens_id.clone();
+                        move || id.clone()
+                    })
+                    .justify_end()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(muted)
+                    .child(
+                        div()
+                            .flex_none()
+                            .debug_selector({
+                                let id = tokens_text_id.clone();
+                                move || id.clone()
+                            })
+                            .children(row.tokens.map(workflow::compact_tokens)),
+                    ),
+            )
+            .child(
+                workflow_table_column(WORKFLOW_TIME_COL, false)
+                    .debug_selector({
+                        let id = time_id.clone();
+                        move || id.clone()
+                    })
+                    .justify_end()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(muted)
+                    .child(
+                        div()
+                            .flex_none()
+                            .debug_selector({
+                                let id = time_text_id.clone();
+                                move || id.clone()
+                            })
+                            .children(time),
+                    ),
+            );
         if let Some(detail) = row.detail.clone() {
             element = element.tooltip(crate::settings::widgets::text_tooltip(detail));
         }

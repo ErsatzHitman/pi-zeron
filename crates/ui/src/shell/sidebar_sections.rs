@@ -983,32 +983,51 @@ mod tests {
         assert!(cx.debug_bounds("session-info-context-header").is_some());
     }
 
-    /// A frame of Pi's v2 replay fixture, its clock moved to now.
-    fn dynamic_frame(index: usize) -> serde_json::Value {
-        fn shift(value: &mut serde_json::Value, by: i64) {
-            match value {
-                serde_json::Value::Object(map) => {
-                    for (key, field) in map.iter_mut() {
-                        if (key.ends_with("At") || key == "at")
-                            && let Some(ms) = field.as_i64()
-                        {
-                            *field = serde_json::json!(ms + by);
-                        } else {
-                            shift(field, by);
-                        }
+    /// Move every timestamp in `value` by `by` milliseconds.
+    fn shift_timestamps(value: &mut serde_json::Value, by: i64) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, field) in map.iter_mut() {
+                    if (key.ends_with("At") || key == "at")
+                        && let Some(ms) = field.as_i64()
+                    {
+                        *field = serde_json::json!(ms + by);
+                    } else {
+                        shift_timestamps(field, by);
                     }
                 }
-                serde_json::Value::Array(items) => items.iter_mut().for_each(|v| shift(v, by)),
-                _ => {}
             }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| shift_timestamps(v, by)),
+            _ => {}
         }
+    }
+
+    /// Move a fixture payload's clock to now, as a live run's would be.
+    fn to_now(frame: &mut serde_json::Value) {
+        let by = chrono::Utc::now().timestamp_millis() - frame["updatedAt"].as_i64().unwrap();
+        shift_timestamps(frame, by);
+    }
+
+    /// A frame of Pi's v2 replay fixture, its clock moved to now.
+    fn dynamic_frame(index: usize) -> serde_json::Value {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/workflow-dynamic-run.json"
         ))
         .unwrap();
         let mut frame = fixture["run"][index].clone();
-        let by = chrono::Utc::now().timestamp_millis() - frame["updatedAt"].as_i64().unwrap();
-        shift(&mut frame, by);
+        to_now(&mut frame);
+        frame
+    }
+
+    /// A v2 run whose phase in progress has twelve agents, its clock moved to
+    /// now: the case a phase table has to list in full and the card has to
+    /// scroll to reach.
+    fn many_agents_frame() -> serde_json::Value {
+        let mut frame: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/workflow-phase-many-agents.json"
+        ))
+        .unwrap();
+        to_now(&mut frame);
         frame
     }
 
@@ -1047,20 +1066,29 @@ mod tests {
             "session-info-workflow-task-6",
             "session-info-workflow-task-7",
             "session-info-workflow-task-pending-2-0",
+            "session-info-workflow-task-6-time",
+            "session-info-workflow-task-6-tokens",
+            "session-info-workflow-task-6-model",
             "session-info-workflow-phase-3",
         ] {
             let bounds = cx.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
             assert!(card.contains(&bounds.center()), "{id}");
         }
         // Time and tokens sit in the header beside `done/total`, not on lines
-        // of their own; an open phase's agents are in a scroll box.
+        // of their own. The phase in progress is open, and every one of its
+        // agents is drawn: the table is the card's own list, with no box of
+        // its own to scroll.
         let header = cx.debug_bounds("session-info-workflow-header").unwrap();
         let totals = cx.debug_bounds("session-info-workflow-totals").unwrap();
         assert!(header.contains(&totals.center()), "time and tokens left the header");
-        assert!(
-            cx.debug_bounds("session-info-workflow-phase-2-rows")
-                .is_some()
-        );
+        for id in [
+            "session-info-workflow-phase-2-table",
+            "session-info-workflow-task-6",
+            "session-info-workflow-task-7",
+            "session-info-workflow-task-pending-2-0",
+        ] {
+            assert!(cx.debug_bounds(id).is_some(), "{id}");
+        }
         assert!(cx.debug_bounds("session-info-workflow-controls").is_some());
         // The v1 layout is not drawn for a grouped run.
         assert!(cx.debug_bounds("session-info-workflow-progress").is_none());
@@ -1101,6 +1129,275 @@ mod tests {
             "a finished run has no Pause or Stop to give a line to"
         );
         assert!(cx.debug_bounds("session-info-workflow-phase-4").is_some());
+    }
+
+    /// `debug_bounds` for a selector built at runtime (the process is short
+    /// enough for the leaked string).
+    fn bounds_of(
+        cx: &mut gpui::VisualTestContext,
+        selector: &str,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        cx.debug_bounds(Box::leak(selector.to_owned().into_boxed_str()))
+    }
+
+    /// A table row's values are drawn whole: Time and Tokens show inside their
+    /// column without being cut, the Model ellipsizes inside its fixed column,
+    /// and every cell stays on the card.
+    fn assert_row_values_fit(
+        cx: &mut gpui::VisualTestContext,
+        card: gpui::Bounds<gpui::Pixels>,
+        id: &str,
+    ) {
+        for column in ["time", "tokens", "model"] {
+            let cell_id = format!("{id}-{column}");
+            let cell = bounds_of(cx, &cell_id).unwrap_or_else(|| panic!("{cell_id}"));
+            assert!(
+                card.contains(&cell.center()),
+                "{cell_id} left the card: {cell:?} in {card:?}",
+            );
+            assert!(
+                cell.right() <= card.right(),
+                "{cell_id} runs past the card: {cell:?} in {card:?}",
+            );
+            let Some(text) = bounds_of(cx, &format!("{id}-{column}-text")) else {
+                continue;
+            };
+            assert!(
+                text.size.width <= cell.size.width,
+                "{cell_id} cuts its value: {text:?} in {cell:?}",
+            );
+            assert!(
+                text.left() >= cell.left() - px(0.5) && text.right() <= cell.right() + px(0.5),
+                "{cell_id} draws its value outside the cell: {text:?} in {cell:?}",
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn an_open_phase_lists_every_agent_and_the_card_scrolls(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                prepare(shell, cx);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                shell.settings.sidebar_collapsed = true;
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("regular".into()));
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        // Short enough that a phase of twelve agents cannot fit the card.
+        cx.simulate_resize(gpui::size(px(1200.0), px(700.0)));
+        cx.run_until_parked();
+
+        // A run whose phase in progress has twelve agents. It opens on its own
+        // and every one of its rows is drawn into the card's list.
+        set_workflow_state(&window, &mut cx, many_agents_frame());
+        let agents: Vec<String> = (0..12)
+            .map(|n| format!("session-info-workflow-task-{n}"))
+            .collect();
+        for id in &agents {
+            assert!(bounds_of(&mut cx, id).is_some(), "{id} is not drawn");
+        }
+
+        // The card's body is the one scroller, and it has room to scroll.
+        let body = window
+            .update(&mut cx, |shell, _, _| shell.session_panel_body_scroll())
+            .unwrap();
+        assert!(
+            body.max_offset().y > px(0.0),
+            "the panel must scroll a long phase, its range is {:?}",
+            body.max_offset(),
+        );
+        // End the window an entering section holds the body at its bottom in,
+        // so the offset this test sets is the one painted.
+        window
+            .update(&mut cx, |shell, _, cx| {
+                shell.test_time =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        body.set_offset(gpui::point(px(0.0), px(0.0)));
+        window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+        let card = cx.debug_bounds("session-info").unwrap();
+        // The agent its rows sort last (`9`) is past the card's edge until the
+        // panel is scrolled.
+        let last = bounds_of(&mut cx, "session-info-workflow-task-9").unwrap();
+        assert!(
+            !card.contains(&last.center()),
+            "a long phase needs the card scrolled: {last:?} is already on {card:?}",
+        );
+
+        // Scrolled to its table, the whole phase is on the card at once: the
+        // header and all twelve rows, not the five that used to fit.
+        let header = cx
+            .debug_bounds("session-info-workflow-phase-1-table")
+            .unwrap();
+        let shift = header.top() - card.top();
+        let offset = body.offset().y;
+        body.set_offset(gpui::point(px(0.0), offset - shift));
+        window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+        let card = cx.debug_bounds("session-info").unwrap();
+        let header = cx
+            .debug_bounds("session-info-workflow-phase-1-table")
+            .unwrap();
+        assert!(
+            card.contains(&header.center()),
+            "the table's header after scrolling: {header:?} in {card:?}",
+        );
+        for id in &agents {
+            let bounds = bounds_of(&mut cx, id).unwrap();
+            assert!(
+                card.contains(&bounds.center()),
+                "{id} is off the card after scrolling: {bounds:?} in {card:?}",
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_workflow_agents_table_never_clips_its_time(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                prepare(shell, cx);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                shell.settings.sidebar_collapsed = true;
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("regular".into()));
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1600.0), px(1400.0)));
+        cx.run_until_parked();
+
+        // `100h 59m`, `999.9k`, a model id longer than its column and two
+        // live timers: every value the table shows, wider than the old 40px
+        // Time column.
+        let rows: Vec<String> = (0..12)
+            .map(|n| format!("session-info-workflow-task-{n}"))
+            .collect();
+        set_workflow_state(&window, &mut cx, many_agents_frame());
+        let card = cx.debug_bounds("session-info").unwrap();
+        for id in &rows {
+            assert_row_values_fit(&mut cx, card, id);
+        }
+        for id in [
+            "session-info-workflow-task-t0",
+            "session-info-workflow-task-t1",
+        ] {
+            // The finished phase above is folded until it is opened.
+            assert!(bounds_of(&mut cx, id).is_none(), "{id}");
+        }
+        click_on(&mut cx, "session-info-workflow-phase-0");
+        let card = cx.debug_bounds("session-info").unwrap();
+        for id in [
+            "session-info-workflow-task-t0",
+            "session-info-workflow-task-t1",
+        ] {
+            assert_row_values_fit(&mut cx, card, id);
+        }
+
+        // A row the payload left empty is drawn with empty columns, which
+        // nothing can clip.
+        set_workflow_state(&window, &mut cx, dynamic_frame(15));
+        let card = cx.debug_bounds("session-info").unwrap();
+        for id in [
+            "session-info-workflow-task-6",
+            "session-info-workflow-task-7",
+            "session-info-workflow-task-pending-2-0",
+        ] {
+            assert_row_values_fit(&mut cx, card, id);
+        }
+
+        // The columns scale with the UI font instead of staying at the widths
+        // a 16px interface needs.
+        set_workflow_state(&window, &mut cx, many_agents_frame());
+        window
+            .update(&mut cx, |_, window, cx| {
+                crate::typography::set_font_size(crate::typography::UiFontSize::ALL[6], window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let card = cx.debug_bounds("session-info").unwrap();
+        for id in &rows {
+            assert_row_values_fit(&mut cx, card, id);
+        }
+    }
+
+    #[gpui::test]
+    fn the_panel_scrolls_to_the_phase_a_run_moves_on_to(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let window = test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                prepare(shell, cx);
+                shell.debug_gate = Some(super::GatePhase::Ready);
+                shell.settings.sidebar_collapsed = true;
+                shell
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("regular".into()));
+                crate::motion::set_reduced_motion(cx, true);
+            })
+            .unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.simulate_resize(gpui::size(px(1200.0), px(700.0)));
+        cx.run_until_parked();
+
+        // The first Verify round runs with the panel at its top.
+        set_workflow_state(&window, &mut cx, dynamic_frame(15));
+        window
+            .update(&mut cx, |shell, _, cx| {
+                shell.test_time =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let body = window
+            .update(&mut cx, |shell, _, _| shell.session_panel_body_scroll())
+            .unwrap();
+        body.set_offset(gpui::point(px(0.0), px(0.0)));
+        window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(body.offset().y, px(0.0), "the card starts at its top");
+        assert!(
+            bounds_of(&mut cx, "session-info-workflow-task-9").is_none(),
+            "the next round's agents are not in this frame",
+        );
+
+        // The run moves on to its next Verify round: the panel scrolls to the
+        // phase in progress, so its table is read without hunting for it.
+        set_workflow_state(&window, &mut cx, dynamic_frame(19));
+        let body = window
+            .update(&mut cx, |shell, _, _| shell.session_panel_body_scroll())
+            .unwrap();
+        assert!(
+            body.offset().y < px(0.0),
+            "the panel scrolled to the new phase: {}",
+            body.offset().y
+        );
+        let card = cx.debug_bounds("session-info").unwrap();
+        for id in [
+            "session-info-workflow-phase-3",
+            "session-info-workflow-task-9",
+            "session-info-workflow-task-10",
+        ] {
+            let bounds = cx.debug_bounds(id).unwrap_or_else(|| panic!("{id}"));
+            assert!(
+                card.contains(&bounds.center()),
+                "{id} is out of view after the reveal: {bounds:?} in {card:?}",
+            );
+        }
     }
 
     #[gpui::test]
