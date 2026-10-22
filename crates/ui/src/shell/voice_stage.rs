@@ -74,6 +74,10 @@ impl Shell {
     /// another thread or to Settings steps the stage aside; voice continues.
     pub(super) fn sync_voice_stage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.state.read(cx).selected_chat.clone();
+        // The chat voice is following, if any. A spoken prompt from the
+        // new-session canvas mints and selects a chat: that selection is
+        // voice's own move, not the user opening another thread.
+        let followed = self.voice.read(cx).agent_chat.clone();
         let navigating_to_settings =
             self.route != self.voice_stage_route && matches!(self.route, Route::Settings(_));
         // Record every render, even with no visibility change: leaving and
@@ -83,7 +87,12 @@ impl Shell {
             && self.voice_stage_was_open
             && (navigating_to_settings || selected != self.voice_stage_selection)
         {
-            self.set_voice_stage_open(false, cx);
+            if !navigating_to_settings && selected.is_some() && selected == followed {
+                // Stay up over the chat voice just started following.
+                self.voice_stage_selection = selected.clone();
+            } else {
+                self.set_voice_stage_open(false, cx);
+            }
         }
         let open = self.voice.read(cx).stage_open;
         if open == self.voice_stage_was_open {
@@ -1087,6 +1096,93 @@ mod tests {
         let orb = cx.debug_bounds("voice-composer-orb").unwrap();
         cx.simulate_click(orb.center(), gpui::Modifiers::default());
         shell.read_with(cx, |shell, cx| assert!(shell.voice.read(cx).stage_open));
+    }
+
+    /// A spoken prompt from the new-session canvas selects the chat it
+    /// mints; that is voice's own move, so the stage stays up. Opening any
+    /// other thread still steps it aside.
+    #[gpui::test]
+    fn a_spoken_prompt_keeps_the_stage_up_over_the_chat_it_minted(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct StageHost(Entity<Shell>);
+        impl Render for StageHost {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.0.update(cx, |shell, cx| {
+                    shell.sync_voice_stage(window, cx);
+                    div()
+                        .size_full()
+                        .children(shell.render_voice_stage(window, cx))
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            StageHost(cx.new(|cx| {
+                let state = cx.new(|_| AppState::new());
+                let mut shell = Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: HarnessId::Mock,
+                    },
+                    cx,
+                );
+                shell.reduced_motion = true;
+                // The new-session canvas: no chat selected yet.
+                shell.voice.update(cx, |voice, cx| {
+                    voice.phase = VoicePhase::Active;
+                    voice.set_stage_open(true, cx);
+                });
+                shell
+            }))
+        });
+        let shell = host.read_with(cx, |host, _| host.0.clone());
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| assert!(shell.voice.read(cx).stage_open));
+
+        // The first spoken prompt mints a chat, selects it, and voice follows
+        // it (`send_prompt` → `follow`).
+        shell.update(cx, |shell, cx| {
+            shell
+                .state
+                .update(cx, |state, _| state.selected_chat = Some("fresh".into()));
+            shell
+                .voice
+                .update(cx, |voice, _| voice.agent_chat = Some("fresh".into()));
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            assert!(shell.voice.read(cx).stage_open, "the call stays on stage");
+            assert_eq!(
+                shell.state.read(cx).selected_chat.as_deref(),
+                Some("fresh")
+            );
+        });
+
+        // Opening another thread is still navigation.
+        shell.update(cx, |shell, cx| {
+            shell
+                .state
+                .update(cx, |state, _| state.selected_chat = Some("other".into()));
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            assert!(!shell.voice.read(cx).stage_open);
+            assert!(shell.voice.read(cx).is_live(), "the call keeps running");
+        });
     }
 
     #[test]
