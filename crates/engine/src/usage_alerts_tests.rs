@@ -113,8 +113,10 @@ fn configurable_threshold() {
 fn unknown_never_alerts() {
     let mut none = account("anthropic", &[]);
     none.usage_error = Some("Rate limited".into());
-    let mut key: AgentAccount = account("openai-codex", &[("5h", 1.0, Some(60))]);
+    // An API key with no quota view: nothing to read, nothing to alert.
+    let mut key: AgentAccount = account("openrouter", &[]);
     key.auth_kind = Some(AgentAuthKind::ApiKey);
+    key.usage_error = Some("API keys have no plan usage".into());
     let mut inactive = account("github-copilot", &[("month", 1.0, Some(60))]);
     inactive.active = false;
     let eval = evaluate(&snap(vec![none, key, inactive]), now(), 10.0);
@@ -122,10 +124,82 @@ fn unknown_never_alerts() {
     assert_eq!(
         eval.coverage.len(),
         1,
-        "API keys and inactive slots are not coverage"
+        "an API key with no windows and an inactive slot are not coverage"
     );
     assert_eq!(eval.coverage[0].status, "unknown");
     assert_eq!(eval.coverage[0].reason.as_deref(), Some("Rate limited"));
+}
+
+/// A key that reports windows (OpenCode Go) is a subscription: it is coverage,
+/// it can alert, and the alert names its provider so only that provider's
+/// sessions are affected.
+#[test]
+fn an_opencode_go_key_with_windows_is_coverage_and_can_alert() {
+    let mut go = account("opencode-go", &[("5h", 0.96, Some(45))]);
+    go.auth_kind = Some(AgentAuthKind::ApiKey);
+    go.plan_label = Some("OpenCode Go".into());
+    let eval = evaluate(&snap(vec![go]), now(), 10.0);
+    assert_eq!(eval.coverage.len(), 1, "a quota-bearing key is coverage");
+    assert_eq!(eval.coverage[0].status, "low");
+    assert_eq!(eval.coverage[0].provider.as_deref(), Some("opencode-go"));
+    assert_eq!(eval.alerts.len(), 1);
+    let alert = &eval.alerts[0];
+    assert_eq!(alert.provider.as_deref(), Some("opencode-go"));
+    assert_eq!(alert.window, "5h");
+    assert_eq!(alert.plan.as_deref(), Some("OpenCode Go"));
+    assert!((alert.remaining_pct - 4.0).abs() < 0.01);
+    assert!(alert.key.starts_with("pi:opencode-go:slot-opencode-go:5h:"));
+    // Only sessions on that provider are affected; another one stays usable.
+    assert!(affects(
+        alert,
+        HarnessId::Pi,
+        Some("opencode-go/deepseek-v4.1-flash"),
+        None
+    ));
+    assert!(!affects(
+        alert,
+        HarnessId::Pi,
+        Some("anthropic/claude-opus-5-5"),
+        None
+    ));
+}
+
+#[test]
+fn an_api_key_without_windows_stays_unknown_and_never_alerts() {
+    let mut key: AgentAccount = account("openrouter", &[]);
+    key.auth_kind = Some(AgentAuthKind::ApiKey);
+    let eval = evaluate(&snap(vec![key]), now(), 10.0);
+    assert!(eval.alerts.is_empty(), "no windows, nothing to alert");
+    assert!(
+        eval.coverage.is_empty(),
+        "a key with no quota view is not a subscription to list as coverage"
+    );
+}
+
+#[test]
+fn an_inactive_opencode_go_key_never_alerts() {
+    let mut go = account("opencode-go", &[("5h", 0.99, Some(45))]);
+    go.auth_kind = Some(AgentAuthKind::ApiKey);
+    go.active = false;
+    let eval = evaluate(&snap(vec![go]), now(), 10.0);
+    assert!(
+        eval.alerts.is_empty(),
+        "a saved, unused key dispatches nothing"
+    );
+    assert!(eval.coverage.is_empty());
+}
+
+#[test]
+fn a_past_due_opencode_go_window_does_not_alert() {
+    let mut go = account(
+        "opencode-go",
+        &[("5h", 0.99, Some(-5)), ("mo", 0.3, Some(9000))],
+    );
+    go.auth_kind = Some(AgentAuthKind::ApiKey);
+    let eval = evaluate(&snap(vec![go]), now(), 10.0);
+    assert!(eval.alerts.is_empty(), "the old window's numbers are over");
+    assert_eq!(eval.coverage.len(), 1);
+    assert_eq!(eval.coverage[0].status, "ok");
 }
 
 #[test]
@@ -545,7 +619,11 @@ fn snapshot_file_has_no_secrets_and_names_unsupported_logins() {
     .unwrap();
     let mut unsupported = unsupported_pi_oauth(&auth);
     unsupported.sort();
-    assert_eq!(unsupported, vec!["pi:clinepass", "pi:openai"]);
+    assert_eq!(
+        unsupported,
+        vec!["pi:openai"],
+        "every provider the engine probes is supported, Cline included"
+    );
     let eval = evaluate(
         &snap(vec![account("anthropic", &[("5h", 0.95, Some(60))])]),
         now(),

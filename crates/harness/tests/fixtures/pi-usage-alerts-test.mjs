@@ -1,7 +1,8 @@
 // Subscription usage alerts, guard side: the engine's `usage-alerts.json` is
 // found (env, data dir, default), trusted only while fresh, and every Pi on a
 // low account is told once and kept from starting new work, while other
-// accounts stay usable. Run against the production `guard.mjs` (argv[2]) and
+// accounts stay usable. A quota-bearing API key (OpenCode Go) is one of those
+// accounts. Run against the production `guard.mjs` (argv[2]) and
 // `guard-preload.mjs` (argv[3]).
 import assert from 'node:assert/strict';
 import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
@@ -27,7 +28,7 @@ let generation = 0;
 const write = (alerts, {updatedAt = NOW, validForSecs = 900, version = 1} = {}) => {
   // A distinct size per write: the reader caches by mtime + size.
   writeFileSync(file, JSON.stringify({version, updatedAt: new Date(updatedAt).toISOString(), validForSecs,
-    thresholdPct: 10, alerts, coverage: [], unsupported: ['pi:openai', 'pi:clinepass'], pad: 'x'.repeat(++generation)}));
+    thresholdPct: 10, alerts, coverage: [], unsupported: ['pi:openai'], pad: 'x'.repeat(++generation)}));
 };
 
 // ── discovery: env, then the data dir, then ~/.zeron (standalone or env-less Pis)
@@ -75,6 +76,29 @@ assert.match(usageBlock({toolName: 'subagent_start', input: {tasks: [{task: 't',
 assert.equal(usageBlock({toolName: 'bash', input: {command: 'ls'}}, low, opus), undefined, 'the current step can finish');
 assert.equal(usageBlock({toolName: 'edit', input: {}}, low, opus), undefined);
 assert.equal(usageBlock({toolName: 'subagent_start', input: {}}, [], opus), undefined, 'no alert, no block');
+
+// ── a quota-bearing API key (OpenCode Go) is a subscription like any other:
+// the engine alerts on it by provider, so the same block matrix applies.
+const goLow = [alert('opencode-go')];
+assert.equal(providerOf('opencode-go/deepseek-v4.1-flash'), 'opencode-go');
+assert.equal(alertsOn(goLow, 'opencode-go').length, 1);
+assert.equal(alertsOn(goLow, 'anthropic').length, 0);
+assert.match(
+  usageBlock({toolName: 'subagent_start', input: {model: 'opencode-go/deepseek-v4.1-flash'}}, goLow, flash),
+  /Start no new work\. Finish the step you are on, write your handoff and end your turn\./,
+  'a low OpenCode Go key blocks new work on that key');
+assert.match(usageBlock({toolName: 'subagent_start', input: {}}, goLow, flash), /Blocked subagent_start/,
+  'a session already on the low key starts nothing new');
+assert.equal(
+  usageBlock({toolName: 'subagent_start', input: {model: 'anthropic/claude-opus-5-5'}}, goLow, opus),
+  undefined, 'another account stays usable while an OpenCode Go key is low');
+assert.match(
+  usageBlock({toolName: 'subagent_start', input: {model: 'opencode-go/deepseek-v4.1-flash'}}, goLow, opus),
+  /opencode-go\/deepseek-v4\.1-flash runs on a subscription that is almost used up/,
+  'a session on another account is kept from dispatching onto the low key');
+assert.equal(usageBlock({toolName: 'bash', input: {command: 'ls'}}, goLow, flash), undefined,
+  'the current step can finish');
+assert.match(usageNote(goLow, {now: NOW}), /usage-opencode-go-20261018T0000Z\.md/);
 
 // ── notes: finish safely, handoff, end; helpers answer briefly
 const note = usageNote(low, {now: NOW});
