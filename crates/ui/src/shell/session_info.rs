@@ -38,7 +38,9 @@ use sections::{ActiveSections, Entry, RowArrivals, SectionKey, stack_height};
 use todos::TodoList;
 use workflow::{RunPhase, TaskRow, WorkflowView};
 use zeron_proto::TodoItem;
-use zeron_proto::extension_ui::{CompactStatus, WorkflowAction, WorkflowState, WorkflowTaskState};
+use zeron_proto::extension_ui::{
+    CachedCompactionState, CompactStatus, WorkflowAction, WorkflowState, WorkflowTaskState,
+};
 
 /// The card's width, its inset from the column's right edge, and the
 /// least gap the reading column keeps from it.
@@ -62,6 +64,9 @@ const BOARD_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 /// The Compaction section's body: the bar line, a gap, the caption line and
 /// its bottom padding.
 const COMPACT_BODY_HEIGHT: f32 = 40.0;
+/// One cost line under the bar (its height plus the body's gap), when the
+/// cached-compaction channel reports a last compaction.
+const COMPACT_COST_LINE_HEIGHT: f32 = 19.0;
 
 /// The panel's own state, held on the shell across chats.
 #[derive(Default)]
@@ -1033,10 +1038,12 @@ impl Shell {
                 SectionData::Background(background),
             ));
         }
-        let (compact, usage) = {
+        let (compact, cached, usage) = {
             let state = self.state.read(cx);
+            let ui = state.extension_ui.of(&chat.id);
             (
-                state.extension_ui.of(&chat.id).and_then(CompactStatus::of),
+                ui.and_then(CompactStatus::of),
+                ui.and_then(CachedCompactionState::of),
                 state.context_usage,
             )
         };
@@ -1069,7 +1076,7 @@ impl Shell {
             self.render_context(&view, status == ChatIndicator::Working, now, &theme, cx)
         });
         let shown = matches!(&self.session_panel.compact_shown, (id, true) if *id == chat.id);
-        let meter = CompactMeter::of(compact.as_ref(), usage, shown);
+        let meter = CompactMeter::of(compact.as_ref(), usage, shown, cached.as_ref());
         self.session_panel.compact_shown = (chat.id.clone(), meter.is_some());
         if let Some(meter) = meter {
             active.push((
@@ -1417,7 +1424,14 @@ impl Shell {
             ),
             SectionData::Compact(meter) => (
                 self.render_compact(meter, theme, cx),
-                stack_height(0) + popover::MENU_GAP + COMPACT_BODY_HEIGHT,
+                stack_height(0)
+                    + popover::MENU_GAP
+                    + COMPACT_BODY_HEIGHT
+                    + if meter.cost.is_some() {
+                        2.0 * COMPACT_COST_LINE_HEIGHT
+                    } else {
+                        0.0
+                    },
             ),
             SectionData::Workflow(view) => {
                 let rows = view.estimated_rows(
@@ -3542,8 +3556,11 @@ impl Shell {
     ) -> Vec<AnyElement> {
         let compacting = meter.compacting();
         let fraction = meter.fraction();
+        let compacted = matches!(meter.phase, Phase::Compacted);
         let (pill, tone) = if compacting {
             ("Compacting", theme.accent)
+        } else if compacted {
+            ("Compacted", theme.success)
         } else if meter.error.is_some() {
             ("Failed", theme.danger)
         } else {
@@ -3606,16 +3623,42 @@ impl Shell {
             )),
             _ => None,
         };
-        let caption_color = if meter.error.is_some() && !compacting {
+        let caption_color = if meter.error.is_some() && !compacting && !compacted {
             theme.danger
         } else {
             theme.text_muted
         };
+        // What the last cached compaction cost, under the bar: the measured
+        // price of the summary call, and Pi's own estimate beside it.
+        let cost_rows: Vec<AnyElement> = meter
+            .cost
+            .as_ref()
+            .map(|cost| {
+                [
+                    (cost.cached_line(), theme.text_muted),
+                    (cost.native_line(), theme.text_muted.opacity(0.8)),
+                ]
+                .into_iter()
+                .map(|(text, color)| {
+                    div()
+                        .h(px(15.0))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(color)
+                        .child(text)
+                        .into_any_element()
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        let body_height =
+            COMPACT_BODY_HEIGHT + cost_rows.len() as f32 * COMPACT_COST_LINE_HEIGHT;
         rows.push(
             div()
                 .id("session-info-compact")
                 .debug_selector(|| "session-info-compact".into())
-                .h(px(COMPACT_BODY_HEIGHT))
+                .h(px(body_height))
                 .px(px(9.0))
                 .pb(px(4.0))
                 .flex()
@@ -3671,6 +3714,7 @@ impl Shell {
                         )
                         .children(elapsed),
                 )
+                .children(cost_rows)
                 .into_any_element(),
         );
         rows

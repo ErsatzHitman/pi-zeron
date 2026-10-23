@@ -137,8 +137,8 @@ timeout or the turn's abort closes it.
 Ops: `set` (whole element, keyed `ns:id`), `patch` (merge into an element),
 `remove`, `reset` (everything), `channel` (keyed payload, e.g.
 `minimal-status:footer`, `pi-goal:status`, `subagents:fleet`, `bash-bg:fleet`,
-`workflow:progress`). A removed element with `durable: true` is kept (last 16)
-in the live state only.
+`workflow:progress`, `cached-compaction:state`). A removed element with
+`durable: true` is kept (last 16) in the live state only.
 
 Plain RPC UI requests are folded into the same live state: `notify` (a notice;
 also transcript text during a turn when no UI watches), `setStatus`,

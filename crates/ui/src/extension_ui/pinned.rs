@@ -6,9 +6,11 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use gpui::{AnyElement, App, Context, SharedString, Window, div, prelude::*, px};
 use zeron_proto::extension_ui::{
-    ExtensionUiState, PiUiElement, PiUiKind, PiUiPlacement, PiUiRowState, PiUiSection,
+    CachedCompactionState, ExtensionUiState, PiUiElement, PiUiKind, PiUiPlacement, PiUiRowState,
+    PiUiSection,
 };
 
 use super::parts::{self, Actions};
@@ -193,6 +195,74 @@ fn money(value: f64) -> String {
     }
 }
 
+/// The cached-compaction channel's chip: how long the prompt cache still lives,
+/// counting down, and what the last cached compaction saved.
+const CACHED_COMPACTION_CHIP_KEY: &str = "channel:cached-compaction";
+
+/// A cache lifetime in seconds, the way a chip's tooltip reads it.
+fn lifetime_label(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+/// The countdown text for `expires_at_ms` as of `now`, matching the terminal
+/// footer: minutes while it is far off, seconds inside the last minute, and
+/// `cache cold` once the entry is gone.
+fn cache_countdown_text(expires_at_ms: u64, now: DateTime<Utc>) -> String {
+    let remaining = expires_at_ms as i64 - now.timestamp_millis();
+    if remaining <= 0 {
+        return "cache cold".into();
+    }
+    let seconds = (remaining + 999) / 1_000;
+    if seconds <= 60 {
+        return format!("cache 0:{seconds:02}");
+    }
+    let minutes = (seconds + 59) / 60;
+    if minutes < 60 {
+        return format!("cache {minutes}m");
+    }
+    format!("cache {}h{:02}", minutes / 60, minutes % 60)
+}
+
+/// The cached-compaction chip's tooltip: the cache's lifetime and tier, and
+/// what the last cached compaction saved against Pi's own (an estimate).
+fn cache_chip_hint(state: &CachedCompactionState) -> String {
+    let mut parts = Vec::new();
+    match state.cache.lifetime_seconds {
+        Some(seconds) => parts.push(format!("Cache lives {}", lifetime_label(seconds))),
+        None => parts.push("Cache lifetime unknown".into()),
+    }
+    if let Some(tier) = state.cache.tier.as_deref().filter(|tier| !tier.is_empty()) {
+        parts.push(format!("{tier} tier"));
+    }
+    if let Some(last) = state.last.as_ref().filter(|last| last.outcome == "compaction") {
+        match last.saved_usd {
+            Some(saved) if saved > 0.0 => {
+                parts.push(format!(
+                    "last cached compaction saved {} (est.)",
+                    money(saved)
+                ));
+            }
+            Some(saved) if saved < 0.0 => {
+                parts.push(format!(
+                    "last cached compaction cost {} more (est.)",
+                    money(-saved)
+                ));
+            }
+            Some(_) => parts.push("last cached compaction broke even".into()),
+            None => {}
+        }
+    }
+    parts.join(" · ")
+}
+
 /// Plan mode's element and plain status line. Build is its resting state, so
 /// only Plan (read-only) earns a chip.
 const MODE_ELEMENT_KEY: &str = "plan:mode";
@@ -214,6 +284,8 @@ fn chip_icon(chip: &Chip) -> &'static str {
         icons::CHECKLIST
     } else if key == "channel:footer" {
         icons::FAST_TIER
+    } else if key == CACHED_COMPACTION_CHIP_KEY {
+        icons::CLOCK_CIRCLE
     } else if key.starts_with("status:zeron:") {
         icons::RESTART
     } else if key.contains("goal") {
@@ -291,14 +363,16 @@ pub(crate) fn footer_metrics(chips: Vec<Chip>) -> Vec<Chip> {
         .into_iter()
         .filter(|chip| {
             chip.key == "channel:footer"
+                || chip.key == CACHED_COMPACTION_CHIP_KEY
                 || chip.key == MODE_ELEMENT_KEY
                 || chip.key.starts_with("status:zeron:")
         })
         .collect()
 }
 
-/// Chips for the session footer, in a stable order.
-pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
+/// Chips for the session footer, in a stable order. `now` dates the cache
+/// countdown, so a live expiry ticks without the extension republishing.
+pub(crate) fn footer_chips(state: &ExtensionUiState, now: DateTime<Utc>) -> Vec<Chip> {
     let mut chips: Vec<Chip> = state
         .typed_elements()
         .into_iter()
@@ -422,6 +496,21 @@ pub(crate) fn footer_chips(state: &ExtensionUiState) -> Vec<Chip> {
                 action: None,
             });
         }
+    }
+    // The cached-compaction extension's prompt cache: how long it still lives,
+    // so the idle compact-before-expiry can be watched without a terminal. No
+    // known lifetime means no countdown (the cached summary still runs).
+    if let Some(cached) = CachedCompactionState::of(state)
+        .filter(|cached| cached.footer_countdown != Some(false))
+        && let Some(expires) = cached.cache.expires_at_ms
+    {
+        chips.push(Chip {
+            key: CACHED_COMPACTION_CHIP_KEY.into(),
+            hint: Some(cache_chip_hint(&cached)),
+            text: cache_countdown_text(expires, now),
+            active: false,
+            action: None,
+        });
     }
     chips
 }
@@ -628,7 +717,8 @@ impl Composer {
 
     /// Status chips for the session footer, or `None` without any.
     pub(crate) fn render_extension_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let chips = footer_metrics(footer_chips(self.live_extension_ui(cx)?));
+        let now = Utc::now();
+        let chips = footer_metrics(footer_chips(self.live_extension_ui(cx)?, now));
         if chips.is_empty() {
             return None;
         }
@@ -773,7 +863,12 @@ fn tray_body(
 mod tests {
     use super::*;
     use serde_json::json;
-    use zeron_proto::extension_ui::{ExtensionStatus, ExtensionWidget};
+    use zeron_proto::extension_ui::{CACHED_COMPACTION_CHANNEL, ExtensionStatus, ExtensionWidget};
+
+    /// A fixed instant, so a countdown's text is deterministic.
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_750_000_000, 0).unwrap()
+    }
 
     #[test]
     fn the_footer_keeps_speed_spend_controls_and_notices_only() {
@@ -792,11 +887,101 @@ mod tests {
             chip(MODE_ELEMENT_KEY, true),
             chip("status:zeron:retry", false),
             chip("channel:footer", false),
+            chip(CACHED_COMPACTION_CHIP_KEY, false),
         ])
         .into_iter()
         .map(|chip| chip.key)
         .collect();
-        assert_eq!(kept, [MODE_ELEMENT_KEY, "status:zeron:retry", "channel:footer"]);
+        assert_eq!(
+            kept,
+            [
+                MODE_ELEMENT_KEY,
+                "status:zeron:retry",
+                "channel:footer",
+                CACHED_COMPACTION_CHIP_KEY
+            ]
+        );
+    }
+
+    #[test]
+    fn a_live_cache_channel_counts_down_and_goes_cold() {
+        let now = now();
+        let mut state = ExtensionUiState::default();
+        // No channel: no chip.
+        assert!(
+            !footer_chips(&state, now)
+                .iter()
+                .any(|chip| chip.key == CACHED_COMPACTION_CHIP_KEY)
+        );
+        let expires = now.timestamp_millis() as u64 + 4 * 60_000;
+        state.channels.insert(
+            CACHED_COMPACTION_CHANNEL.into(),
+            json!({
+                "v": 1,
+                "cache": {"lifetimeSeconds": 300, "source": "reported", "expiresAtMs": expires,
+                          "cached": true, "tier": "short"},
+                "preExpiry": {"enabled": true, "minContextTokens": 50_000, "armed": true},
+                "last": {"atMs": 1, "trigger": "threshold", "outcome": "compaction",
+                         "costUsd": 0.0481, "nativeCostUsd": 0.1459, "savedUsd": 0.0978,
+                         "cacheShare": 0.99}
+            }),
+        );
+        let chip = |state: &ExtensionUiState, at: DateTime<Utc>| {
+            footer_chips(state, at)
+                .into_iter()
+                .find(|chip| chip.key == CACHED_COMPACTION_CHIP_KEY)
+        };
+        let live = chip(&state, now).expect("a countdown chip");
+        assert_eq!(live.text, "cache 4m");
+        assert_eq!(chip_icon(&live), icons::CLOCK_CIRCLE);
+        let hint = live.hint.as_deref().unwrap();
+        assert!(hint.contains("Cache lives 5m"), "{hint}");
+        assert!(hint.contains("short tier"), "{hint}");
+        assert!(hint.contains("saved $0.098 (est.)"), "{hint}");
+        // Inside the last minute it counts in seconds, then reads cold.
+        assert_eq!(
+            chip(&state, now + chrono::TimeDelta::seconds(215))
+                .unwrap()
+                .text,
+            "cache 0:25"
+        );
+        assert_eq!(
+            chip(&state, now + chrono::TimeDelta::seconds(600))
+                .unwrap()
+                .text,
+            "cache cold"
+        );
+        // The countdown off, or no known lifetime: no chip at all.
+        state.channels.insert(
+            CACHED_COMPACTION_CHANNEL.into(),
+            json!({"cache": {"expiresAtMs": expires}, "footerCountdown": false}),
+        );
+        assert!(chip(&state, now).is_none());
+        state.channels.insert(
+            CACHED_COMPACTION_CHANNEL.into(),
+            json!({"cache": {"cached": false}}),
+        );
+        assert!(chip(&state, now).is_none());
+    }
+
+    #[test]
+    fn the_cache_countdown_chip_follows_the_footer_chip() {
+        let now = now();
+        let mut state = ExtensionUiState::default();
+        state.channels.insert(
+            "minimal-status:footer".into(),
+            json!({"tokensPerSecond": 41.6,
+                   "session": {"costUsd": 0.04, "cacheHitRate": 0.8}}),
+        );
+        state.channels.insert(
+            CACHED_COMPACTION_CHANNEL.into(),
+            json!({"cache": {"expiresAtMs": now.timestamp_millis() as u64 + 120_000}}),
+        );
+        let keys: Vec<String> = footer_metrics(footer_chips(&state, now))
+            .into_iter()
+            .map(|chip| chip.key)
+            .collect();
+        assert_eq!(keys, ["channel:footer", CACHED_COMPACTION_CHIP_KEY]);
     }
 
     #[test]
@@ -848,7 +1033,7 @@ mod tests {
         assert_eq!(trays, vec!["bash:jobs", "btw:thread", "widget:advisor"]);
         assert_eq!(tray_elements(&state, false).len(), 2);
         assert!(working(&tray_elements(&state, true)[0]));
-        let chips = footer_chips(&state);
+        let chips = footer_chips(&state, now());
         let texts: Vec<&str> = chips.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -900,7 +1085,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let texts: Vec<String> = footer_chips(&state).into_iter().map(|c| c.text).collect();
+        let texts: Vec<String> = footer_chips(&state, now()).into_iter().map(|c| c.text).collect();
         assert_eq!(texts, vec!["Plan", "RTK on"]);
     }
 
@@ -915,7 +1100,7 @@ mod tests {
             text: "Build".into(),
         };
         let texts = |state: &ExtensionUiState| -> Vec<String> {
-            footer_chips(state).into_iter().map(|c| c.text).collect()
+            footer_chips(state, now()).into_iter().map(|c| c.text).collect()
         };
         for element in [
             json!({"id":"mode","ns":"plan","kind":"status","placement":"status",
@@ -991,7 +1176,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let chips = footer_chips(&state);
+        let chips = footer_chips(&state, now());
         assert_eq!(chips.len(), 1, "{chips:?}");
         assert_eq!(chips[0].key, "status:other");
     }

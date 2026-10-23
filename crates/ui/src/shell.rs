@@ -1640,9 +1640,11 @@ enum ShellEscapeOutcome {
 
 /// When the shell next has render-only clock pixels to repaint, as of `now`:
 /// every second while the selected chat is Working (the trailer's elapsed
-/// timer and its 7s flavour word), else the next wall-clock minute for
-/// relative "5m"/"2h" labels. State transitions (staleness, device presence,
-/// send grace) arrive as AppState notifications instead — see
+/// timer and its 7s flavour word), and every second while its prompt cache is
+/// inside the last minute before it expires (the cached-compaction countdown
+/// chip); else the next wall-clock minute for relative "5m"/"2h" labels.
+/// State transitions (staleness, device presence, send grace, a cache that
+/// expired) arrive as AppState notifications or PIUI frames instead — see
 /// [`AppState::watch_clock_transitions`]. Nothing else ticks: AwaitingInput
 /// and Errored show no clock, and the connection pill has no countdown (its
 /// spinner animates itself).
@@ -1653,6 +1655,21 @@ fn shell_clock_wake(state: &AppState, now: DateTime<Utc>) -> DateTime<Utc> {
         .is_some_and(|id| state.indicator_for(id, now) == Indicator::Working);
     if working {
         return now + chrono::TimeDelta::seconds(1);
+    }
+    // The cached-compaction countdown ticks locally: the extension publishes
+    // the absolute expiry, not a frame a second.
+    let expiry = state
+        .selected_chat
+        .as_deref()
+        .and_then(|id| state.extension_ui.of(id))
+        .and_then(zeron_proto::extension_ui::CachedCompactionState::of)
+        .and_then(|cached| cached.cache.expires_at_ms)
+        .and_then(|ms| DateTime::from_timestamp_millis(ms as i64));
+    if let Some(expiry) = expiry {
+        let remaining = expiry - now;
+        if remaining > chrono::TimeDelta::zero() && remaining <= chrono::TimeDelta::minutes(1) {
+            return now + chrono::TimeDelta::seconds(1);
+        }
     }
     DateTime::from_timestamp((now.timestamp().div_euclid(60) + 1) * 60, 0)
         .unwrap_or(now + chrono::TimeDelta::minutes(1))
@@ -15457,6 +15474,36 @@ mod tests {
         // AppState notification, not a shell tick.
         state.sessions[0].status = zeron_proto::SessionStatus::AwaitingInput;
         assert_redraw_at(cx, &state, now, now + chrono::TimeDelta::minutes(1));
+    }
+
+    #[gpui::test]
+    fn a_live_cache_expiry_ticks_the_countdown_every_second(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let now = clock_epoch();
+        let mut state = AppState::new();
+        state.sessions = vec![clock_session("chat", zeron_proto::SessionStatus::Idle, now)];
+        state.selected_chat = Some("chat".into());
+        state.extension_ui.chat = Some("chat".into());
+        let set_expiry = |state: &mut AppState, offset_ms: i64| {
+            state.extension_ui.state.channels.insert(
+                zeron_proto::extension_ui::CACHED_COMPACTION_CHANNEL.into(),
+                serde_json::json!({
+                    "cache": {"expiresAtMs": now.timestamp_millis() as u64 + offset_ms as u64}
+                }),
+            );
+        };
+        // Inside the last minute the countdown ticks once a second.
+        set_expiry(&mut state, 30_000);
+        assert_redraw_at(cx, &state, now, now + chrono::TimeDelta::seconds(1));
+        // Far from expiry, and past it, the next minute is enough.
+        set_expiry(&mut state, 10 * 60_000);
+        assert_redraw_at(cx, &state, now, clock_epoch() + chrono::TimeDelta::minutes(1));
+        state.extension_ui.state.channels.insert(
+            zeron_proto::extension_ui::CACHED_COMPACTION_CHANNEL.into(),
+            serde_json::json!({"cache": {"expiresAtMs": now.timestamp_millis() as u64 - 1}}),
+        );
+        assert_redraw_at(cx, &state, now, clock_epoch() + chrono::TimeDelta::minutes(1));
     }
 
     #[gpui::test]
