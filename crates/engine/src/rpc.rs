@@ -1993,6 +1993,31 @@ fn forward_deadline(method: &str) -> std::time::Duration {
 /// running engine reaps an abandoned login after the same 15 minutes.
 const LOGIN_TUNNEL_TTL: Duration = Duration::from_secs(15 * 60);
 
+/// `GetCachedCompactionSettings` / `SetCachedCompactionSettings`: the device's
+/// own `cached-compaction.json`, read (and, on a save, normalised off the
+/// runtime) with the reply being what the file now sets.
+async fn cached_compaction_reply(
+    method: &str,
+    params: serde_json::Value,
+    agent_dir: std::path::PathBuf,
+) -> Result<RpcReply, RpcError> {
+    use crate::cached_compaction::{self, CachedCompactionSettings};
+    let save: Option<CachedCompactionSettings> =
+        if method == methods::SET_CACHED_COMPACTION_SETTINGS {
+            Some(parse_params(params)?)
+        } else {
+            None
+        };
+    let settings = tokio::task::spawn_blocking(move || match save {
+        Some(settings) => cached_compaction::write(&agent_dir, settings),
+        None => Ok(cached_compaction::read(&agent_dir)),
+    })
+    .await
+    .map_err(|e| RpcError::Failed(e.to_string()))?
+    .map_err(RpcError::Failed)?;
+    RpcReply::value(&settings)
+}
+
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
@@ -2011,6 +2036,9 @@ fn forwardable(method: &str) -> bool {
             // Pi's loop.json is on the device that runs it.
             | methods::GET_ADVISOR_SETTINGS
             | methods::SET_ADVISOR_SETTINGS
+            // And its cached-compaction.json, next to it.
+            | methods::GET_CACHED_COMPACTION_SETTINGS
+            | methods::SET_CACHED_COMPACTION_SETTINGS
             // So is its subagents.json.
             | methods::GET_SUBAGENT_SETTINGS
             | methods::SET_SUBAGENT_SETTINGS
@@ -2631,6 +2659,9 @@ impl RpcService for EngineRpc {
                 .map_err(|e| RpcError::Failed(e.to_string()))?
                 .map_err(RpcError::Failed)?;
                 RpcReply::value(&settings)
+            }
+            methods::GET_CACHED_COMPACTION_SETTINGS | methods::SET_CACHED_COMPACTION_SETTINGS => {
+                cached_compaction_reply(method, params, self.agent_accounts.pi_agent_dir()).await
             }
             methods::GET_SUBAGENT_SETTINGS | methods::SET_SUBAGENT_SETTINGS => {
                 use crate::subagent_settings::{self, SubagentSettings};
@@ -5131,6 +5162,88 @@ mod tests {
         let frame = next_frame(&mut stream).await;
         assert!(frame.is_object());
         assert_eq!(frame["checkoutId"], "c");
+    }
+
+    #[tokio::test]
+    async fn cached_compaction_settings_read_the_defaults_and_normalise_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        async fn get(agent_dir: std::path::PathBuf) -> serde_json::Value {
+            let reply = cached_compaction_reply(
+                methods::GET_CACHED_COMPACTION_SETTINGS,
+                serde_json::json!({}),
+                agent_dir,
+            )
+            .await
+            .unwrap();
+            match reply {
+                RpcReply::Value(value) => value,
+                RpcReply::Stream(_) => panic!("a unary reply"),
+            }
+        }
+        async fn set(
+            agent_dir: std::path::PathBuf,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, RpcError> {
+            match cached_compaction_reply(
+                methods::SET_CACHED_COMPACTION_SETTINGS,
+                params,
+                agent_dir,
+            )
+            .await?
+            {
+                RpcReply::Value(value) => Ok(value),
+                RpcReply::Stream(_) => panic!("a unary reply"),
+            }
+        }
+        let dir_path = || dir.path().to_path_buf();
+        // An empty agent dir replies the extension's own defaults, and a read
+        // creates nothing.
+        let read = get(dir_path()).await;
+        assert_eq!(read["enabled"], serde_json::json!(true));
+        assert_eq!(read["compactBeforeExpiry"], serde_json::json!(true));
+        assert_eq!(read["minContextTokens"], serde_json::json!(50_000));
+        assert_eq!(read["leadMs"], serde_json::json!(20_000));
+        assert_eq!(read["cacheRetention"], serde_json::json!("auto"));
+        assert_eq!(read["costCard"], serde_json::json!(true));
+        assert_eq!(read["footerCountdown"], serde_json::json!(true));
+        assert!(!crate::cached_compaction::path(dir.path()).exists());
+        // A save is clamped, and the GET that follows returns it.
+        let saved = set(
+            dir_path(),
+            serde_json::json!({
+                "enabled": false,
+                "compactBeforeExpiry": true,
+                "minContextTokens": 1,
+                "leadMs": 900_000_000u64,
+                "cacheRetention": "long",
+                "costCard": true,
+                "footerCountdown": false
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved["enabled"], serde_json::json!(false));
+        assert_eq!(saved["minContextTokens"], serde_json::json!(1_000));
+        assert_eq!(saved["leadMs"], serde_json::json!(3_600_000));
+        assert_eq!(saved["cacheRetention"], serde_json::json!("long"));
+        assert_eq!(saved["footerCountdown"], serde_json::json!(false));
+        assert_eq!(get(dir_path()).await, saved);
+        // An unknown retention is refused, and what is on disk still stands.
+        let error = set(
+            dir_path(),
+            serde_json::json!({ "cacheRetention": "forever" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, RpcError::Failed(ref message) if message.contains("not a cache retention")),
+            "{error:?}"
+        );
+        assert_eq!(
+            get(dir_path()).await,
+            saved,
+            "a refused save changes nothing"
+        );
     }
 
     #[tokio::test]

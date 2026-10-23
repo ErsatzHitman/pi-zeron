@@ -86,6 +86,9 @@ pub struct ShortcutsPage {
     thread_naming: Entity<crate::settings::thread_naming::ThreadNamingCard>,
     /// Settings → General's advisor card (its own Pi-only pickers).
     advisor: Entity<crate::settings::advisor::AdvisorCard>,
+    /// Settings → General's cached compaction card (the compaction
+    /// extension's own switches).
+    cached_compaction: Entity<crate::settings::cached_compaction::CachedCompactionCard>,
     /// Settings → General's default subagent card (a Pi-only picker).
     default_subagent: Entity<crate::settings::default_subagent::DefaultSubagentCard>,
     /// Settings → General's decision gate card (Jev or SubQ Snap).
@@ -140,6 +143,12 @@ impl ShortcutsPage {
                 let state = state.clone();
                 cx.new(|cx| crate::settings::advisor::AdvisorCard::new(state, cx))
             },
+            cached_compaction: {
+                let state = state.clone();
+                cx.new(|cx| {
+                    crate::settings::cached_compaction::CachedCompactionCard::new(state, cx)
+                })
+            },
             default_subagent: {
                 let state = state.clone();
                 cx.new(|cx| {
@@ -186,6 +195,7 @@ impl ShortcutsPage {
             .update(cx, |card, cx| card.refresh(cx));
         self.thread_naming.update(cx, |card, cx| card.refresh(cx));
         self.advisor.update(cx, |card, cx| card.refresh(cx));
+        self.cached_compaction.update(cx, |card, cx| card.refresh(cx));
         self.decision_gate.update(cx, |card, cx| card.refresh(cx));
         self.pi.update(cx, |card, cx| card.refresh(cx));
     }
@@ -997,7 +1007,8 @@ impl Render for ShortcutsPage {
                                     .child(self.pi.clone())
                                     .child(self.default_subagent.clone())
                                     .child(self.decision_gate.clone())
-                                    .child(self.advisor.clone()),
+                                    .child(self.advisor.clone())
+                                    .child(self.cached_compaction.clone()),
                             ),
                     )
                     .fade_overflow_y(&self.scroll.scroll),
