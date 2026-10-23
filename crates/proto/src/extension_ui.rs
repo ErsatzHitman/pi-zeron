@@ -61,6 +61,114 @@ impl CompactStatus {
     }
 }
 
+/// The cached-compaction extension's state channel ([`CachedCompactionState`]):
+/// whether the next compaction replays the captured request at cache-read
+/// prices, how long the prompt cache still lives, and what the last compaction
+/// cost against Pi's own. Whole-state per payload, republished on every ticker
+/// tick; absent when the extension is not loaded or its process is gone.
+pub const CACHED_COMPACTION_CHANNEL: &str = "cached-compaction:state";
+
+/// The [`CACHED_COMPACTION_CHANNEL`] payload. Every field defaults, so a newer
+/// extension cannot break an older UI.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CachedCompactionState {
+    /// Payload shape version.
+    pub v: u32,
+    /// Increments on each publish (the extension dedupes unchanged ones).
+    pub seq: u64,
+    /// Host clock, unix ms, when this payload was built.
+    pub at: Option<u64>,
+    pub model: CachedCompactionModel,
+    pub cache: CachedCompactionCache,
+    /// What the next compaction would do, and why.
+    pub next: CachedCompactionNext,
+    /// The last compaction attempt this session, or none yet.
+    pub last: Option<CachedCompactionLast>,
+    pub pre_expiry: CachedCompactionPreExpiry,
+    /// The extension's footer-countdown switch. Absent means it publishes the
+    /// countdown (payloads from before the field existed have no such key).
+    pub footer_countdown: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CachedCompactionModel {
+    pub provider: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CachedCompactionCache {
+    /// The prompt cache's lifetime, when the provider reports one.
+    pub lifetime_seconds: Option<u64>,
+    /// Where the lifetime came from: `reported`, `model` or `default`.
+    pub source: Option<String>,
+    /// Host clock, unix ms, when the cache entry dies.
+    pub expires_at_ms: Option<u64>,
+    /// Whether a cache entry is live right now.
+    pub cached: bool,
+    /// `short` or `long`.
+    pub tier: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CachedCompactionNext {
+    /// `cached`, `native` or `none`.
+    pub path: String,
+    pub reason: Option<String>,
+}
+
+/// One compaction attempt, as the extension reports it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CachedCompactionLast {
+    /// Host clock, unix ms, when the attempt finished.
+    pub at_ms: Option<u64>,
+    /// `manual`, `threshold`, `overflow` or `expiry`.
+    pub trigger: Option<String>,
+    /// `compaction`, `native`, `cancelled` or `failed`.
+    pub outcome: String,
+    /// Human-readable why: the fallback gate that refused, or the path taken.
+    pub reason: Option<String>,
+    pub tokens_before: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Measured cost of the cached summary call.
+    pub cost_usd: Option<f64>,
+    /// What Pi's own compaction is estimated to have sent.
+    pub native_tokens: Option<u64>,
+    /// The estimate's cost, from chars/4 and the model's prices.
+    pub native_cost_usd: Option<f64>,
+    /// `native_cost_usd - cost_usd`; negative means the cached path cost more.
+    pub saved_usd: Option<f64>,
+    /// cacheRead / prompt tokens of the summary call.
+    pub cache_share: Option<f64>,
+    /// Wall-clock duration of the summary call.
+    pub seconds: Option<f64>,
+}
+
+/// The idle compact-before-expiry timer's state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CachedCompactionPreExpiry {
+    /// The idle compact-before-expiry timer is on for this session.
+    pub enabled: bool,
+    /// The context floor below which it never fires.
+    pub min_context_tokens: u64,
+    /// A ticker is running and the expiry is known.
+    pub armed: bool,
+}
+
+impl CachedCompactionState {
+    pub fn of(ui: &ExtensionUiState) -> Option<Self> {
+        Self::deserialize(ui.channels.get(CACHED_COMPACTION_CHANNEL)?).ok()
+    }
+}
+
 /// The Pi context-window extension's breakdown of the context window: what
 /// the provider measured, and how the model's view splits into tools, the
 /// system prompt, skills, MCP server instructions and messages (estimated,
@@ -1540,6 +1648,59 @@ mod tests {
         assert_eq!(CompactStatus::of(&ui), Some(CompactStatus::default()));
         ui.channels.insert(COMPACT_CHANNEL.into(), json!("nope"));
         assert_eq!(CompactStatus::of(&ui), None);
+    }
+
+    #[test]
+    fn the_cached_compaction_state_round_trips_and_defaults() {
+        let mut ui = ExtensionUiState::default();
+        assert_eq!(CachedCompactionState::of(&ui), None);
+        let payload = json!({
+            "v": 1, "seq": 3, "at": 1_750_000_000_000u64,
+            "model": {"provider": "anthropic", "id": "claude-sonnet-4-5"},
+            "cache": {"lifetimeSeconds": 300, "source": "reported",
+                      "expiresAtMs": 1_750_000_300_000u64, "cached": true, "tier": "short"},
+            "next": {"path": "cached", "reason": "the captured request can be replayed"},
+            "last": {"at": 1_750_000_000_000u64, "trigger": "threshold", "outcome": "compaction",
+                     "reason": "cached summary", "tokensBefore": 120_000, "cachedReadTokens": 118_000,
+                     "cachedInputTokens": 300, "outputTokens": 900, "costUsd": 0.0481,
+                     "nativeTokens": 41_000, "nativeCostUsd": 0.1459, "savedUsd": 0.0978,
+                     "cacheShare": 0.99, "seconds": 6.4},
+            "preExpiry": {"enabled": true, "minContextTokens": 50_000, "armed": true},
+            "footerCountdown": true,
+            "log": "/tmp/cached-compaction.jsonl",
+            "futureField": {"x": 1},
+        });
+        ui.channels
+            .insert(CACHED_COMPACTION_CHANNEL.into(), payload.clone());
+        let state = CachedCompactionState::of(&ui).expect("parses");
+        assert_eq!(state.v, 1);
+        assert_eq!(state.seq, 3);
+        assert_eq!(state.model.provider, "anthropic");
+        assert_eq!(state.cache.lifetime_seconds, Some(300));
+        assert_eq!(state.cache.expires_at_ms, Some(1_750_000_300_000));
+        assert!(state.cache.cached);
+        assert_eq!(state.next.path, "cached");
+        assert_eq!(state.pre_expiry.min_context_tokens, 50_000);
+        assert!(state.pre_expiry.armed);
+        assert_eq!(state.footer_countdown, Some(true));
+        let last = state.last.as_ref().expect("a last compaction");
+        assert_eq!(last.outcome, "compaction");
+        assert_eq!(last.trigger.as_deref(), Some("threshold"));
+        assert_eq!(last.cost_usd, Some(0.0481));
+        assert_eq!(last.saved_usd, Some(0.0978));
+        assert_eq!(last.cache_share, Some(0.99));
+        // Unknown keys are ignored, and the payload round-trips what it read.
+        let back: CachedCompactionState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(back, state);
+        // An empty object is the default, not an error.
+        ui.channels
+            .insert(CACHED_COMPACTION_CHANNEL.into(), json!({}));
+        assert_eq!(CachedCompactionState::of(&ui), Some(CachedCompactionState::default()));
+        // A non-object is not a payload at all.
+        ui.channels
+            .insert(CACHED_COMPACTION_CHANNEL.into(), json!("nope"));
+        assert_eq!(CachedCompactionState::of(&ui), None);
     }
 
     #[test]
