@@ -637,6 +637,12 @@ fn compact_path(path: &str) -> String {
 }
 
 /// What the goal's status reads as, and whether it is at work.
+///
+/// `waiting` is a goal parked on an external event, and it stays `Waiting`
+/// while the session answers a user message typed during that wait: that turn
+/// does not resume the goal (see [`zeron_proto::extension_ui::GOAL_CHANNEL`]).
+/// So waiting is never at work and is not a goal awaiting the user; only
+/// `active` is. A status this build does not know reads as `Set`, not running.
 fn goal_status(status: &str) -> (&'static str, bool) {
     match status {
         "active" => ("Running", true),
@@ -1722,6 +1728,11 @@ impl Shell {
 
     /// The goal pi-goal is working toward: its status, objective and
     /// progress line.
+    ///
+    /// The status pill comes from [`goal_status`] and the line under it is the
+    /// payload's `detail` verbatim, so a `waiting` goal shows 'Waiting' with
+    /// `waiting: <reason>` — also while the session answers a user message
+    /// typed during that wait (see [`zeron_proto::extension_ui::GOAL_CHANNEL`]).
     fn render_goal(
         &self,
         goal: &serde_json::Value,
@@ -3715,8 +3726,18 @@ mod tests {
     fn goal_statuses_read_plainly() {
         assert_eq!(goal_status("active"), ("Running", true));
         assert_eq!(goal_status("waiting"), ("Waiting", false));
+        assert_eq!(goal_status("paused"), ("Paused", false));
+        assert_eq!(goal_status("blocked"), ("Blocked", false));
         assert_eq!(goal_status("budget_limited"), ("Budget reached", false));
         assert_eq!(goal_status("something-new"), ("Set", false));
+        // No status at all: the goal is set, not at work.
+        assert_eq!(goal_status(""), ("Set", false));
+        // The payload's shape does not change for a user turn during a wait
+        // (see GOAL_CHANNEL): the pill stays Waiting, so it is not work and
+        // not a question for the user. Only `active` reads as at work.
+        for status in ["waiting", "paused", "blocked", "budget_limited", ""] {
+            assert!(!goal_status(status).1, "{status} is not at work");
+        }
     }
 
     #[test]
