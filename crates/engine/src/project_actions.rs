@@ -376,7 +376,16 @@ fn root_string(project_root: &Path) -> String {
 /// device paths: they are the project root and the checkout being launched in.
 fn environment_path(path: &Path) -> String {
     #[cfg(windows)]
-    let path = dunce::simplified(path);
+    {
+        // `dunce` keeps verbatim UNC paths as they are, so `\\?\UNC\server\share`
+        // is rewritten to the plain `\\server\share` form here.
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        return dunce::simplified(path).to_string_lossy().into_owned();
+    }
+    #[cfg(not(windows))]
     path.to_string_lossy().into_owned()
 }
 

@@ -1689,7 +1689,11 @@ fn read_absolute_file_blocking(
 ) -> Result<WorkspaceFileText, WorkspaceFilesError> {
     match resolve_absolute_read(workspace, path)? {
         AbsoluteRead::Inside(relative) => {
-            let mut file = read_file_blocking(&workspace.root, &relative, cancel)?;
+            // The relative path was cut from the CANONICAL root (long names, and
+            // `\\?\` on Windows), so the containment check must use that root too:
+            // an 8.3 or unprefixed spelling of the same folder would read as an escape.
+            let root = std::fs::canonicalize(&workspace.root).unwrap_or(workspace.root.clone());
+            let mut file = read_file_blocking(&root, &relative, cancel)?;
             file.checkout_id = workspace.checkout_id.clone();
             Ok(file)
         }

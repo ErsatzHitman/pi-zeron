@@ -638,7 +638,9 @@ impl Repos {
         let trimmed = url.trim().trim_end_matches('/');
         let name = trimmed
             .trim_end_matches(".git")
-            .rsplit(['/', ':'])
+            // `\` too: a local Windows path names its folder after the last
+            // backslash, and a rooted remainder would make `join` escape `repos`.
+            .rsplit(['/', '\\', ':'])
             .next()
             .filter(|s| !s.is_empty())
             .unwrap_or("repo")
