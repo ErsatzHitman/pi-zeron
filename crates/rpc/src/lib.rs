@@ -55,6 +55,14 @@ pub mod methods {
     /// Save `{model: string|null, fallbacks: string[]}`; replies like
     /// `GetAdvisorSettings`.
     pub const SET_ADVISOR_SETTINGS: &str = "SetAdvisorSettings";
+    /// The cached-compaction extension's switches — enable, the idle
+    /// pre-expiry timer's context floor and lead, cache retention, the cost
+    /// card and the footer countdown — from this device's
+    /// `cached-compaction.json` (`CachedCompactionSettings`).
+    pub const GET_CACHED_COMPACTION_SETTINGS: &str = "GetCachedCompactionSettings";
+    /// Save `CachedCompactionSettings` (the limits clamped, an unknown
+    /// retention refused); replies like `GetCachedCompactionSettings`.
+    pub const SET_CACHED_COMPACTION_SETTINGS: &str = "SetCachedCompactionSettings";
     /// The default agent (Pi model and thinking level) of every child an
     /// agent starts, from this device's `subagents.json` (`SubagentSettings`).
     pub const GET_SUBAGENT_SETTINGS: &str = "GetSubagentSettings";

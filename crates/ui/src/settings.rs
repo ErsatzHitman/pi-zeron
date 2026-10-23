@@ -20,6 +20,7 @@ pub mod accounts;
 pub mod advisor;
 pub mod api_keys;
 pub mod appearance;
+pub mod cached_compaction;
 pub mod decision_gate;
 pub mod default_subagent;
 pub mod archived;

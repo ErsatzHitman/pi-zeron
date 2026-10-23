@@ -20,6 +20,7 @@ pub mod advisor_settings;
 pub mod agent_accounts;
 pub mod api_keys;
 pub mod auth;
+pub mod cached_compaction;
 mod change_request_store;
 pub mod change_requests;
 pub mod chat2_host;

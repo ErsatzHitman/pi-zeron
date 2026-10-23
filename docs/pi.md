@@ -587,3 +587,18 @@ consult, so a change applies to the next one. The card warns when Snap is
 chosen and the store holds no SubQ key: the gate then lets launches through
 without a consult. `/decisions model [jev|snap]` sets the same file, and
 `DECISIONS_MODEL` overrides it.
+
+## Cached compaction
+
+Settings → General → Cached compaction is the card for the cached-compaction
+extension: a compaction that resends the exact last request plus one
+`summarize` instruction, so the model reads its prompt cache instead of the
+whole conversation. The card sets its master switch, the idle
+compact-before-expiry timer (context floor and lead time), the cache retention
+the session asks for (`auto`, `short` or `long`), and whether its cost card and
+the footer countdown are drawn. The engine writes them to
+`<pi agent dir>/cached-compaction.json` (`GetCachedCompactionSettings` /
+`SetCachedCompactionSettings`), keeping every key it does not own; the
+extension re-reads the file at every compaction, so a change reaches running
+chats at their next one. The same values are set from a terminal with
+`/cached-compaction`. Learn more: `docs/reference/cached-compaction.md`.
